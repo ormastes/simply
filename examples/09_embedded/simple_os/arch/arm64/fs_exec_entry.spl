@@ -1,0 +1,106 @@
+# ARM64 filesystem executable acceptance entry.
+
+extern fn serial_println(msg: text)
+extern fn rt_qemu_exit_success()
+extern fn arm_fs_exec_print_success_marker()
+extern fn rt_exit(code: i32)
+extern fn rt_arm_array_len_u32(arr: [u8]) -> u32
+extern fn rt_arm64_harden_canary_value() -> i64
+extern fn rt_sosix_collector_nonce_echo() -> i64
+
+use os.services.vfs.arm_fs_exec_vfs.{arm_fs_exec_vfs_boot_init}
+use os.services.vfs.arm_fs_exec_vfs.{arm_fs_exec_read_file_bytes}
+use os.kernel.loader.arm64_fs_exec_spawn.{
+    arm64_fs_exec_spawn, arm64_fs_exec_spawn_ring3,
+    arm64_fs_exec_load_and_launch_hello_world
+}
+
+# Freestanding module-var init never runs, so `_mmio_test_mode` reads
+# garbage-true; force hardware MMIO before the VFS/loader touch the device.
+use os.kernel.boot.mmio.{mmio_disable_test_mode}
+
+fn _smoke_spawn_app(app_name: text, app_path: text):
+    val bytes = arm_fs_exec_read_file_bytes(app_path)
+    val byte_len = rt_arm_array_len_u32(bytes)
+    if byte_len <= 4:
+        serial_println("[arm-fs-exec] app-read:fail app={app_name} path={app_path}")
+        return
+    serial_println("[desktop-e2e] vfs-app-read:ok source=generic-vfs path={app_path} bytes={byte_len}")
+    val pid = arm64_fs_exec_spawn(app_path, [app_path], [])
+    if pid > 0:
+        serial_println("[desktop-e2e] process-backed:ok app={app_name} pid={pid}")
+
+fn spl_start():
+    mmio_disable_test_mode()
+    serial_println("")
+    serial_println("=== SimpleOS ARM64 FS exec boot ===")
+    serial_println("[harden] canary arch=aarch64 value=" + rt_arm64_harden_canary_value().to_text())
+
+    if not arm_fs_exec_vfs_boot_init():
+        serial_println("[arm-fs-exec] vfs:fail")
+        serial_println("TEST FAILED")
+        rt_qemu_exit_success()
+        return
+
+    if rt_sosix_collector_nonce_echo() != 1:
+        serial_println("[arm64-collector-nonce] /SOSIXNON.TXT read failed")
+        serial_println("TEST FAILED")
+        rt_qemu_exit_success()
+        return
+    serial_println("guest-entry")
+
+    val pid = arm64_fs_exec_load_and_launch_hello_world()
+    if pid <= 0:
+        serial_println("[arm-fs-exec] spawn:fail")
+        serial_println("TEST FAILED")
+        rt_qemu_exit_success()
+        return
+
+    serial_println("[desktop-e2e] process-backed:ok app=hello_world pid={pid}")
+    _smoke_spawn_app("simple_compiler", "/sys/apps/simple_compiler")
+    _smoke_spawn_app("simple_interpreter", "/sys/apps/simple_interpreter")
+    _smoke_spawn_app("simple_loader", "/sys/apps/simple_loader")
+
+    # Lane BA in-guest Simple toolchain gate: read /hello.spl, then load+spawn
+    # the real cross-built interpreter staged at /usr/bin/simple with
+    # argv ["/usr/bin/simple", "/hello.spl"].
+    val hello_bytes = arm_fs_exec_read_file_bytes("/hello.spl")
+    val hello_len = rt_arm_array_len_u32(hello_bytes)
+    serial_println("[simple-gate] hello-spl-read bytes={hello_len}")
+    val sim_bytes = arm_fs_exec_read_file_bytes("/usr/bin/simple")
+    val sim_len = rt_arm_array_len_u32(sim_bytes)
+    serial_println("[simple-gate] usr-bin-simple-read bytes={sim_len}")
+    if sim_len > 4:
+        val sim_rc = arm64_fs_exec_spawn_ring3("/usr/bin/simple", ["/usr/bin/simple", "/hello.spl"], [])
+        if sim_rc == 0:
+            serial_println("[simple-gate] execution:ok app=/usr/bin/simple argv=/hello.spl exit=0")
+        else:
+            serial_println("[simple-gate] execution:fail app=/usr/bin/simple rc={sim_rc}")
+    else:
+        serial_println("[simple-gate] usr-bin-simple missing (stage with SIMPLEOS_SIMPLE_BINARY)")
+
+    # The disk producer emits architecture-matched SMF-wrapped ELF probes for
+    # these standalone toolchain applications. Keep the guest launch set in
+    # lockstep with the ARM64 acceptance catalog: a catalog-required marker
+    # must be backed by a real VFS read and scheduler-owned process image.
+    _smoke_spawn_app("llvm", "/sys/apps/llvm")
+    _smoke_spawn_app("clang", "/sys/apps/clang")
+    _smoke_spawn_app("rust", "/sys/apps/rust")
+
+    arm_fs_exec_print_success_marker()
+
+    # Phase 2: enter the actual AArch64 ELF mounted at the FAT root. The payload
+    # emits its nonce through syscall 60; syscall 0 then resumes this blocking
+    # kernel call with the raw user exit code.
+    serial_println("[arm-fs-exec] mounted-elf:attempt path=/FSEXEC.ELF")
+    val handoff_rc = arm64_fs_exec_spawn_ring3(
+        "/FSEXEC.ELF", ["/FSEXEC.ELF"], []
+    )
+    serial_println("[arm-fs-exec] mounted-elf:return rc={handoff_rc}")
+    if handoff_rc == 0:
+        serial_println("[arm64-user] kernel-resumed exit=0")
+        serial_println("TEST PASSED")
+        rt_qemu_exit_success()
+        return
+    serial_println("TEST FAILED")
+    rt_exit(1)

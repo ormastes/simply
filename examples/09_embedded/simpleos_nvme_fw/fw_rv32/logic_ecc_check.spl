@@ -1,0 +1,17 @@
+fn _rv32_ecc_check_with_recomputed(data: i64, stored: i64, injected_flips: i64, recomputed: i64) -> i64:
+    val flips: i64 = if injected_flips < 0: 0 else: injected_flips
+    if flips >= 2:
+        return 2
+    if ((stored >> 6) & 2047) != ((recomputed >> 6) & 2047):
+        return 2
+    val syndrome: i64 = (stored ^ recomputed) & 31
+    val overall: i64 = ((stored >> 5) ^ (recomputed >> 5)) & 1
+    if syndrome == 0:
+        if overall == 0:
+            if flips == 1:
+                return 1
+            return 0
+        return 1
+    if overall == 0:
+        return 2
+    1

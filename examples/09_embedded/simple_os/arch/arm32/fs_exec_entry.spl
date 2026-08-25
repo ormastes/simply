@@ -1,0 +1,142 @@
+# ARM32 filesystem executable acceptance entry.
+#
+# Mirrors the riscv64 smoke_entry pattern: each contract marker is gated behind
+# a real capability probe (FAT32 NVFS, SMF CLI ELF load, SMF GUI package, native
+# GUI render surface write). Markers are never printed unconditionally.
+
+extern fn serial_println(msg: text)
+extern fn rt_qemu_exit_success()
+extern fn rt_arm32_nvfs_probe() -> i64
+extern fn rt_sosix_collector_nonce_echo() -> i32
+extern fn rt_arm32_smf_cli_probe() -> i64
+extern fn rt_arm32_smf_cli_load() -> i64
+extern fn rt_arm32_smf_gui_probe() -> i64
+extern fn rt_arm32_native_gui_process_render() -> i64
+extern fn rt_arm32_qemu_nonce_echo() -> i32
+extern fn rt_arm32_fs_list_apps() -> i32
+extern fn rt_arm32_fs_read_program() -> i64
+extern fn rt_arm32_fs_program_stack() -> i64
+extern fn rt_arm32_fs_program_generation() -> i64
+extern fn rt_arm32_fs_privilege_fault_entry() -> i64
+extern fn rt_arm32_fs_exec_malformed_selftest() -> i32
+extern fn rt_arm32_exec_stale_reap_selftest(token: u32, generation: u32) -> i32
+extern fn rt_arm32_context_roundtrip_probe(token: u32, generation: u32) -> i32
+extern fn rt_arm32_fat32_bounds_selftest() -> i32
+extern fn rt_arm32_unowned_svc_selftest() -> i32
+extern fn rt_arm32_user_isolation_verify() -> i32
+extern fn rt_arm32_svc_vector_init() -> i64
+
+use os.kernel.arch.arm32.user_entry.{enter_user_blocking as rt_arm32_enter_user_first_blocking}
+
+fn spl_start():
+    serial_println("")
+    serial_println("=== SimpleOS ARM32 FS exec boot ===")
+    serial_println("SimpleOS ARM32 boot OK")
+
+    if rt_arm32_nvfs_probe() == 1:
+        serial_println("[arm32-nvfs] image read ok")
+    else:
+        serial_println("[arm32-nvfs] image read failed")
+        serial_println("TEST FAILED")
+        rt_qemu_exit_success()
+        return
+
+    if rt_sosix_collector_nonce_echo() != 1:
+        serial_println("[arm32-collector-nonce] target media read failed")
+        serial_println("TEST FAILED")
+        rt_qemu_exit_success()
+        return
+    serial_println("guest-entry")
+
+    if rt_arm32_qemu_nonce_echo() != 1:
+        serial_println("[arm32-nonce] prepared guest nonce missing or invalid")
+        serial_println("TEST FAILED")
+        rt_qemu_exit_success()
+        return
+    if rt_arm32_fat32_bounds_selftest() != 1 or rt_arm32_unowned_svc_selftest() != 1:
+        serial_println("[arm32-user] FAT/SVC negative fixture failed")
+        serial_println("TEST FAILED")
+        rt_qemu_exit_success()
+        return
+    serial_println("ARM32_UNOWNED_SVC_OK completion=unchanged continuation=unconsumed")
+
+    if rt_arm32_smf_cli_probe() == 1:
+        serial_println("FS_MOUNT_OK")
+        serial_println("SMF_DISCOVERY_OK")
+    else:
+        serial_println("[arm32-smf] cli launch probe failed")
+        serial_println("TEST FAILED")
+        rt_qemu_exit_success()
+        return
+
+    if rt_arm32_smf_cli_load() == 1:
+        serial_println("ELF_LOAD_OK arch=arm32 app=/sys/apps/hello_world.smf")
+        serial_println("SMF_CLI_LAUNCH_OK app=/sys/apps/hello_world.smf")
+    else:
+        serial_println("[arm32-smf] cli elf load failed")
+        serial_println("TEST FAILED")
+        rt_qemu_exit_success()
+        return
+
+    if rt_arm32_smf_gui_probe() == 1:
+        serial_println("[arm32-smf] gui package found app=/sys/apps/browser_demo.smf")
+    else:
+        serial_println("[arm32-smf] wm gui launch probe failed")
+        serial_println("TEST FAILED")
+        rt_qemu_exit_success()
+        return
+
+    if rt_arm32_native_gui_process_render() == 1:
+        serial_println("SMF_WM_GUI_LAUNCH_OK app=/sys/apps/browser_demo.smf pid=1002 wm=arm32_desktop_shell_contract")
+        serial_println("NATIVE_GUI_PROCESS_RENDER_OK app=/sys/apps/browser_demo.smf pid=1002")
+    else:
+        serial_println("[arm32-smf] native gui process render failed")
+        serial_println("TEST FAILED")
+        rt_qemu_exit_success()
+        return
+
+    if rt_arm32_fs_list_apps() <= 0:
+        serial_println("[arm32-user] real /SYS/APPS enumeration failed")
+        serial_println("TEST FAILED")
+        rt_qemu_exit_success()
+        return
+    serial_println("FS_PROGRAM_BEGIN path=/FSEXEC.ELF arch=arm32")
+    val entry = rt_arm32_fs_read_program()
+    val user_sp = rt_arm32_fs_program_stack()
+    val generation = rt_arm32_fs_program_generation()
+    if (entry <= 0 or user_sp <= 0 or generation <= 0 or
+        rt_arm32_user_isolation_verify() != 1 or rt_arm32_svc_vector_init() != 1):
+        serial_println("[arm32-user] mounted ELF staging failed")
+        serial_println("TEST FAILED")
+        rt_qemu_exit_success()
+        return
+    if rt_arm32_fs_exec_malformed_selftest() != 1:
+        serial_println("[arm32-user] malformed ELF behavioral fixture failed")
+        serial_println("TEST FAILED")
+        rt_qemu_exit_success()
+        return
+    serial_println("ARM32_ELF_ADMISSION_NEGATIVE_OK fixtures=identity,wx,arithmetic,entry,overlap,alignment")
+    serial_println("ARM32_EL0_ISOLATION_OK ap=short-descriptor wx=denied stack=xn")
+
+    # Per-boot one-shot token. It is retained only by the SVC owner and this
+    # blocked caller; the child ABI exposes no token field.
+    val token = 0x41333237u32
+    val exit_status = rt_arm32_enter_user_first_blocking(
+        entry as u32, user_sp as u32, token, generation as u32)
+    if exit_status == 37 and rt_arm32_exec_stale_reap_selftest(token, generation as u32) == 1:
+        serial_println("FS_PROGRAM_END rc=37 reaped=true generation=exact stale=denied")
+        val fault_entry = rt_arm32_fs_privilege_fault_entry()
+        val fault_status = rt_arm32_enter_user_first_blocking(
+            fault_entry as u32, user_sp as u32, 0x41333238u32, generation as u32)
+        if fault_status == -14:
+            serial_println("ARM32_EL0_PRIVILEGE_FAULT_OK rc=-14 instruction=mrc-p15")
+            val context_status = rt_arm32_context_roundtrip_probe(
+                0x41333239u32, generation as u32).to_i64()
+            if context_status == 41:
+                serial_println("ARM32_CONTEXT_ROUNDTRIP_OK r4=50 rc=41")
+                serial_println("TEST PASSED")
+                rt_qemu_exit_success()
+                return
+    serial_println("[arm32-user] exact reap failed rc={exit_status}")
+    serial_println("TEST FAILED")
+    rt_qemu_exit_success()

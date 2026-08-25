@@ -1,0 +1,73 @@
+# Example: Calculator Test Suite
+# Demonstrates basic describe/context/it structure with matchers
+
+import spec.{describe, context, it, expect, before_each, after_each}
+import spec.matchers.{eq, gt, lt, be_true, be_false}
+import math.{Calculator}
+
+describe "Calculator":
+    var calc: Calculator
+
+    before_each:
+        calc = Calculator.new()
+
+    after_each:
+        # Cleanup if needed
+        calc = None
+
+    context "addition":
+        it "adds positive numbers":
+            val result = calc.add(2, 3)
+            expect(result).to eq(5)
+
+        it "adds negative numbers":
+            val result = calc.add(-2, -3)
+            expect(result).to eq(-5)
+
+        it "adds zero":
+            val result = calc.add(5, 0)
+            expect(result).to eq(5)
+
+    context "subtraction":
+        it "subtracts numbers":
+            val result = calc.subtract(10, 3)
+            expect(result).to eq(7)
+
+        it "handles negative results":
+            val result = calc.subtract(3, 10)
+            expect(result).to eq(-7)
+
+    context "multiplication":
+        it "multiplies positive numbers":
+            val result = calc.multiply(4, 5)
+            expect(result).to eq(20)
+
+        it "multiplication by zero":
+            val result = calc.multiply(100, 0)
+            expect(result).to eq(0)
+
+    context "division":
+        it "divides numbers":
+            val result = calc.divide(10, 2)
+            expect(result).to eq(5)
+
+        it "returns float for inexact division":
+            val result = calc.divide(10, 3)
+            expect(result).to gt(3.0)
+            expect(result).to lt(4.0)
+
+        it "raises error on division by zero":
+            expect_raises(DivisionError):
+                calc.divide(10, 0)
+
+    context "chaining operations":
+        it "chains multiple operations":
+            calc.add(5, 3)          # = 8
+            calc.multiply(2)         # = 16
+            calc.subtract(6)         # = 10
+            expect(calc.result()).to eq(10)
+
+        it "resets between operations":
+            calc.add(5, 5)
+            calc.reset()
+            expect(calc.result()).to eq(0)

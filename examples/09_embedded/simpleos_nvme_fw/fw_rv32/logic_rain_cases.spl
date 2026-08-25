@@ -1,0 +1,9 @@
+use logic_rain_core.*
+use logic_rain_recover_cases.*
+use logic_rain_address_cases.*
+
+fn rv32_rain_cases_selftest() -> i32:
+    val recover: i32 = rv32_rain_recover_cases_selftest()
+    if recover != 0:
+        return recover
+    rv32_rain_address_cases_selftest()

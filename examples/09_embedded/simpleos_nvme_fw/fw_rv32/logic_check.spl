@@ -1,0 +1,8 @@
+use logic.{nvme_fw_rv32_logic_selftest}
+
+fn main():
+    val fail = nvme_fw_rv32_logic_selftest()
+    if fail == 0:
+        print "RV32 NVME FW LOGIC OK"
+    else:
+        print "RV32 NVME FW LOGIC FAIL"

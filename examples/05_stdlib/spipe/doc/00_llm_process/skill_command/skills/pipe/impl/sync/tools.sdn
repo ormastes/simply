@@ -1,0 +1,8 @@
+# llm-process-gen: managed source=pipe_impl_sync_tools source_sha256=597e07db61bbeaac71c0da6fbf123a1cc0baddd381bf528258cf3c2c573a9b75 content_sha256=3840902195ac919342bd8d274c3430fabcc69adf2e9dd83853253ce1a9464754
+skill_tools |skill, stage|
+    sync, impl
+
+tools |id, type, name, purpose|
+    jj, cli, "jj", "Commit, fetch, rebase, inspect ops, and push with worktree-aware sync flow"
+    git, cli, "git", "Audit tracked file counts and remote commit ranges"
+    simple_cli, cli, "bin/simple", "Run post-resolve tests, bug-gen, and todo-scan checks"

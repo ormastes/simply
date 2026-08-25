@@ -1,0 +1,112 @@
+# Unit tests for analytics module
+# @cover src/core/analytics.spl 80%
+
+use src.core.analytics.{vault_structure, find_orphan_notes, compute_vault_stats, FolderInfo, VaultStats}
+
+describe "analytics":
+    """Tests for vault analytics: structure, orphans, and stats"""
+
+    # Sample vault at test/fixtures/sample_vault/ has:
+    # - daily/2024-01-15.md
+    # - decisions/adr-001.md
+    # - meetings/standup-notes.md
+    # - projects/project-alpha.md
+    # - reference/api-design.md
+    # - index.md
+
+    val vault_path = "test/fixtures/sample_vault"
+
+    context "vault_structure":
+        """Folder hierarchy with file and subfolder counts"""
+
+        it "returns folder hierarchy":
+            val folders = vault_structure(vault_path)
+            # Should have folders: . (root), daily, decisions, meetings, projects, reference
+            expect(folders.len()).to_be_greater_than(0)
+            # Root folder should have index.md (1 file)
+            var root_found = false
+            for f in folders:
+                if f.path == ".":
+                    root_found = true
+                    expect(f.file_count).to_equal(1)
+                    # Root has 5 subfolders: daily, decisions, meetings, projects, reference
+                    expect(f.subfolder_count).to_equal(5)
+            expect(root_found).to_equal(true)
+
+        it "counts files per folder":
+            val folders = vault_structure(vault_path)
+            for f in folders:
+                if f.path == "projects":
+                    expect(f.file_count).to_equal(1)
+                if f.path == "daily":
+                    expect(f.file_count).to_equal(1)
+
+        it "returns sorted by path":
+            val folders = vault_structure(vault_path)
+            if folders.len() > 1:
+                var i = 1
+                while i < folders.len():
+                    # Each path should be >= previous (sorted)
+                    expect(folders[i].path >= folders[i - 1].path).to_equal(true)
+                    i = i + 1
+
+    context "find_orphan_notes":
+        """Detect notes with no incoming wikilinks"""
+
+        it "identifies notes with no backlinks":
+            val orphans = find_orphan_notes(vault_path)
+            # All notes in sample_vault are well-linked from index.md:
+            # index.md links to: project-alpha, api-design, 2024-01-15, standup-notes, adr-001
+            # So no non-daily, non-index note should be orphan
+            # index.md is excluded, daily notes are excluded
+            # All other notes (adr-001, standup-notes, project-alpha, api-design) have incoming links
+            expect(orphans.len()).to_equal(0)
+
+        it "excludes index.md from orphan detection":
+            val orphans = find_orphan_notes(vault_path)
+            var index_in_orphans = false
+            for o in orphans:
+                if o == "index.md":
+                    index_in_orphans = true
+            expect(index_in_orphans).to_equal(false)
+
+        it "excludes daily notes by default":
+            val orphans = find_orphan_notes(vault_path)
+            var daily_in_orphans = false
+            for o in orphans:
+                if o.starts_with("daily/"):
+                    daily_in_orphans = true
+            expect(daily_in_orphans).to_equal(false)
+
+    context "compute_vault_stats":
+        """Comprehensive vault metrics"""
+
+        it "counts notes correctly":
+            val stats = compute_vault_stats(vault_path)
+            # 6 notes total in sample vault
+            expect(stats.total_notes).to_equal(6)
+
+        it "counts links correctly":
+            val stats = compute_vault_stats(vault_path)
+            # Each note has wikilinks; total should be > 0
+            expect(stats.total_links).to_be_greater_than(0)
+
+        it "counts unique tags":
+            val stats = compute_vault_stats(vault_path)
+            # Many tags across notes: index, hub, project, active, engineering,
+            # daily, journal, decision, adr, architecture, meeting, standup,
+            # recurring, reference, api, design
+            expect(stats.total_tags).to_be_greater_than(5)
+
+        it "counts tasks":
+            val stats = compute_vault_stats(vault_path)
+            # project-alpha has 5 tasks, daily has 3, standup has 3 = 11 total
+            expect(stats.total_tasks).to_be_greater_than(0)
+
+        it "counts words":
+            val stats = compute_vault_stats(vault_path)
+            expect(stats.total_words).to_be_greater_than(0)
+
+        it "computes average links per note":
+            val stats = compute_vault_stats(vault_path)
+            expect(stats.avg_links_per_note).to_be_greater_than(0.0)

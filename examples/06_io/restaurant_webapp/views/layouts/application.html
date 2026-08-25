@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{title}} - Simple Restaurant</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <nav class="navbar">
+        <a href="/" class="brand">Simple Restaurant</a>
+        <div class="nav-links">
+            <a href="/menu">Menu</a>
+            <a href="/admin">Admin</a>
+        </div>
+    </nav>
+
+    {{>shared/_flash}}
+
+    <main class="container">
+        {{content}}
+    </main>
+
+    <footer class="footer">
+        <p>Simple Web Infra Test &mdash; Restaurant/Store App</p>
+    </footer>
+</body>
+</html>

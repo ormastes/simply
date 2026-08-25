@@ -1,0 +1,45 @@
+{{#layout "application"}}
+
+<h1>Items &mdash; {{group_name}}</h1>
+<a href="/admin/templates/{{template_id}}/groups" class="btn">&larr; Back to Groups</a>
+
+<h2>Add Item</h2>
+<form method="POST" action="/admin/groups/{{group_id}}/items" class="form form-inline">
+    <input type="hidden" name="csrf_token" value="{{csrf_token}}">
+    <input type="text" name="name" placeholder="Item name" required>
+    <input type="text" name="description" placeholder="Description">
+    <input type="number" name="price" placeholder="Price (cents)" value="0">
+    <input type="number" name="sort_order" placeholder="Order" value="0">
+    <button type="submit" class="btn btn-primary">Add</button>
+</form>
+
+<table class="table">
+    <thead>
+        <tr>
+            <th>Order</th>
+            <th>Name</th>
+            <th>Price</th>
+            <th>Available</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+        {{#each items}}
+        <tr>
+            <td>{{sort_order}}</td>
+            <td>{{name}}</td>
+            <td>{{price_display}}</td>
+            <td>{{#if available}}Yes{{else}}No{{/if}}</td>
+            <td>
+                <a href="/admin/items/{{id}}/edit" class="btn btn-sm">Edit</a>
+                <form method="POST" action="/admin/items/{{id}}/delete" style="display:inline;">
+                    <input type="hidden" name="csrf_token" value="{{../csrf_token}}">
+                    <button type="submit" class="btn btn-sm btn-danger">Delete</button>
+                </form>
+            </td>
+        </tr>
+        {{/each}}
+    </tbody>
+</table>
+
+{{/layout}}

@@ -1,0 +1,27 @@
+# Causal Mask — from scratch
+# Chapter 3: "Build a Large Language Model From Scratch" (Rasbt)
+#
+# Creates a triangular mask that prevents attending to future tokens.
+# Mask values: 0.0 = attend, -999999.0 = block (added to attention scores before softmax)
+
+use std.pure.tensor.{PureTensor, tensor_from_data}
+
+# Create causal (lower-triangular) mask
+# Returns [seq_len, seq_len] where:
+#   mask[i][j] = 0.0     if j <= i  (can attend)
+#   mask[i][j] = -999999.0 if j > i   (blocked)
+fn create_causal_mask(seq_len: i64) -> PureTensor<f64>:
+    var data: [f64] = []
+    var i = 0
+    while i < seq_len:
+        var j = 0
+        while j < seq_len:
+            if j <= i:
+                data.push(0.0)
+            else:
+                data.push(-999999.0)
+            j = j + 1
+        i = i + 1
+    tensor_from_data(data, [seq_len, seq_len])
+
+export create_causal_mask

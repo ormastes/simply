@@ -1,0 +1,179 @@
+"""
+ipc_msg_check — host-only absolute-oracle checks for logic_ipc_msg_core codec.
+
+This file validates the IPC message packing and unpacking codec via:
+1. Absolute oracle assertions on known input/output pairs
+2. Round-trip extraction tests for all three fields
+3. Out-of-range boundary tests (opcode 0, 10; tag 256; status 4)
+4. with_status field replacement preserving opcode+tag
+5. Negative w0 input handling (extractors must return -1)
+
+Run host-only:
+  timeout 300 bin/simple run examples/09_embedded/simpleos_nvme_fw/fw_rv32/ipc_msg_check.spl
+
+Exit code is meaningful (0 = all checks pass, non-zero = failure).
+"""
+
+use logic_ipc_msg_core.*
+
+# Calibration oracle: pack(2, 5, 0) must equal 1282
+#   Expected: opcode=2 + tag=5*256 + status=0*65536 = 2 + 1280 + 0 = 1282
+fn _check_pack_basic() -> i32:
+    val result = msg_w0_pack(2, 5, 0)
+    if result != 1282:
+        return 1
+    0
+
+# Calibration oracle: pack(9, 255, 3) must equal 261897
+#   Expected: opcode=9 + tag=255*256 + status=3*65536 = 9 + 65280 + 196608 = 261897
+fn _check_pack_max() -> i32:
+    val result = msg_w0_pack(9, 255, 3)
+    if result != 261897:
+        return 1
+    0
+
+# Round-trip test: extract all three fields from pack(2, 5, 0)
+fn _check_roundtrip_2_5_0() -> i32:
+    val w0 = msg_w0_pack(2, 5, 0)
+    if msg_w0_opcode(w0) != 2:
+        return 1
+    if msg_w0_tag(w0) != 5:
+        return 1
+    if msg_w0_status(w0) != 0:
+        return 1
+    0
+
+# Round-trip test: extract all three fields from pack(9, 255, 3)
+fn _check_roundtrip_9_255_3() -> i32:
+    val w0 = msg_w0_pack(9, 255, 3)
+    if msg_w0_opcode(w0) != 9:
+        return 1
+    if msg_w0_tag(w0) != 255:
+        return 1
+    if msg_w0_status(w0) != 3:
+        return 1
+    0
+
+# Round-trip test: extract all three fields from pack(1, 0, 0)
+fn _check_roundtrip_1_0_0() -> i32:
+    val w0 = msg_w0_pack(1, 0, 0)
+    if msg_w0_opcode(w0) != 1:
+        return 1
+    if msg_w0_tag(w0) != 0:
+        return 1
+    if msg_w0_status(w0) != 0:
+        return 1
+    0
+
+# Out-of-range: opcode 0 (below valid range 1..9) must return -1
+fn _check_pack_opcode_0() -> i32:
+    val result = msg_w0_pack(0, 5, 0)
+    if result != -1:
+        return 1
+    0
+
+# Out-of-range: opcode 10 (above valid range 1..9) must return -1
+fn _check_pack_opcode_10() -> i32:
+    val result = msg_w0_pack(10, 5, 0)
+    if result != -1:
+        return 1
+    0
+
+# Out-of-range: tag 256 (above valid range 0..255) must return -1
+fn _check_pack_tag_256() -> i32:
+    val result = msg_w0_pack(2, 256, 0)
+    if result != -1:
+        return 1
+    0
+
+# Out-of-range: status 4 (above valid range 0..3) must return -1
+fn _check_pack_status_4() -> i32:
+    val result = msg_w0_pack(2, 5, 4)
+    if result != -1:
+        return 1
+    0
+
+# Extractors on -1 input must return -1
+fn _check_extractor_neg1() -> i32:
+    if msg_w0_opcode(-1) != -1:
+        return 1
+    if msg_w0_tag(-1) != -1:
+        return 1
+    if msg_w0_status(-1) != -1:
+        return 1
+    0
+
+# with_status: replace status in w0, preserving opcode and tag
+# Start with pack(2, 5, 0), change status to 2
+fn _check_with_status_basic() -> i32:
+    val w0 = msg_w0_pack(2, 5, 0)
+    val w0_modified = msg_w0_with_status(w0, 2)
+    if msg_w0_opcode(w0_modified) != 2:
+        return 1
+    if msg_w0_tag(w0_modified) != 5:
+        return 1
+    if msg_w0_status(w0_modified) != 2:
+        return 1
+    0
+
+# with_status on -1 input must return -1
+fn _check_with_status_neg1() -> i32:
+    val result = msg_w0_with_status(-1, 1)
+    if result != -1:
+        return 1
+    0
+
+# with_status with invalid new_status (4) must return -1
+fn _check_with_status_invalid_status() -> i32:
+    val w0 = msg_w0_pack(2, 5, 0)
+    val result = msg_w0_with_status(w0, 4)
+    if result != -1:
+        return 1
+    0
+
+# Master test function: run all checks
+fn ipc_msg_codec_check() -> i32:
+    # Absolute oracles
+    if _check_pack_basic() != 0:
+        return 1
+    if _check_pack_max() != 0:
+        return 1
+
+    # Round-trip extraction
+    if _check_roundtrip_2_5_0() != 0:
+        return 1
+    if _check_roundtrip_9_255_3() != 0:
+        return 1
+    if _check_roundtrip_1_0_0() != 0:
+        return 1
+
+    # Out-of-range packing
+    if _check_pack_opcode_0() != 0:
+        return 1
+    if _check_pack_opcode_10() != 0:
+        return 1
+    if _check_pack_tag_256() != 0:
+        return 1
+    if _check_pack_status_4() != 0:
+        return 1
+
+    # Negative input handling
+    if _check_extractor_neg1() != 0:
+        return 1
+
+    # with_status field replacement
+    if _check_with_status_basic() != 0:
+        return 1
+    if _check_with_status_neg1() != 0:
+        return 1
+    if _check_with_status_invalid_status() != 0:
+        return 1
+
+    0
+
+fn main():
+    val fail = ipc_msg_codec_check()
+    if fail == 0:
+        print "IPC MSG CODEC CHECK PASS"
+    else:
+        print "IPC MSG CODEC CHECK FAIL"

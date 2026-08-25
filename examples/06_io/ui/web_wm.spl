@@ -1,0 +1,10 @@
+# Web Window Manager
+#
+# Multi-window desktop WM served via HTTP+WebSocket.
+# Open http://localhost:3333 in a browser to view.
+# Windows are draggable, resizable floating divs.
+
+use app.ui.web.server.{run_web_wm}
+
+fn main() -> i64:
+    return run_web_wm("examples/ui/simpleos_web_wm.ui.sdn", 3333)

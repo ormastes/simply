@@ -1,0 +1,21 @@
+# Minimal Simple 2D line drawing app for the Electron render backend.
+#
+# Launch:
+#   ./tools/electron-shell/node_modules/.bin/electron --no-sandbox tools/electron-shell \
+#       --simple-bin bin/simple --entry examples/ui/line_drawing_render.spl
+
+use app.ui.ipc.protocol.{build_ipc_render}
+
+fn app_html() -> text:
+    return "<svg width='1280' height='720' viewBox='0 0 1280 720' preserveAspectRatio='none' " +
+        "style='display:block;width:1280px;height:720px;background:#101820' xmlns='http://www.w3.org/2000/svg'>" +
+        "<rect width='1280' height='720' fill='#101820'/>" +
+        "<line x1='80' y1='90' x2='1200' y2='630' stroke='#33a1fd' stroke-width='8' stroke-linecap='round'/>" +
+        "<line x1='80' y1='630' x2='1200' y2='90' stroke='#ffc857' stroke-width='8' stroke-linecap='round'/>" +
+        "<line x1='140' y1='360' x2='1140' y2='360' stroke='#4ade80' stroke-width='6' stroke-linecap='round'/>" +
+        "<line x1='640' y1='80' x2='640' y2='640' stroke='#f472b6' stroke-width='6' stroke-linecap='round'/>" +
+        "</svg>"
+
+fn main() -> i64:
+    print build_ipc_render(app_html())
+    return 0

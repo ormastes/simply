@@ -1,0 +1,256 @@
+# Concurrency Modes Examples
+#
+# Demonstrates the three concurrency modes in Simple:
+# - actor (default): Erlang-style message passing, no shared state
+# - lock_base: Rust-style shared state with locks
+# - unsafe: Manual control for FFI/low-level code
+
+# =============================================================================
+# Mode 1: Actor Mode (Default) - Erlang-style
+# =============================================================================
+#
+# The default mode. No shared mutable state, only message passing.
+# Data races are impossible by design.
+
+@concurrency_mode(actor)
+mod actor_example
+
+use compiler.core.{spawn, send, receive}
+
+/**
+Counter actor that responds to messages.
+*/
+actor Counter:
+    count: i64 = 0
+
+    fn increment():
+        self.count += 1
+
+    fn decrement():
+        self.count -= 1
+
+    fn get() -> i64:
+        return self.count
+
+fn actor_mode_example():
+    # Spawn an actor
+    val counter = spawn Counter()
+
+    # Send messages
+    counter.send(:increment)
+    counter.send(:increment)
+    counter.send(:decrement)
+
+    # Ask for result (blocks for response)
+    val value = counter.ask(:get)
+    println("Counter value: {}", value)  # 1
+
+    # All data is immutable or actor-local
+    # Cannot use: mut T, Mutex, Atomic
+    # These types are not available in actor mode
+
+
+# =============================================================================
+# Mode 2: Lock-Base Mode - Rust-style
+# =============================================================================
+#
+# Opt-in mode for shared mutable state with lock protection.
+# Provides mut T, iso T, Mutex, RwLock, Atomic, concurrent collections.
+
+@concurrency_mode(lock_base)
+mod lock_base_example
+
+use infra.sync.{Mutex, RwLock}
+use infra.atomic.AtomicInt
+use infra.concurrent.{ConcurrentMap, ConcurrentQueue}
+use compiler.core.thread.spawn
+
+/**
+Shared counter using Mutex.
+*/
+fn mutex_example():
+    # Mutex protects shared mutable state
+    val counter = Mutex.new(0)
+
+    # Spawn threads that increment concurrently
+    val threads = []
+    for i in range(10):
+        val t = spawn \:
+            for j in range(1000):
+                counter.lock(_ + 1)
+        threads.push(t)
+
+    # Wait for all threads
+    for t in threads:
+        t.join()
+
+    val final_value = counter.get()
+    println("Mutex counter: {}", final_value)  # 10000
+
+/**
+Read-write lock for read-heavy workloads.
+*/
+fn rwlock_example():
+    val data = RwLock.new(Map.new())
+
+    # Multiple concurrent readers
+    val readers = []
+    for i in range(5):
+        val r = spawn \:
+            data.read(_.get("key"))
+        readers.push(r)
+
+    # One exclusive writer
+    val writer = spawn \:
+        data.write(_.insert("key", 42))
+
+    writer.join()
+    for r in readers:
+        r.join()
+
+/**
+Atomic operations without locks.
+*/
+fn atomic_example():
+    val counter = AtomicInt.new(0)
+
+    # Lock-free increment
+    val threads = []
+    for i in range(10):
+        val t = spawn \:
+            for j in range(1000):
+                counter.fetch_add(1)
+        threads.push(t)
+
+    for t in threads:
+        t.join()
+
+    println("Atomic counter: {}", counter.load())  # 10000
+
+/**
+Concurrent collections with GC support.
+*/
+fn concurrent_collections_example():
+    # GC-managed objects in concurrent map
+    struct User:
+        name: str
+        age: i64
+
+    val users = ConcurrentMap<str, User>.new()
+
+    # Insert from multiple threads
+    val threads = []
+    for i in range(10):
+        val t = spawn \:
+            val user = User(name: format!("User{}", i), age: 20 + i)
+            users.insert(format!("user{}", i), user)
+        threads.push(t)
+
+    for t in threads:
+        t.join()
+
+    # Read concurrently
+    val user = users.get("user0")
+    match user:
+        case Some(u):
+            println("User: {}, age {}", u.name, u.age)
+        case None:
+            println("User not found")
+
+    # Concurrent queue
+    val queue = ConcurrentQueue[i64].new()
+
+    # Producers
+    for i in range(5):
+        spawn \:
+            queue.push(i)
+
+    # Consumers
+    for i in range(5):
+        spawn \:
+            val value = queue.pop()
+            match value:
+                case Some(v):
+                    println("Consumed: {}", v)
+                case None:
+                    pass
+
+
+# =============================================================================
+# Mode 3: Unsafe Mode - Manual Control
+# =============================================================================
+#
+# For FFI and low-level code. No safety guarantees.
+
+@unsafe
+mod unsafe_example
+
+/**
+Direct memory manipulation (FFI, low-level).
+*/
+fn raw_pointer_example():
+    # Allocate raw memory
+    val ptr: *mut i64 = alloc_raw(8)
+
+    # Direct write (no safety checks)
+    unsafe:
+        *ptr = 42
+        val value = *ptr
+        println("Raw value: {}", value)
+
+    # Free manually
+    free_raw(ptr)
+
+/**
+Unsafe atomic operations for performance.
+*/
+fn unsafe_atomic_relaxed():
+    val counter: *mut i64 = alloc_atomic(0)
+
+    # Relaxed ordering - no synchronization
+    unsafe:
+        atomic_fetch_add_relaxed(counter, 1)
+        val value = atomic_load_relaxed(counter)
+
+    free_atomic(counter)
+
+
+# =============================================================================
+# Comparing Modes
+# =============================================================================
+
+/**
+Mode comparison table:
+
++------------------------------------------------------------------+
+| Mode       | Shared State | mut T | Mutex | Atomic | Data Races  |
++------------------------------------------------------------------+
+| actor      | ❌ No        | ❌    | ❌    | ❌     | Impossible  |
+| lock_base  | ✅ Yes       | ✅    | ✅    | ✅     | Runtime trap|
+| unsafe     | ✅ Yes       | ✅    | ✅    | ✅     | Undefined   |
++------------------------------------------------------------------+
+
+Use cases:
+- actor:      General concurrent programming, services, web servers
+- lock_base:  Performance-critical shared state, data structures
+- unsafe:     FFI, low-level optimization, custom allocators
+*/
+
+fn main():
+    println("=== Concurrency Modes Demo ===")
+    println("")
+
+    # Actor mode is default
+    actor_mode_example()
+    println("")
+
+    # Lock-base mode requires explicit annotation
+    mutex_example()
+    rwlock_example()
+    atomic_example()
+    concurrent_collections_example()
+    println("")
+
+    # Unsafe mode for low-level code
+    raw_pointer_example()
+    unsafe_atomic_relaxed()

@@ -1,0 +1,89 @@
+struct HudOptions:
+    provider: text
+    mode: text
+    watch: bool
+    interval_ms: i64
+    path: text
+    color: bool
+    show_inputs: bool
+    help: bool
+
+struct ProviderSnapshot:
+    provider: text
+    connected: bool
+    session_id: text
+    source_path: text
+    cwd: text
+    model: text
+    status_text: text
+    note: text
+    last_tool: text
+    last_tool_input: text
+    agent_count: i64
+    todos_done: i64
+    todos_total: i64
+    input_tokens: i64
+    cached_input_tokens: i64
+    output_tokens: i64
+    total_tokens: i64
+    context_window: i64
+    context_active_tokens: i64
+    rate_primary_pct: i64
+    rate_secondary_pct: i64
+
+struct VcsSnapshot:
+    backend: text
+    headline: text
+    parent: text
+    dirty_count: i64
+    clean: bool
+
+struct HudState:
+    providers: [ProviderSnapshot]
+    vcs: VcsSnapshot
+
+fn default_options(path: text) -> HudOptions:
+    HudOptions(
+        provider: "auto",
+        mode: "statusline",
+        watch: false,
+        interval_ms: 1500,
+        path: path,
+        color: true,
+        show_inputs: true,
+        help: false
+    )
+
+fn empty_snapshot(provider: text) -> ProviderSnapshot:
+    ProviderSnapshot(
+        provider: provider,
+        connected: false,
+        session_id: "",
+        source_path: "",
+        cwd: "",
+        model: "",
+        status_text: "",
+        note: "",
+        last_tool: "",
+        last_tool_input: "",
+        agent_count: 0,
+        todos_done: 0,
+        todos_total: 0,
+        input_tokens: 0,
+        cached_input_tokens: 0,
+        output_tokens: 0,
+        total_tokens: 0,
+        context_window: 0,
+        context_active_tokens: 0,
+        rate_primary_pct: 0,
+        rate_secondary_pct: 0
+    )
+
+fn empty_vcs() -> VcsSnapshot:
+    VcsSnapshot(
+        backend: "none",
+        headline: "no vcs",
+        parent: "",
+        dirty_count: 0,
+        clean: true
+    )

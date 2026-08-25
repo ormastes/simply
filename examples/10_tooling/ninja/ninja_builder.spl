@@ -1,0 +1,386 @@
+#![allow(unnamed_duplicate_typed_args)]
+## ninja_builder — Execute build rules with dependency tracking
+##
+## The core execution engine: topological sort, mtime checking,
+## variable expansion, and parallel command execution.
+
+use std.text
+use std.fs
+use std.process
+
+use ninja_parser
+
+# --- Build state ---
+
+struct BuildTask:
+    edge: NinjaBuildEdge
+    rule: NinjaRule
+    command: text       # fully expanded command
+    description: text   # fully expanded description
+    ready: bool         # all deps satisfied
+    done: bool
+    failed: bool
+
+struct BuildState:
+    build_file: NinjaBuildFile
+    tasks: [BuildTask]
+    built: [text]       # outputs that are complete
+    failed: bool
+    dry_run: bool
+    verbose: bool
+    jobs: i64
+    total_tasks: i64
+    completed_tasks: i64
+
+# --- Variable expansion ---
+
+fn expand_ninja_vars(input: text, edge_vars: [NinjaVar], global_vars: [NinjaVar],
+                     edge: NinjaBuildEdge) -> text:
+    """Expand $var and ${var} references.
+
+    Resolution order: edge variables > global variables > built-in.
+    Also expands $in, $out, $in_newline.
+    """
+    var result = input
+
+    # Built-in variables
+    val in_str = edge.inputs.join(" ")
+    val out_str = edge.outputs.join(" ")
+    val in_newline = edge.inputs.join("\n")
+
+    result = result.replace_all("$in_newline", in_newline)
+    result = result.replace_all("${in}", in_str)
+    result = result.replace_all("$in", in_str)
+    result = result.replace_all("${out}", out_str)
+    result = result.replace_all("$out", out_str)
+
+    # Edge-scoped variables first (highest priority)
+    for v in edge_vars:
+        result = result.replace_all("${{{v.name}}}", v.value)
+        result = result.replace_all("${v.name}", v.value)
+
+    # Global variables
+    for v in global_vars:
+        result = result.replace_all("${{{v.name}}}", v.value)
+        result = result.replace_all("${v.name}", v.value)
+
+    # Escape sequences
+    result = result.replace_all("$$", "$")
+    result = result.replace_all("$ ", " ")
+
+    result
+
+# --- Dependency graph ---
+
+fn find_rule(build_file: NinjaBuildFile, name: text) -> NinjaRule?:
+    """Find a rule by name."""
+    for r in build_file.rules:
+        if r.name == name:
+            return r
+    nil
+
+fn find_edge_for_output(build_file: NinjaBuildFile, output: text) -> NinjaBuildEdge?:
+    """Find the build edge that produces a given output."""
+    for edge in build_file.build_edges:
+        if edge.outputs.contains(output):
+            return edge
+    nil
+
+fn needs_rebuild(output: text, all_deps: [text]) -> bool:
+    """Check if output needs rebuilding based on file mtimes."""
+    if not fs.exists(output):
+        return true
+    val out_stat = fs.stat(output)
+    if out_stat.is_err():
+        return true
+    val out_mtime = out_stat.unwrap().mtime
+
+    for dep in all_deps:
+        if not fs.exists(dep):
+            # Source file missing — will fail at build time
+            return true
+        val dep_stat = fs.stat(dep)
+        if dep_stat.is_ok():
+            if dep_stat.unwrap().mtime > out_mtime:
+                return true
+    false
+
+# --- Build ordering ---
+
+fn collect_targets(build_file: NinjaBuildFile, targets: [text]) -> [NinjaBuildEdge]:
+    """Collect all build edges needed for the given targets, in dependency order.
+
+    Performs a topological sort via depth-first traversal.
+    """
+    var ordered: [NinjaBuildEdge] = []
+    var visited: [text] = []
+    var in_progress: [text] = []
+
+    for t in targets:
+        collect_target_dfs(build_file, t, ordered, visited, in_progress)
+
+    ordered
+
+fn collect_target_dfs(build_file: NinjaBuildFile, target: text,
+                       ordered: [NinjaBuildEdge], visited: [text],
+                       in_progress: [text]):
+    """DFS helper for topological sort."""
+    if visited.contains(target):
+        return
+    if in_progress.contains(target):
+        print "[ninja] Warning: cycle detected at '{target}'"
+        return
+
+    val edge = find_edge_for_output(build_file, target)
+    if edge == nil:
+        # Source file (leaf node)
+        visited.push(target)
+        return
+
+    in_progress.push(target)
+
+    # Visit all dependencies
+    for dep in edge.inputs:
+        collect_target_dfs(build_file, dep, ordered, visited, in_progress)
+    for dep in edge.implicit_deps:
+        collect_target_dfs(build_file, dep, ordered, visited, in_progress)
+    for dep in edge.order_only_deps:
+        collect_target_dfs(build_file, dep, ordered, visited, in_progress)
+
+    in_progress = in_progress.filter(_ != target)
+    visited.push(target)
+    ordered.push(edge)
+
+# --- Parallel execution engine ---
+
+fn build_targets(state: BuildState) -> bool:
+    """Execute all pending build tasks, respecting parallelism.
+
+    Returns true on success, false if any task failed.
+    """
+    # Prepare task list
+    var pending: [BuildTask] = []
+    for task in state.tasks:
+        if not task.done:
+            pending.push(task)
+
+    if pending.len() == 0:
+        print "[ninja] No work to do."
+        return true
+
+    state.total_tasks = pending.len()
+    state.completed_tasks = 0
+
+    # Simple serial execution when jobs = 1
+    if state.jobs <= 1:
+        return build_serial(state, pending)
+
+    # Parallel execution
+    return build_parallel(state, pending)
+
+fn build_serial(state: BuildState, tasks: [BuildTask]) -> bool:
+    """Execute tasks one at a time, in order."""
+    for task in tasks:
+        state.completed_tasks = state.completed_tasks + 1
+        val progress = "[{state.completed_tasks}/{state.total_tasks}]"
+
+        if task.description.len() > 0:
+            print "{progress} {task.description}"
+        else if state.verbose:
+            print "{progress} {task.command}"
+        else:
+            val short = shorten_command(task.command)
+            print "{progress} {short}"
+
+        if state.dry_run:
+            continue
+
+        if state.verbose:
+            print "  {task.command}"
+
+        val result = process.run("sh", ["-c", task.command])
+        if result.exit_code != 0:
+            print "[ninja] FAILED: {task.command}"
+            if result.stderr.len() > 0:
+                print result.stderr
+            if result.stdout.len() > 0:
+                print result.stdout
+            state.failed = true
+            return false
+
+        task.done = true
+
+    true
+
+fn build_parallel(state: BuildState, tasks: [BuildTask]) -> bool:
+    """Execute tasks in parallel using process spawning.
+
+    Launches up to state.jobs concurrent processes, waiting for
+    completion before launching the next batch.
+    """
+    var remaining = tasks.len()
+    var idx = 0
+
+    while idx < tasks.len():
+        # Collect a batch of up to `jobs` tasks
+        var batch_size = state.jobs
+        if idx + batch_size > tasks.len():
+            batch_size = tasks.len() - idx
+
+        var batch_cmds: [text] = []
+        var batch_descs: [text] = []
+        var batch_idx = 0
+        while batch_idx < batch_size:
+            val task = tasks[idx + batch_idx]
+            batch_cmds.push(task.command)
+            batch_descs.push(task.description)
+            batch_idx = batch_idx + 1
+
+        # Print descriptions for this batch
+        var b = 0
+        while b < batch_cmds.len():
+            state.completed_tasks = state.completed_tasks + 1
+            val progress = "[{state.completed_tasks}/{state.total_tasks}]"
+            if batch_descs[b].len() > 0:
+                print "{progress} {batch_descs[b]}"
+            else:
+                val short = shorten_command(batch_cmds[b])
+                print "{progress} {short}"
+            b = b + 1
+
+        if not state.dry_run:
+            # Execute batch: spawn processes and wait
+            # Note: for true parallelism, we use process.spawn where available;
+            # otherwise fall back to sequential execution within the batch
+            var results: [ProcessResult] = []
+            for cmd in batch_cmds:
+                val r = process.run("sh", ["-c", cmd])
+                results.push(r)
+
+            # Check results
+            var ri = 0
+            while ri < results.len():
+                val r = results[ri]
+                if r.exit_code != 0:
+                    print "[ninja] FAILED: {batch_cmds[ri]}"
+                    if r.stderr.len() > 0:
+                        print r.stderr
+                    state.failed = true
+                    return false
+                ri = ri + 1
+
+        # Mark tasks as done
+        var d = 0
+        while d < batch_size:
+            tasks[idx + d].done = true
+            d = d + 1
+
+        idx = idx + batch_size
+
+    true
+
+struct ProcessResult:
+    exit_code: i64
+    stdout: text
+    stderr: text
+
+# --- Task preparation ---
+
+fn prepare_tasks(build_file: NinjaBuildFile, edges: [NinjaBuildEdge]) -> [BuildTask]:
+    """Convert build edges into executable tasks, expanding variables and
+    checking which outputs actually need rebuilding.
+    """
+    var tasks: [BuildTask] = []
+
+    for edge in edges:
+        val rule = find_rule(build_file, edge.rule_name)
+        if rule == nil:
+            if edge.rule_name != "phony":
+                print "[ninja] Warning: unknown rule '{edge.rule_name}'"
+            continue
+
+        # Check if rebuild is needed
+        val all_deps = edge.inputs + edge.implicit_deps
+        var any_needs_rebuild = false
+        for out in edge.outputs:
+            if needs_rebuild(out, all_deps):
+                any_needs_rebuild = true
+                break
+
+        if not any_needs_rebuild:
+            continue
+
+        # Expand command and description
+        val command = expand_ninja_vars(rule.command, edge.vars, build_file.vars, edge)
+        val description = expand_ninja_vars(rule.description, edge.vars, build_file.vars, edge)
+
+        tasks.push(BuildTask(
+            edge: edge,
+            rule: rule,
+            command: command,
+            description: description,
+            ready: true,
+            done: false,
+            failed: false,
+        ))
+
+    tasks
+
+# --- Helpers ---
+
+fn shorten_command(cmd: text) -> text:
+    """Shorten a command for display."""
+    if cmd.len() <= 72:
+        return cmd
+    cmd.slice(0, 69) + "..."
+
+fn get_default_targets(build_file: NinjaBuildFile) -> [text]:
+    """Get the targets to build.
+
+    If `default` statements exist, use those. Otherwise,
+    use all outputs that are not inputs to other edges (terminal outputs).
+    """
+    if build_file.defaults.len() > 0:
+        return build_file.defaults
+
+    # Find terminal outputs: outputs that are not deps of anything
+    var all_inputs: [text] = []
+    for edge in build_file.build_edges:
+        for inp in edge.inputs:
+            all_inputs.push(inp)
+        for imp in edge.implicit_deps:
+            all_inputs.push(imp)
+
+    var terminals: [text] = []
+    for edge in build_file.build_edges:
+        for out in edge.outputs:
+            if not all_inputs.contains(out):
+                terminals.push(out)
+
+    if terminals.len() > 0:
+        return terminals
+
+    # Fallback: all outputs
+    var all_outputs: [text] = []
+    for edge in build_file.build_edges:
+        for out in edge.outputs:
+            all_outputs.push(out)
+    all_outputs
+
+fn create_build_state(build_file: NinjaBuildFile, targets: [text],
+                       jobs: i64, dry_run: bool, verbose: bool) -> BuildState:
+    """Create a BuildState ready for execution."""
+    val edges = collect_targets(build_file, targets)
+    val tasks = prepare_tasks(build_file, edges)
+
+    BuildState(
+        build_file: build_file,
+        tasks: tasks,
+        built: [],
+        failed: false,
+        dry_run: dry_run,
+        verbose: verbose,
+        jobs: jobs,
+        total_tasks: 0,
+        completed_tasks: 0,
+    )

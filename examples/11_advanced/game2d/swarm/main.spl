@@ -1,0 +1,83 @@
+# Swarm — 30 bouncing circles demo using physics + game2d
+use std.nogc_sync_mut.game2d.app.run.{run}
+use std.nogc_sync_mut.game2d.render.canvas.{Canvas}
+use std.nogc_sync_mut.game2d.math.{DrawMode}
+use std.common.engine.ids.{NodeId}
+use std.common.engine.math2d.{Vec2}
+use std.common.engine.color.{EngineColor}
+use std.nogc_sync_mut.engine.physics.config.{default_physics_config_2d}
+use std.nogc_sync_mut.engine.physics.world2d.{PhysicsWorld2D}
+
+val SWARM_COUNT: i64 = 30
+val WALL_HALF: f64 = 8.0
+
+fn node(i: i64) -> NodeId:
+    NodeId(raw: i)
+
+fn setup_world() -> PhysicsWorld2D:
+    var config = default_physics_config_2d()
+    config.gravity = Vec2(x: 0.0, y: 0.0)
+    config.restitution = 1.0
+    config.friction = 0.0
+    var world = PhysicsWorld2D.create(config)
+    var i = 0
+    while i < SWARM_COUNT:
+        val col = i % 6
+        val row = i / 6
+        val x = (col as f64) * 2.5 - 6.0
+        val y = (row as f64) * 2.5 - 5.0
+        world.add_dynamic_body(node(i), x, y, 1.0)
+        world.add_circle_collider(node(i), 0.4)
+        val vx = ((i * 3 + 1) % 7 - 3).to_f64()
+        val vy = ((i * 5 + 2) % 7 - 3).to_f64()
+        world.set_velocity(node(i), vx, vy)
+        i = i + 1
+    world
+
+class Game:
+    world: PhysicsWorld2D
+    count: i64
+
+    fn load(self):
+        pass_do_nothing
+
+    fn update(self, dt: f32):
+        val _ = dt
+
+    fn fixed_update(self, step: f32):
+        val _ = step
+        self.world.step(0.016)
+        var i = 0
+        while i < self.count:
+            val pos = self.world.get_position(node(i))
+            if pos.x > WALL_HALF:
+                val vel = self.world.get_velocity(node(i))
+                self.world.set_velocity(node(i), -vel.x, vel.y)
+            if pos.x < -WALL_HALF:
+                val vel = self.world.get_velocity(node(i))
+                self.world.set_velocity(node(i), -vel.x, vel.y)
+            if pos.y > WALL_HALF:
+                val vel = self.world.get_velocity(node(i))
+                self.world.set_velocity(node(i), vel.x, -vel.y)
+            if pos.y < -WALL_HALF:
+                val vel = self.world.get_velocity(node(i))
+                self.world.set_velocity(node(i), vel.x, -vel.y)
+            i = i + 1
+
+    fn draw(self, ctx: Canvas):
+        ctx.clear(EngineColor(r: 0.05, g: 0.05, b: 0.1, a: 1.0))
+        val cyan = EngineColor(r: 0.2, g: 0.8, b: 1.0, a: 1.0)
+        val scale = 45.0
+        val cx = 400.0
+        val cy = 300.0
+        var i = 0
+        while i < self.count:
+            val pos = self.world.get_position(node(i))
+            val sx = cx + pos.x * scale
+            val sy = cy - pos.y * scale
+            ctx.circle(DrawMode.Fill, Vec2(x: sx, y: sy), 8.0, cyan)
+            i = i + 1
+        ctx.text("Swarm", Vec2(x: 10.0, y: 20.0), EngineColor(r: 1.0, g: 1.0, b: 1.0, a: 1.0))
+
+fn main():
+    run(Game(world: setup_world(), count: SWARM_COUNT), "Swarm", 800, 600)

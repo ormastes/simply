@@ -1,0 +1,128 @@
+#![allow(export_outside_init)]
+# DEMO ONLY — Training loop is pseudocode via print statements. No real tensor ops.
+#!/usr/bin/env simple
+# XOR Problem with PyTorch Backend (cuda:1)
+# Full training example using PyTorch FFI on 2nd GPU
+
+use std.torch.{torch_available, TorchTensorWrapper}
+use std.src.dl.config.{Device, load_config}
+
+fn main():
+    print "=== XOR Problem - PyTorch Backend (cuda:1) ==="
+    print ""
+    
+    # Check PyTorch availability
+    if not torch_available():
+        print "⚠ PyTorch not available - falling back to Pure Simple"
+        print "  Run examples/pure_nn/xor_training_example.spl for CPU version"
+        return
+    
+    print "✓ PyTorch FFI backend active"
+    print ""
+    
+    # Load and verify configuration
+    print "Configuration:"
+    val config = load_config()
+    print "  Device: {config.device.to_string()}"
+    print "  DType: {config.dtype.to_string()}"
+    print "  Backend: PyTorch FFI"
+    print ""
+    
+    # Verify 2nd GPU
+    match config.device:
+        case Device.CUDA(id):
+            if id == 1:
+                print "✓ Using 2nd GPU (cuda:1) as configured"
+            else:
+                print "⚠ Using GPU {id} - expected cuda:1"
+        case _:
+            print "⚠ Not using CUDA device"
+    
+    print ""
+    
+    # Build neural network
+    print "Building Neural Network (PyTorch backend)..."
+    print "Architecture:"
+    print "  Input: 2"
+    print "  Hidden: 8 -> ReLU -> 4 -> ReLU"
+    print "  Output: 1 (Sigmoid)"
+    print "  Total Layers: 3 Linear + 2 ReLU + 1 Sigmoid"
+    print ""
+    
+    # XOR training data
+    print "Preparing XOR Training Data..."
+    print "  XOR Truth Table:"
+    print "    [0, 0] -> 0"
+    print "    [0, 1] -> 1"
+    print "    [1, 0] -> 1"
+    print "    [1, 1] -> 0"
+    print ""
+    
+    # Note: In full implementation, we'd create PyTorch tensors
+    # For now, we show the structure
+    print "Creating tensors on cuda:1..."
+    val input_00 = TorchTensorWrapper.tensor_zeros([1, 2])
+    val input_01 = TorchTensorWrapper.tensor_zeros([1, 2])
+    val input_10 = TorchTensorWrapper.tensor_zeros([1, 2])
+    val input_11 = TorchTensorWrapper.tensor_zeros([1, 2])
+    print "  ✓ Input tensors created (4 examples)"
+    print ""
+    
+    # Training configuration
+    print "Training Configuration:"
+    print "  Optimizer: SGD"
+    print "  Learning Rate: 0.5"
+    print "  Momentum: 0.9"
+    print "  Loss: MSE (Mean Squared Error)"
+    print "  Epochs: 500"
+    print "  Device: cuda:1 (2nd GPU)"
+    print ""
+    
+    print "Starting Training..."
+    print "(Note: Full training loop will be implemented when"
+    print " PyTorch FFI runtime loading is enabled)"
+    print ""
+    
+    # Training loop structure (示意)
+    print "Training Loop Structure:"
+    print "  for epoch in 1..500:"
+    print "    # Forward pass on GPU"
+    print "    output = model.forward(input)"
+    print "    "
+    print "    # Compute loss"
+    print "    loss = mse_loss(output, target)"
+    print "    "
+    print "    # Backward pass (autograd on GPU)"
+    print "    loss.backward()"
+    print "    "
+    print "    # Update parameters"
+    print "    optimizer.step()"
+    print "    optimizer.zero_grad()"
+    print ""
+    
+    print "=== Expected Results (After Training) ==="
+    print "Predictions:"
+    print "  [0, 0] -> ~0.0 (target: 0.0)"
+    print "  [0, 1] -> ~1.0 (target: 1.0)"
+    print "  [1, 0] -> ~1.0 (target: 1.0)"
+    print "  [1, 1] -> ~0.0 (target: 0.0)"
+    print ""
+    print "Accuracy: >95% (typically 100% for XOR)"
+    print "Final Loss: <0.01"
+    print ""
+    print "=== Performance Notes ==="
+    print "PyTorch + CUDA Advantages:"
+    print "  ✓ GPU acceleration (even for small networks)"
+    print "  ✓ Optimized CUDA kernels"
+    print "  ✓ Automatic mixed precision support"
+    print "  ✓ Multi-GPU scaling capability"
+    print ""
+    print "Using 2nd GPU (cuda:1) Benefits:"
+    print "  ✓ GPU 0 free for other tasks"
+    print "  ✓ Dedicated training device"
+    print "  ✓ No resource contention"
+    print ""
+    print "✓ Example structure complete!"
+    print "  (Full training will work once FFI runtime loading is enabled)"
+
+export main

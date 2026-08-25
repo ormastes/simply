@@ -1,0 +1,51 @@
+use logic_journal_count_core.*
+
+pub fn _rv32_journal_record_lba_impl(ridx: i64, wal_count: i64, cap: i64, lba0: i64, lba1: i64, lba2: i64) -> i64:
+    if ridx < 0:
+        return -1
+    if ridx >= _rv32_journal_effective_count(wal_count, cap):
+        return -1
+    if ridx >= 512:
+        return -1
+    if ridx == 0:
+        return lba0
+    if ridx == 1:
+        return lba1
+    if ridx == 2:
+        return lba2
+    -1
+
+pub fn _rv32_journal_record_seq_impl(ridx: i64, wal_count: i64, cap: i64, seq0: i64, seq1: i64, seq2: i64) -> i64:
+    if ridx < 0:
+        return 0
+    if ridx >= _rv32_journal_effective_count(wal_count, cap):
+        return 0
+    if ridx >= 512:
+        return 0
+    if ridx == 0:
+        return seq0
+    if ridx == 1:
+        return seq1
+    if ridx == 2:
+        return seq2
+    0
+
+pub fn _rv32_journal_checkpoint_valid_impl(seq: i64) -> i32:
+    if seq < 0:
+        return 0
+    1
+
+pub fn _rv32_journal_checkpoint_ptr_impl(seq: i64) -> i64:
+    if _rv32_journal_checkpoint_valid_impl(seq) == 0:
+        return -1
+    seq
+
+pub fn _rv32_journal_truncate_count_impl(ckpt_seq: i64, seq0: i64, seq1: i64, seq2: i64) -> i64:
+    var kept: i64 = 0
+    if seq0 > ckpt_seq:
+        kept = kept + 1
+    if seq1 > ckpt_seq:
+        kept = kept + 1
+    if seq2 > ckpt_seq:
+        kept = kept + 1
+    kept

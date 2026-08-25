@@ -1,0 +1,83 @@
+# clang argv tokenize probe — isolates the Phase 2e Inc 2 sshd.spl
+# _sshd_tokenize_command() bug from the SSH/NVMe/clang machinery, for fast
+# iteration (boots in ~seconds vs ~5min for the full clang-over-SSH harness).
+#
+# FINDING: `text.char_code_at(i)` mis-decodes (garbage / boxed-object values
+# at scattered indices) when `text` is DYNAMICALLY built at runtime (e.g. via
+# rt_string_from_byte_array — exactly how a decoded SSH command arrives). It
+# reproduces even at the shallowest possible frame (bare `_start()`, no
+# SSH/accept-loop), so it is NOT the frame-depth-sensitive
+# starts_with/char_at bug tracked in
+# doc/08_tracking/bug/x64_freestanding_text_char_at_starts_with.md — it is a
+# separate char_code_at-on-dynamic-text issue (a rodata string LITERAL
+# iterates fine with char_code_at; a heap-built one does not). `_dump_codes`
+# below reproduces the mis-decode for the record.
+#
+# WORKAROUND (used by sshd.spl _sshd_tokenize_command): convert the text to a
+# [u8] ONCE via `rt_string_to_byte_array`, then index bytes with
+# `rt_bytes_u8_at` — never `char_code_at` on dynamic text. `_tokenize_via_bytes`
+# below is byte-identical to the fixed sshd.spl logic and PASSES.
+
+extern fn serial_println(msg: text)
+extern fn rt_port_outb(port: u16, value: u8)
+extern fn rt_push_byte(arr: [u8], byte_val: i64) -> [u8]
+extern fn rt_string_from_byte_array(arr: [u8]) -> text
+extern fn rt_string_to_byte_array(s: text) -> [u8]
+extern fn rt_bytes_u8_at(arr: [u8], idx: i64) -> i64
+
+fn _build_command_bytes() -> [u8]:
+    val s = "clang -cc1 -triple x86_64-unknown-simpleos -emit-obj -o /out2.o -x c /hello.c"
+    var out: [u8] = []
+    var i: u64 = 0
+    while i < s.len():
+        out = rt_push_byte(out, s.char_code_at(i))
+        i = i + 1
+    out
+
+fn _dump_codes(command: text):
+    """Reproduces the char_code_at-on-dynamic-text mis-decode for the record."""
+    var i: u64 = 0
+    val n = command.len()
+    while i < n:
+        val code = command.char_code_at(i)
+        serial_println("[probe] code[{i}]={code}")
+        i = i + 1
+
+fn _tokenize_via_bytes(command: text) -> [text]:
+    val bytes = rt_string_to_byte_array(command)
+    var tokens: [text] = []
+    var cur: [u8] = []
+    var i: i64 = 0
+    val n = bytes.len().to_i64()
+    while i < n:
+        val code = rt_bytes_u8_at(bytes, i)
+        if code == 32:
+            if cur.len() > 0:
+                tokens.push(rt_string_from_byte_array(cur))
+                cur = []
+        else:
+            cur = rt_push_byte(cur, code)
+        i = i + 1
+    if cur.len() > 0:
+        tokens.push(rt_string_from_byte_array(cur))
+    tokens
+
+fn _start():
+    val command_bytes = _build_command_bytes()
+    val command = rt_string_from_byte_array(command_bytes)
+    serial_println("[probe] command len={command.len()} value={command}")
+    _dump_codes(command)
+
+    val tokens = _tokenize_via_bytes(command)
+    serial_println("[probe] token count={tokens.len()}")
+    var i: u64 = 0
+    while i < tokens.len():
+        serial_println("[probe] token[{i}]={tokens[i]}")
+        i = i + 1
+
+    if tokens.len() == 10:
+        serial_println("PROBE PASS clang_argv_tokenize ok")
+    else:
+        serial_println("PROBE FAIL clang_argv_tokenize wrong count expected=10")
+
+    rt_port_outb(0xf4u16, 0x03u8)

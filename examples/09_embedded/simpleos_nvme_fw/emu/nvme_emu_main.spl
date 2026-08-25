@@ -1,0 +1,169 @@
+"""
+nvme_emu_main — the end-to-end demo for the pure-Simple NVMe host/device emulator.
+
+Drives the public NvmeEmu API (nvme_device.spl) through the realistic DMA split:
+host DMA lands a buffer in shared memory, the device DMA pulls it across the
+boundary into the FTL/NAND, and the read path walks back the other way. Four
+scenarios, all asserted with expect_eq:
+
+  1. Build the emulator.
+  2. Host writes a page to LBA 5 (lands NAND channel 0), reads it back through the
+     full host<->device path, asserts the 4 words survive.
+  3. A second LBA whose physical page lands in a DIFFERENT NAND channel (ch1):
+     write distinct words, read back, assert. Both interfaces + both channels work.
+  4. SEAM PROOF: re-plug a corrupting memcpy on the DEVICE side (a LAMBDA per
+     gotcha 2), write LBA 6, read it back, assert the FIRST word is corrupted while
+     the others are intact -- proving the device memcpy is genuinely on the data
+     path. Restore the identity copy, write+read LBA 7 clean, assert clean.
+  5. Same proof on the HOST side: corrupt the host DMA and observe word0 flip.
+
+Prints "EMU E2E PASS" iff every assert held, else "EMU E2E FAIL ({n})".
+This file HAS a `fn main()` -- it is the e2e gate for the whole emulator.
+"""
+
+use nvme_ct.*
+use nvme_shared.*
+use nvme_memcpy.*
+use nand_onfi.*
+use ftl_emu.*
+use nvme_host.*
+use nvme_device.*
+
+fn main() -> i64:
+    var fails: i64 = 0
+    print "=== NVMe pure-Simple host<->device emulator: end-to-end demo ==="
+
+    # ── 1. Build ──────────────────────────────────────────────────────────────
+    var emu: NvmeEmu = nvme_emu_new()
+    fails = fails + expect_eq(emu.free_ppns(), NUM_PAGES, "1: fresh emu free_ppns == NUM_PAGES")
+    fails = fails + expect_eq(emu.host_completions(), 0, "1: no completions initially")
+
+    # ── 2. Host write/read LBA 5 (channel 0) through the full path ─────────────
+    print "-- step 2: LBA 5 (NAND channel 0) --"
+    var w5: [i64] = []
+    w5 = w5.push(0xA1)
+    w5 = w5.push(0xB2)
+    w5 = w5.push(0xC3)
+    w5 = w5.push(0xD4)
+    fails = fails + expect_eq(bool_i64(emu.host_write(Cid(value: 1), Lba(value: 5), Addr(value: 16), w5)), 1, "2: host_write LBA5 accepted")
+    fails = fails + expect_eq(emu.dev_step(), 1, "2: dev_step processes write LBA5")
+    val c5 = emu.host_reap()
+    fails = fails + expect_eq(c5.cid.value, 1, "2: write LBA5 completion cid")
+    fails = fails + expect_eq(c5.status, SC_SUCCESS, "2: write LBA5 completion success")
+    # LBA5 is the first write -> cursor 0 -> ppn0 -> NAND channel 0.
+    fails = fails + expect_eq(ppn_channel(Ppn(value: 0)).value, 0, "2: LBA5 physical channel == 0")
+    fails = fails + expect_eq(bool_i64(emu.host_read_submit(Cid(value: 2), Lba(value: 5), Addr(value: 32))), 1, "2: read LBA5 submitted")
+    fails = fails + expect_eq(emu.dev_step(), 1, "2: dev_step processes read LBA5")
+    val cr5 = emu.host_reap()
+    fails = fails + expect_eq(cr5.status, SC_SUCCESS, "2: read LBA5 completion success")
+    val r5 = emu.host_fetch_data(Addr(value: 32), WORDS_PER_PAGE)
+    fails = fails + expect_eq(r5.get(0), 0xA1, "2: LBA5 word0 survives full path")
+    fails = fails + expect_eq(r5.get(1), 0xB2, "2: LBA5 word1 survives full path")
+    fails = fails + expect_eq(r5.get(2), 0xC3, "2: LBA5 word2 survives full path")
+    fails = fails + expect_eq(r5.get(3), 0xD4, "2: LBA5 word3 survives full path")
+
+    # ── 3. A second LBA whose page lands in NAND channel 1 ─────────────────────
+    # The sequential allocator places page N at cursor N; ppn >= 64 -> channel 1.
+    # After step 2 the cursor is 1, so 63 filler writes advance it to 64; the next
+    # write (LBA 20) then lands ppn64 -> channel 1.
+    print "-- step 3: a second LBA landing in NAND channel 1 --"
+    var filler: [i64] = []
+    filler = filler.push(7)
+    filler = filler.push(7)
+    filler = filler.push(7)
+    filler = filler.push(7)
+    var fl: i64 = 30
+    while fl < 93:
+        emu.host_write(Cid(value: 300 + fl), Lba(value: fl), Addr(value: 48), filler)
+        emu.dev_step()
+        emu.host_reap()
+        fl = fl + 1
+    fails = fails + expect_eq(emu.free_ppns(), NUM_PAGES - 64, "3: 64 ppns consumed -> next page is channel 1")
+    var w20: [i64] = []
+    w20 = w20.push(0x10)
+    w20 = w20.push(0x20)
+    w20 = w20.push(0x30)
+    w20 = w20.push(0x40)
+    fails = fails + expect_eq(bool_i64(emu.host_write(Cid(value: 21), Lba(value: 20), Addr(value: 16), w20)), 1, "3: host_write LBA20 accepted")
+    fails = fails + expect_eq(emu.dev_run(), 1, "3: dev_run drains write LBA20")
+    val c20 = emu.host_reap()
+    fails = fails + expect_eq(c20.status, SC_SUCCESS, "3: write LBA20 completion success")
+    # LBA20 is the 65th write -> cursor 64 -> ppn64 -> NAND channel 1.
+    fails = fails + expect_eq(ppn_channel(Ppn(value: 64)).value, 1, "3: LBA20 physical channel == 1 (DIFFERENT channel)")
+    fails = fails + expect_eq(bool_i64(emu.host_read_submit(Cid(value: 22), Lba(value: 20), Addr(value: 32))), 1, "3: read LBA20 submitted")
+    fails = fails + expect_eq(emu.dev_run(), 1, "3: dev_run processes read LBA20")
+    val cr20 = emu.host_reap()
+    fails = fails + expect_eq(cr20.status, SC_SUCCESS, "3: read LBA20 completion success")
+    val r20 = emu.host_fetch_data(Addr(value: 32), WORDS_PER_PAGE)
+    fails = fails + expect_eq(r20.get(0), 0x10, "3: LBA20 word0 survives full path (ch1)")
+    fails = fails + expect_eq(r20.get(1), 0x20, "3: LBA20 word1 survives full path (ch1)")
+    fails = fails + expect_eq(r20.get(2), 0x30, "3: LBA20 word2 survives full path (ch1)")
+    fails = fails + expect_eq(r20.get(3), 0x40, "3: LBA20 word3 survives full path (ch1)")
+
+    # ── 4. SEAM PROOF: device-side memcpy is settable AND on the data path ─────
+    print "-- step 4: device DMA seam proof (fault inject then restore) --"
+    # Plug a corrupting copy on the DEVICE side (LAMBDA wrapping the named fn).
+    emu.set_dev_memcpy(\s, o, n: dma_copy_corrupt(s, o, n))
+    var w6: [i64] = []
+    w6 = w6.push(1)
+    w6 = w6.push(2)
+    w6 = w6.push(3)
+    w6 = w6.push(4)
+    emu.host_write(Cid(value: 6), Lba(value: 6), Addr(value: 16), w6)
+    emu.dev_step()   # device DMA corrupts word0 on the way into NAND
+    emu.host_reap()
+    # Restore the identity device DMA so the read-back reveals raw NAND contents.
+    emu.set_dev_memcpy(\s, o, n: dma_copy_words(s, o, n))
+    emu.host_read_submit(Cid(value: 16), Lba(value: 6), Addr(value: 32))
+    emu.dev_step()
+    emu.host_reap()
+    val r6 = emu.host_fetch_data(Addr(value: 32), WORDS_PER_PAGE)
+    fails = fails + expect_eq(bool_i64(r6.get(0) != 1), 1, "4: device memcpy CORRUPTED word0 (got != 1)")
+    fails = fails + expect_eq(r6.get(0), 2, "4: corrupted word0 == 2 (1 -> 1+1)")
+    fails = fails + expect_eq(r6.get(1), 2, "4: word1 intact (==2)")
+    fails = fails + expect_eq(r6.get(2), 3, "4: word2 intact (==3)")
+    fails = fails + expect_eq(r6.get(3), 4, "4: word3 intact (==4)")
+
+    # Identity device DMA restored -> LBA 7 must round-trip perfectly clean.
+    var w7: [i64] = []
+    w7 = w7.push(70)
+    w7 = w7.push(71)
+    w7 = w7.push(72)
+    w7 = w7.push(73)
+    emu.host_write(Cid(value: 7), Lba(value: 7), Addr(value: 16), w7)
+    emu.dev_step()
+    emu.host_reap()
+    emu.host_read_submit(Cid(value: 17), Lba(value: 7), Addr(value: 32))
+    emu.dev_step()
+    emu.host_reap()
+    val r7 = emu.host_fetch_data(Addr(value: 32), WORDS_PER_PAGE)
+    fails = fails + expect_eq(r7.get(0), 70, "4: clean device DMA word0 (==70)")
+    fails = fails + expect_eq(r7.get(1), 71, "4: clean device DMA word1 (==71)")
+    fails = fails + expect_eq(r7.get(2), 72, "4: clean device DMA word2 (==72)")
+    fails = fails + expect_eq(r7.get(3), 73, "4: clean device DMA word3 (==73)")
+
+    # ── 5. SEAM PROOF: host-side memcpy is equally on the data path ────────────
+    print "-- step 5: host DMA seam proof (fault inject then restore) --"
+    emu.set_host_memcpy(\s, o, n: dma_copy_corrupt(s, o, n))
+    var w8: [i64] = []
+    w8 = w8.push(900)
+    w8 = w8.push(910)
+    w8 = w8.push(920)
+    w8 = w8.push(930)
+    emu.host_write(Cid(value: 8), Lba(value: 8), Addr(value: 16), w8)  # host DMA corrupts word0 in
+    emu.dev_step()
+    emu.host_reap()
+    emu.set_host_memcpy(\s, o, n: dma_copy_words(s, o, n))   # clean host DMA to read out
+    emu.host_read_submit(Cid(value: 18), Lba(value: 8), Addr(value: 32))
+    emu.dev_step()
+    emu.host_reap()
+    val r8 = emu.host_fetch_data(Addr(value: 32), WORDS_PER_PAGE)
+    fails = fails + expect_eq(bool_i64(r8.get(0) != 900), 1, "5: host memcpy CORRUPTED word0 (got != 900)")
+    fails = fails + expect_eq(r8.get(0), 901, "5: corrupted word0 == 901 (900 -> 900+1)")
+    fails = fails + expect_eq(r8.get(3), 930, "5: host DMA left word3 intact (==930)")
+
+    if fails == 0:
+        print "EMU E2E PASS"
+    else:
+        print "EMU E2E FAIL ({fails})"
+    fails

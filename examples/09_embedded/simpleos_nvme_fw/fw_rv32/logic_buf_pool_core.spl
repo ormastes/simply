@@ -1,0 +1,103 @@
+# logic_buf_pool_core — PURE index-pool-allocator algebra for the wave-3
+# 16-slot IPC buf pool (design contract: doc/05_design/hardware/
+# nvme_fw_multicore/fourcore_ipc_index_handle_design.md §5). No shm/memory
+# access here; the thin rv32/host driver performs the loads/stores the
+# verdicts prescribe (same split as logic_ipc_ring_core.spl).
+#
+# Word layout (capacity, FREE_HEAD/ALLOC_COUNT/NEXT[]/DATA[] indices) is owned
+# by logic_ipc_layout_core.spl (L2, single source of truth) — this file only
+# adds the ALLOCATOR ALGEBRA on top: the in-use marker, free-list init values,
+# and the alloc/free verdicts. Do not redefine buf_pool_free_head_idx /
+# buf_pool_alloc_count_idx / buf_pool_next_idx / buf_pool_data_idx /
+# buf_slot_valid here — import them.
+
+use logic_ipc_layout_core.*
+
+# Sentinel written into NEXT[slot] while a slot is allocated (as opposed to
+# on the free list, where NEXT[slot] holds the next free slot or
+# ipc_null_idx()). Never equal to a legal slot index or to ipc_null_idx().
+fn BUF_IN_USE() -> i64:
+    -2
+
+# ── free-list initialization (design §5: "intrusive free-list stored in the
+# pool's NEXT words") ────────────────────────────────────────────────────────
+# Fresh-pool NEXT[] values: slot i (i < capacity-1) points to i+1; the last
+# slot terminates the chain with ipc_null_idx(). Bounds-checked: invalid slot
+# -> ipc_null_idx() (fail-closed).
+fn buf_pool_init_next_val(slot: i64) -> i64:
+    if buf_slot_valid(slot) == 0:
+        return ipc_null_idx()
+    if slot == buf_pool_capacity() - 1:
+        return ipc_null_idx()
+    slot + 1
+
+# ── alloc verdict ─────────────────────────────────────────────────────────────
+# No separate "ok" bit is needed: ipc_null_idx() (-1) can never be a legal
+# slot index, so a single value unambiguously carries both pieces of
+# information the driver needs:
+#   verdict >= 0            => OK; slot to allocate == verdict (== free_head)
+#   verdict == ipc_null_idx() => FAIL / no-op:
+#       - pool empty (free_head == IPC_NULL_IDX), or
+#       - free_head itself is out of bounds (corrupt state, fail-closed), or
+#       - alloc_count is already >= capacity (defensive: pool believed full)
+# Driver action on OK: new_head = NEXT[verdict] (read BEFORE overwriting);
+# NEXT[verdict] = BUF_IN_USE; FREE_HEAD = new_head; ALLOC_COUNT += 1.
+fn buf_alloc_verdict(free_head: i64, alloc_count: i64) -> i64:
+    if buf_slot_valid(free_head) == 0:
+        return ipc_null_idx()
+    if alloc_count < 0:
+        return ipc_null_idx()
+    if alloc_count >= buf_pool_capacity():
+        return ipc_null_idx()
+    free_head
+
+# ── free verdict ──────────────────────────────────────────────────────────────
+# Packed verdict convention (matches logic_ipc_ring_core.spl's ring_verdict_*
+# bit-packing style):
+#   bit 0       = ok flag (1 = free accepted, 0 = rejected)
+#   bits [2:1]  = err code, meaningful only when ok == 0
+#                 0 = none, 1 = ERR_BOUNDS, 2 = ERR_DOUBLE_FREE
+#   bits [63:3] = always 0 (reserved)
+# So: success -> verdict == 1; bounds failure -> verdict == 2;
+#     double-free failure -> verdict == 4.
+# Unpack with buf_free_verdict_ok / buf_free_verdict_err — never inspect the
+# packed i64 directly outside this file.
+fn buf_free_err_none() -> i64:
+    0
+
+fn buf_free_err_bounds() -> i64:
+    1
+
+fn buf_free_err_double_free() -> i64:
+    2
+
+fn buf_free_verdict_pack(ok: i64, err: i64) -> i64:
+    (err << 1) | ok
+
+fn buf_free_verdict_ok(verdict: i64) -> i32:
+    if (verdict & 1) == 1:
+        return 1
+    0
+
+fn buf_free_verdict_err(verdict: i64) -> i64:
+    verdict >> 1
+
+# slot: the pool index the caller wants to release.
+# next_val: the CURRENT value of NEXT[slot] (read by the driver before this
+#   call) — must be BUF_IN_USE for the free to be legal; any other value
+#   means the slot is already on the free list (or never allocated), which is
+#   a double-free.
+# free_head / alloc_count: current pool header words, accepted for interface
+#   symmetry with buf_alloc_verdict and because a legitimate driver call site
+#   already holds all four words; alloc_count is used defensively below (a
+#   free when nothing is outstanding is itself a double-free-class defect).
+# Driver action on OK (verdict == 1): NEXT[slot] = free_head (old head);
+# FREE_HEAD = slot; ALLOC_COUNT -= 1.
+fn buf_free_verdict(slot: i64, next_val: i64, free_head: i64, alloc_count: i64) -> i64:
+    if buf_slot_valid(slot) == 0:
+        return buf_free_verdict_pack(0, buf_free_err_bounds())
+    if alloc_count <= 0:
+        return buf_free_verdict_pack(0, buf_free_err_double_free())
+    if next_val != BUF_IN_USE():
+        return buf_free_verdict_pack(0, buf_free_err_double_free())
+    buf_free_verdict_pack(1, buf_free_err_none())

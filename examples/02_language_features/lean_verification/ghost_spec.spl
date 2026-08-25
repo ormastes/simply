@@ -1,0 +1,19 @@
+# Ghost code example
+# Demonstrates: @ghost functions, spec-only helpers, runtime erasure
+#
+# Ghost functions are erased at runtime. They exist only for use in
+# contract expressions (in:/out: clauses) and Lean proof obligations.
+
+@ghost
+fn is_sorted(xs: List<i64>) -> bool:
+    # Ghost - erased at runtime, used only in contracts
+    for i in range(xs.len() - 1):
+        if xs[i] > xs[i + 1]:
+            return false
+    true
+
+@verify
+fn insert_sorted(xs: List<i64>, x: i64) -> List<i64>:
+    in: is_sorted(xs)
+    out(ret): is_sorted(ret)
+    pass_todo

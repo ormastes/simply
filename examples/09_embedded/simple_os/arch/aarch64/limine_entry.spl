@@ -1,0 +1,42 @@
+# aarch64 Limine boot-entry milestone wrapper.
+#
+# Two separate native-build conventions this file satisfies at once:
+#
+# 1. Boot-object autodiscovery keys off the ENTRY file's own directory: it
+#    looks for a sibling `boot/` dir next to whatever .spl file is passed as
+#    --entry (see link_objects_freestanding() in
+#    src/compiler_rust/compiler/src/pipeline/native_project/linker.rs).
+#    limine_boot_aarch64.spl's boot logic lives under src/os/kernel/boot/,
+#    which is the wrong directory for that autodiscovery (its OWN sibling
+#    `boot/` would resolve to src/os/kernel/boot/boot/, which doesn't
+#    exist). This wrapper sits in
+#    examples/09_embedded/simple_os/arch/aarch64/ so the sibling
+#    examples/09_embedded/simple_os/arch/aarch64/boot/freestanding_runtime.c
+#    gets discovered and linked in.
+#
+# 2. Entry-symbol aliasing: native-build compiles every top-level function
+#    with its full module path mangled in (confirmed 2026-08-07: a function
+#    named `kernel_main` here linked as
+#    `examples__09_embedded__simple_os__arch__aarch64__limine_entry__kernel_main`,
+#    NOT bare `kernel_main` — `ENTRY(kernel_main)` in linker_limine.ld
+#    silently resolved to nothing, entry point 0x0, and --gc-sections then
+#    discarded the entire reachable graph as unrooted, producing a "linked
+#    successfully" 1 KB binary with no .text at all). The linker only
+#    auto-generates a `--defsym=_start=<mangled sym>` / `--entry=_start`
+#    alias for a top-level function literally named `_start` in the entry
+#    file (see the `raw_start_candidate` derivation in linker.rs, matched
+#    verbatim against this file's own mangled-path + `___start` pattern —
+#    exactly mirroring examples/09_embedded/simple_os/arch/riscv64/entry.spl's
+#    `fn _start():`). linker_limine.ld's ENTRY() must therefore say
+#    `ENTRY(_start)`, not `ENTRY(kernel_main)`.
+
+use os.kernel.boot.limine_boot_aarch64.{limine_aarch64_boot_main}
+
+@noreturn
+fn _start():
+    """aarch64 Limine ELF entry point (see file header for why this must be
+    named `_start`, not `kernel_main`). Limine hands off with EL1, MMU off,
+    a valid stack, and no arguments — no assembly boot glue needed here,
+    unlike riscv64/x86_64's `_start` (which set up their own stack/mode
+    first)."""
+    limine_aarch64_boot_main()

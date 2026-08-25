@@ -1,0 +1,629 @@
+# x86_64 Desktop GUI Entry -- Production interactive desktop with VFS
+#
+# Combines gui_entry.spl (BGA framebuffer, PS/2 input, compositor, shell)
+# with desktop_e2e_entry.spl (kernel init, VFS boot, launcher, IPC) for a
+# fully interactive desktop session with filesystem-backed app launching.
+#
+# Boot sequence:
+# 1. COM1 serial init
+# 2. Kernel IDT + memory bootstrap (PMM/VMM)
+# 3. Syscall shim + interrupt runtime install
+# 4. VFS boot init (NVMe FAT32 mount)
+# 5. BGA framebuffer init with validated hardware readback
+# 6. PS/2 keyboard + mouse init
+# 7. Compositor + DesktopShell
+# 8. Persistent Engine2D-backed interactive event loop (shell.run_baremetal)
+#
+# Serial markers:
+#   [desktop-gui] spl_start
+#   [desktop-gui] boot
+#   [vfs] mounted fat32 device=nvme0 volume=simpleos
+#   [desktop-gui] desktop-ready
+#
+# QEMU scenario: x64-desktop-gui (gui_mode: true + NVMe + removable + net)
+
+use os.kernel.arch.x86_64.console.{serial_init, serial_writeln}
+use os.kernel.boot.cpu.{port_inb, port_outb}
+use os.drivers.framebuffer.bga_init.{bga_device_id, bga_init_scanout, bga_pci_decode_is_enabled, find_bga_pci_device, scanout_evidence_is_valid, bga_mmio_read, bga_read}
+use os.services.audio.audio_service.{
+    SIMPLEOS_HDA_OK,
+    simpleos_hda_start,
+    simpleos_hda_started,
+    simpleos_hda_stream_id,
+    simpleos_hda_submit_pcm_i16,
+    simpleos_hda_submission_count,
+    simpleos_hda_submitted_frames,
+    simpleos_hda_last_pcm_hash,
+}
+use os.services.audio.audio_offload_service.{simpleos_audio_offload_start, simpleos_audio_offload_started}
+use os.drivers.framebuffer.fb_driver.{FramebufferDriver}
+use common.ui.glyph_bitmap_8x16.{get_glyph_8x16}
+use os.drivers.input.ps2_keyboard.{Ps2Keyboard}
+use os.drivers.input.ps2_mouse.{Ps2Mouse, MouseState}
+use os.compositor.compositor.{Compositor}
+use os.compositor.compositor_engine2d.{Engine2dCompositorBackend}
+use os.compositor.engine2d_wm_frame_executor.{Engine2dWmFrameExecutor}
+use os.compositor.input_backend.{Ps2InputBackend}
+use os.compositor.engine2d_display.{create_fb_engine_sized}
+use os.compositor.engine2d_baremetal_core.{
+    baremetal_simd_fill_enabled,
+    baremetal_simd_fill_hits,
+    baremetal_simd_fill_chunks,
+    baremetal_simd_fill_tail_pixels
+}
+use os.desktop.shell.{DesktopShell}
+use os.desktop.font_bootstrap.{simpleos_desktop_register_selected_fonts_from_vfs, simpleos_desktop_registered_font_count, simpleos_desktop_selected_font_count, simpleos_desktop_font_failure_summary, simpleos_desktop_default_font_registered}
+use std.gc_async_mut.gpu.browser_engine.simple_web_html_layout_renderer_foundation.{simple_web_layout_set_render_budget_floor_ms}
+use os.services.launcher.launcher.{launcher_get_app_count}
+use os.services.vfs.vfs_init.{vfs_boot_init, vfs_mount_removable, g_vfs_read_file_bytes, g_vfs_read_file_text}
+use os.services.vfs.vfs_write_ops.{g_vfs_file_exists}
+use os.services.pkg.pkg_service.{pkg_service_init}
+use os.kernel.arch.x86_64.interrupt.{X86Interrupt}
+use os.kernel.arch.x86_64.arch_init.{arch_x86_64_direct_boot_init}
+use os.kernel.arch.x86_64.interrupt.{x86_dispatch_installed_syscall_abi}
+use os.kernel.memory.pmm.{pmm_init_identity_range}
+use os.kernel.memory.vmm.{vmm_activate, vmm_bootstrap_pd_entry0, vmm_bootstrap_pdpt_entry0, vmm_bootstrap_pml4_entry0, vmm_init_from_global_pmm, vmm_kernel_pml4_phys}
+use os.kernel.memory.vmm_address_space.{vmm_map_nvme_bar_high}
+use os.kernel.boot.mmio.{mmio_disable_test_mode}
+use os.kernel.boot.monotonic_hardware.{boot_monotonic_prepare, boot_monotonic_now_us}
+use os.kernel.arch.x86_64.host_gpu_ivshmem_vmm.{map_qemu_host_gpu_ivshmem_bar2_active_vmm}
+use common.gpu.simpleos_host_gpu_protocol.{SIMPLEOS_HOST_GPU_ISA_X86_64, SIMPLEOS_HOST_GPU_BACKEND_VULKAN}
+use std.common.crypto.sha256.{sha256_u8_hex}
+use std.common.encoding.font_registry.{validate_selected_font_asset, font_registry_debug_expected_names, font_registry_force_native_digest_route}
+use std.common.encoding.sfnt.{sfnt_debug_selected_names}
+use std.common.string_core.{char_from_code}
+use os.compositor.simpleos_wm_theme_bootstrap.{install_generated_simpleos_wm_theme, apply_simpleos_css_theme_override}
+
+@export("C", name: "rt_file_exists")
+fn rt_file_exists(path: text) -> bool:
+    g_vfs_file_exists(path)
+
+@export("C", name: "rt_file_read_bytes")
+fn rt_file_read_bytes(path: text) -> [u8]:
+    # Route hosted-style byte reads to the mounted VFS (overrides the weak
+    # baremetal trap stub). On a degraded/absent mount this returns empty
+    # bytes, so callers like font loading fail SOFT instead of halting.
+    g_vfs_read_file_bytes(path)
+
+@export("C", name: "ord")
+fn ord(value: text) -> i64:
+    if value.len() == 0:
+        return 0
+    value.char_code_at(0) as i64
+use os.kernel.abi.syscall_shim.{shim_init}
+use os.kernel.scheduler.scheduler.{Scheduler}
+use os.kernel.ipc.ipc.{IpcManager}
+use os.kernel.log.klog.{KernelLog}
+
+# Pin in the same change as FONT_REGION_EXPECTED_SHA256 in the host checker
+# after retaining the canonical taskbar-clock QEMU crop.
+# Pinned 2026-07-19 after the authoritative Aetheric snapshot replaced the
+# Aqua taskbar fill. The canonical wrapper independently verifies this guest
+# hash through host-side QMP pmemsave over the same 56x48 RGB
+# region; reproducible across runs; region = 2576 bg + 112 glyph pixels of
+# the 12px Noto Sans Mono "00:00" clock).
+# Function, not a module-global val: module-global text initializers are
+# empty/nil at runtime on the freestanding lane (module-init gap), which made
+# the len()==64 gate fail even with the pin present (guest printed the SAME
+# sha as the pin yet took the oracle-pending branch, 2026-07-18).
+fn taskbar_clock_region_rgb_sha256_pin() -> text:
+    "addf76edf6d23ca9bea6d698ca1d30bc4bd8dd684bb50ff3158ef755bd2854fc"
+
+extern fn serial_println(msg: text)
+extern fn rt_gui_set_fb(addr: u64, width: u64)
+extern fn rt_ptr_read_i64(addr: i64, offset: i64) -> i64
+extern fn rt_ptr_read_i32(addr: i64, offset: i64) -> i32
+extern fn rt_ptr_write_i32(addr: i64, offset: i64, value: i32)
+extern fn rt_baremetal_heap_start() -> u64
+extern fn rt_baremetal_heap_reserved_end() -> u64
+
+fn _vram_mapping_probe(fb_addr: i64, pml4_phys: i64):
+    """One-shot scalar diagnostics for the black-capture fault: prove where
+    virt fb_addr maps (page-walk the live tables) and whether a direct
+    write lands (read back). All scalar reads — no aggregates."""
+    # Page walk for fb_addr (identity CR3 root is a physical address that is
+    # itself identity-mapped, so raw reads walk the live tables).
+    val pml4_index = (fb_addr >> 39) & 0x1FF
+    val pdpt_index = (fb_addr >> 30) & 0x1FF
+    val pd_index = (fb_addr >> 21) & 0x1FF
+    val pml4e = rt_ptr_read_i64(pml4_phys, pml4_index * 8)
+    var pdpte: i64 = 0
+    var pde: i64 = 0
+    if (pml4e & 1) != 0:
+        val pdpt_phys = pml4e & 0x000FFFFFFFFFF000
+        pdpte = rt_ptr_read_i64(pdpt_phys, pdpt_index * 8)
+        if (pdpte & 1) != 0 and (pdpte & 0x80) == 0:
+            val pd_phys = pdpte & 0x000FFFFFFFFFF000
+            pde = rt_ptr_read_i64(pd_phys, pd_index * 8)
+    serial_println("[vram-probe] fb={fb_addr} pml4i={pml4_index} pdpti={pdpt_index} pdi={pd_index} pml4e={pml4e} pdpte={pdpte} pde={pde}")
+    # Direct write + readback at fb offset 0 and 64.
+    rt_ptr_write_i32(fb_addr, 0, unsafe_cast_probe_color())
+    rt_ptr_write_i32(fb_addr, 64, unsafe_cast_probe_color())
+    val rb0 = rt_ptr_read_i32(fb_addr, 0)
+    val rb64 = rt_ptr_read_i32(fb_addr, 64)
+    serial_println("[vram-probe] write-readback rb0={rb0} rb64={rb64} expected={unsafe_cast_probe_color()}")
+
+fn unsafe_cast_probe_color() -> i32:
+    2054847231  # 0x7A7B7C7F: distinctive non-black test pattern
+
+# DEBUG-LEVEL GATE: probes below are diagnostic-only and silent in production
+# boots. Flip the literal to true to re-enable; see
+# doc/07_guide/os/baremetal/baremetal_simple_codegen_landmines.md (probe
+# convention). Content is preserved intentionally — do not delete the probes.
+# Function, not a module-global val: module-global initializers are
+# unreliable at runtime on this freestanding lane (module-init gap — see
+# taskbar_clock_region_rgb_sha256_pin() above for the same workaround), which
+# would make a bool val's flip-to-true re-enable silently no-op.
+fn _probe_debug() -> bool:
+    false
+
+fn _dbg_vbe_readback(tag: text):
+    # DEBUG-INSTR: re-read live BGA/VBE dispi regs to catch late clobbers.
+    if not _probe_debug():
+        return
+    val pci = find_bga_pci_device()
+    if pci.found and pci.mmio_bar >= 0x01000000:
+        val x = bga_mmio_read(pci.mmio_bar, 0x01)
+        val y = bga_mmio_read(pci.mmio_bar, 0x02)
+        val en = bga_mmio_read(pci.mmio_bar, 0x04)
+        val vw = bga_mmio_read(pci.mmio_bar, 0x06)
+        val vh = bga_mmio_read(pci.mmio_bar, 0x07)
+        serial_println("[dbg-vbe] {tag} xres={x} yres={y} enable={en} virt_w={vw} virt_h={vh}")
+    else:
+        val x = bga_read(0x01)
+        val y = bga_read(0x02)
+        val en = bga_read(0x04)
+        serial_println("[dbg-vbe] {tag} io xres={x} yres={y} enable={en}")
+
+fn _taskbar_clock_region_rgb_sha256(fb: FramebufferDriver, width: i32, height: i32) -> text:
+    if width < 56 or height < 48:
+        return ""
+    var rgb: [u8] = []
+    var y = (height - 48).to_u32()
+    while y < height.to_u32():
+        var x = (width - 56).to_u32()
+        while x < width.to_u32():
+            val pixel = fb.read_pixel(x, y)
+            rgb.push(((pixel >> 16) & 0xFF).to_u8())
+            rgb.push(((pixel >> 8) & 0xFF).to_u8())
+            rgb.push((pixel & 0xFF).to_u8())
+            x = x + 1
+        y = y + 1
+    sha256_u8_hex(rgb)
+
+var g_vfs_mounted: bool = false
+
+fn _ps2_wait_input_clear():
+    var timeout: i64 = 100000
+    while timeout > 0:
+        val status = port_inb(0x64)
+        if (status & 0x02) == 0:
+            return
+        timeout = timeout - 1
+
+fn _ps2_wait_output_full():
+    var timeout: i64 = 100000
+    while timeout > 0:
+        val status = port_inb(0x64)
+        if (status & 0x01) != 0:
+            return
+        timeout = timeout - 1
+
+fn _ps2_mouse_write(byte_val: u8):
+    _ps2_wait_input_clear()
+    port_outb(0x64, 0xD4)
+    _ps2_wait_input_clear()
+    port_outb(0x60, byte_val)
+
+fn _ps2_mouse_read() -> u8:
+    _ps2_wait_output_full()
+    port_inb(0x60)
+
+fn _ps2_flush_output_buffer():
+    """Drain any stale bytes (device ACKs, leftover scancodes) out of the
+    i8042 output buffer so the next 0x60 read returns what the caller
+    actually asked for."""
+    var guard: i64 = 32
+    while guard > 0:
+        val status = port_inb(0x64)
+        if (status & 0x01) == 0:
+            return
+        port_inb(0x60)
+        guard = guard - 1
+
+fn _keyboard_bootstrap_init():
+    port_outb(0x64, 0xAD)
+    port_outb(0x64, 0xA7)
+    port_inb(0x60)
+    port_outb(0x64, 0xAE)
+    port_outb(0x60, 0xF4)
+    # Consume the keyboard's 0xFA ACK for the 0xF4 (enable-scanning)
+    # command. Leaving it queued poisoned the NEXT 0x60 read: mouse init's
+    # config-byte read (command 0x20) returned this ACK instead of the
+    # config byte and wrote 0xDA back — bit4 set = keyboard clock DISABLED
+    # — which is why the guest never saw a single scancode after boot
+    # (root cause of the dead QMP-F11 input route, proven live 2026-07-12).
+    _ps2_wait_output_full()
+    port_inb(0x60)
+
+fn _mouse_bootstrap_init(mouse: Ps2Mouse):
+    port_outb(0x64, 0xA8)
+    _ps2_wait_input_clear()
+    _ps2_flush_output_buffer()
+    port_outb(0x64, 0x20)
+    _ps2_wait_output_full()
+    val config = port_inb(0x60)
+    # Force bit1 on (mouse IRQ line), bits 4+5 off (keyboard + mouse port
+    # clocks ENABLED). Never trust the read blindly for the keyboard-enable
+    # bit: a polluted config byte here silently kills the keyboard port.
+    val new_config = (config | 0x02) & 0xCF
+    serial_println("[ps2-init] config_read={config} config_written={new_config}")
+    port_outb(0x64, 0x60)
+    _ps2_wait_input_clear()
+    port_outb(0x60, new_config)
+    _ps2_wait_input_clear()
+    _ps2_mouse_write(0xF6)
+    _ps2_mouse_read()
+    _ps2_mouse_write(0xF4)
+    _ps2_mouse_read()
+    mouse.initialized = true
+
+fn _submit_hda_boot_calibration() -> i64:
+    """Submit a non-silent application-owned PCM period to the HDA service."""
+    var samples: [i64] = []
+    var frame = 0
+    while frame < 128:
+        val sample = if frame % 16 < 8: 8192 else: -8192
+        samples.push(sample)
+        samples.push(sample)
+        frame = frame + 1
+    simpleos_hda_submit_pcm_i16(samples, 2)
+
+fn spl_start():
+    # Canonical Cocoa/UEFI lane uses -m 2G. Reserve the whole link-resident
+    # kernel + bump-heap prefix before the PMM allocates VMM page tables.
+    # The old 0x18000000 boundary bisected the 512MiB C heap and allowed the
+    # PML4/PDPT to land at 0x18004000/0x18005000 inside malloc's future range.
+    val total_memory: u64 = 0x80000000
+    val kernel_start: u64 = 0x100000
+    val heap_start = rt_baremetal_heap_start()
+    val reserved_end = rt_baremetal_heap_reserved_end()
+    # Scanout resolution -- default mode "4k" (true-color ARGB8888, 33.2MB
+    # framebuffer; requires BGA/std-vga vgamem_mb>=64, see
+    # scripts/check/check-simpleos-wm-fullscreen-evidence.shs). To switch
+    # modes, replace 3840/2160 below with 7680/4320 ("8k", ~132MB
+    # framebuffer). 8K is NOT verified end-to-end: QEMU's std-vga/BGA VBE
+    # dispi extension has not been confirmed to scan out past 4K, and 132MB
+    # of VRAM is far beyond what a std-vga BAR comfortably maps --
+    # virtio-gpu/bochs-display would be the realistic path to real 8K.
+    # These are kept as literals (not module-level `val` constants) because
+    # referencing a module-level u32 `val` from spl_start() on this
+    # freestanding native-build target silently produced a garbage scanout
+    # (observed width=16000 height=1048 instead of 3840x2160) -- see
+    # doc/08_tracking/bug/x64_freestanding_module_level_val_u32_desktop_gui_2026-07-12.md.
+    val framebuffer_width: u32 = 3840
+    val framebuffer_height: u32 = 2160
+    val framebuffer_bpp: u32 = 32
+
+    serial_init()
+    serial_println("[desktop-gui] spl_start")
+    serial_println("[desktop-gui] boot")
+    serial_println("[desktop-gui] heap-physical-range start={heap_start} reserved_end={reserved_end} total_memory={total_memory}")
+    # Slow-platform calibration knob: under QEMU TCG (~30x slower than
+    # native) the native-tuned web render budget genuinely expires before
+    # compute_styles reaches node 0 ([web-style-producer] budget-break at=0),
+    # leaving every window with default styles and an empty material digest.
+    # Floor the budget at 5 minutes; the budget still expires past the floor.
+    simple_web_layout_set_render_budget_floor_ms(300000)
+    val theme_snapshot = install_generated_simpleos_wm_theme()
+    serial_println("[theme-evidence] id={theme_snapshot.id} source_manifest_sha256={theme_snapshot.source_manifest_sha256} material_sha256={theme_snapshot.material_sha256} backdrop_filter=unavailable fallback=solid-material")
+
+    arch_x86_64_direct_boot_init()
+    serial_println("[desktop-gui] arch-direct-bootstrap:ok")
+    mmio_disable_test_mode()
+    serial_println("[desktop-gui] hardware-mmio:ok")
+
+    serial_println("[desktop-gui] pmm-bootstrap:begin")
+    if pmm_init_identity_range(total_memory, kernel_start, reserved_end):
+        serial_println("[desktop-gui] pmm-bootstrap:ok")
+        serial_println("[desktop-gui] vmm-bootstrap:begin")
+        vmm_init_from_global_pmm(0)
+        serial_println("[desktop-gui] vmm-bootstrap:return")
+        serial_println("[desktop-gui] vmm-bootstrap:root={vmm_kernel_pml4_phys()} pml4e0={vmm_bootstrap_pml4_entry0()} pdpte0={vmm_bootstrap_pdpt_entry0()} pde0={vmm_bootstrap_pd_entry0()}")
+        if vmm_activate():
+            serial_println("[desktop-gui] memory-bootstrap:ok")
+            # Map the NVMe MMIO BAR at its higher-half slot (PML4[384],
+            # VA 0xFFFFC00000000000 -> phys 0xC000000000) in the active kernel
+            # page table. The C NVMe init (_nvme_init_controller in
+            # baremetal_stubs.c) derefs this VA directly; without the mapping it
+            # page-faults under OVMF (where PCI enumeration actually populates the
+            # BAR) — the ring-3 entries already call this, the desktop entry did
+            # not. Harmless under -kernel (unused if the C init never runs).
+            vmm_map_nvme_bar_high()
+            serial_println("[desktop-gui] nvme-bar-high:mapped")
+        else:
+            serial_println("[desktop-gui] memory-bootstrap:activation-failed")
+            return
+    else:
+        serial_println("[desktop-gui] memory-bootstrap:fail")
+
+    shim_init(Scheduler.new_bootstrap(), IpcManager.new(), KernelLog.new(256))
+
+    if not X86Interrupt.runtime_installed():
+        X86Interrupt.install_bootstrap_runtime(64)
+
+    val hda_status = simpleos_hda_start()
+    if hda_status == SIMPLEOS_HDA_OK:
+        serial_println(
+            "[hda-init] ok started={simpleos_hda_started()} stream={simpleos_hda_stream_id()} format=48000-stereo-s16"
+        )
+        val calibration_frames = _submit_hda_boot_calibration()
+        serial_println(
+            "[hda-pcm] application=desktop calibration_frames={calibration_frames} submissions={simpleos_hda_submission_count()} submitted_frames={simpleos_hda_submitted_frames()} pcm_hash={simpleos_hda_last_pcm_hash()}"
+        )
+    else:
+        serial_println("[hda-init] unavailable status={hda_status}")
+
+    # The second ivshmem function is optional. Direct HDA playback remains the
+    # CPU-owned fallback when QEMU was launched without the CUDA audio service.
+    val audio_offload_status = simpleos_audio_offload_start()
+    serial_println("[audio-offload] status={audio_offload_status} started={simpleos_audio_offload_started()}")
+
+    g_vfs_mounted = vfs_boot_init()
+    if g_vfs_mounted:
+        serial_println("[vfs] mounted fat32 device=nvme0 volume=simpleos")
+    else:
+        serial_println("[vfs] mount_failed fat32 reason=no-nvme-or-bad-fs")
+
+    # The generated Aetheric snapshot is the first-frame baseline. A boot-media
+    # /THEME.CSS may then override only the six WM chrome tokens, after the VFS
+    # mount has completed and before the compositor/frame executor exists.
+    val theme_css = if g_vfs_mounted:
+        g_vfs_read_file_text("/THEME.CSS")
+    else:
+        ""
+    val theme_override_applied = if g_vfs_mounted:
+        apply_simpleos_css_theme_override(theme_css)
+    else:
+        false
+    serial_println("[theme-override] path=/THEME.CSS mount={g_vfs_mounted} bytes={theme_css.len()} applied={theme_override_applied}")
+
+    # The freestanding kernel has no env, so keep selected-asset validation
+    # on the native digest route before the shared desktop owner registers
+    # every pinned face.
+    font_registry_force_native_digest_route()
+    val font_catalog_complete = simpleos_desktop_register_selected_fonts_from_vfs()
+    val font_registered_count = simpleos_desktop_registered_font_count()
+    val font_total_count = simpleos_desktop_selected_font_count()
+    val font_failures: text = simpleos_desktop_font_failure_summary()
+    # Readiness is the DEFAULT face, not the whole pinned corpus: the desktop
+    # draws with the monospace default only, so a missing script-coverage face
+    # must not force the bitmap fallback on a boot that loaded its font.
+    val font_loaded = simpleos_desktop_default_font_registered()
+    serial_println("[desktop-gui] font register accepted={font_loaded} catalog_complete={font_catalog_complete} registered={font_registered_count}/{font_total_count} unregistered={font_failures}")
+
+    if vfs_mount_removable(1, "/media/sd0"):
+        serial_println("[desktop-gui] removable mounted at /media/sd0")
+    else:
+        serial_println("[desktop-gui] no removable media found")
+
+    pkg_service_init()
+    serial_println("[desktop-gui] pkg service initialized")
+
+    serial_println("[desktop-gui] initializing framebuffer...")
+    val scanout = bga_init_scanout(framebuffer_width, framebuffer_height, framebuffer_bpp)
+    val bga_pci = find_bga_pci_device()
+    val bga_id = bga_device_id()
+    val pci_decode = bga_pci_decode_is_enabled(bga_pci)
+    serial_println("[scanout-evidence] address={scanout.address} width={scanout.width} height={scanout.height} stride={scanout.stride} pixel_format={scanout.pixel_format} generation={scanout.generation} device_id={bga_id} pci_found={bga_pci.found} pci_device={bga_pci.device} framebuffer_bar={bga_pci.framebuffer_bar} mmio_bar={bga_pci.mmio_bar} pci_decode={pci_decode}")
+    if not scanout_evidence_is_valid(scanout):
+        serial_println("[scanout-invalid] unsupported-or-incomplete-metadata")
+        return
+    rt_gui_set_fb(scanout.address, scanout.width.to_u64())
+    _vram_mapping_probe(scanout.address as i64, vmm_kernel_pml4_phys() as i64)
+    var fb = FramebufferDriver.from_scanout_raw(scanout.address, scanout.width, scanout.height, scanout.stride, framebuffer_bpp)
+    val screen_width = scanout.width.to_i32()
+    val screen_height = scanout.height.to_i32()
+    var engine = create_fb_engine_sized(fb, screen_width, screen_height)
+    serial_println("[desktop-gui] framebuffer ready width={scanout.width} height={scanout.height} pitch={scanout.stride}")
+    serial_println("[desktop-gui] engine2d-ready backend=baremetal-framebuffer persistent=true")
+
+    var keyboard: Ps2Keyboard = Ps2Keyboard(
+        shift_held: false,
+        ctrl_held: false,
+        alt_held: false,
+        caps_lock: false
+    )
+    _keyboard_bootstrap_init()
+    serial_println("[desktop-gui] keyboard ready")
+
+    val initial_mouse_state = MouseState(
+        x: screen_width.to_i64() / 2,
+        y: screen_height.to_i64() / 2,
+        left_button: false,
+        right_button: false,
+        middle_button: false,
+        dx: 0,
+        dy: 0,
+        screen_width: screen_width.to_i64(),
+        screen_height: screen_height.to_i64()
+    )
+    var mouse: Ps2Mouse = Ps2Mouse(
+        state: initial_mouse_state,
+        prev_left: false,
+        prev_right: false,
+        packet_byte0: 0,
+        packet_byte1: 0,
+        packet_byte2: 0,
+        packet_index: 0,
+        initialized: false
+    )
+    _mouse_bootstrap_init(mouse)
+    serial_println("[desktop-gui] mouse ready")
+
+    val font_path = "assets/fonts/google-fonts/ofl/notosansmono/NotoSansMono[wdth,wght].ttf"
+    # load_font_bytes routes through the selected-asset registry validator,
+    # including exact byte length, SHA-256, sfnt tables, names, and axes.
+    # Always attempt the read (no longer gated on g_vfs_mounted): the hosted
+    # Fat32Core/BlockDevice trait path (g_root_fat32) is still avoided --
+    # g_vfs_read_file_bytes now tries the pure-Simple scalar/direct FAT32
+    # reader first (vfs_boot_read_pure_nvme_fat32_path_bytes), which never
+    # touches g_root_fat32, before falling back to the g_vfs_initialized-gated
+    # hosted path. On a failed FAT32/NVMe mount (`[vfs] mount_failed`) the
+    # direct reader itself no-ops safely (returns []), and the existing
+    # g_vfs_initialized gate inside g_vfs_read_file_bytes still protects the
+    # hosted Fat32Core dispatch from the null-deref (cr2=0x0) miscompile
+    # described below -- so this remains crash-safe on every degraded boot
+    # path while unblocking the common case where the disk + direct reader
+    # are healthy but the hosted mount was skipped for the C8
+    # blockdevice-dispatch-codegen-bug.
+    val font_guest_path = "/SYS/FONTS/NOTOSANS"
+    val font_blob = g_vfs_read_file_bytes(font_guest_path)
+    serial_println("[desktop-gui] font read guest_path={font_guest_path} bytes={font_blob.len()}")
+    val engine_font_loaded = engine.load_font_bytes(font_path, font_blob)
+    if not engine_font_loaded:
+        # Affordable now: sha256 is allocation-light and sfnt parsing
+        # indexes the blob directly, so one diagnostic re-validate fits.
+        val diag = validate_selected_font_asset(font_path, font_blob)
+        val v_selected = diag.selected
+        val v_valid = diag.valid
+        val v_reason: text = diag.reason
+        serial_println("[desktop-gui] font validate selected={v_selected} valid={v_valid} reason={v_reason}")
+        val names_diag: text = sfnt_debug_selected_names(font_blob)
+        serial_println("[desktop-gui] font names decoded={names_diag}")
+        serial_println("[desktop-gui] font names expected=|Noto Sans Mono|Regular|Noto Sans Mono Regular|NotoSansMono-Regular|Version 2.014")
+        val expected_rt: text = font_registry_debug_expected_names(font_path)
+        serial_println("[desktop-gui] font names expected-runtime={expected_rt}")
+        # Micro-probe of the exact ops _sfnt_utf16be_text uses per char.
+        val cp_a: i64 = 65
+        val chr_a: text = cp_a.chr()
+        val cfc_a: text = char_from_code(cp_a)
+        var cat_t: text = ""
+        cat_t = cat_t + cfc_a
+        val cat_len = cat_t.len()
+        serial_println("[desktop-gui] chr-probe chr='{chr_a}' cfc='{cfc_a}' cat='{cat_t}' len={cat_len}")
+    val font_ready = font_loaded and engine_font_loaded
+    if font_ready:
+        serial_println("[desktop-gui] font identity=sha256=2cb2adb378a8f574213e23df697050b83c54c27df465a2015552740b2769a081;axes=wght=400,wdth=100 raster=pure-sfnt-glyf")
+    else:
+        serial_println("[desktop-gui] font unavailable fallback=bitmap")
+
+    var compositor_backend = Engine2dCompositorBackend.create(engine)
+    compositor_backend.w = screen_width
+    compositor_backend.h = screen_height
+    var compositor_input = Ps2InputBackend.create(keyboard, mouse)
+    var compositor: Compositor = Compositor.with_backends(
+        compositor_backend,
+        compositor_input,
+        screen_width,
+        screen_height
+    )
+    serial_println("[desktop-gui] compositor ready")
+
+    var shell: DesktopShell = DesktopShell.new(compositor)
+    shell.init_baremetal()
+    serial_println("[desktop-gui] shell initialized")
+
+    # Keep launch and ownership validation in the entry scope. Bootstrap HIR
+    # lowering cannot reliably resolve a DesktopShell helper parameter yet.
+    serial_println("[desktop-gui] spawn begin app=Browser Demo app_id=1")
+    val browser_pid = x86_dispatch_installed_syscall_abi(13u64, 1u64, 0u64, 2u64, 0u64, 0u64, 0u64)
+    serial_println("[desktop-gui] spawn return app=Browser Demo pid={browser_pid}")
+    if browser_pid > 0:
+        val browser_materialized = shell.materialize_process_launch_scalar(1, browser_pid as u64)
+        serial_println("[desktop-gui] materialize return app=Browser Demo ok={browser_materialized} owned={shell.process_owned_surface_count_scalar()}")
+
+    serial_println("[desktop-gui] spawn begin app=Hello World app_id=3")
+    val hello_pid = x86_dispatch_installed_syscall_abi(13u64, 3u64, 0u64, 2u64, 0u64, 0u64, 0u64)
+    serial_println("[desktop-gui] spawn return app=Hello World pid={hello_pid}")
+    if hello_pid > 0:
+        val hello_materialized = shell.materialize_process_launch_scalar(3, hello_pid as u64)
+        serial_println("[desktop-gui] materialize return app=Hello World ok={hello_materialized} owned={shell.process_owned_surface_count_scalar()}")
+
+    serial_println("[desktop-gui] spawn begin app=Clang app_id=12")
+    val clang_pid = x86_dispatch_installed_syscall_abi(13u64, 12u64, 0u64, 2u64, 0u64, 0u64, 0u64)
+    serial_println("[desktop-gui] spawn return app=Clang pid={clang_pid}")
+    if clang_pid > 0:
+        val clang_materialized = shell.materialize_process_launch_scalar(12, clang_pid as u64)
+        serial_println("[desktop-gui] materialize return app=Clang ok={clang_materialized} owned={shell.process_owned_surface_count_scalar()}")
+    val owned_surface_count = shell.process_owned_surface_count_scalar()
+    if owned_surface_count == 0:
+        # Disk-less WM harness: no app binary is present on the boot medium, so
+        # every spawn returns a clean negative and no app surface is owned. The
+        # desktop must still render its WM + shell chrome and be captured rather
+        # than exit before painting. Partial ownership (1..2) still fails hard
+        # below, since that indicates a real per-app regression, not absent media.
+        serial_println("[desktop-gui] degraded-no-disk apps=0")
+        # A window-less compositor makes the F11 maximize/restore evidence
+        # impossible; give the WM one genuine system window (see
+        # ensure_baremetal_system_window doc).
+        shell.ensure_baremetal_system_window()
+    elif owned_surface_count < 3:
+        serial_println("[production-readiness-failed] reason=process-owned-surfaces expected=3 actual={owned_surface_count}")
+        port_outb(0xF4, 1)
+        return
+    else:
+        serial_println("[desktop-gui] process-owned-surfaces-ready count={owned_surface_count}")
+
+    val registered = launcher_get_app_count()
+    serial_println("[desktop-gui] launcher apps={registered}")
+    boot_monotonic_prepare()
+    val host_gpu_base = map_qemu_host_gpu_ivshmem_bar2_active_vmm()
+    val negotiation_started_us = boot_monotonic_now_us()
+    # `backend_required: false` is passed EXPLICITLY, never left to its declared
+    # default. Under native/baremetal codegen an omitted trailing default is NOT
+    # materialized at all -- the callee reads an uninitialized register/stack
+    # slot, which for this parameter came back `true` and flipped the x86_64 lane
+    # from `host-gpu-fallback` to `host-gpu-required-rejected`. The gate's QEMU
+    # cmdline has no ivshmem device, so a required host GPU can never be
+    # satisfied there and the lane failed closed.
+    # Compiler defect: doc/08_tracking/bug/native_trailing_default_param_reads_uninitialized_2026-08-09.md
+    val wm_frame_executor = Engine2dWmFrameExecutor.create_host_gpu(engine, fb, host_gpu_base, SIMPLEOS_HOST_GPU_ISA_X86_64, SIMPLEOS_HOST_GPU_BACKEND_VULKAN, screen_width.to_i64(), screen_height.to_i64(), negotiation_started_us, baremetal_simd_fill_enabled(), false)
+    # Paint the first desktop frame BEFORE announcing readiness: the evidence
+    # wrapper captures its baseline immediately after the readiness markers,
+    # and an unpainted scanout at that instant is an honest FAIL, not a race
+    # to be excused.
+    _dbg_vbe_readback("pre-first-frame")
+    val first_frame_revision = shell.render_baremetal_first_frame(wm_frame_executor)
+    _dbg_vbe_readback("post-first-frame")
+    if first_frame_revision <= 0:
+        serial_println("[production-readiness-failed] reason=simple2d-or-simple-web-frame-invalid")
+        port_outb(0xF4, 1)
+        return
+    val simd_enabled = baremetal_simd_fill_enabled()
+    val simd_hits = baremetal_simd_fill_hits()
+    val simd_chunks = baremetal_simd_fill_chunks()
+    val simd_tail_pixels = baremetal_simd_fill_tail_pixels()
+    if not simd_enabled or simd_hits == 0 or simd_chunks == 0:
+        serial_println("[engine2d-simd] fatal arch=x86_64 isa=sse2 reason=zero-runtime-receipt")
+        port_outb(0xF4, 1)
+        return
+    serial_println("[engine2d-simd] arch=x86_64 isa=sse2 enabled=1 fill_hits={simd_hits} fill_chunks={simd_chunks} fill_tail_pixels={simd_tail_pixels}")
+    if _probe_debug():
+        val pb: u8 = 0x6Cu8
+        val pm: u8 = 0x80u8
+        val pt = (pb & pm) != 0u8
+        val pt_num = if pt: 1 else: 0
+        serial_println("[glyph-probe2] u8ne={pt_num}")
+        val pbi = pb as i64
+        val pmi = pm as i64
+        val pti = (pbi & pmi) != 0
+        val pti_num = if pti: 1 else: 0
+        serial_println("[glyph-probe2] i64ne={pti_num}")
+        val cc = "X".char_code_at(0)
+        serial_println("[glyph-probe2] ccraw={cc} ccshl3={cc * 8}")
+
+    if font_ready:
+        val region_sha256 = _taskbar_clock_region_rgb_sha256(fb, screen_width, screen_height)
+        val pinned_region_sha256: text = taskbar_clock_region_rgb_sha256_pin()
+        if pinned_region_sha256.len() == 64 and region_sha256 == pinned_region_sha256:
+            serial_println("[font-evidence] guest_path={font_guest_path} asset_bytes={font_blob.len()} family=Noto Sans Mono asset_sha256=2cb2adb378a8f574213e23df697050b83c54c27df465a2015552740b2769a081 raster=pure-sfnt-glyf route=shared-wm-draw-ir component_id=taskbar-clock font_size=12 text=00:00 region=right56,bottom48 region_rgb_sha256={region_sha256}")
+        else:
+            serial_println("[font-evidence-unavailable] reason=canonical-taskbar-clock-oracle-pending route=shared-wm-draw-ir component_id=taskbar-clock region=right56,bottom48 region_rgb_sha256={region_sha256}")
+    else:
+        serial_println("[font-evidence-unavailable] reason=selected-font-unavailable route=shared-wm-draw-ir component_id=taskbar-clock")
+    serial_println("[desktop-gui] desktop-ready")
+    serial_println("[production-readiness] wm=live simple_gui=object-tree simple_web=content-frame renderer=engine2d process_owned_surfaces={owned_surface_count} scanout_generation={scanout.generation}")
+
+    shell.run_baremetal(wm_frame_executor)
+    serial_println("[desktop-gui] shell exited")

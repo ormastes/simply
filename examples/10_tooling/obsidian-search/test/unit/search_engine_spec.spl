@@ -1,0 +1,92 @@
+# Unit tests for search_engine module
+
+use src.core.indexer.{IndexDb, open_index_memory, close_index_db, create_schema, index_note}
+use src.core.search_engine.{SearchResult, search_vault_query, search_by_tag, search_tasks, search_decisions, like_search, apply_tag_filter, apply_path_filter}
+
+describe "SearchEngine":
+    """Tests for text search and filtering"""
+
+    context "search by tag":
+        """Tag-based search"""
+
+        it "finds notes with matching tag":
+            val db = open_index_memory()
+            create_schema(db)
+            index_note(db, "/v/a.md", "a.md", "---\ntags: [meeting, standup]\n---\n# Meeting Notes", 1000)
+            index_note(db, "/v/b.md", "b.md", "---\ntags: [project]\n---\n# Project Docs", 1000)
+            val results = search_by_tag(db, "meeting")
+            expect(results.len()).to_equal(1)
+            expect(results[0].path).to_equal("a.md")
+            close_index_db(db)
+
+        it "returns empty for non-matching tag":
+            val db = open_index_memory()
+            create_schema(db)
+            index_note(db, "/v/a.md", "a.md", "---\ntags: [project]\n---\n# Doc", 1000)
+            val results = search_by_tag(db, "nonexistent")
+            expect(results.len()).to_equal(0)
+            close_index_db(db)
+
+    context "text search":
+        """Full-text search with scoring"""
+
+        it "finds notes by title":
+            val db = open_index_memory()
+            create_schema(db)
+            index_note(db, "/v/a.md", "a.md", "# Alpha Project\n\nDetails here", 1000)
+            index_note(db, "/v/b.md", "b.md", "# Beta Notes\n\nOther details", 1000)
+            val results = search_vault_query(db, "Alpha", 10)
+            expect(results.len()).to_equal(1)
+            close_index_db(db)
+
+        it "ranks title matches higher":
+            val db = open_index_memory()
+            create_schema(db)
+            index_note(db, "/v/a.md", "a.md", "# Search Engine\n\nAbout searching.", 1000)
+            index_note(db, "/v/b.md", "b.md", "# Notes\n\nSome search mention.", 1000)
+            val results = search_vault_query(db, "Search", 10)
+            expect(results.len()).to_equal(2)
+            # Title match should rank first
+            expect(results[0].path).to_equal("a.md")
+            close_index_db(db)
+
+    context "task search":
+        """Searching for tasks"""
+
+        it "finds open tasks":
+            val db = open_index_memory()
+            create_schema(db)
+            index_note(db, "/v/a.md", "a.md", "# Tasks\n- [ ] Review PR\n- [x] Setup env", 1000)
+            val results = search_tasks(db, "Review", "open")
+            expect(results.len()).to_equal(1)
+            close_index_db(db)
+
+        it "finds all tasks matching query":
+            val db = open_index_memory()
+            create_schema(db)
+            index_note(db, "/v/a.md", "a.md", "# Work\n- [ ] Setup project\n- [x] Setup environment", 1000)
+            val results = search_tasks(db, "Setup", "")
+            expect(results.len()).to_equal(2)
+            close_index_db(db)
+
+    context "operator filtering":
+        """Applying post-search filters"""
+
+        it "filters by tag":
+            val db = open_index_memory()
+            create_schema(db)
+            val r1 = SearchResult(note_id: 1, path: "a.md", title: "A", snippet: "", bm25_score: 1.0, tags: "meeting,standup", mtime: 0)
+            val r2 = SearchResult(note_id: 2, path: "b.md", title: "B", snippet: "", bm25_score: 1.0, tags: "project", mtime: 0)
+            var results = [r1, r2]
+            val filtered = apply_tag_filter(db, results, "meeting")
+            expect(filtered.len()).to_equal(1)
+            expect(filtered[0].path).to_equal("a.md")
+            close_index_db(db)
+
+        it "filters by path prefix":
+            val r1 = SearchResult(note_id: 1, path: "daily/2024-01-15.md", title: "Daily", snippet: "", bm25_score: 1.0, tags: "", mtime: 0)
+            val r2 = SearchResult(note_id: 2, path: "projects/alpha.md", title: "Alpha", snippet: "", bm25_score: 1.0, tags: "", mtime: 0)
+            val results = [r1, r2]
+            val filtered = apply_path_filter(results, "daily/")
+            expect(filtered.len()).to_equal(1)
+            expect(filtered[0].path).to_equal("daily/2024-01-15.md")

@@ -1,0 +1,104 @@
+# Mobile Soft Keyboard Bar
+# Renders a horizontal bar of common keys (Tab, Esc, Ctrl, arrows, etc.)
+# at the screen bottom. Auto-shows on Android/iOS, hides on desktop.
+
+# ============================================================================
+# Key Button
+# ============================================================================
+
+struct KeyButton:
+    label: text
+    key_value: text
+    width: i32
+
+# ============================================================================
+# Mobile Keybar Widget
+# ============================================================================
+
+class MobileKeybar:
+    buttons: [KeyButton]
+    visible: bool
+    selected_index: i32
+
+    static fn create() -> MobileKeybar:
+        var btns: [KeyButton] = []
+        btns.push(KeyButton(label: "Tab", key_value: "tab", width: 5))
+        btns.push(KeyButton(label: "Esc", key_value: "escape", width: 5))
+        btns.push(KeyButton(label: "Ctrl", key_value: "ctrl", width: 6))
+        btns.push(KeyButton(label: "|", key_value: "|", width: 3))
+        btns.push(KeyButton(label: "/", key_value: "/", width: 3))
+        btns.push(KeyButton(label: "\u{2190}", key_value: "left", width: 3))
+        btns.push(KeyButton(label: "\u{2191}", key_value: "up", width: 3))
+        btns.push(KeyButton(label: "\u{2193}", key_value: "down", width: 3))
+        btns.push(KeyButton(label: "\u{2192}", key_value: "right", width: 3))
+        MobileKeybar(buttons: btns, visible: false, selected_index: -1)
+
+    me show():
+        self.visible = true
+
+    me hide():
+        self.visible = false
+
+    me set_visible(v: bool):
+        self.visible = v
+
+    fn is_visible() -> bool:
+        self.visible
+
+    # Render the keybar as a single line
+    fn render(screen_width: i32) -> text:
+        if not self.visible:
+            return ""
+        val esc = "\u{001b}"
+        var line = "{esc}[7m"  # Reverse video
+        var total_width = 0
+        var i = 0
+        while i < self.buttons.len():
+            val btn = self.buttons[i]
+            if total_width + btn.width + 1 > screen_width:
+                break
+            if i > 0:
+                line = "{line}{esc}[0m|{esc}[7m"
+                total_width = total_width + 1
+            # Pad label to button width
+            var padded = btn.label
+            while padded.len() < btn.width:
+                padded = " {padded}"
+                if padded.len() < btn.width:
+                    padded = "{padded} "
+            line = "{line}{padded}"
+            total_width = total_width + btn.width
+            i = i + 1
+        # Fill remaining width
+        while total_width < screen_width:
+            line = "{line} "
+            total_width = total_width + 1
+        line = "{line}{esc}[0m"
+        return line
+
+    # Check if a click at x position hits a button, return key_value
+    fn hit_test(x: i32) -> text:
+        var offset = 0
+        var i = 0
+        while i < self.buttons.len():
+            val btn = self.buttons[i]
+            if i > 0:
+                offset = offset + 1  # separator
+            if x >= offset and x < offset + btn.width:
+                return btn.key_value
+            offset = offset + btn.width
+            i = i + 1
+        return ""
+
+    fn height() -> i32:
+        if self.visible:
+            return 1
+        return 0
+
+fn should_show_keybar(platform_name: text, config_mode: text) -> bool:
+    if config_mode == "always":
+        return true
+    if config_mode == "never":
+        return false
+    # Auto mode: show on mobile
+    return platform_name == "android" or platform_name == "ios"

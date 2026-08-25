@@ -1,0 +1,4 @@
+use logic_power_cycle_cases.*
+
+fn rv32_power_cycle_selftest() -> i32:
+    rv32_power_cycle_cases_selftest()

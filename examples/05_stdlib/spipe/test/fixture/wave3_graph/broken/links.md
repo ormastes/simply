@@ -1,0 +1,8 @@
+<!-- spipe:artifact uid=A-00000000000000000000000005 key=broken.links -->
+# Broken links
+
+[missing artifact](spipe://project/P-11111111111111111111111111/artifact/A-00000000000000000000000999)
+
+[missing section](spipe://project/P-11111111111111111111111111/section/S-00000000000000000000000999)
+
+[unavailable project](spipe://project/P-00000000000000000000000999/artifact/A-00000000000000000000000001)

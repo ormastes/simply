@@ -1,0 +1,94 @@
+# GLYPH-FIX-7 (2026-07-19) discrimination probe: `for ch in <dynamic text>:
+# ch.char_code_at(0)` -- the exact idiom font_renderer.spl's
+# _prepare_text_active fallback loop and measure_text_width both use to
+# decode each character of a draw_text() content string on freestanding.
+# The kernel's clock label (host_taskbar_clock_label, host_compositor_core.spl)
+# builds its 5-char text via NESTED interpolation: `"0{hour}"`-style parts
+# combined as `"{hour_text}:{minute_text}"`. This probe reproduces that exact
+# construction (not a plain literal, not a single-level interpolation) and
+# feeds the result through the same `for ch in content: ch.char_code_at(0)`
+# loop, printing every codepoint, alongside a literal-string control run
+# through the identical loop for comparison.
+#
+# Modeled on text_char_at_store_probe_entry.spl (no nvme/net/vmm deps, direct
+# port I/O serial + isa-debug-exit).
+
+extern fn serial_println(msg: text)
+extern fn rt_port_outb(port: u16, value: u8)
+extern fn rt_string_char_at(s: text, idx: i64) -> i64
+extern fn rt_string_len(str: text) -> i64
+extern fn rt_probe_raw(v: text) -> i64
+extern fn rt_array_len(v: text) -> i64
+
+fn _nested_interp_clock(hour: i64, minute: i64) -> text:
+    val hour_text = if hour < 10: "0{hour}" else: "{hour}"
+    val minute_text = if minute < 10: "0{minute}" else: "{minute}"
+    "{hour_text}:{minute_text}"
+
+fn _start():
+    # Dynamic: nested-interpolation clock label, exactly mirroring
+    # host_taskbar_clock_label's construction (content_len=5, matches the
+    # kernel's live [vec-atlas-probe] content_len=5 case).
+    val dynamic_text = _nested_interp_clock(9, 5)
+    serial_println("[probe] dynamic_text len expected=5 actual={dynamic_text.len()}")
+    var di = 0
+    for ch in dynamic_text:
+        val cp = ch.char_code_at(0)
+        serial_println("[probe] dynamic idx={di} cp={cp}")
+        di = di + 1
+
+    # Control: identical loop shape over a plain literal of the same length
+    # and similar byte content ("09:05"), through the SAME char_code_at(0)
+    # call site pattern.
+    val literal_text = "09:05"
+    serial_println("[probe] literal_text len expected=5 actual={literal_text.len()} rt_array_len={rt_array_len(literal_text)}")
+    var li = 0
+    for ch in literal_text:
+        val ch_raw_bits = rt_probe_raw(ch)
+        val cp = ch.char_code_at(0)
+        val ch_len = ch.len()
+        val ch_len_raw = rt_string_len(ch)
+        val ch_raw_char_at = rt_string_char_at(ch, 0)
+        serial_println("[probe] literal idx={li} raw_bits={ch_raw_bits} cp={cp} ch_len={ch_len} ch_len_raw={ch_len_raw} ch_raw_char_at={ch_raw_char_at}")
+        # "Erased receiver" workaround probe (documented landmine: chained
+        # methods on an erased-type receiver misdispatch; an explicit typed
+        # intermediate `val` fixes it). If `ch2` behaves correctly where
+        # `ch` above does not, the for-loop pattern variable's STATIC type
+        # is erased to ANY (not `text`) somewhere in HIR/MIR, and dispatch
+        # of `.char_code_at()` on the erased receiver is the actual defect.
+        val ch2: text = ch
+        val ch2_raw_bits = rt_probe_raw(ch2)
+        val ch2_cp = ch2.char_code_at(0)
+        val ch2_len = ch2.len()
+        serial_println("[probe] literal-typed idx={li} raw_bits={ch2_raw_bits} cp={ch2_cp} ch2_len={ch2_len}")
+        li = li + 1
+
+    # Decisive control (advisor-directed): produce a 1-char substring the
+    # SAME way `for ch in text` does (char_at on the source string) but
+    # OUTSIDE any loop, then run it through the identical raw-bits +
+    # char_code_at + rt_string_len probes. If `d` here behaves correctly
+    # while `ch` above does not, the for-loop binding itself corrupts the
+    # value (codegen bug). If `d` ALSO fails, the defect is in 1-char
+    # substring production/consumption (char_at/rt_string_new/char_code_at
+    # interaction) regardless of loops -- a baremetal_stubs.c-level bug.
+    val d = literal_text.char_at(0)
+    val d_raw_bits = rt_probe_raw(d)
+    val d_cp = d.char_code_at(0)
+    val d_len = d.len()
+    val d_len_raw = rt_string_len(d)
+    serial_println("[probe] noloop_charat0 raw_bits={d_raw_bits} cp={d_cp} d_len={d_len} d_len_raw={d_len_raw}")
+
+    # Control 2: same literal, decoded via explicit-index while-loop calling
+    # char_code_at(i) directly on the WHOLE text value (not on a for-loop
+    # substring) -- matches abi_probe_entry.spl's proven-working P13e shape
+    # (`t.char_code_at(0)` on the full string). Isolates whether the defect
+    # is in char_code_at() itself or specifically in the `for ch in text`
+    # iteration-produced substring binding.
+    var wi: i64 = 0
+    while wi < literal_text.len().to_i64():
+        val cp2 = literal_text.char_code_at(wi)
+        serial_println("[probe] indexed idx={wi} cp={cp2}")
+        wi = wi + 1
+
+    serial_println("PROBE DONE char_code_at_loop")
+    rt_port_outb(0xf4u16, 0x03u8)

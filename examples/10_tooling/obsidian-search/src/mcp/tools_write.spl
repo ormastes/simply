@@ -1,0 +1,90 @@
+# MCP Tool schemas — 4 write tools (Phase A)
+#
+# Defines tool schemas for create_note, edit_note, delete_note, move_note.
+
+use src.util.json_helpers.{js, jp, jo, jo1, jo2, jo3, ja, LB, RB, SB_L, SB_R}
+
+# --- Tool schema builder helpers ---
+
+fn make_string_prop(description: text) -> text:
+    jo2(jp("type", js("string")), jp("description", js(description)))
+
+fn make_tool_write(name: text, description: text, props: text, required: text, destructive: bool) -> text:
+    val schema = jo3(
+        jp("type", js("object")),
+        jp("properties", props),
+        jp("required", required)
+    )
+    val annotations = jo3(
+        jp("readOnlyHint", "false"),
+        jp("destructiveHint", if destructive: "true" else: "false"),
+        jp("idempotentHint", if destructive: "true" else: "false")
+    )
+    var tool_obj = LB()
+    tool_obj = tool_obj + jp("name", js(name))
+    tool_obj = tool_obj + "," + jp("description", js(description))
+    tool_obj = tool_obj + "," + jp("inputSchema", schema)
+    tool_obj = tool_obj + "," + jp("annotations", annotations)
+    tool_obj = tool_obj + RB()
+    tool_obj
+
+# --- Write tool schemas ---
+
+fn make_write_tools() -> [text]:
+    var tools: [text] = []
+
+    # 1. create_note
+    var cn_props = LB()
+    cn_props = cn_props + jp("path", make_string_prop("Relative path for the new note in the vault (e.g. 'daily/2024-01-15.md')"))
+    cn_props = cn_props + "," + jp("content", make_string_prop("Content of the note (markdown)"))
+    cn_props = cn_props + "," + jp("frontmatter", make_string_prop("Optional JSON string for YAML frontmatter header (e.g. '{\"title\":\"My Note\",\"tags\":[\"a\",\"b\"]}')"))
+    cn_props = cn_props + RB()
+    tools.push(make_tool_write(
+        "create_note",
+        "Create a new note in the Obsidian vault. Fails if note already exists.",
+        cn_props,
+        ja([js("path"), js("content")]),
+        false
+    ))
+
+    # 2. edit_note
+    var en_props = LB()
+    en_props = en_props + jp("path", make_string_prop("Relative path of the note to edit"))
+    en_props = en_props + "," + jp("content", make_string_prop("Content to add or replace"))
+    en_props = en_props + "," + jp("mode", make_string_prop("Edit mode: 'append' (default), 'prepend', 'overwrite', or 'insert_after_heading'"))
+    en_props = en_props + RB()
+    tools.push(make_tool_write(
+        "edit_note",
+        "Edit an existing note. Modes: append (default), prepend, overwrite, insert_after_heading (content prefix '## Heading\\n---\\n' specifies target heading).",
+        en_props,
+        ja([js("path"), js("content")]),
+        false
+    ))
+
+    # 3. delete_note
+    var dn_props = LB()
+    dn_props = dn_props + jp("path", make_string_prop("Relative path of the note to delete"))
+    dn_props = dn_props + "," + jp("confirm", make_string_prop("Must be 'yes' to confirm deletion"))
+    dn_props = dn_props + RB()
+    tools.push(make_tool_write(
+        "delete_note",
+        "Delete a note from the vault. Requires confirm='yes' as safety check.",
+        dn_props,
+        ja([js("path"), js("confirm")]),
+        true
+    ))
+
+    # 4. move_note
+    var mn_props = LB()
+    mn_props = mn_props + jp("old_path", make_string_prop("Current relative path of the note"))
+    mn_props = mn_props + "," + jp("new_path", make_string_prop("New relative path for the note"))
+    mn_props = mn_props + RB()
+    tools.push(make_tool_write(
+        "move_note",
+        "Move a note to a new path and update all wikilinks [[old_name]] to [[new_name]] across the vault.",
+        mn_props,
+        ja([js("old_path"), js("new_path")]),
+        false
+    ))
+
+    tools

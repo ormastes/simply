@@ -1,0 +1,627 @@
+# Simple Browser — pure-Simple rendering via the Blink-style paint pipeline.
+#
+# Phase D: replaces the previous iframe-based chrome with a Canvas2D-driven
+# paint loop. The Electron shell is now just a Canvas2D host; the address
+# strip, input field, Go button, and content area are all composed from
+# PaintOps generated here in this file and serialized via
+# `display_list_to_canvas2d_ops`.
+#
+# Launch:
+#   ./tools/electron-shell/node_modules/.bin/electron \
+#       tools/electron-shell examples/ui/simple_browser.spl
+#
+# Env vars:
+#   SIMPLE_THEME            "light" or default dark
+#   SIMPLE_BROWSER_URL      seed URL displayed in the address bar
+#                           (default https://example.com)
+#
+# IPC events handled in the main loop:
+#   MouseEvent(down)  — focus the input, or click the Go button
+#   KeyPress          — append to focused input; Enter runs Go
+#   InputChange       — also syncs the input value
+#   FocusEvent        — update focused box (input | none)
+#   ScrollEvent       — translate the content area by dy
+#   Resize            — update viewport and repaint
+#   Quit              — exit
+#
+# ---------------------------------------------------------------------------
+# HONEST SCOPING
+# ---------------------------------------------------------------------------
+# * The real Blink modules live under `std.lib.blink.*` and use that prefix
+#   internally; they are NOT importable from `examples/ui/`. This file
+#   therefore talks directly to the Canvas2D serializer without going
+#   through Blink's cascade/layout/paint walker.
+# * The chrome (address strip, input, Go button) is composed from PaintOps
+#   and sent through `display_list_to_canvas2d_ops` + `build_ipc_paint_canvas`
+#   — the same downstream path that `paint_tree_new_with_forms` would take.
+# * The content area is rendered by the in-repo browser engine and serialized
+#   as Canvas2D ops for the Electron host shell.
+# * Text shaping is delegated to Canvas2D's fillText; widths are estimates.
+# * Image decoding is handled by the Canvas2D <img> cache on the shell side.
+# * Hosted navigation supports direct URL fetches plus minimal HTML form
+#   submission for GET and POST.
+# * Inline JS, cookies, sessionStorage, and localStorage are routed through
+#   BrowserSession for the hosted shell.
+# * Inline styles, linked stylesheets, and CSS @import now flow through the
+#   session document into the renderer.
+# * Bidi, tables, flex fidelity, complex CSS, video, and web fonts are still
+#   not supported here.
+# ---------------------------------------------------------------------------
+
+use app.ui.ipc.protocol.{parse_ipc_message, build_ipc_paint_canvas, build_ipc_request_fetch,
+    build_ipc_request_http}
+use common.ui.widget.{UIEvent}
+use common.render_scene.scene_to_canvas2d_json.{display_list_to_canvas2d_ops,
+    render_scene_to_canvas2d_ops_with_offset}
+use std.common.web.browser_session.{BrowserSession, BrowserRequest, BrowserResponse}
+use std.common.web.simple_browser_page.{SimpleBrowserPageState,
+    simple_browser_blank_page, simple_browser_loading_page,
+    simple_browser_error_page, simple_browser_render_remote_page,
+    simple_browser_rerender, simple_browser_hit_target,
+    simple_browser_set_field_value, simple_browser_field_value,
+    simple_browser_field_form_key, simple_browser_submit_request}
+use common.render_scene.paint_types.{PaintOp, DisplayList}
+use std.common.color.types.{Color, from_rgb, from_rgba, white}
+use common.ui.simple_theme.{SimpleTheme}
+
+use std.io_runtime.{env_get, read_file}
+extern fn rt_stdin_read_line() -> text?
+
+# ---------------------------------------------------------------------------
+# Layout constants (the chrome is fixed-size; content fills the rest)
+# ---------------------------------------------------------------------------
+
+val INPUT_H: f64 = 32.0
+val BUTTON_W: f64 = 64.0
+val BUTTON_H: f64 = 32.0
+val BUTTON_MARGIN: f64 = 16.0
+val NAV_BUTTON_W: f64 = 34.0
+val NAV_BUTTON_GAP: f64 = 8.0
+
+# ---------------------------------------------------------------------------
+# Env-var resolution
+# ---------------------------------------------------------------------------
+
+fn _resolve_theme() -> text:
+    val env_val = env_get("SIMPLE_THEME") ?? ""
+    if env_val != "":
+        return env_val
+    return "dark"
+
+fn _resolve_url() -> text:
+    val env_val = env_get("SIMPLE_BROWSER_URL") ?? ""
+    if env_val != "":
+        return env_val
+    return "https://example.com"
+
+fn _is_mac() -> bool:
+    val plat = env_get("SIMPLE_ELECTRON_PLATFORM") ?? ""
+    return plat == "darwin"
+
+fn _top_inset() -> f64:
+    if _is_mac():
+        return 28.0
+    return 0.0
+
+fn _left_inset() -> f64:
+    if _is_mac():
+        return 92.0
+    return 16.0
+
+fn _input_y() -> f64:
+    return _top_inset() + 10.0
+
+fn _chrome_height() -> f64:
+    return _top_inset() + 52.0
+
+# ---------------------------------------------------------------------------
+# Theme palette
+# ---------------------------------------------------------------------------
+
+class Palette:
+    strip_bg: Color
+    strip_border: Color
+    fg: Color
+    accent: Color
+    input_bg: Color
+    input_border: Color
+    placeholder: Color
+    content_bg: Color
+    subtle: Color
+
+fn _parse_color(hex: text) -> Color:
+    if hex.starts_with("#"):
+        if hex.len() == 7:
+            val r = i64.from_hex(hex.substring(1, 3)).to_i32()
+            val g = i64.from_hex(hex.substring(3, 5)).to_i32()
+            val b = i64.from_hex(hex.substring(5, 7)).to_i32()
+            return from_rgb(r, g, b)
+        return from_rgb(0, 0, 0)
+    if hex.starts_with("rgba"):
+        val inner = hex.substring(5, hex.len() - 1)
+        val parts = inner.split(",")
+        if parts.len() == 4:
+            val r = parts[0].trim().to_int() as i32
+            val g = parts[1].trim().to_int() as i32
+            val b = parts[2].trim().to_int() as i32
+            return from_rgba(r, g, b, 200)
+    return from_rgb(0, 0, 0)
+
+fn _palette(theme_name: text) -> Palette:
+    var theme_path = "config/themes/{theme_name}.simple-theme"
+    if theme_name == "light":
+        theme_path = "config/themes/light.simple-theme"
+    elif theme_name == "dark":
+        theme_path = "config/themes/obsidian.simple-theme"
+
+    val css = read_file(theme_path)
+    if css == "":
+        return Palette(
+            strip_bg: from_rgba(18, 18, 31, 235),
+            strip_border: from_rgba(149, 142, 152, 51),
+            fg: from_rgb(227, 224, 243),
+            accent: from_rgb(198, 198, 200),
+            input_bg: from_rgba(127, 127, 127, 46),
+            input_border: from_rgba(149, 142, 152, 80),
+            placeholder: from_rgba(227, 224, 243, 120),
+            content_bg: from_rgb(20, 20, 30),
+            subtle: from_rgba(227, 224, 243, 140)
+        )
+
+    val theme = SimpleTheme.from_css(theme_name, css)
+    val ui_fg = _parse_color(theme.resolve_token("ui-fg"))
+    val app_surface = _parse_color(theme.resolve_token("app-surface"))
+    val app_border = _parse_color(theme.resolve_token("app-border"))
+    val app_bg = _parse_color(theme.resolve_token("app-bg"))
+    val ui_accent = _parse_color(theme.resolve_token("ui-accent"))
+
+    return Palette(
+        strip_bg: app_surface,
+        strip_border: app_border,
+        fg: ui_fg,
+        accent: ui_accent,
+        input_bg: from_rgba(127, 127, 127, 46),
+        input_border: app_border,
+        placeholder: from_rgba(ui_fg.r, ui_fg.g, ui_fg.b, 120),
+        content_bg: app_bg,
+        subtle: from_rgba(ui_fg.r, ui_fg.g, ui_fg.b, 140)
+    )
+
+# ---------------------------------------------------------------------------
+# Chrome painting
+# ---------------------------------------------------------------------------
+
+fn _nav_back_x() -> f64:
+    return _left_inset()
+
+fn _nav_forward_x() -> f64:
+    return _nav_back_x() + NAV_BUTTON_W + NAV_BUTTON_GAP
+
+fn _nav_reload_x() -> f64:
+    return _nav_forward_x() + NAV_BUTTON_W + NAV_BUTTON_GAP
+
+fn _input_x(vw: f64) -> f64:
+    return _nav_reload_x() + NAV_BUTTON_W + 12.0
+
+fn _input_w(vw: f64) -> f64:
+    return vw - _input_x(vw) - BUTTON_W - BUTTON_MARGIN - 8.0
+
+fn _button_x(vw: f64) -> f64:
+    return vw - BUTTON_W - BUTTON_MARGIN
+
+fn _build_nav_button(ops: [PaintOp], x: f64, y: f64, label: text, pal: Palette, enabled: bool) -> [PaintOp]:
+    val bg = if enabled: pal.input_bg else: from_rgba(127, 127, 127, 22)
+    val fg = if enabled: pal.fg else: pal.placeholder
+    var out = ops.push(PaintOp.FillRect(x: x, y: y, w: NAV_BUTTON_W, h: BUTTON_H, color: bg))
+    out = out.push(PaintOp.DrawBorder(
+        x: x, y: y, w: NAV_BUTTON_W, h: BUTTON_H,
+        widths: [1.0, 1.0, 1.0, 1.0],
+        colors: [pal.input_border, pal.input_border, pal.input_border, pal.input_border]
+    ))
+    return out.push(PaintOp.DrawText(
+        x: x + 12.0,
+        y: y + BUTTON_H / 2.0 + 5.0,
+        text_content: label,
+        font_size: 13.0,
+        color: fg
+    ))
+
+fn _build_chrome_ops(url: text, pal: Palette, vw: f64, focused_input: bool, can_go_back: bool, can_go_forward: bool) -> [PaintOp]:
+    var ops: [PaintOp] = []
+    val ch = _chrome_height()
+    val ty = _top_inset()
+    ops = ops.push(PaintOp.FillRect(x: 0.0, y: ty, w: vw, h: ch - ty, color: pal.strip_bg))
+    ops = ops.push(PaintOp.FillRect(x: 0.0, y: ch - 1.0, w: vw, h: 1.0, color: pal.strip_border))
+
+    val iy = _input_y()
+    ops = _build_nav_button(ops, _nav_back_x(), iy, "<", pal, can_go_back)
+    ops = _build_nav_button(ops, _nav_forward_x(), iy, ">", pal, can_go_forward)
+    ops = _build_nav_button(ops, _nav_reload_x(), iy, "R", pal, true)
+
+    val ix = _input_x(vw)
+    val iw = _input_w(vw)
+    val ih = INPUT_H
+    ops = ops.push(PaintOp.FillRect(x: ix, y: iy, w: iw, h: ih, color: pal.input_bg))
+    val border_w: f64 = if focused_input: 2.0 else: 1.0
+    val border_color: Color = if focused_input: pal.accent else: pal.input_border
+    val widths: [f64] = [border_w, border_w, border_w, border_w]
+    val colors: [Color] = [border_color, border_color, border_color, border_color]
+    ops = ops.push(PaintOp.DrawBorder(x: ix, y: iy, w: iw, h: ih, widths: widths, colors: colors))
+
+    var shown = url
+    var text_color = pal.fg
+    if shown == "":
+        shown = "Enter URL..."
+        text_color = pal.placeholder
+    ops = ops.push(PaintOp.DrawText(
+        x: ix + 10.0,
+        y: iy + ih / 2.0 + 5.0,
+        text_content: shown,
+        font_size: 13.0,
+        color: text_color
+    ))
+
+    val bx = _button_x(vw)
+    val by = iy
+    val bw = BUTTON_W
+    val bh = BUTTON_H
+    ops = ops.push(PaintOp.FillRect(x: bx, y: by, w: bw, h: bh, color: pal.accent))
+    ops = ops.push(PaintOp.DrawText(
+        x: bx + 20.0,
+        y: by + bh / 2.0 + 5.0,
+        text_content: "Go",
+        font_size: 13.0,
+        color: white()
+    ))
+    return ops
+
+# ---------------------------------------------------------------------------
+# IPC emission
+# ---------------------------------------------------------------------------
+
+val _LB = r"{"
+val _RB = r"}"
+
+fn _json_body(ops_json: text) -> text:
+    if ops_json.len() <= 2:
+        return ""
+    return ops_json.substring(1, ops_json.len() - 1)
+
+fn _concat_json_arrays(first: text, second: text) -> text:
+    val first_body = _json_body(first)
+    val second_body = _json_body(second)
+    if first_body == "":
+        return "[" + second_body + "]"
+    if second_body == "":
+        return "[" + first_body + "]"
+    return "[" + first_body + "," + second_body + "]"
+
+fn _content_viewport_h(vh: i32) -> i32:
+    val content_h = vh - _chrome_height().to_i32()
+    if content_h < 96:
+        return 96
+    return content_h
+
+fn _content_json(page: SimpleBrowserPageState, theme: text, vw: i32, vh: i32, scroll_y: f64) -> text:
+    val content_y = _chrome_height().to_i32()
+    val content_h = _content_viewport_h(vh)
+    val bg_color = if theme == "light": "rgb(255,255,255)" else: "rgb(20,20,30)"
+    val bg = _LB + "\"op\":\"fillRect\",\"x\":0,\"y\":{content_y},\"w\":{vw},\"h\":{content_h},\"color\":\"" + bg_color + "\"" + _RB
+    val clip = _LB + "\"op\":\"pushClip\",\"x\":0,\"y\":{content_y},\"w\":{vw},\"h\":{content_h}" + _RB
+    val scene_json = render_scene_to_canvas2d_ops_with_offset(page.to_scene(), 0, content_y - scroll_y.to_i32())
+    val unclip = _LB + "\"op\":\"popClip\"" + _RB
+    val scene_body = _json_body(scene_json)
+    if scene_body == "":
+        return "[" + bg + "," + clip + "," + unclip + "]"
+    return "[" + bg + "," + clip + "," + scene_body + "," + unclip + "]"
+
+fn _emit_paint(chrome_ops: [PaintOp], page: SimpleBrowserPageState, theme: text, vw: i32, vh: i32, scroll_y: f64):
+    val dl = DisplayList(ops: chrome_ops)
+    val chrome_json = display_list_to_canvas2d_ops(dl)
+    val content_json = _content_json(page, theme, vw, vh, scroll_y)
+    val merged = _concat_json_arrays(content_json, chrome_json)
+    print build_ipc_paint_canvas(merged, vw, vh)
+
+# ---------------------------------------------------------------------------
+# Hit testing
+# ---------------------------------------------------------------------------
+
+fn _hit_input(x: f64, y: f64, vw: f64) -> bool:
+    val ix = _input_x(vw)
+    val iw = _input_w(vw)
+    val iy = _input_y()
+    return x >= ix and x <= ix + iw and y >= iy and y <= iy + INPUT_H
+
+fn _hit_button(x: f64, y: f64, vw: f64) -> bool:
+    val bx = _button_x(vw)
+    val by = _input_y()
+    return x >= bx and x <= bx + BUTTON_W and y >= by and y <= by + BUTTON_H
+
+fn _hit_nav_button(x: f64, y: f64, left: f64) -> bool:
+    val by = _input_y()
+    return x >= left and x <= left + NAV_BUTTON_W and y >= by and y <= by + BUTTON_H
+
+fn _hit_back(x: f64, y: f64) -> bool:
+    return _hit_nav_button(x, y, _nav_back_x())
+
+fn _hit_forward(x: f64, y: f64) -> bool:
+    return _hit_nav_button(x, y, _nav_forward_x())
+
+fn _hit_reload(x: f64, y: f64) -> bool:
+    return _hit_nav_button(x, y, _nav_reload_x())
+
+fn _page_from_session(session: BrowserSession, viewport_w: i32, viewport_h: i32) -> SimpleBrowserPageState:
+    return simple_browser_render_remote_page(
+        session.current_url,
+        session.render_html_document(),
+        viewport_w,
+        viewport_h
+    )
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+fn _send_request(request: BrowserRequest):
+    if request.headers == "" and (request.method == "" or (request.method == "GET" and request.body == "" and request.content_type == "")):
+        print build_ipc_request_fetch(request.url, request.id)
+    else:
+        print build_ipc_request_http(request.url, request.id, request.method, request.headers, request.body, request.content_type)
+
+fn _drain_session_requests(session: BrowserSession, pending_request_ids: [text]) -> [text]:
+    var next_ids = pending_request_ids
+    while session.has_pending_requests():
+        val req_opt = session.take_pending_request()
+        if req_opt != nil:
+            _send_request(req_opt)
+            next_ids = next_ids + [req_opt.id]
+        else:
+            return next_ids
+    return next_ids
+
+fn _remove_pending_request(pending_request_ids: [text], request_id: text) -> [text]:
+    var next_ids: [text] = []
+    for current_id in pending_request_ids:
+        if current_id != request_id:
+            next_ids = next_ids + [current_id]
+    return next_ids
+
+fn _response_kind(request_id: text) -> text:
+    if request_id.starts_with("script-"):
+        return "script"
+    if request_id.starts_with("style-"):
+        return "style"
+    if request_id.starts_with("module-"):
+        return "module"
+    if request_id.starts_with("fetch-"):
+        return "fetch"
+    return "document"
+
+fn _has_loading_request(pending_request_ids: [text]) -> bool:
+    for request_id in pending_request_ids:
+        if request_id.starts_with("document-") or request_id.starts_with("script-") or request_id.starts_with("style-") or request_id.starts_with("module-"):
+            return true
+    return false
+
+fn main() -> i64:
+    val theme = _resolve_theme()
+    val pal = _palette(theme)
+    var url = _resolve_url()
+    var focused_input: bool = false
+    var focused_field_key: text = ""
+    var scroll_y: f64 = 0.0
+    var viewport_w: i32 = 1024
+    var viewport_h: i32 = 768
+    var pending_request_ids: [text] = []
+    var session = BrowserSession.new()
+
+    var page = simple_browser_blank_page(url, viewport_w, _content_viewport_h(viewport_h))
+    val chrome0 = _build_chrome_ops(url, pal, viewport_w.to_f64(), focused_input, session.can_go_back(), session.can_go_forward())
+    _emit_paint(chrome0, page, theme, viewport_w, viewport_h, scroll_y)
+
+    var running = true
+    while running:
+        val line_opt = rt_stdin_read_line()
+        if line_opt != nil:
+            val line = line_opt
+            if line != "":
+                val event_opt = parse_ipc_message(line)
+                if event_opt != nil:
+                    val event = event_opt
+                    var dirty = false
+                    var trigger_fetch = false
+                    match event:
+                        case UIEvent.Quit:
+                            running = false
+                        case UIEvent.Resize(w, h):
+                            viewport_w = w
+                            viewport_h = h
+                            page = simple_browser_rerender(page, viewport_w, _content_viewport_h(viewport_h))
+                            dirty = true
+                        case UIEvent.MouseEvent(x, y, _, kind):
+                            val vw2 = viewport_w.to_f64()
+                            if kind == "down":
+                                if _hit_input(x, y, vw2):
+                                    if not focused_input:
+                                        focused_input = true
+                                        dirty = true
+                                elif _hit_back(x, y):
+                                    if session.can_go_back():
+                                        match session.go_back():
+                                            case Ok(_):
+                                                url = session.current_url
+                                                page = _page_from_session(session, viewport_w, _content_viewport_h(viewport_h))
+                                            case Err(e):
+                                                page = simple_browser_error_page(url, e, viewport_w, _content_viewport_h(viewport_h))
+                                    focused_input = false
+                                    focused_field_key = ""
+                                    scroll_y = 0.0
+                                    dirty = true
+                                elif _hit_forward(x, y):
+                                    if session.can_go_forward():
+                                        match session.go_forward():
+                                            case Ok(_):
+                                                url = session.current_url
+                                                page = _page_from_session(session, viewport_w, _content_viewport_h(viewport_h))
+                                            case Err(e):
+                                                page = simple_browser_error_page(url, e, viewport_w, _content_viewport_h(viewport_h))
+                                    focused_input = false
+                                    focused_field_key = ""
+                                    scroll_y = 0.0
+                                    dirty = true
+                                elif _hit_reload(x, y):
+                                    match session.reload():
+                                        case Ok(_):
+                                            url = session.current_url
+                                            page = _page_from_session(session, viewport_w, _content_viewport_h(viewport_h))
+                                        case Err(_e):
+                                            match session.begin_network_navigation(url, "GET", "", "", ""):
+                                                case Ok(_):
+                                                    trigger_fetch = true
+                                                    page = simple_browser_loading_page(url, viewport_w, _content_viewport_h(viewport_h))
+                                                case Err(e2):
+                                                    page = simple_browser_error_page(url, e2, viewport_w, _content_viewport_h(viewport_h))
+                                    focused_input = false
+                                    focused_field_key = ""
+                                    scroll_y = 0.0
+                                    dirty = true
+                                elif _hit_button(x, y, vw2):
+                                    match session.begin_network_navigation(url, "GET", "", "", ""):
+                                        case Ok(_):
+                                            trigger_fetch = true
+                                        case Err(e):
+                                            page = simple_browser_error_page(url, e, viewport_w, _content_viewport_h(viewport_h))
+                                    focused_input = false
+                                    focused_field_key = ""
+                                    dirty = true
+                                else:
+                                    if focused_input:
+                                        focused_input = false
+                                        dirty = true
+                                    focused_field_key = ""
+                                    val content_origin_y = _chrome_height()
+                                    if y >= content_origin_y:
+                                        val page_x = x.to_i32()
+                                        val page_y = (y - content_origin_y + scroll_y).to_i32()
+                                        val target_opt = simple_browser_hit_target(page, page_x, page_y)
+                                        if target_opt != nil:
+                                            val target = target_opt
+                                            if target.kind == "anchor":
+                                                url = target.action
+                                                match session.begin_network_navigation(url, "GET", "", "", ""):
+                                                    case Ok(_):
+                                                        trigger_fetch = true
+                                                    case Err(e):
+                                                        page = simple_browser_error_page(url, e, viewport_w, _content_viewport_h(viewport_h))
+                                                dirty = true
+                                            elif target.kind == "field":
+                                                focused_field_key = target.field_key
+                                                dirty = true
+                                            elif target.kind == "submit":
+                                                val request = simple_browser_submit_request(page, target.form_key, target.action, target.method)
+                                                if request.url != "":
+                                                    url = request.url
+                                                    match session.begin_network_navigation(request.url, request.method, "", request.body, request.content_type):
+                                                        case Ok(_):
+                                                            trigger_fetch = true
+                                                        case Err(e):
+                                                            page = simple_browser_error_page(url, e, viewport_w, _content_viewport_h(viewport_h))
+                                                    dirty = true
+                        case UIEvent.KeyPress(key):
+                            if focused_input:
+                                if key == "Enter":
+                                    match session.begin_network_navigation(url, "GET", "", "", ""):
+                                        case Ok(_):
+                                            trigger_fetch = true
+                                        case Err(e):
+                                            page = simple_browser_error_page(url, e, viewport_w, _content_viewport_h(viewport_h))
+                                    focused_input = false
+                                    dirty = true
+                                elif key == "Backspace":
+                                    if url.len() > 0:
+                                        url = url.substring(0, url.len() - 1)
+                                        dirty = true
+                                elif key.len() == 1:
+                                    url = url + key
+                                    dirty = true
+                            elif focused_field_key != "":
+                                var next_val = simple_browser_field_value(page, focused_field_key)
+                                if key == "Enter":
+                                    val form_key = simple_browser_field_form_key(page, focused_field_key)
+                                    val request = simple_browser_submit_request(page, form_key, "", "")
+                                    if request.url != "":
+                                        url = request.url
+                                        match session.begin_network_navigation(request.url, request.method, "", request.body, request.content_type):
+                                            case Ok(_):
+                                                trigger_fetch = true
+                                            case Err(e):
+                                                page = simple_browser_error_page(url, e, viewport_w, _content_viewport_h(viewport_h))
+                                        dirty = true
+                                elif key == "Backspace":
+                                    if next_val.len() > 0:
+                                        next_val = next_val.substring(0, next_val.len() - 1)
+                                        page = simple_browser_set_field_value(page, focused_field_key, next_val)
+                                        dirty = true
+                                elif key.len() == 1:
+                                    next_val = next_val + key
+                                    page = simple_browser_set_field_value(page, focused_field_key, next_val)
+                                    dirty = true
+                        case UIEvent.InputChange(_tid, value):
+                            if focused_input:
+                                url = value
+                                dirty = true
+                        case UIEvent.FocusEvent(_tid, kind):
+                            if kind == "focus":
+                                if not focused_input:
+                                    focused_input = true
+                                    dirty = true
+                            else:
+                                if focused_input:
+                                    focused_input = false
+                                    dirty = true
+                        case UIEvent.ScrollEvent(_sx, _sy, _dx, dy):
+                            val max_scroll = if page.doc_height > _content_viewport_h(viewport_h): (page.doc_height - _content_viewport_h(viewport_h)).to_f64() else: 0.0
+                            var new_scroll = scroll_y + dy
+                            if new_scroll < 0.0:
+                                new_scroll = 0.0
+                            if new_scroll > max_scroll:
+                                new_scroll = max_scroll
+                            scroll_y = new_scroll
+                            dirty = true
+                        case UIEvent.FetchResult(req_id, fr_url, status, headers, body, err):
+                            pending_request_ids = _remove_pending_request(pending_request_ids, req_id)
+                            scroll_y = 0.0
+                            focused_field_key = ""
+                            match session.commit_network_response(BrowserResponse.create(
+                                request_id: req_id,
+                                kind: _response_kind(req_id),
+                                url: fr_url,
+                                status: status,
+                                headers: headers,
+                                body: body,
+                                error: err
+                            )):
+                                case Ok(_):
+                                    url = session.current_url
+                                    pending_request_ids = _drain_session_requests(session, pending_request_ids)
+                                    if _has_loading_request(pending_request_ids):
+                                        page = simple_browser_loading_page(url, viewport_w, _content_viewport_h(viewport_h))
+                                    else:
+                                        page = _page_from_session(session, viewport_w, _content_viewport_h(viewport_h))
+                                case Err(e):
+                                    url = fr_url
+                                    page = simple_browser_error_page(fr_url, e, viewport_w, _content_viewport_h(viewport_h))
+                            dirty = true
+                        case _:
+                            pass
+                    if trigger_fetch:
+                        scroll_y = 0.0
+                        focused_field_key = ""
+                        page = simple_browser_loading_page(url, viewport_w, _content_viewport_h(viewport_h))
+                        pending_request_ids = _drain_session_requests(session, pending_request_ids)
+                        if pending_request_ids.len() == 0:
+                            page = _page_from_session(session, viewport_w, _content_viewport_h(viewport_h))
+                    if dirty:
+                        val chrome_ops = _build_chrome_ops(url, pal, viewport_w.to_f64(), focused_input, session.can_go_back(), session.can_go_forward())
+                        _emit_paint(chrome_ops, page, theme, viewport_w, viewport_h, scroll_y)
+    return 0

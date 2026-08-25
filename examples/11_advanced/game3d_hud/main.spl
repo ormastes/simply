@@ -1,0 +1,173 @@
+# 3D + 2D HUD composition proof (offscreen, no window) — master plan G4.4.
+#
+# Renders the game3d_smoke scene (near green + far red triangle, 160x120) with
+# the CPU 3D backend, then composites a 2D HUD (score bar + "SCORE 42" text)
+# on top of the SAME final pixel buffer via the Engine2D software backend:
+# the 3D frame is blitted as the bottom layer, HUD drawn above it.
+#
+# Layer bookkeeping goes through the real surface_layer bridge where it works
+# in the interpreter: LayerTree.create_layer + Scene3DLayer + DisplayEntry +
+# the z_paint_order oracle decide back-to-front order. The composite_order /
+# flatten_to_paint_order path is NOT used: the interpreter cannot `for`-iterate
+# List<T> ("error: semantic: cannot iterate over this type"), which kills both
+# surface_layer.composite_order and std.compositor.stacking.flatten_to_paint_order.
+# Scene3DLayer.attach is also avoided: class params are copied even with `mut`,
+# so the tree's next_id advance inside attach is lost and a later create_layer
+# hands out a colliding layer id (observed: both layers got id 0).
+#
+# Checks (PASS/FAIL lines):
+#   HUD-PRESENT   — HUD bar pixel over former background shows HUD color
+#   SCENE-VISIBLE — 3D pixels outside the HUD (green center, bg corner) survive
+#   OVERLAY-ORDER — pixel where HUD overlaps 3D red geometry shows HUD color
+#   TEXT-PRESENT  — white "SCORE 42" glyph pixels exist inside the bar
+#
+# Run: SIMPLE_TIMEOUT_SECONDS=120 bin/simple run examples/11_advanced/game3d_hud/main.spl
+
+use std.gpu.engine3d.engine.{Engine3D}
+use std.gpu.engine3d.types3d.{
+    vertex3d_pos_normal, material_unlit,
+    mat4_identity, mat4_perspective, mat4_look_at,
+    CULL_NONE, color3d_r, color3d_g, color3d_b
+}
+use std.gpu.engine2d.backend_software.{SoftwareBackend}
+use std.nogc_sync_mut.engine.render.surface_layer.{Scene3DLayer, z_paint_order}
+use std.compositor.layer.{LayerTree, DisplayEntry}
+use std.io_runtime.{write_file}
+
+val W: i32 = 160
+val H: i32 = 120
+val BG: u32 = 0xFF202020
+val GREEN: u32 = 0xFF00CC00
+val RED: u32 = 0xFFCC0000
+val HUD_BLUE: u32 = 0xFF2060E0
+val WHITE: u32 = 0xFFFFFFFF
+val OUT: text = "build/game3d_hud.ppm"
+
+# HUD bar rect — overlaps the red triangle's right flank at row 60 so the
+# overlay-order pixel (100,60) is smoke-verified 3D geometry underneath.
+val BAR_X: i32 = 96
+val BAR_Y: i32 = 52
+val BAR_W: i32 = 58
+val BAR_H: i32 = 16
+
+fn check(label: text, pixels: [u32], x: i32, y: i32, expected: u32) -> bool:
+    val got = pixels[y * W + x]
+    val ok = got == expected
+    val status = if ok: "PASS" else: "FAIL"
+    print "{status} {label} ({x},{y}) r={color3d_r(got)} g={color3d_g(got)} b={color3d_b(got)}"
+    ok
+
+fn render_scene3d() -> [u32]:
+    var engine = Engine3D.create(W, H)
+    print "3d backend: {engine.backend_name()}"
+    val view = mat4_look_at(0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0)
+    val proj = mat4_perspective(1.0472, (W as f32) / (H as f32), 0.1, 100.0)
+    engine.set_camera(view, proj)
+    engine.set_cull_mode(CULL_NONE)
+    engine.begin_frame()
+    engine.clear(BG)
+    engine.clear_depth()
+    val model = mat4_identity()
+    engine.submit_triangle(
+        vertex3d_pos_normal(-0.5, -0.5, 1.0, 0.0, 0.0, 1.0),
+        vertex3d_pos_normal(0.5, -0.5, 1.0, 0.0, 0.0, 1.0),
+        vertex3d_pos_normal(0.0, 0.5, 1.0, 0.0, 0.0, 1.0),
+        material_unlit(GREEN), model)
+    engine.submit_triangle(
+        vertex3d_pos_normal(-2.0, -2.0, -1.0, 0.0, 0.0, 1.0),
+        vertex3d_pos_normal(2.0, -2.0, -1.0, 0.0, 0.0, 1.0),
+        vertex3d_pos_normal(0.0, 2.5, -1.0, 0.0, 0.0, 1.0),
+        material_unlit(RED), model)
+    engine.end_frame()
+    engine.read_pixels()
+
+fn draw_hud(mut b: SoftwareBackend):
+    b.draw_rect_filled(BAR_X, BAR_Y, BAR_W, BAR_H, HUD_BLUE)
+    b.draw_text(BAR_X + 4, BAR_Y + 5, "SCORE 42", WHITE, 6)
+
+fn main():
+    val pixels3d = render_scene3d()
+
+    # --- surface_layer bridge: register both layers, derive paint order ---
+    var tree = LayerTree.new()
+    val scene_lid = tree.create_layer(1, 0.0, 0.0, 160.0, 120.0)
+    val hud_lid = tree.create_layer(2, BAR_X as f64, BAR_Y as f64, BAR_W as f64, BAR_H as f64)
+    val scene = Scene3DLayer(
+        target_id: 1, layer_id: scene_lid, z_index: 0,
+        width: W as i64, height: H as i64)
+    val scene_entry = scene.display_entry()
+    val hud_entry = DisplayEntry.create(hud_lid, 1)
+    val order = z_paint_order([hud_entry.z_index, scene_entry.z_index])
+    print "paint order (back-to-front z): {order[0]} {order[1]}"
+
+    # --- composite onto ONE surface, in bridge-decided order ---
+    var b = SoftwareBackend.create()
+    if not b.init(W, H):
+        print "FAIL 2d backend init"
+        return
+    var i = 0
+    while i < order.len():
+        if order[i] == scene_entry.z_index:
+            b.draw_image(0, 0, W, H, pixels3d)
+        else:
+            draw_hud(b)
+        i = i + 1
+    val final_px = b.read_pixels()
+
+    var ok = true
+    # HUD over former background region (bottom-right of bar was BG in 3D frame).
+    if pixels3d[66 * W + 152] != BG:
+        print "FAIL hud-present precondition: (152,66) not background in 3D frame"
+        ok = false
+    if not check("HUD-PRESENT", final_px, 152, 66, HUD_BLUE):
+        ok = false
+    # 3D scene untouched outside the HUD.
+    if not check("SCENE-VISIBLE center=green", final_px, W / 2, H / 2, GREEN):
+        ok = false
+    if not check("SCENE-VISIBLE corner=bg", final_px, 2, 2, BG):
+        ok = false
+    # HUD wins where it overlaps 3D geometry: (100,60) is red in the raw 3D frame.
+    if pixels3d[60 * W + 100] != RED:
+        print "FAIL overlay-order precondition: (100,60) not red in 3D frame"
+        ok = false
+    if not check("OVERLAY-ORDER", final_px, 100, 60, HUD_BLUE):
+        ok = false
+    # Text: white glyph pixels somewhere inside the bar.
+    var white_count = 0
+    var ty = BAR_Y
+    while ty < BAR_Y + BAR_H:
+        var tx = BAR_X
+        while tx < BAR_X + BAR_W:
+            if final_px[ty * W + tx] == WHITE:
+                white_count = white_count + 1
+            tx = tx + 1
+        ty = ty + 1
+    if white_count > 0:
+        print "PASS TEXT-PRESENT white glyph pixels in bar: {white_count}"
+    else:
+        print "FAIL TEXT-PRESENT no white pixels in bar"
+        ok = false
+
+    # Dump PPM for eyeballing.
+    var body = ""
+    var y = 0
+    while y < H:
+        var row = ""
+        var x = 0
+        while x < W:
+            val p = final_px[y * W + x]
+            row = row + "{color3d_r(p)} {color3d_g(p)} {color3d_b(p)}\n"
+            x = x + 1
+        body = body + row
+        y = y + 1
+    val ppm = "P3\n{W} {H}\n255\n" + body
+    if write_file(OUT, ppm):
+        print "wrote {OUT}"
+    else:
+        print "FAIL could not write {OUT}"
+        ok = false
+
+    if ok:
+        print "GAME3D_HUD PASS"
+    else:
+        print "GAME3D_HUD FAIL"

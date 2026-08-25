@@ -1,0 +1,15 @@
+fn _rv32_ecc_bit(v: i64, bit: i64) -> i64:
+    (v >> bit) & 1
+
+fn _rv32_ecc_parity_pos(pos: i64) -> i32:
+    if pos == 1:
+        return 1
+    if pos == 2:
+        return 1
+    if pos == 4:
+        return 1
+    if pos == 8:
+        return 1
+    if pos == 16:
+        return 1
+    0

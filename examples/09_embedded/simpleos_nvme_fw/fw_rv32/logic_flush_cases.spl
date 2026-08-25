@@ -1,0 +1,9 @@
+use logic_flush_cmd_cases.*
+use logic_flush_dirty_cases.*
+
+fn rv32_flush_cases_selftest() -> i32:
+    if rv32_flush_cmd_cases_selftest() != 0:
+        return 1
+    if rv32_flush_dirty_cases_selftest() != 0:
+        return 1
+    0

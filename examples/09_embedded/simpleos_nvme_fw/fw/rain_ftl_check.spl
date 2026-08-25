@@ -1,0 +1,89 @@
+"""
+rain_ftl_check — FTL-integrated RAIN channel reconstruction (gap-closure P8, wired).
+
+Proves the RAIN parity is load-bearing in the live FTL, not a standalone model: write known
+data through the real FTL write path, then make a whole channel (die) go uncorrectable and
+rebuild it from parity maintained by the writes + the surviving channels. Every
+logical block must read back its original value through the normal FTL read path.
+
+Run: bin/simple run examples/09_embedded/simpleos_nvme_fw/fw/rain_ftl_check.spl
+"""
+
+use nvme_types.*
+use fil_scheduler.*     # NUM_CHANNELS
+use rain.*
+use ftl.*
+
+fn main():
+    var fail: i64 = 0
+    var ftl: Ftl = ftl_new()
+
+    # Write known, nonzero data to a span of LBAs (fills several blocks across channels).
+    val N: i64 = 256
+    var i: i64 = 0
+    while i < N:
+        val v: i64 = (i % 251) + 1
+        val st: i64 = ftl.write(i, v)
+        fail = fail + expect_eq(st, SC_SUCCESS, "write LBA succeeds")
+        i = i + 1
+
+    # Choose the channel that backs LBA 0 — guaranteed to hold live data to lose.
+    val ppn0: i64 = ftl.physical_ppn(0)
+    val blk0: i64 = ppn_block(ppn0)
+    val failed: i64 = blk0 % NUM_CHANNELS
+
+    # Simulate the die failure: every live page on that channel goes uncorrectable.
+    var corrupted: i64 = 0
+    var first: i64 = NULL_IDX
+    i = 0
+    while i < N:
+        val ppn: i64 = ftl.physical_ppn(i)
+        if ppn != UNMAP:
+            val blk: i64 = ppn_block(ppn)
+            if blk % NUM_CHANNELS == failed:
+                ftl.inject_read_bitflip(ppn, 2)     # 2 flips → NAND_ECC_FAIL (uncorrectable)
+                corrupted = corrupted + 1
+                if first == NULL_IDX:
+                    first = i
+        i = i + 1
+    var some: i64 = 0
+    if corrupted > 0:
+        some = 1
+    fail = fail + expect_eq(some, 1, "the failed channel held live data to lose")
+
+    # Sealing must not poison a stripe when any page in that stripe is unreadable.
+    val seal_ppn: i64 = rain_ppn(1, 1, 0)
+    fail = fail + expect_eq(ftl.fil.program(seal_ppn, 901, 1, 2), NAND_OK, "seal survivor setup program")
+    ftl.rain_update_page(seal_ppn, 0, 2)
+    val seal_parity: i64 = ftl.rain_parity[rain_stripe_idx(seal_ppn)]
+    ftl.fil.corrupt_page_data(seal_ppn, 7)
+    ftl.inject_read_bitflip(seal_ppn, 2)
+    ftl.rain_seal()
+    fail = fail + expect_eq(ftl.rain_parity[rain_stripe_idx(seal_ppn)], seal_parity, "seal preserves parity when a page is unreadable")
+    ftl.inject_read_bitflip(seal_ppn, 0)
+    ftl.fil.corrupt_page_data(seal_ppn, 2)
+
+    # Before the rebuild, a lost block reads as an uncorrectable media error.
+    val st_pre: i64 = ftl.read_status(first)
+    fail = fail + expect_eq(st_pre, SC_MEDIA_ERR, "lost block is uncorrectable before the rebuild")
+
+    # Rebuild the channel from RAIN parity + the survivors.
+    val rebuilt: i64 = ftl.rain_recover_channel(failed)
+    fail = fail + expect_eq(rebuilt, corrupted, "every lost page was rebuilt")
+
+    # After the rebuild the block is clean and reads its original value.
+    val st_post: i64 = ftl.read_status(first)
+    fail = fail + expect_eq(st_post, SC_SUCCESS, "rebuilt block reads clean")
+
+    # Every LBA survives the channel failure (read through the normal FTL path).
+    i = 0
+    while i < N:
+        val want: i64 = (i % 251) + 1
+        val got: i64 = ftl.read(i)
+        fail = fail + expect_eq(got, want, "LBA survives the channel failure")
+        i = i + 1
+
+    if fail == 0:
+        print "RAIN-FTL OK"
+    else:
+        print "RAIN-FTL FAIL ({fail})"

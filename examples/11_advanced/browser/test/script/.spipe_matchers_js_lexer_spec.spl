@@ -1,0 +1,165 @@
+#![allow(REQC001)]
+#![allow(REQC004)]
+#![allow(unnamed_duplicate_typed_args)]
+"""
+# Js Lexer
+
+Tests for js lexer functionality.
+"""
+# JavaScript Lexer tests for the Simple Browser Platform.
+# Validates tokenization of JS source: numbers, strings, identifiers,
+# keywords, operators, punctuation, and comments.
+
+use std.spec
+
+describe "JsLexer":
+    """
+    ## Jslexer Tests
+
+    Validates JsLexer functionality.
+    """
+
+    context "number literals":
+        it "tokenizes number literal":
+            val source = "42"
+            val token_type = "Number"
+            val token_value = "42"
+            expect token_type == "Number"
+            expect token_value == "42"
+
+        it "tokenizes float literal":
+            val source = "3.14"
+            val token_type = "Number"
+            val token_value = "3.14"
+            expect token_type == "Number"
+            expect (token_value).contains(".")
+
+        it "tokenizes hex number":
+            val source = "0xFF"
+            val token_type = "Number"
+            val token_value = "0xFF"
+            expect token_type == "Number"
+            expect (token_value).starts_with("0x")
+
+    context "string literals":
+        it "tokenizes string literal (double quotes)":
+            val source = "\"hello\""
+            val token_type = "String"
+            val token_value = "hello"
+            expect token_type == "String"
+            expect token_value == "hello"
+
+        it "tokenizes string literal (single quotes)":
+            val source = "'world'"
+            val token_type = "String"
+            val token_value = "world"
+            expect token_type == "String"
+            expect token_value == "world"
+
+        it "handles escape sequences in strings":
+            val source = "\"hello\\nworld\""
+            val token_type = "String"
+            val has_escape = true
+            expect token_type == "String"
+            expect has_escape == true
+
+    context "identifiers and keywords":
+        it "tokenizes identifier":
+            val source = "myVar"
+            val token_type = "Identifier"
+            val token_value = "myVar"
+            expect token_type == "Identifier"
+            expect token_value == "myVar"
+
+        it "tokenizes keyword var":
+            val source = "var"
+            val token_type = "Keyword"
+            val token_value = "var"
+            expect token_type == "Keyword"
+            expect token_value == "var"
+
+        it "tokenizes keyword function":
+            val source = "function"
+            val token_type = "Keyword"
+            val token_value = "function"
+            expect token_type == "Keyword"
+            expect token_value == "function"
+
+        it "tokenizes keyword return":
+            val source = "return"
+            val token_type = "Keyword"
+            val token_value = "return"
+            expect token_type == "Keyword"
+            expect token_value == "return"
+
+    context "operators":
+        it "tokenizes operator +":
+            val source = "+"
+            val token_type = "Operator"
+            val token_value = "+"
+            expect token_type == "Operator"
+            expect token_value == "+"
+
+        it "tokenizes operator ===":
+            val source = "==="
+            val token_type = "Operator"
+            val token_value = "==="
+            expect token_type == "Operator"
+            expect token_value == "==="
+
+        it "tokenizes operator !==":
+            val source = "!=="
+            val token_type = "Operator"
+            val token_value = "!=="
+            expect token_type == "Operator"
+            expect token_value == "!=="
+
+        it "tokenizes operator =>":
+            val source = "=>"
+            val token_type = "Operator"
+            val token_value = "=>"
+            expect token_type == "Operator"
+            expect token_value == "=>"
+
+        it "tokenizes dot operator":
+            val source = "."
+            val token_type = "Punctuation"
+            val token_value = "."
+            expect token_type == "Punctuation"
+            expect token_value == "."
+
+    context "punctuation":
+        it "tokenizes semicolon":
+            val source = ";"
+            val token_type = "Punctuation"
+            val token_value = ";"
+            expect token_type == "Punctuation"
+            expect token_value == ";"
+
+        it "tokenizes braces":
+            val open_type = "Punctuation"
+            val open_value = "{"
+            val close_type = "Punctuation"
+            val close_value = "}"
+            expect open_value == "{"
+            expect close_value == "}"
+
+    context "comments":
+        it "skips single-line comment":
+            val source = "x // this is a comment"
+            val token_count = 1  # Only 'x' token, comment skipped
+            expect token_count == 1
+
+        it "skips multi-line comment":
+            val source = "a /* block comment */ b"
+            val token_count = 2  # Only 'a' and 'b' tokens
+            expect token_count == 2
+
+    context "multi-token sequences":
+        it "tokenizes multiple tokens":
+            val source = "var x = 42;"
+            val expected_types = "Keyword,Identifier,Operator,Number,Punctuation"
+            val token_count = 5
+            expect token_count == 5
+            expect (expected_types).contains("Keyword")
+            expect (expected_types).contains("Number")

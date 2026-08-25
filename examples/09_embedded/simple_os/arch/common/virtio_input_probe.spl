@@ -1,0 +1,70 @@
+# Guest-resident pure-Simple VirtIO-input calibration probe.
+
+use os.drivers.virtio.virtio_input_mmio.{
+    VIRTIO_INPUT_DEVICE_CONTROLLER,
+    VirtioInputMmioDevice,
+    virtio_input_mmio_find_kind
+}
+use os.drivers.virtio.virtio_input_wire.{
+    VIRTIO_INPUT_DEVICE_KEYBOARD,
+    VIRTIO_INPUT_DEVICE_POINTER
+}
+
+extern fn serial_println(msg: text)
+
+fn _emit_input_event(sequence: i64, kind: text, type_: u16, code: u16, value: u32):
+    serial_println("SIMPLEOS_INPUT_EVENT sequence={sequence} kind={kind} type={type_} code={code} value={value} order=monotonic")
+
+fn simpleos_virtio_input_probe(arch: text, poll_limit: i64, mmio_start: u64, mmio_slots: i64, mmio_stride: u64) -> bool:
+    var keyboard = virtio_input_mmio_find_kind(mmio_start, mmio_slots, mmio_stride, VIRTIO_INPUT_DEVICE_KEYBOARD)
+    var pointer = virtio_input_mmio_find_kind(mmio_start, mmio_slots, mmio_stride, VIRTIO_INPUT_DEVICE_POINTER)
+    var controller = virtio_input_mmio_find_kind(mmio_start, mmio_slots, mmio_stride, VIRTIO_INPUT_DEVICE_CONTROLLER)
+    if not keyboard.ready or not pointer.ready:
+        val keyboard_ready = if keyboard.ready: 1 else: 0
+        val pointer_ready = if pointer.ready: 1 else: 0
+        serial_println("SIMPLEOS_INPUT_READY status=failed arch={arch} keyboard={keyboard_ready} pointer={pointer_ready}")
+        keyboard.shutdown()
+        pointer.shutdown()
+        controller.shutdown()
+        return false
+    val controller_ready = if controller.ready: 1 else: 0
+    serial_println("SIMPLEOS_INPUT_READY status=ready arch={arch} keyboard=1 pointer=1 controller={controller_ready}")
+    var sequence: i64 = 0
+    var keyboard_seen = false
+    var pointer_seen = false
+    var controller_seen = false
+    var polls: i64 = 0
+    while polls < poll_limit and (not keyboard_seen or not pointer_seen):
+        if keyboard.receipt_available():
+            val keyboard_receipt = keyboard.poll_receipt()
+            val event = keyboard_receipt.event
+            sequence = sequence + 1
+            _emit_input_event(sequence, "keyboard", event.type_, event.code, event.value)
+            keyboard_seen = true
+        if pointer.receipt_available():
+            val pointer_receipt = pointer.poll_receipt()
+            val event = pointer_receipt.event
+            sequence = sequence + 1
+            _emit_input_event(sequence, "pointer", event.type_, event.code, event.value)
+            pointer_seen = true
+        if controller.ready and controller.receipt_available():
+            val controller_receipt = controller.poll_receipt()
+            val event = controller_receipt.event
+            sequence = sequence + 1
+            _emit_input_event(sequence, "controller", event.type_, event.code, event.value)
+            controller_seen = true
+        polls = polls + 1
+    if not controller.ready:
+        serial_println("SIMPLEOS_INPUT_CONTROLLER status=unavailable reason=qemu-host-gamepad-not-attached")
+    elif not controller_seen:
+        serial_println("SIMPLEOS_INPUT_CONTROLLER status=ready-no-event")
+    keyboard.shutdown()
+    pointer.shutdown()
+    controller.shutdown()
+    if keyboard_seen and pointer_seen:
+        serial_println("SIMPLEOS_INPUT_PROBE status=pass arch={arch} events={sequence} order=monotonic")
+        return true
+    serial_println("SIMPLEOS_INPUT_PROBE status=failed arch={arch} keyboard_seen={keyboard_seen} pointer_seen={pointer_seen}")
+    false
+
+export simpleos_virtio_input_probe

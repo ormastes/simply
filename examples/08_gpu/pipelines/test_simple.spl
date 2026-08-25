@@ -1,0 +1,123 @@
+#!/usr/bin/env simple
+# Simple GPU Test - Runtime Compatible
+#
+# Tests basic PyTorch FFI operations
+
+use std.torch.{torch_available, torch_cuda_available, TorchTensorWrapper, TorchStream}
+
+fn test_backend_detection():
+    print "=== Backend Detection ==="
+
+    val torch_avail = torch_available()
+    print "PyTorch available: {torch_avail}"
+
+    if torch_avail:
+        val cuda_avail = torch_cuda_available()
+        print "CUDA available: {cuda_avail}"
+
+        if cuda_avail:
+            print "✓ GPU backend ready"
+        else:
+            print "⚠ CPU only (no CUDA)"
+    else:
+        print "✗ PyTorch not available"
+
+    print ""
+
+fn test_tensor_creation():
+    print "=== Tensor Creation ==="
+
+    if not torch_available():
+        print "⚠ Skipped (PyTorch not available)"
+        print ""
+        return
+
+    # Create tensor
+    val t = TorchTensorWrapper.tensor_zeros([10, 10])
+    print "Created tensor: {t.numel()} elements"
+
+    val shape = t.shape()
+    print "Shape: {shape}"
+    print "✓ Tensor creation works"
+    print ""
+
+fn test_cuda_transfer():
+    print "=== CUDA Transfer ==="
+
+    if not torch_cuda_available():
+        print "⚠ Skipped (CUDA not available)"
+        print ""
+        return
+
+    # Create tensor on CPU
+    val t = TorchTensorWrapper.tensor_ones([100, 100])
+    print "Created CPU tensor: {t.numel()} elements"
+
+    # Move to GPU
+    val gpu_t = t.cuda(0)
+    val is_cuda = gpu_t.is_cuda()
+    print "Moved to GPU: {is_cuda}"
+
+    if is_cuda:
+        print "✓ CUDA transfer works"
+    else:
+        print "✗ CUDA transfer failed"
+
+    print ""
+
+fn test_stream_creation():
+    print "=== Stream Creation ==="
+
+    if not torch_cuda_available():
+        print "⚠ Skipped (CUDA not available)"
+        print ""
+        return
+
+    # Create stream
+    val stream = TorchStream.create(0)
+    print "Created CUDA stream"
+
+    # Sync stream
+    stream.synchronize()
+    print "✓ Stream sync works"
+
+    # Query stream
+    val complete = stream.query()
+    print "Stream complete: {complete}"
+    print ""
+
+fn test_basic_operations():
+    print "=== Basic Operations ==="
+
+    if not torch_available():
+        print "⚠ Skipped (PyTorch not available)"
+        print ""
+        return
+
+    # Create tensors
+    val a = TorchTensorWrapper.tensor_ones([5, 5])
+    val b = TorchTensorWrapper.tensor_ones([5, 5])
+
+    # Add
+    val c = a.add(b)
+    print "Addition: {a.numel()} + {b.numel()} = {c.numel()} elements"
+
+    # ReLU
+    val d = c.relu()
+    print "ReLU activation applied"
+
+    print "✓ Basic operations work"
+    print ""
+
+fn main():
+    print "GPU Interface Test (Runtime Compatible)\n"
+    print "========================================\n"
+
+    test_backend_detection()
+    test_tensor_creation()
+    test_cuda_transfer()
+    test_stream_creation()
+    test_basic_operations()
+
+    print "========================================\n"
+    print "Test complete!\n"

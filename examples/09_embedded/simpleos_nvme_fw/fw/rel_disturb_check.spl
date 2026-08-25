@@ -1,0 +1,173 @@
+"""
+rel_disturb_check — absolute oracles for rel_disturb.spl (STRAW-lite
+read-disturb reclaim, contract: doc/05_design/hardware/nand_recovery/
+recovery_algorithms_design.md §5, design §9 L6). Known values at known points,
+not self-comparison — every assertion below is computed by hand against the
+Boyer-Moore pseudocode and the design's exact threshold constants.
+
+THIS FILE IS A MODULE SEPARATE FROM rel_disturb.spl. Every RelDisturbState and
+RelAction below is built here or by a rel_disturb.spl/rel_types.spl
+constructor and read back through its fields HERE, exercising the same
+module-boundary round-trip the L1 gate proved for RelAction.
+
+Oracles:
+  0. rel_disturb_new() zero-initializes both arrays to length NUM_BLOCKS.
+  1. Boyer-Moore finds the TRUE majority page: a scripted 6-read sequence on
+     one block where page 3 is a strict majority (5 of 6 reads) settles on
+     hot_page == 3 (the classic Boyer-Moore guarantee: a true majority always
+     survives).
+  2. Boyer-Moore WITHOUT a majority is still fully deterministic: a scripted
+     6-read round-robin sequence (1,2,3,1,2,3 — no page reaches a majority)
+     settles on an EXACT, hand-computed candidate/count (hot_page == 2,
+     hot_count == 0) — the design-documented behavior (§5 "Does NOT do in v1":
+     a non-majority candidate is an estimate, but never garbage/non-
+     deterministic).
+  3. rel_disturb_due fires EXACTLY at the design thresholds, not before:
+     - block-wide rd_disturb gate: rd_disturb_blk == READ_DISTURB_THRESHOLD
+       (50) does NOT fire (`>`, not `>=`); 51 fires ReclaimNow with arg == blk.
+     - hot-page gate: hot_count == REL_DISTURB_HOTPAGE_MIN (40) does NOT fire;
+       41 fires ReclaimNow with arg == blk.
+  4. Per-block isolation: heavy observe() traffic on one block leaves every
+     other block's hot_page/hot_count at its zero default, and rel_disturb_due
+     verdicts are independent per block.
+  5. rel_disturb_clear clears EXACTLY the requested block, leaving a second
+     block's nonzero state untouched (proves it is not a global reset).
+
+Run: bin/simple run examples/09_embedded/simpleos_nvme_fw/fw/rel_disturb_check.spl
+Gate: prints "REL DISTURB OK" and exits 0.
+"""
+
+use nvme_types.*
+use nd_types.*
+use rel_types.*
+use rel_disturb.*
+
+# Dense array of length n, all 0 except index `idx` which is `v`.
+fn at_val(n: i64, idx: i64, v: i64) -> [i64]:
+    var a: [i64] = []
+    var i: i64 = 0
+    while i < n:
+        if i == idx:
+            a.push(v)
+        else:
+            a.push(0)
+        i = i + 1
+    a
+
+# Dense array of length n, all 0 except two named indices.
+fn at_val2(n: i64, idx1: i64, v1: i64, idx2: i64, v2: i64) -> [i64]:
+    var a: [i64] = []
+    var i: i64 = 0
+    while i < n:
+        if i == idx1:
+            a.push(v1)
+        elif i == idx2:
+            a.push(v2)
+        else:
+            a.push(0)
+        i = i + 1
+    a
+
+fn kind_of(a: RelAction) -> i64:
+    a.kind
+
+fn arg_of(a: RelAction) -> i64:
+    a.arg
+
+fn main():
+    var fail: i64 = 0
+
+    # ── Oracle 0: rel_disturb_new() zero-initializes both arrays ──────────────
+    val fresh: RelDisturbState = rel_disturb_new()
+    fail = fail + expect_eq(fresh.hot_page.len(), NUM_BLOCKS, "rel_disturb_new: hot_page length == NUM_BLOCKS")
+    fail = fail + expect_eq(fresh.hot_count.len(), NUM_BLOCKS, "rel_disturb_new: hot_count length == NUM_BLOCKS")
+    fail = fail + expect_eq(fresh.hot_page[0], 0, "rel_disturb_new: hot_page[0] defaults 0")
+    fail = fail + expect_eq(fresh.hot_count[63], 0, "rel_disturb_new: hot_count[63] (last block) defaults 0")
+
+    # ── Oracle 1: Boyer-Moore finds the TRUE majority page ─────────────────────
+    # Block 2, page sequence [3,3,3,3,3,7] — page 3 is a strict majority
+    # (5 of 6). Hand trace: obs(3)->cnt=1,pg=3; obs(3)->2; obs(3)->3; obs(3)->4;
+    # obs(3)->5; obs(7) mismatch -> cnt=4, pg stays 3.
+    var maj: RelDisturbState = rel_disturb_new()
+    val blk_maj: NdBlock = nd_block(2)
+    maj = rel_disturb_observe(maj, blk_maj, nd_page(3))
+    maj = rel_disturb_observe(maj, blk_maj, nd_page(3))
+    maj = rel_disturb_observe(maj, blk_maj, nd_page(3))
+    maj = rel_disturb_observe(maj, blk_maj, nd_page(3))
+    maj = rel_disturb_observe(maj, blk_maj, nd_page(3))
+    maj = rel_disturb_observe(maj, blk_maj, nd_page(7))
+    fail = fail + expect_eq(maj.hot_page[2], 3, "Boyer-Moore: true majority page 3 survives (5 of 6 reads)")
+    fail = fail + expect_eq(maj.hot_count[2], 4, "Boyer-Moore: majority candidate count == 4 after cancel-out")
+
+    # ── Oracle 2: deterministic behavior WITHOUT a majority ────────────────────
+    # Block 4, page sequence [1,2,3,1,2,3] — no page reaches a majority (each
+    # appears exactly twice out of six). Hand trace: obs(1)->cnt=1,pg=1;
+    # obs(2) mismatch->cnt=0,pg stays 1; obs(3)->cnt=1,pg=3 (cnt was 0);
+    # obs(1) mismatch->cnt=0,pg stays 3; obs(2)->cnt=1,pg=2 (cnt was 0);
+    # obs(3) mismatch->cnt=0,pg stays 2. Final: hot_page=2, hot_count=0 — an
+    # EXACT deterministic outcome, not "no result"/garbage.
+    var nomaj: RelDisturbState = rel_disturb_new()
+    val blk_nomaj: NdBlock = nd_block(4)
+    nomaj = rel_disturb_observe(nomaj, blk_nomaj, nd_page(1))
+    nomaj = rel_disturb_observe(nomaj, blk_nomaj, nd_page(2))
+    nomaj = rel_disturb_observe(nomaj, blk_nomaj, nd_page(3))
+    nomaj = rel_disturb_observe(nomaj, blk_nomaj, nd_page(1))
+    nomaj = rel_disturb_observe(nomaj, blk_nomaj, nd_page(2))
+    nomaj = rel_disturb_observe(nomaj, blk_nomaj, nd_page(3))
+    fail = fail + expect_eq(nomaj.hot_page[4], 2, "Boyer-Moore: non-majority round-robin settles on hand-computed page 2 (deterministic)")
+    fail = fail + expect_eq(nomaj.hot_count[4], 0, "Boyer-Moore: non-majority round-robin settles on hand-computed count 0 (deterministic)")
+    # hot_count == 0 also proves rel_disturb_due cannot mis-fire off a
+    # no-majority candidate (0 is nowhere near REL_DISTURB_HOTPAGE_MIN).
+    val nomaj_verdict: RelAction = rel_disturb_due(nomaj, blk_nomaj, 0)
+    fail = fail + expect_eq(kind_of(nomaj_verdict), rel_act_accept(), "no-majority block with rd_disturb=0 stays Accept")
+
+    # ── Oracle 3a: block-wide rd_disturb gate fires EXACTLY at the threshold ──
+    val gate_state: RelDisturbState = rel_disturb_new()
+    val blk_gate: NdBlock = nd_block(10)
+    val at_thresh: RelAction = rel_disturb_due(gate_state, blk_gate, READ_DISTURB_THRESHOLD)
+    fail = fail + expect_eq(kind_of(at_thresh), rel_act_accept(), "rd_disturb == READ_DISTURB_THRESHOLD (50) does NOT fire (> not >=)")
+    val above_thresh: RelAction = rel_disturb_due(gate_state, blk_gate, READ_DISTURB_THRESHOLD + 1)
+    fail = fail + expect_eq(kind_of(above_thresh), rel_act_reclaim(), "rd_disturb == THRESHOLD+1 (51) fires ReclaimNow")
+    fail = fail + expect_eq(arg_of(above_thresh), 10, "ReclaimNow arg == blk (10) on block-wide gate")
+
+    # ── Oracle 3b: hot-page gate fires EXACTLY at the design threshold ────────
+    val at_min_state: RelDisturbState = RelDisturbState(hot_page: at_val(NUM_BLOCKS, 20, 6), hot_count: at_val(NUM_BLOCKS, 20, 40))
+    val blk_min: NdBlock = nd_block(20)
+    val at_min: RelAction = rel_disturb_due(at_min_state, blk_min, 0)
+    fail = fail + expect_eq(kind_of(at_min), rel_act_accept(), "hot_count == REL_DISTURB_HOTPAGE_MIN (40) does NOT fire (> not >=)")
+
+    val above_min_state: RelDisturbState = RelDisturbState(hot_page: at_val(NUM_BLOCKS, 20, 6), hot_count: at_val(NUM_BLOCKS, 20, 41))
+    val above_min: RelAction = rel_disturb_due(above_min_state, blk_min, 0)
+    fail = fail + expect_eq(kind_of(above_min), rel_act_reclaim(), "hot_count == MIN+1 (41) fires ReclaimNow")
+    fail = fail + expect_eq(arg_of(above_min), 20, "ReclaimNow arg == blk (20) on hot-page gate")
+
+    # ── Oracle 4: per-block isolation ──────────────────────────────────────────
+    # Drive block 30 hard (way past both gates); block 31 must stay untouched.
+    var iso: RelDisturbState = rel_disturb_new()
+    val blk_hot: NdBlock = nd_block(30)
+    val blk_cold: NdBlock = nd_block(31)
+    var i: i64 = 0
+    while i < 45:
+        iso = rel_disturb_observe(iso, blk_hot, nd_page(9))
+        i = i + 1
+    fail = fail + expect_eq(iso.hot_page[30], 9, "isolation: hammered block 30 hot_page == 9")
+    fail = fail + expect_eq(iso.hot_count[30], 45, "isolation: hammered block 30 hot_count == 45 (all matches)")
+    fail = fail + expect_eq(iso.hot_page[31], 0, "isolation: untouched block 31 hot_page stays 0")
+    fail = fail + expect_eq(iso.hot_count[31], 0, "isolation: untouched block 31 hot_count stays 0")
+    val hot_verdict: RelAction = rel_disturb_due(iso, blk_hot, 0)
+    fail = fail + expect_eq(kind_of(hot_verdict), rel_act_reclaim(), "isolation: hammered block 30 verdict is ReclaimNow")
+    val cold_verdict: RelAction = rel_disturb_due(iso, blk_cold, 0)
+    fail = fail + expect_eq(kind_of(cold_verdict), rel_act_accept(), "isolation: untouched block 31 verdict stays Accept despite block 30's state")
+
+    # ── Oracle 5: erase/reclaim clears EXACTLY one block ───────────────────────
+    val two_blocks: RelDisturbState = RelDisturbState(hot_page: at_val2(NUM_BLOCKS, 3, 7, 9, 2), hot_count: at_val2(NUM_BLOCKS, 3, 5, 9, 3))
+    val cleared: RelDisturbState = rel_disturb_clear(two_blocks, nd_block(3))
+    fail = fail + expect_eq(cleared.hot_page[3], 0, "clear: block 3 hot_page reset to 0")
+    fail = fail + expect_eq(cleared.hot_count[3], 0, "clear: block 3 hot_count reset to 0")
+    fail = fail + expect_eq(cleared.hot_page[9], 2, "clear: sibling block 9 hot_page UNTOUCHED (2) — not a global reset")
+    fail = fail + expect_eq(cleared.hot_count[9], 3, "clear: sibling block 9 hot_count UNTOUCHED (3) — not a global reset")
+
+    if fail == 0:
+        print "REL DISTURB OK"
+    else:
+        print "REL DISTURB FAIL ({fail})"

@@ -1,0 +1,45 @@
+# Application Routes — Full Standalone Web Server Example
+#
+# Demonstrates the routing API from the lightweight lib.
+#
+# Reuses: std.nogc_sync_mut.http_server (lightweight lib)
+# Lib source: src/lib/nogc_sync_mut/http_server/
+# Design: doc/05_design/simple_web_server_example.md
+
+use std.nogc_sync_mut.http_server.types.{HttpRequest, HttpResponse}
+use std.nogc_sync_mut.http_server.router.{Router}
+use config.{ServerConfig}
+use static_files.{make_static_handler}
+use error_pages.{handle_404}
+use middleware.{with_logging, with_cors, with_server_header}
+
+fn register_routes(router: Router, config: ServerConfig) -> Router:
+    router.get("/", handle_index)
+    router.get("/api/health", handle_health)
+    router.post("/api/echo", handle_echo)
+    router.get("/api/info", handle_info)
+    router.mount("/static", make_static_handler(config.static_root, "/static"))
+    router.set_not_found(handle_404)
+    return router
+
+fn handle_index(req: HttpRequest) -> HttpResponse:
+    val body = "<!DOCTYPE html>\n<html>\n<head><title>Simple Web Server</title>"
+    val css = "<link rel=\"stylesheet\" href=\"/static/style.css\">"
+    val heading = "</head>\n<body>\n<h1>Simple Web Server</h1>"
+    val nav = "<nav><a href=\"/api/health\">Health</a> | <a href=\"/api/info\">Info</a></nav>"
+    val desc = "<p>This server is built on the lightweight <code>std.nogc_sync_mut.http_server</code> lib.</p>"
+    val footer = "</body>\n</html>"
+    HttpResponse.html("{body}{css}{heading}\n{nav}\n{desc}\n{footer}")
+
+fn handle_health(req: HttpRequest) -> HttpResponse:
+    HttpResponse.json("{\"status\": \"ok\"}")
+
+fn handle_echo(req: HttpRequest) -> HttpResponse:
+    val ct = req.content_type()
+    if ct.starts_with("application/json"):
+        return HttpResponse.json(req.body)
+    return HttpResponse.ok(req.body)
+
+fn handle_info(req: HttpRequest) -> HttpResponse:
+    val info = "{\"server\": \"SimpleWebServer/1.0\", \"lib\": \"std.nogc_sync_mut.http_server\"}"
+    HttpResponse.json(info)

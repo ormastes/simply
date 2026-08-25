@@ -1,0 +1,117 @@
+# 31. cuBLAS Equivalent - GEMM, DOT, AXPY
+#
+# cuBLAS wraps three families of routines this module reproduces:
+#   cublasSgemm  C = A x B          -> gpu_gemm(a, b, m, n, k)
+#   cublasSdot   sum(x[i] * y[i])   -> gpu_dot(x, y)
+#   cublasSaxpy  y = alpha * x + y  -> gpu_axpy(alpha, x, y)
+#
+# std.gpu ships these as Result-returning host helpers (no cublasCreate /
+# cublasDestroy handle lifecycle). Today they run a CPU fallback; the tiled
+# GEMM kernel below is the device-side formulation (same shape as module 17)
+# and is what a GPU-backed gpu_gemm dispatches to.
+#
+# C/CUDA equivalent:
+#   cublasHandle_t h; cublasCreate(&h);
+#   cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &alpha, d_b, n, d_a, k, &beta, d_c, n);
+#   cublasSdot(h, n, d_x, 1, d_y, 1, &result);
+#   cublasSaxpy(h, n, &alpha, d_x, 1, d_y, 1);
+#   cublasDestroy(h);
+
+use std.gpu.*
+
+val TILE_SIZE = 16
+
+# ============================================================================
+# Device-side GEMM kernel (tiled, shared memory) - the cuBLAS-style formulation
+# ============================================================================
+
+@gpu_kernel
+fn gemm_kernel(a: GpuPtr, b: GpuPtr, c: GpuPtr, m: i64, n: i64, k: i64):
+    val tile_a = gpu_shared_array_f32(TILE_SIZE * TILE_SIZE)
+    val tile_b = gpu_shared_array_f32(TILE_SIZE * TILE_SIZE)
+    val tx = gpu_local_id_x()
+    val ty = gpu_local_id_y()
+    val row = gpu_block_id_y() * TILE_SIZE + ty
+    val col = gpu_block_id_x() * TILE_SIZE + tx
+
+    var sum = 0.0
+    var t = 0
+    while t < (k + TILE_SIZE - 1) / TILE_SIZE:
+        val a_col = t * TILE_SIZE + tx
+        val b_row = t * TILE_SIZE + ty
+        if row < m and a_col < k:
+            gpu_shared_store_f32(tile_a, ty * TILE_SIZE + tx, gpu_load_f32(a, row * k + a_col))
+        else:
+            gpu_shared_store_f32(tile_a, ty * TILE_SIZE + tx, 0.0)
+        if b_row < k and col < n:
+            gpu_shared_store_f32(tile_b, ty * TILE_SIZE + tx, gpu_load_f32(b, b_row * n + col))
+        else:
+            gpu_shared_store_f32(tile_b, ty * TILE_SIZE + tx, 0.0)
+        gpu_syncthreads()
+        var i = 0
+        while i < TILE_SIZE:
+            sum = sum + gpu_shared_load_f32(tile_a, ty * TILE_SIZE + i) * gpu_shared_load_f32(tile_b, i * TILE_SIZE + tx)
+            i = i + 1
+        gpu_syncthreads()
+        t = t + 1
+
+    if row < m and col < n:
+        gpu_store_f32(c, row * n + col, sum)
+
+# ============================================================================
+# Host-side reference (used by spec.spl to cross-check gpu_gemm)
+# ============================================================================
+
+fn cpu_gemm(a: [f32], b: [f32], m: i64, n: i64, k: i64) -> [f32]:
+    var c = [for i in 0..(m * n): 0.0]
+    var i = 0
+    while i < m:
+        var j = 0
+        while j < n:
+            var sum = 0.0
+            var p = 0
+            while p < k:
+                sum = sum + a[i * k + p] * b[p * n + j]
+                p = p + 1
+            c[i * n + j] = sum
+            j = j + 1
+        i = i + 1
+    c
+
+fn format_row(values: [f32], start: i64, count: i64) -> text:
+    var parts: [text] = []
+    for i in 0..count:
+        parts.push("{values[start + i]}")
+    "[" + parts.join(", ") + "]"
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn main():
+    # A is 2x3, B is 3x2 -> C is 2x2
+    val a = [1.0, 2.0, 3.0,
+             4.0, 5.0, 6.0]
+    val b = [7.0,  8.0,
+             9.0,  10.0,
+             11.0, 12.0]
+
+    match gpu_gemm(a, b, 2, 2, 3):
+        case Ok(c):
+            print "GEMM result (2x2):"
+            print "  {format_row(c, 0, 2)}"
+            print "  {format_row(c, 2, 2)}"
+            val reference = cpu_gemm(a, b, 2, 2, 3)
+            print "  matches CPU reference: {c[0] == reference[0] and c[3] == reference[3]}"
+        case Err(e):
+            print "GEMM error: {e.message}"
+
+    val x = [1.0, 2.0, 3.0, 4.0]
+    val y = [5.0, 6.0, 7.0, 8.0]
+    match gpu_dot(x, y):
+        case Ok(v): print "Dot product: {v}"
+        case Err(e): print "Dot error: {e.message}"
+
+    match gpu_axpy(2.0, x, y):
+        case Ok(r): print "AXPY result (2*x + y): {format_row(r, 0, 4)}"
+        case Err(e): print "AXPY error: {e.message}"

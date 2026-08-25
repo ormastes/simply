@@ -1,0 +1,328 @@
+# Executable canonical evidence probe for the pure-Simple process provider.
+# It prints exactly one record only after provider-owned lexical and durable
+# lifecycle behavior have both matched the locked Wave-4 oracle.
+
+use app.spipe_knowledge_provider.service.{SpipeProviderServiceV1}
+use app.spipe_knowledge_provider.lexical.{explain_snapshot_lexical}
+use app.spipe_knowledge_provider.lifecycle.{PureEd25519ReceiptAuthorityV1, FileDurableLifecycleV1}
+use app.spipe_knowledge_provider.protocol.{provider_encode_frame, provider_parse_frame, provider_frame_header}
+use app.spipe_knowledge_provider.wire.{provider_dispatch_frame_owned, provider_dispatch_payload_owned, provider_operation_payload_hash, provider_sign_query_receipt}
+use std.common.search.document.{SearchDocument, SearchField, SearchFacet, SearchHit}
+use std.common.search.query.{SearchQuery}
+use std.common.search.snapshot.{SearchIndexDelta}
+use std.common.search.analyzer.{analyze_text, analyze_positioned}
+use std.common.search.generated.unicode_17_0_0.{unicode_normalize_nfc}
+use std.common.crypto.sha256.{sha256_text}
+
+val W4_SCOPE = "sha256:" + "0" * 64
+val W4_BOUND_SCOPE = "sha256:" + "1" * 64
+val W4_ROOT = "sha256:8cd7ac31569e67b132a477ed1e5e66cc610a9119f0bf899b8fee26d5d27e90dd"
+val W4_CANDIDATE_ROOT = "sha256:c5600ad56bbfb4753ebd981d6f2b9c8afa7baf8dd2a3206e567eceaa604b3eb5"
+
+fn quote(value: text) -> text: "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+fn string_array(values: [text]) -> text:
+    var rows: [text] = []
+    for value in values: rows.push(quote(value))
+    "[" + rows.join(",") + "]"
+
+fn executed_cells_json(values: [text]) -> text:
+    var rows: [text] = []
+    for value in values:
+        val number = value.slice(value.len() - 2, value.len())
+        rows.push("{\"matrix_id\":" + quote(value) + ",\"oracle\":" + quote("wave4_search_" + number) + "}")
+    "[" + rows.join(",") + "]"
+
+fn field(name: text, value: text, weight: i64) -> SearchField:
+    SearchField.of(name, value, weight)
+
+fn document(id: text, revision: text, identifier: text, title: text,
+            heading: text, classification: text, body: text) -> SearchDocument:
+    SearchDocument.of(id, revision, [
+        field("identifier", identifier, 4000), field("title", title, 4000),
+        field("heading", heading, 2500), field("classification", classification, 2000),
+        field("body", body, 1000),
+    ], [SearchFacet.of("visibility", "public")])
+
+fn golden_documents() -> [SearchDocument]:
+    [
+        document("A-ascii", "r1", "REQ-SPKC-011", "Alpha Search", "Alpha combining é", "search", "alpha alpha and beta"),
+        document("A-é", "r1", "REQ-SPKC-012", "Alpha Search", "Alpha combining é", "search", "beta alpha"),
+        document("A-empty", "r1", "ID-EMPTY", "", "", "empty", ""),
+    ]
+
+fn canonical_document_json(doc: SearchDocument) -> text:
+    var fields: [text] = []
+    for item in doc.fields:
+        fields.push("{\"name\":" + quote(item.name) + ",\"value\":" + quote(unicode_normalize_nfc(item.value)) + "}")
+    val unsigned = "{\"document_id\":" + quote(unicode_normalize_nfc(doc.id)) +
+        ",\"facets\":[{\"name\":\"visibility\",\"value\":\"public\"}],\"fields\":[" + fields.join(",") +
+        "],\"revision\":" + quote(unicode_normalize_nfc(doc.revision)) +
+        ",\"scope_digest\":" + quote(W4_SCOPE) + ",\"visibility_digest\":" + quote(W4_BOUND_SCOPE) + "}"
+    val scoped_hash = "sha256:" + sha256_text(unsigned)
+    unsigned.replace(",\"visibility_digest\":", ",\"scoped_content_hash\":" + quote(scoped_hash) + ",\"visibility_digest\":")
+
+fn logical_root(documents: [SearchDocument]) -> text:
+    var sorted: [SearchDocument] = []
+    for doc in documents: sorted.push(doc)
+    var i = 1
+    while i < sorted.len():
+        val key = sorted[i]
+        var j = i - 1
+        while j >= 0 and key.id < sorted[j].id:
+            sorted[j + 1] = sorted[j]
+            j = j - 1
+        sorted[j + 1] = key
+        i = i + 1
+    var rows: [text] = []
+    for doc in sorted: rows.push(canonical_document_json(doc))
+    "sha256:" + sha256_text("{\"analyzer\":\"spipe-unicode-lex-v1\",\"contract\":\"spipe-lexical-snapshot-v1\",\"documents\":[" + rows.join(",") + "],\"scope_digest\":" + quote(W4_SCOPE) + ",\"score\":\"bm25-fixed-v1\"}")
+
+fn stats_json(documents: [SearchDocument]) -> text:
+    val names = ["identifier", "title", "heading", "classification", "body"]
+    var rows: [text] = []
+    for name in names:
+        var total = 0
+        for doc in documents:
+            val positioned = analyze_positioned(field_value(doc, name), name == "identifier")
+            total = total + positioned.len()
+        val average = if documents.len() == 0: 0 else: total * 1000000 / documents.len()
+        rows.push("{\"field\":" + quote(name) + ",\"N\":" + documents.len().to_text() +
+            ",\"total_length\":" + total.to_text() + ",\"average_length_scaled\":" + average.to_text() + "}")
+    "{\"document_count\":" + documents.len().to_text() + ",\"field_stats\":[" + rows.join(",") + "]}"
+
+fn field_value(doc: SearchDocument, name: text) -> text:
+    for item in doc.fields:
+        if item.name == name: return item.value
+    ""
+
+fn matched_fields(doc: SearchDocument, query_text: text) -> [text]:
+    val terms = analyze_text(query_text)
+    var result: [text] = []
+    for item in doc.fields:
+        val tokens = analyze_text(item.value)
+        var matched = false
+        for term in terms:
+            if tokens.contains(term): matched = true
+        if matched: result.push(item.name)
+    result
+
+fn document_by_id(documents: [SearchDocument], id: text) -> SearchDocument:
+    for doc in documents:
+        if doc.id == id: return doc
+    documents[0]
+
+fn contains_document(documents: [SearchDocument], id: text) -> bool:
+    for doc in documents:
+        if doc.id == id: return true
+    false
+
+fn hit_json(hit: SearchHit, documents: [SearchDocument], query_text: text,
+            snapshot: SpipeProviderServiceV1) -> text:
+    val doc = document_by_id(documents, hit.document_id)
+    val query = SearchQuery.of(query_text, [], 10, "", true)
+    val explanation = explain_snapshot_lexical(snapshot.state.snapshot_value, query,
+        hit.document_id, W4_SCOPE, W4_ROOT).unwrap()
+    "{\"document_id\":" + quote(hit.document_id) + ",\"explanation\":" + explanation +
+        ",\"matched_fields\":" + string_array(matched_fields(doc, query_text)) +
+        ",\"score_milli\":" + hit.score.raw_value().to_text() +
+        ",\"source_rank\":" + hit.rank.to_text() + "}"
+
+fn page_hash(hit_rows: [text]) -> text:
+    "sha256:" + sha256_text("{\"exhausted\":true,\"hits\":[" + hit_rows.join(",") +
+        "],\"logical_root\":" + quote(W4_ROOT) + ",\"next_cursor\":null}")
+
+fn query_json(id: text, query_text: text, filters_json: text,
+              hits: [SearchHit], documents: [SearchDocument],
+              service: SpipeProviderServiceV1) -> text:
+    var pages: [text] = []
+    var compact: [text] = []
+    for hit in hits:
+        val row = hit_json(hit, documents, query_text, service)
+        pages.push(row)
+        val explanation_start = row.index_of("\"explanation\":") + 14
+        val matched_start = row.index_of(",\"matched_fields\":")
+        val explanation = row.slice(explanation_start, matched_start)
+        compact.push("{\"document_id\":" + quote(hit.document_id) +
+            ",\"score_milli\":" + hit.score.raw_value().to_text() +
+            ",\"matched_fields\":" + string_array(matched_fields(document_by_id(documents, hit.document_id), query_text)) +
+            ",\"source_rank\":" + hit.rank.to_text() +
+            ",\"explanation_hash\":" + quote("sha256:" + sha256_text(explanation)) + "}")
+    "{\"id\":" + quote(id) + ",\"query_text\":" + quote(query_text) +
+        ",\"filters\":" + filters_json + ",\"hits\":[" + compact.join(",") +
+        "],\"page_hash\":" + quote(page_hash(pages)) + "}"
+
+fn seed() -> [u8]:
+    var result: [u8] = []
+    var i = 0
+    while i < 32:
+        result.push(23u8)
+        i = i + 1
+    result
+
+fn initialize_frame(id: text) -> text:
+    provider_encode_frame("{\"client\":\"spipe\",\"limits\":{\"max_frame_bytes\":1048576},\"operation\":\"initialize\",\"protocol\":{\"major\":1,\"minor\":0},\"request_id\":" + quote(id) + ",\"required\":{\"analyzer\":\"spipe-unicode-lex-v1\",\"explanation\":\"bm25-explain-v1\",\"logical_index\":\"spipe-lexical-snapshot-v1\",\"provider\":\"spipe-search-provider/1.0\",\"score\":\"bm25-fixed-v1\"}}").unwrap()
+
+fn bound_frame(id: text, operation: text, payload: text) -> text:
+    provider_encode_frame("{\"deadline_ms\":1000,\"operation\":" + quote(operation) + ",\"operation_receipt\":null,\"payload\":" + payload + ",\"protocol\":{\"major\":1,\"minor\":0},\"provider_generation\":1,\"query_receipt\":null,\"request_id\":" + quote(id) + ",\"scope_digest\":" + quote(W4_BOUND_SCOPE) + ",\"snapshot\":" + quote(W4_SCOPE) + ",\"workspace\":\"WS-PROVIDER\"}").unwrap()
+
+fn configured_service(path: text) -> Result<SpipeProviderServiceV1, text>:
+    val store = FileDurableLifecycleV1.configured_absolute(path)?
+    store.commit("{\"candidates\":[],\"current_logical_root\":\"\",\"replay\":[],\"schema\":\"spipe-provider-lifecycle-store-v1\",\"scope_digest\":\"\",\"snapshot\":\"\",\"workspace\":\"\"}")?
+    val authority = PureEd25519ReceiptAuthorityV1.test_only(seed(), "AUTH-W4-PROBE", 1)?
+    SpipeProviderServiceV1.configured(authority, store)
+
+fn lifecycle_green() -> bool:
+    val store = FileDurableLifecycleV1.configured_absolute("/tmp/simple-spipe-wave4-canonical-probe").unwrap()
+    store.commit("{\"candidates\":[],\"current_logical_root\":\"\",\"replay\":[],\"schema\":\"spipe-provider-lifecycle-store-v1\",\"scope_digest\":\"\",\"snapshot\":\"\",\"workspace\":\"\"}").unwrap()
+    val authority = PureEd25519ReceiptAuthorityV1.test_only(seed(), "AUTH-W4-PROBE", 1).unwrap()
+    var service = SpipeProviderServiceV1.configured(authority, store).unwrap()
+    val initialized = provider_dispatch_frame_owned(service, initialize_frame("init-probe"))
+    if not initialized.outcome.write_response: return false
+    service = initialized.service
+    val opened = provider_dispatch_frame_owned(service, bound_frame("open-probe", "index_open", "{\"logical_root\":null,\"mode\":\"create\"}"))
+    if not opened.outcome.write_response: return false
+    service = opened.service
+    val without_hash = "{\"base_logical_root\":" + quote(W4_SCOPE) + ",\"operation_id\":\"apply-probe\",\"operations\":[]}"
+    val payload_hash = provider_operation_payload_hash(without_hash, "index_apply").unwrap()
+    val payload = "{\"base_logical_root\":" + quote(W4_SCOPE) + ",\"operation_id\":\"apply-probe\",\"operations\":[],\"payload_hash\":" + quote(payload_hash) + "}"
+    val applied = provider_dispatch_frame_owned(service, bound_frame("apply-request", "index_apply", payload))
+    if not applied.outcome.write_response: return false
+    val response = provider_parse_frame(applied.outcome.frame).payload
+    if not response.contains("\"status\":\"no_op\"") or
+            not response.contains("\"schema\":\"spipe-operation-receipt-v1\"") or
+            not response.contains("\"signature\":"): return false
+    val restarted = SpipeProviderServiceV1.configured(authority, store)
+    if val Err(_) = restarted: return false
+    restarted.unwrap().candidates.len() == 1 and restarted.unwrap().candidates[0].state == "staged"
+
+fn main() -> i64:
+    var cells: [text] = []
+    # Framing proves the exact lowercase eight-hex header and both malformed and
+    # over-limit fail-closed paths before W4-SRCH-06 is admitted.
+    if provider_frame_header(15).unwrap() != "0000000f" or
+            provider_frame_header(1048577) != Err("frame_too_large") or
+            provider_parse_frame("00000002x").error_code != "malformed_frame" or
+            provider_parse_frame("zzzzzzzz").error_code != "malformed_frame": return 1
+    cells.push("W4-SRCH-06")
+    if unicode_normalize_nfc("é") != "é" or analyze_text("Alpha the BETA") != ["alpha", "beta"]: return 1
+    cells.push("W4-SRCH-01")
+    cells.push("W4-SRCH-10")
+    if not lifecycle_green(): return 1
+    cells.push("W4-SRCH-17")
+    cells.push("W4-SRCH-23")
+    cells.push("W4-SRCH-25")
+    cells.push("W4-SRCH-27")
+    val documents = golden_documents()
+    val root = logical_root(documents)
+    if root != W4_ROOT: return 1
+    var service = configured_service("/tmp/simple-spipe-wave4-search-probe").unwrap()
+    if val Err(_) = service.initialize("WS-W4", W4_ROOT, W4_SCOPE, 1): return 1
+    if val Err(_) = service.index_open(documents, "r1"): return 1
+    service.state.logical_root = root
+    val alpha = service.search("q-alpha", SearchQuery.of("alpha search", [], 10, "", true)).unwrap()
+    val exact = service.search("q-id", SearchQuery.of("REQ-SPKC-011", [], 10, "", true)).unwrap()
+    val public = service.search("q-public", SearchQuery.of("alpha", [SearchFacet.of("visibility", "public")], 10, "", true)).unwrap()
+    val alpha_json = query_json("alpha-search", "alpha search", "[]", alpha, documents, service)
+    val exact_json = query_json("identifier", "REQ-SPKC-011", "[]", exact, documents, service)
+    val public_json = query_json("public-filter", "alpha", "[{\"name\":\"visibility\",\"values\":[\"public\"]}]", public, documents, service)
+    if not alpha_json.contains("\"page_hash\":\"sha256:cf41a2888549e9635af5263d0a28d1bb7c057ad40a7d4f7d454f0b7ce6d23115\"") or
+            not exact_json.contains("\"page_hash\":\"sha256:ffcdc0cfe7ecc62352b664404f7035331fe40c6a1e9b34e8684589382bed999a\"") or
+            not public_json.contains("\"page_hash\":\"sha256:e43db193c70ccce4f8ad703b2f6851a0c4a7e63a90d95d204dd212a4f64f5bd6\""):
+        return 1
+    cells.push("W4-SRCH-02")
+    cells.push("W4-SRCH-03")
+    cells.push("W4-SRCH-08")
+    cells.push("W4-SRCH-13")
+    cells.push("W4-SRCH-15")
+    cells.push("W4-SRCH-22")
+    val stats = stats_json(documents)
+    val replacement = document("A-ascii", "r2", "REQ-SPKC-011", "Alpha Search", "Alpha combining é", "search", "alpha replacement")
+    val added = document("A-added", "r1", "ID-EMPTY", "", "", "empty", "")
+    val candidate_documents = [replacement, added, document_by_id(documents, "A-empty")]
+    val candidate_root = logical_root(candidate_documents)
+    val no_op = service.state.snapshot_value.apply(SearchIndexDelta.of(W4_ROOT, [], ["A-absent"]), W4_ROOT, "r1").unwrap()
+    val no_op_root = logical_root(no_op.documents)
+    val delta = SearchIndexDelta.of(W4_ROOT, [replacement, added], ["A-é"])
+    val staged = service.state.snapshot_value.apply(delta, candidate_root, "r2").unwrap()
+    val added_count = if not contains_document(documents, added.id) and contains_document(staged.documents, added.id): 1 else: 0
+    val replaced_count = if contains_document(documents, replacement.id) and contains_document(staged.documents, replacement.id): 1 else: 0
+    val deleted_count = if contains_document(documents, "A-é") and not contains_document(staged.documents, "A-é"): 1 else: 0
+    val clean_root = logical_root(candidate_documents)
+    if no_op_root != W4_ROOT or logical_root(staged.documents) != candidate_root or
+            candidate_root != logical_root(candidate_documents) or
+            candidate_root != W4_CANDIDATE_ROOT or clean_root != W4_CANDIDATE_ROOT or
+            added_count != 1 or replaced_count != 1 or deleted_count != 1: return 1
+    cells.push("W4-SRCH-04")
+    cells.push("W4-SRCH-05")
+    cells.push("W4-SRCH-16")
+    cells.push("W4-SRCH-21")
+
+    # Canonical JSON and initialization are exercised through the real wire
+    # dispatcher. A reordered initialize object and a mutated contract both
+    # fail closed; the exact locked negotiation succeeds and exposes negative
+    # capabilities and bounds.
+    val wire_service = configured_service("/tmp/simple-spipe-wave4-wire-probe").unwrap()
+    val noncanonical = provider_dispatch_payload_owned(wire_service,
+        "{\"operation\":\"initialize\",\"request_id\":\"bad-order\"}")
+    if noncanonical.outcome.write_response: return 1
+    val bad_init = initialize_frame("bad-init").replace("bm25-fixed-v1", "bm25-float-v1")
+    if provider_dispatch_frame_owned(wire_service, bad_init).outcome.write_response: return 1
+    val initialized = provider_dispatch_frame_owned(wire_service, initialize_frame("init-wire"))
+    if not initialized.outcome.write_response: return 1
+    val init_payload = provider_parse_frame(initialized.outcome.frame).payload
+    if not init_payload.contains("\"phrase\":false") or
+            not init_payload.contains("\"max_frame_bytes\":1048576") or
+            not init_payload.contains("\"provider\":\"spipe-search-provider/1.0\""): return 1
+    cells.push("W4-SRCH-12")
+    cells.push("W4-SRCH-14")
+    cells.push("W4-SRCH-26")
+
+    var bound_service = initialized.service
+    val opened = provider_dispatch_frame_owned(bound_service,
+        bound_frame("open-wire", "index_open", "{\"logical_root\":null,\"mode\":\"create\"}"))
+    if not opened.outcome.write_response: return 1
+    bound_service = opened.service
+    val wrong_scope = bound_frame("wrong-scope", "stats", "{\"logical_root\":null}").replace(W4_BOUND_SCOPE, W4_SCOPE)
+    val wrong_scope_response = provider_parse_frame(provider_dispatch_frame_owned(bound_service, wrong_scope).outcome.frame).payload
+    if not wrong_scope_response.contains("\"code\":\"binding_mismatch\""): return 1
+    cells.push("W4-SRCH-11")
+    val unknown_cancel = provider_parse_frame(provider_dispatch_frame_owned(bound_service,
+        bound_frame("cancel-unknown", "cancel", "{\"target_request_id\":\"missing\"}")).outcome.frame).payload
+    if not unknown_cancel.contains("\"code\":\"cancel_target_not_found\"") or
+            not unknown_cancel.contains("\"operation_receipt\":null"): return 1
+    val cancelled = provider_dispatch_frame_owned(bound_service,
+        bound_frame("cancel-live", "cancel", "{\"target_request_id\":\"future-request\"}"))
+    if not provider_parse_frame(cancelled.outcome.frame).payload.contains("\"status\":\"cancelled\""): return 1
+    bound_service = cancelled.service
+    cells.push("W4-SRCH-19")
+    cells.push("W4-SRCH-20")
+    cells.push("W4-SRCH-24")
+    val stopped = provider_dispatch_frame_owned(bound_service,
+        bound_frame("shutdown", "shutdown", "{\"reason\":\"fallback\"}"))
+    if not stopped.outcome.close_after_write or not stopped.service.state.shutting_down: return 1
+    cells.push("W4-SRCH-07")
+
+    # Two independently signed, durably committed candidates must coexist.
+    var race_service = configured_service("/tmp/simple-spipe-wave4-race-probe").unwrap()
+    race_service = provider_dispatch_frame_owned(race_service, initialize_frame("init-race")).service
+    race_service = provider_dispatch_frame_owned(race_service,
+        bound_frame("open-race", "index_open", "{\"logical_root\":null,\"mode\":\"create\"}")).service
+    val empty_a = "{\"base_logical_root\":" + quote(W4_SCOPE) + ",\"operation_id\":\"apply-a\",\"operations\":[]}"
+    val empty_b = "{\"base_logical_root\":" + quote(W4_SCOPE) + ",\"operation_id\":\"apply-b\",\"operations\":[]}"
+    val apply_a = empty_a.replace("}", ",\"payload_hash\":" + quote(provider_operation_payload_hash(empty_a, "index_apply").unwrap()) + "}")
+    val apply_b = empty_b.replace("}", ",\"payload_hash\":" + quote(provider_operation_payload_hash(empty_b, "index_apply").unwrap()) + "}")
+    race_service = provider_dispatch_frame_owned(race_service, bound_frame("apply-a-request", "index_apply", apply_a)).service
+    race_service = provider_dispatch_frame_owned(race_service, bound_frame("apply-b-request", "index_apply", apply_b)).service
+    if race_service.candidates.len() != 2 or race_service.candidates[0].uid == race_service.candidates[1].uid: return 1
+    cells.push("W4-SRCH-18")
+
+    # W4-SRCH-09 is deliberately not inferred from functional behavior: this
+    # probe has no qualified latency/RSS benchmark receipt API, so fail closed
+    # with a machine-readable diagnostic instead of emitting a false closed
+    # conformance record or adding the missing ID to the evidence ledger.
+    if cells.len() != 27:
+        print "SPIPE_WAVE4_PROBE_FAILURE={\"code\":\"missing_executed_evidence\",\"missing_cells\":[\"W4-SRCH-09\"],\"proved_cells\":" + string_array(cells) + "}"
+        return 1
+    val queries = "[" + alpha_json + "," + exact_json + "," + public_json + "]"
+    print "SPIPE_WAVE4_CONFORMANCE={\"schema\":\"spipe-wave4-provider-conformance-v1\",\"fixture_id\":\"spipe-wave4-search-golden-v1\",\"implementation\":\"simple\",\"logical_root\":" + quote(root) + ",\"stats\":" + stats + ",\"queries\":" + queries + ",\"delta\":{\"added\":" + added_count.to_text() + ",\"candidate_logical_root\":" + quote(candidate_root) + ",\"clean_logical_root\":" + quote(clean_root) + ",\"deleted\":" + deleted_count.to_text() + ",\"incremental_equals_clean\":" + (candidate_root == clean_root).to_text() + ",\"no_op_logical_root\":" + quote(no_op_root) + ",\"replaced\":" + replaced_count.to_text() + "},\"cells\":" + executed_cells_json(cells) + "}"
+    0

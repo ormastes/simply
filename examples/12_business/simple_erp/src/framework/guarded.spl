@@ -1,0 +1,93 @@
+# Business Framework — Guarded Write Core
+#
+# The ONE gate every business write passes through, regardless of lane
+# (CRM, reservation, sale, market, restaurant, ...). A lane contributes only
+# its domain validation and an action name; the framework owns the order of
+# checks and the failure vocabulary, so every lane fails closed the same way:
+#
+#   session -> rbac -> domain validation -> idempotency -> accepted
+#
+# Lanes NEVER hand-roll this sequence (that is how bypass bugs are born).
+
+use framework.registry.{LaneDef, default_lanes}
+use framework.org.{default_roles, org_role_can}
+use std.nogc_sync_mut.enterprise_store.store.{EnterpriseStore, uow_begin, uow_commit, uow_rollback}
+use std.nogc_sync_mut.enterprise_store.records.{idempotency_seen, idempotency_record, outbox_append, audit_append}
+
+# Identity / tenancy context. Composition, not inheritance: lanes embed these
+# structs in their own request types as fields.
+struct Tenant:
+    val id: text
+    val name: text
+
+struct Actor:
+    val id: i64
+    val name: text
+    val role: text
+
+struct Session:
+    val token: text
+    val user_id: i64
+    val tenant_id: text
+    val active: bool
+
+# Every gate outcome is explicit. reason is machine-readable and closed-set:
+# accepted | invalid-session | forbidden | invalid-record | duplicate-key | needs-approval
+struct WriteResult:
+    val ok: bool
+    val reason: text
+    val audit_action: text
+    val ledger_key: text
+
+# Role policy is registry DATA (framework/org.spl default_roles), evaluated
+# against the app's registered lanes (framework/registry.spl). ONE policy
+# source: changing a role or adding a business is a registration, not an edit
+# here.
+fn role_can_for(lanes: [LaneDef], role: text, action: text) -> bool:
+    return org_role_can(default_roles(), lanes, role, action)
+
+fn role_can(role: text, action: text) -> bool:
+    return role_can_for(default_lanes(), role, action)
+
+fn session_valid(session: Session, tenant: Tenant, user: Actor) -> bool:
+    return session.active and session.tenant_id == tenant.id and session.user_id == user.id and session.token.len() > 0
+
+fn denied(reason: text, action: text) -> WriteResult:
+    return WriteResult { ok: false, reason: reason, audit_action: action, ledger_key: "" }
+
+# The shared gate, parameterized by the app's lane registry. `record_valid` is
+# the lane's domain validation verdict. Idempotency, audit, and outbox are
+# DURABLE via std.enterprise_store: the key check reads the store's
+# idempotency table, and an accepted write records key + audit entry + outbox
+# event in ONE unit of work (replacing the old in-memory used_keys array).
+fn gate_write_for(lanes: [LaneDef], store: EnterpriseStore, session: Session, tenant: Tenant, user: Actor, action: text, record_valid: bool, idempotency_key: text) -> WriteResult:
+    if !session_valid(session, tenant, user):
+        return denied("invalid-session", action)
+    if !role_can_for(lanes, user.role, action):
+        return denied("forbidden", action)
+    if !record_valid or idempotency_key.len() == 0:
+        return denied("invalid-record", action)
+    if idempotency_seen(store, tenant.id, idempotency_key):
+        return denied("duplicate-key", action)
+    uow_begin(store)
+    val recorded = idempotency_record(store, tenant.id, idempotency_key, "accepted")
+    val audited = audit_append(store, tenant.id, "{user.id}", action, idempotency_key)
+    val queued = outbox_append(store, tenant.id, action, idempotency_key)
+    if recorded and audited and queued:
+        uow_commit(store)
+        return WriteResult { ok: true, reason: "accepted", audit_action: action, ledger_key: idempotency_key }
+    uow_rollback(store)
+    return denied("duplicate-key", action)
+
+# The stock-suite gate: the registry defaulted to this example's five lanes.
+fn gate_write(store: EnterpriseStore, session: Session, tenant: Tenant, user: Actor, action: text, record_valid: bool, idempotency_key: text) -> WriteResult:
+    return gate_write_for(default_lanes(), store, session, tenant, user, action, record_valid, idempotency_key)
+
+# Approval overlay on the shared gate. A gate failure reason stands first;
+# otherwise a large write (amount >= threshold) by a non-approver (and
+# non-admin) is held for approval BEFORE any durable effect is recorded.
+fn gate_write_with_approval(store: EnterpriseStore, session: Session, tenant: Tenant, user: Actor, action: text, record_valid: bool, idempotency_key: text, amount_minor: i64, threshold_minor: i64, approver_role: text) -> WriteResult:
+    if session_valid(session, tenant, user) and role_can(user.role, action) and record_valid and idempotency_key.len() > 0 and !idempotency_seen(store, tenant.id, idempotency_key):
+        if amount_minor >= threshold_minor and user.role != approver_role and user.role != "admin":
+            return denied("needs-approval", action)
+    return gate_write(store, session, tenant, user, action, record_valid, idempotency_key)

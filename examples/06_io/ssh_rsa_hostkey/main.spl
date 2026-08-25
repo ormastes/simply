@@ -1,0 +1,49 @@
+# Example: SSH daemon with RSA host key loaded from disk
+#
+# Boots an SshDaemon that advertises rsa-sha2-256 + ssh-ed25519, listening
+# on a configurable port. Demonstrates:
+#   1. Loading an RSA PKCS#8 host key from a PEM file via load_host_rsa_key().
+#   2. Installing the key so the daemon signs KEX exchange hashes with RSA.
+#   3. Starting the daemon — clients that prefer rsa-sha2-256 receive an RSA
+#      signature over the KEX exchange hash; ssh-ed25519 clients use Ed25519.
+#
+# Fixture generation (one-time, requires openssl):
+#   openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+#     -outform PEM -out host_rsa_key.pem
+#
+# Usage:
+#   bin/simple run examples/ssh_rsa_hostkey/main.spl <port> <key.pem>
+#
+# Then from another terminal:
+#   ssh -o HostKeyAlgorithms=rsa-sha2-256 -p <port> user@localhost
+#   # password: password  (default demo account)
+
+use os.apps.sshd.sshd.{SshDaemon}
+use os.apps.sshd.sshd_host_key_loader_ext.*
+
+fn main(args: [text]) -> i64:
+    if args.len() < 2:
+        print "usage: ssh_rsa_hostkey <port> <path-to-rsa-pem>"
+        return 1
+
+    val port_num = args[0].to_i64()
+    val key_path = args[1]
+
+    var daemon = SshDaemon.new(port_num.to_u16())
+
+    # Load RSA host key from PEM (or DER) file.
+    # Default users (root/simpleos, user/password) are pre-installed.
+    match daemon.load_host_rsa_key(key_path):
+        Ok(_) =>
+            print "[ssh] loaded RSA host key from {key_path}"
+        Err(msg) =>
+            print "[ssh] ERROR: failed to load host key: {msg}"
+            return 2
+
+    print "[ssh] starting daemon on port {port_num} — advertising rsa-sha2-256 + ssh-ed25519"
+
+    match daemon.start():
+        Ok(_) => 0
+        Err(msg) =>
+            print "[ssh] ERROR: daemon exited: {msg}"
+            1

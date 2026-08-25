@@ -1,0 +1,83 @@
+# Lane BA board gate: prove the QEMU virt (cortex-a72) -> SimpleOS arm64
+# kernel -> virtio-blk -> FAT32 path locates and reads the REAL cross-built
+# aarch64-unknown-simpleos `simple` interpreter ELF (staged at root /SIMPLE.ELF,
+# aliased /simple.elf) and its /hello.spl source.
+#
+# Mirrors examples/09_embedded/simple_os/arch/riscv64/simple_tool_probe_entry.spl
+# (BR64 lane). Uses the proven root directory-scan read path
+# (arm_fs_exec_read_file_bytes -> _arm_fat32_read_short_name_from_dir on cluster
+# 2); it deliberately avoids the /SYS/APPS subdirectory descent and the
+# hello_world.smf boot preload so the staging read is proven independent of the
+# cranelift find_sys miscompile.
+#
+# Build (bootstrap seed, cranelift backend):
+#   <seed> native-build --source build/os/generated --source src/os \
+#     --source examples/09_embedded/simple_os --backend cranelift \
+#     --opt-level=aggressive --entry-closure \
+#     --entry examples/09_embedded/simple_os/arch/arm64/simple_tool_probe_entry.spl \
+#     --target aarch64-unknown-none \
+#     -o build/os/simpleos_arm64_simple_tool_probe.elf \
+#     --linker-script examples/09_embedded/simple_os/arch/arm64/fs_exec_linker.ld
+# Run:
+#   qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 384M -nographic \
+#     -global virtio-mmio.force-legacy=false \
+#     -drive file=build/os/fat32-arm64.img,if=none,id=armdisk,format=raw \
+#     -device virtio-blk-device,drive=armdisk
+
+extern fn serial_println(msg: text)
+extern fn rt_qemu_exit_success()
+extern fn rt_arm_array_len_u32(arr: [u8]) -> u32
+extern fn rt_arm_array_get_byte_u32(arr: [u8], idx: u64) -> u32
+
+use os.services.vfs.arm_fs_exec_vfs.{arm_fs_exec_read_file_bytes, arm_fs_exec_probe_init}
+use os.kernel.boot.mmio.{mmio_disable_test_mode}
+
+fn _is_elf(bytes: [u8]) -> bool:
+    if rt_arm_array_len_u32(bytes) < 4:
+        return false
+    rt_arm_array_get_byte_u32(bytes, 0) == 0x7F and
+        rt_arm_array_get_byte_u32(bytes, 1) == 69 and
+        rt_arm_array_get_byte_u32(bytes, 2) == 76 and
+        rt_arm_array_get_byte_u32(bytes, 3) == 70
+
+fn _machine_u16(bytes: [u8]) -> u32:
+    # ELF header e_machine at offset 18 (little-endian u16). EM_AARCH64 = 183.
+    if rt_arm_array_len_u32(bytes) < 20:
+        return 0
+    rt_arm_array_get_byte_u32(bytes, 18) + (rt_arm_array_get_byte_u32(bytes, 19) * 256)
+
+fn spl_start():
+    mmio_disable_test_mode()
+    serial_println("")
+    serial_println("=== SimpleOS ARM64 simple-tool staging gate ===")
+
+    if not arm_fs_exec_probe_init():
+        serial_println("[arm64-gate] virtio-blk/FAT32 init failed")
+        serial_println("TEST FAILED")
+        rt_qemu_exit_success()
+        return
+
+    val tool = arm_fs_exec_read_file_bytes("/simple.elf")
+    val tool_len = rt_arm_array_len_u32(tool)
+    if tool_len > 4 and _is_elf(tool):
+        val mach = _machine_u16(tool)
+        serial_println("ARM64_SIMPLE_TOOL_ELF_OK path=/simple.elf first_cluster_bytes={tool_len} e_machine={mach}")
+    else:
+        serial_println("[arm64-gate] /simple.elf ELF probe failed len={tool_len}")
+        serial_println("TEST FAILED")
+        rt_qemu_exit_success()
+        return
+
+    val hello = arm_fs_exec_read_file_bytes("/hello.spl")
+    val hello_len = rt_arm_array_len_u32(hello)
+    if hello_len > 4:
+        serial_println("ARM64_HELLO_SPL_OK path=/hello.spl bytes={hello_len}")
+    else:
+        serial_println("[arm64-gate] /hello.spl probe failed len={hello_len}")
+        serial_println("TEST FAILED")
+        rt_qemu_exit_success()
+        return
+
+    serial_println("ARM64_SIMPLE_TOOL_GATE_PASS")
+    serial_println("TEST PASSED")
+    rt_qemu_exit_success()

@@ -1,0 +1,146 @@
+app:
+    title: "Collections Demo"
+    theme: glass_dark
+
+layout:
+    type: vbox
+    id: root
+    children:
+        columns:
+            type: hbox
+            id: columns
+            children:
+                left_panel:
+                    type: panel
+                    id: left_panel
+                    width: 25
+                    title: "List"
+                    children:
+                        fruit_list:
+                            type: list
+                            id: fruit_list
+                            selected_index: "2"
+                            children:
+                                item_0:
+                                    type: text
+                                    id: fruit_0
+                                    label: "Apple"
+                                item_1:
+                                    type: text
+                                    id: fruit_1
+                                    label: "Banana"
+                                item_2:
+                                    type: text
+                                    id: fruit_2
+                                    label: "Cherry"
+                                item_3:
+                                    type: text
+                                    id: fruit_3
+                                    label: "Date"
+                                item_4:
+                                    type: text
+                                    id: fruit_4
+                                    label: "Elderberry"
+                                item_5:
+                                    type: text
+                                    id: fruit_5
+                                    label: "Fig"
+                                item_6:
+                                    type: text
+                                    id: fruit_6
+                                    label: "Grape"
+                                item_7:
+                                    type: text
+                                    id: fruit_7
+                                    label: "Honeydew"
+                center_panel:
+                    type: panel
+                    id: center_panel
+                    flex: 1
+                    title: "Table"
+                    children:
+                        people_table:
+                            type: table
+                            id: people_table
+                            headers: "Name|Age|City|Role"
+                            sort_column: "0"
+                            sort_dir: "asc"
+                            children:
+                                row_0:
+                                    type: text
+                                    id: people_row_0
+                                    label: "Alice|30|Seoul|Engineer"
+                                row_1:
+                                    type: text
+                                    id: people_row_1
+                                    label: "Bob|25|Busan|Designer"
+                                row_2:
+                                    type: text
+                                    id: people_row_2
+                                    label: "Carol|35|Incheon|Manager"
+                                row_3:
+                                    type: text
+                                    id: people_row_3
+                                    label: "Dave|28|Daejeon|Analyst"
+                                row_4:
+                                    type: text
+                                    id: people_row_4
+                                    label: "Eve|32|Gwangju|Developer"
+                right_panel:
+                    type: panel
+                    id: right_panel
+                    width: 30
+                    title: "File Browser"
+                    children:
+                        file_tree:
+                            type: tree
+                            id: file_tree
+                            children:
+                                d_documents:
+                                    type: treenode
+                                    id: d_documents
+                                    label: "Documents"
+                                    expanded: true
+                                    children:
+                                        d_work:
+                                            type: treenode
+                                            id: d_work
+                                            label: "Work"
+                                            expanded: false
+                                        d_personal:
+                                            type: treenode
+                                            id: d_personal
+                                            label: "Personal"
+                                            expanded: true
+                                            children:
+                                                f_notes:
+                                                    type: treenode
+                                                    id: f_notes
+                                                    label: "notes.txt"
+                                                f_todo:
+                                                    type: treenode
+                                                    id: f_todo
+                                                    label: "todo.md"
+                                d_pictures:
+                                    type: treenode
+                                    id: d_pictures
+                                    label: "Pictures"
+                                    expanded: false
+                                d_downloads:
+                                    type: treenode
+                                    id: d_downloads
+                                    label: "Downloads"
+                                    expanded: true
+                                    children:
+                                        f_report:
+                                            type: treenode
+                                            id: f_report
+                                            label: "report.pdf"
+                                        f_data:
+                                            type: treenode
+                                            id: f_data
+                                            label: "data.csv"
+        status:
+            type: statusbar
+            left: "NORMAL MODE"
+            right: "Collections Demo"

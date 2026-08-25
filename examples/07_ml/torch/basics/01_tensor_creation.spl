@@ -1,0 +1,65 @@
+#![allow(export_outside_init)]
+# DEMO ONLY — Uses stale API. Not runnable without updating to current Tensor class.
+#!/usr/bin/env simple
+# Basic Tensor Creation with PyTorch FFI
+# Demonstrates creating tensors on cuda:1 (2nd GPU)
+
+use std.torch.{torch_available, torch_version, TorchTensorWrapper}
+use std.src.dl.config.{Device}
+
+fn main():
+    print "=== PyTorch Tensor Creation (CUDA:1 - 2nd GPU) ==="
+    print ""
+    
+    # Check if PyTorch is available
+    print "Backend Check:"
+    val available = torch_available()
+    print "  torch_available() = {available}"
+    
+    if available:
+        val version = torch_version()
+        print "  torch_version() = {version}"
+        print ""
+        print "✓ PyTorch FFI backend ready"
+    else:
+        print "  ⚠ Running in stub mode (PyTorch not installed)"
+        print "  Install PyTorch to enable GPU acceleration"
+        return
+    
+    print ""
+    
+    # Create tensors with different initialization
+    print "Creating tensors on 2nd GPU (cuda:1)..."
+    print ""
+    
+    # Zeros tensor
+    print "1. Zeros tensor [3, 4]:"
+    val zeros = TorchTensorWrapper.tensor_zeros([3, 4])
+    print "   Shape: {zeros.shape()}"
+    print "   Dimensions: {zeros.ndim()}D"
+    print "   Total elements: {zeros.numel()}"
+    print ""
+    
+    # Ones tensor
+    print "2. Ones tensor [2, 5]:"
+    val ones = TorchTensorWrapper.tensor_ones([2, 5])
+    print "   Shape: {ones.shape()}"
+    print "   Dimensions: {ones.ndim()}D"
+    print "   Total elements: {ones.numel()}"
+    print ""
+    
+    # Random tensor
+    print "3. Random tensor [4, 4] (normal distribution):"
+    val randn = TorchTensorWrapper.tensor_randn([4, 4])
+    print "   Shape: {randn.shape()}"
+    print "   Dimensions: {randn.ndim()}D"
+    print "   Total elements: {randn.numel()}"
+    print ""
+    
+    print "=== Summary ==="
+    print "All tensors created successfully on cuda:1 (2nd GPU)"
+    print "Device placement: Automatic via dl.config.sdn"
+    print ""
+    print "✓ Example complete!"
+
+export main

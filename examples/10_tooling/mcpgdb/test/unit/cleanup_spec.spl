@@ -1,0 +1,116 @@
+"""
+# Cleanup
+
+Tests for cleanup functionality.
+"""
+#![allow(unnamed_duplicate_typed_args)]
+# Live smoke tests for mcpgdb process lifecycle and cleanup.
+# These tests require gdb to be available on the system.
+
+extern fn rt_dir_remove_all(path: text) -> bool
+
+use std.io_runtime.{file_delete, process_run, write_file, file_exists}
+
+fn shell_bin() -> text:
+    "bash"
+
+fn simple_binary() -> text:
+    "bin/simple"
+
+fn gdb_available() -> bool:
+    val (_s, _e, code) = process_run(shell_bin(), ["-c", "which gdb >/dev/null 2>&1"])
+    code == 0
+
+fn clangd_available() -> bool:
+    val (_s, _e, code) = process_run(shell_bin(), ["-c", "which clangd >/dev/null 2>&1"])
+    code == 0
+
+fn run_runner(source: text, body: text) -> (text, text, i64):
+    val request_path = "/tmp/mcpgdb_test_cleanup_request.json"
+    write_file(request_path, body)
+    val cmd = "MCPGDB_REQUEST_PATH=" + request_path + " " + simple_binary() + " " + source
+    val result = process_run(shell_bin(), ["-c", cmd])
+    file_delete(request_path)
+    result
+
+fn count_mcpgdb_gdb_processes() -> i64:
+    val (stdout, _e, _c) = process_run(shell_bin(), ["-c",
+        "pgrep -f 'gdb.*--quiet.*--nx' 2>/dev/null | wc -l"])
+    val trimmed = stdout.trim()
+    if trimmed == "":
+        return 0
+    int(trimmed) ?? 0
+
+fn cleanup_test_state():
+    rt_dir_remove_all("/tmp/mcpgdb_dbg_1")
+    rt_dir_remove_all("/tmp/mcpgdb_dbg_2")
+    file_delete("/tmp/mcpgdb_test_cleanup_request.json")
+    val (_s, _e, _c) = rt_process_run(shell_bin(), ["-c",
+        "rm -f ~/.mcpgdb/state 2>/dev/null || true"])
+
+describe "mcpgdb process cleanup":
+    """
+    ## Mcpgdb Process Cleanup Tests
+
+    Validates mcpgdb process cleanup functionality.
+    """
+
+    context "debug_session_close kills debugger child":
+        it "creates and closes a session without leaking gdb processes":
+            if not gdb_available():
+                print "SKIP: gdb not available"
+                return
+            cleanup_test_state()
+            val before = count_mcpgdb_gdb_processes()
+            val create_body = "{\"jsonrpc\":\"2.0\",\"id\":\"t1\",\"method\":\"tools/call\",\"params\":{\"name\":\"debug_session_create\",\"arguments\":{\"backend\":\"gdb\"}}}"
+            val (create_out, _ce, create_code) = run_runner("src/app/mcpgdb/debug_session_runner.spl", create_body)
+            expect(create_code).to_equal(0)
+            expect(create_out).to_contain("dbg_")
+            val during = count_mcpgdb_gdb_processes()
+            expect(during).to_be_greater_than(before)
+            val close_body = "{\"jsonrpc\":\"2.0\",\"id\":\"t2\",\"method\":\"tools/call\",\"params\":{\"name\":\"debug_session_close\",\"arguments\":{\"session_id\":\"dbg_1\"}}}"
+            val (close_out, _le, close_code) = run_runner("src/app/mcpgdb/debug_session_runner.spl", close_body)
+            expect(close_code).to_equal(0)
+            expect(close_out).to_contain("closed")
+            val (_delay_s, _delay_e, _delay_c) = rt_process_run(shell_bin(), ["-c", "sleep 0.5"])
+            val after = count_mcpgdb_gdb_processes()
+            expect(after).to_equal(before)
+            cleanup_test_state()
+
+    context "concurrent sessions":
+        it "maintains state isolation between two sessions":
+            if not gdb_available():
+                print "SKIP: gdb not available"
+                return
+            cleanup_test_state()
+            val body1 = "{\"jsonrpc\":\"2.0\",\"id\":\"t1\",\"method\":\"tools/call\",\"params\":{\"name\":\"debug_session_create\",\"arguments\":{\"backend\":\"gdb\"}}}"
+            val (out1, _e1, code1) = run_runner("src/app/mcpgdb/debug_session_runner.spl", body1)
+            expect(code1).to_equal(0)
+            expect(out1).to_contain("dbg_1")
+            val body2 = "{\"jsonrpc\":\"2.0\",\"id\":\"t2\",\"method\":\"tools/call\",\"params\":{\"name\":\"debug_session_create\",\"arguments\":{\"backend\":\"gdb\"}}}"
+            val (out2, _e2, code2) = run_runner("src/app/mcpgdb/debug_session_runner.spl", body2)
+            expect(code2).to_equal(0)
+            expect(out2).to_contain("dbg_2")
+            val list_body = "{\"jsonrpc\":\"2.0\",\"id\":\"t3\",\"method\":\"tools/call\",\"params\":{\"name\":\"debug_session_list\",\"arguments\":{}}}"
+            val (list_out, _e3, list_code) = run_runner("src/app/mcpgdb/debug_state_runner.spl", list_body)
+            expect(list_code).to_equal(0)
+            expect(list_out).to_contain("dbg_1")
+            expect(list_out).to_contain("dbg_2")
+            val close1 = "{\"jsonrpc\":\"2.0\",\"id\":\"t4\",\"method\":\"tools/call\",\"params\":{\"name\":\"debug_session_close\",\"arguments\":{\"session_id\":\"dbg_1\"}}}"
+            val (_co1, _ce1, _cc1) = run_runner("src/app/mcpgdb/debug_session_runner.spl", close1)
+            val close2 = "{\"jsonrpc\":\"2.0\",\"id\":\"t5\",\"method\":\"tools/call\",\"params\":{\"name\":\"debug_session_close\",\"arguments\":{\"session_id\":\"dbg_2\"}}}"
+            val (_co2, _ce2, _cc2) = run_runner("src/app/mcpgdb/debug_session_runner.spl", close2)
+            val (_delay_s, _delay_e, _delay_c) = rt_process_run(shell_bin(), ["-c", "sleep 0.5"])
+            expect(rt_file_exists("/tmp/mcpgdb_dbg_1")).to_equal(false)
+            expect(rt_file_exists("/tmp/mcpgdb_dbg_2")).to_equal(false)
+            cleanup_test_state()
+
+    context "clangd tool path":
+        it "responds to clangd diagnostics request":
+            if not clangd_available():
+                print "SKIP: clangd not available"
+                return
+            val body = "{\"jsonrpc\":\"2.0\",\"id\":\"t1\",\"method\":\"tools/call\",\"params\":{\"name\":\"clangd_diagnostics\",\"arguments\":{\"file\":\"/dev/null\"}}}"
+            val (out, _e, code) = run_runner("src/app/mcpgdb/clangd_runner.spl", body)
+            if code == 0:
+                expect(out.len()).to_be_greater_than(0)

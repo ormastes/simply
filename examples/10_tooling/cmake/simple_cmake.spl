@@ -1,0 +1,146 @@
+## simple_cmake — CMake-like build configuration generator for SimpleOS
+##
+## Parses CMakeLists.txt and generates Makefile or build.ninja output.
+## A SimpleOS-native replacement for cmake that runs without a host cmake.
+##
+## Usage:
+##   bin/simple run examples/cmake/simple_cmake.spl -- -S path/to/project -B build
+##   bin/simple run examples/cmake/simple_cmake.spl -- -S project -B build -G Ninja
+##   bin/simple run examples/cmake/simple_cmake.spl -- --help
+
+use std.fs
+use std.process
+use std.text
+use std.cli
+
+# Import project modules
+use cmake_parser
+use cmake_generator
+
+# --- CLI ---
+
+struct CmakeCliArgs:
+    source_dir: text
+    build_dir: text
+    generator: text          # "Make" or "Ninja"
+    definitions: [CmakeVar]  # -DVAR=VALUE
+    show_help: bool
+
+fn parse_cli_args(args: [text]) -> CmakeCliArgs:
+    """Parse command-line arguments."""
+    var source_dir = "."
+    var build_dir = "build"
+    var generator = "Make"
+    var definitions: [CmakeVar] = []
+    var show_help = false
+
+    var i = 0
+    while i < args.len():
+        val arg = args[i]
+
+        if arg == "-S":
+            i = i + 1
+            if i < args.len():
+                source_dir = args[i]
+
+        else if arg == "-B":
+            i = i + 1
+            if i < args.len():
+                build_dir = args[i]
+
+        else if arg == "-G":
+            i = i + 1
+            if i < args.len():
+                generator = args[i]
+
+        else if arg.starts_with("-D"):
+            # -DVAR=VALUE
+            val def_str = arg.slice(2, arg.len())
+            val eq_pos = def_str.index_of("=")
+            if eq_pos > 0:
+                val name = def_str.slice(0, eq_pos)
+                val value = def_str.slice(eq_pos + 1, def_str.len())
+                definitions.push(CmakeVar(name: name, value: value))
+
+        else if arg == "--help" or arg == "-h":
+            show_help = true
+
+        i = i + 1
+
+    CmakeCliArgs(
+        source_dir: source_dir,
+        build_dir: build_dir,
+        generator: generator,
+        definitions: definitions,
+        show_help: show_help,
+    )
+
+fn print_help():
+    print "simple_cmake -- CMake-like build configuration generator"
+    print ""
+    print "Usage:"
+    print "  simple_cmake -S <source-dir> -B <build-dir> [options]"
+    print ""
+    print "Options:"
+    print "  -S <dir>        Source directory (contains CMakeLists.txt)"
+    print "  -B <dir>        Build directory (output)"
+    print "  -G <generator>  Generator: Make (default) or Ninja"
+    print "  -DVAR=VALUE     Define a cache variable"
+    print "  --help, -h      Show this help"
+    print ""
+    print "Supported CMake commands:"
+    print "  cmake_minimum_required(VERSION X.Y)"
+    print "  project(NAME LANGUAGES C CXX)"
+    print "  add_executable(name src1.c src2.c)"
+    print "  add_library(name STATIC src1.c)"
+    print "  target_link_libraries(target lib1 lib2)"
+    print "  target_include_directories(target PUBLIC dir)"
+    print "  set(VAR value)"
+    print "  if(VAR)/else()/endif()"
+    print "  message(STATUS \"msg\")"
+    print "  option(NAME \"description\" DEFAULT)"
+    print "  find_program(VAR name)"
+    print "  find_library(VAR name)"
+
+# --- Main ---
+
+fn main():
+    val args = cli.args()
+    val cli_args = parse_cli_args(args)
+
+    if cli_args.show_help:
+        print_help()
+        return
+
+    # Locate CMakeLists.txt
+    val cmake_file = "{cli_args.source_dir}/CMakeLists.txt"
+    if not fs.exists(cmake_file):
+        print "[cmake] Error: {cmake_file} not found"
+        process.exit(1)
+
+    print "[cmake] Source directory: {cli_args.source_dir}"
+    print "[cmake] Build directory:  {cli_args.build_dir}"
+    print "[cmake] Generator:        {cli_args.generator}"
+
+    # Parse
+    print "[cmake] Parsing {cmake_file}..."
+    val commands = parse_cmake_file(cmake_file)
+    print "[cmake] Parsed {commands.len()} commands"
+
+    # Interpret into project model
+    var project = interpret_commands(commands, cli_args.source_dir, cli_args.build_dir)
+
+    # Apply -D definitions (override parsed variables)
+    for d in cli_args.definitions:
+        # Remove existing var with same name, then add new one
+        project.vars = project.vars.filter(_.name != d.name)
+        project.vars.push(d)
+
+    # Generate output
+    write_build_file(project, cli_args.generator)
+
+    print "[cmake] Configuration complete."
+    if cli_args.generator == "Ninja":
+        print "[cmake] Run 'ninja -C {cli_args.build_dir}' to build."
+    else:
+        print "[cmake] Run 'make -C {cli_args.build_dir}' to build."

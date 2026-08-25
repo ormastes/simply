@@ -1,0 +1,10 @@
+#![allow(unnamed_duplicate_typed_args)]
+# Korean Stock MCP - Configuration
+#
+# Environment variable management for API keys.
+
+fn get_dart_api_key() -> text:
+    rt_env_get("DART_API_KEY") ?? ""
+
+fn get_krx_api_key() -> text:
+    rt_env_get("KRX_API_KEY") ?? ""

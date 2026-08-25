@@ -1,0 +1,135 @@
+"""
+nvme_memcpy — the pluggable DMA / memcpy seam shared by the NVMe host and device
+sides. `dma_copy_words` is the real transfer loop; `dma_copy_corrupt` is a fault
+model that proves a custom DMA is actually plugged in. The Dma struct carries the
+copy as a fn-field — per gotcha 2 the field MUST be assigned a LAMBDA wrapping a
+named fn (assigning the bare named fn returns garbage). Invoke it by binding the
+field to a local first (`var f = me.copy; f(...)`): this module always runs under
+the interpreter (importing nvme_ct's Ppn newtype forces a JIT->interpreter
+fallback), where the inline `(me.copy)(...)` form resolves as an unknown symbol.
+Copy helpers READ from their array arg and RETURN a new array (gotcha 3) — they
+never write into the arg.
+"""
+use nvme_ct.*
+use nvme_shared.*
+
+# Real DMA: read src[off .. off+n] into a freshly built array and return it.
+fn dma_copy_words(src: [i64], off: i64, n: i64) -> [i64]:
+    var out: [i64] = []
+    var i: i64 = 0
+    while i < n:
+        out.push(src[off + i])
+        i = i + 1
+    out
+
+# Fault model: same copy, but the FIRST transferred word is altered (w+1). Used to
+# prove a non-default DMA is genuinely applied, not silently ignored.
+fn dma_copy_corrupt(src: [i64], off: i64, n: i64) -> [i64]:
+    var out: [i64] = []
+    var i: i64 = 0
+    while i < n:
+        var w: i64 = src[off + i]
+        if i == 0:
+            out.push(w + 1)
+        else:
+            out.push(w)
+        i = i + 1
+    out
+
+struct Dma:
+    copy:   fn([i64], i64, i64) -> [i64]
+    faults: i64
+
+# Default DMA: copy is a LAMBDA wrapping the named fn (gotcha 2 — a bare named fn
+# field returns garbage).
+fn dma_new() -> Dma:
+    Dma(copy: \s, o, n: dma_copy_words(s, o, n), faults: 0)
+
+impl Dma:
+    # Swap in a new copy implementation. Callers must pass a lambda (gotcha 2).
+    me set_copy(f: fn([i64], i64, i64) -> [i64]):
+        me.copy = f
+
+    me run(src: [i64], off: i64, n: i64) -> [i64]:
+        # Bind the fn-field to a local before invoking. In interpreter mode (which
+        # this module always runs under — importing nvme_ct's Ppn newtype forces a
+        # JIT->interpreter fallback) the inline form `(me.copy)(...)` resolves as an
+        # unknown symbol; binding to a local first calls the closure correctly.
+        var f = me.copy
+        f(src, off, n)
+
+# A composed/nested holder, to prove the fn-field works as a struct member, not
+# just at top level.
+struct Box:
+    d: Dma
+
+fn box_new() -> Box:
+    Box(d: dma_new())
+
+# ── Self-test ─────────────────────────────────────────────────────────────────
+fn shared_memcpy_selftest() -> i64:
+    var failures: i64 = 0
+
+    # ---- SharedMem round-trip (store then load exact values) ----
+    var mem: SharedMem = shared_mem_new()
+    var payload: [i64] = [111, 222, 333, 444]
+    mem.store(Addr(value: 8), payload)
+    var back: [i64] = mem.load(Addr(value: 8), 4)
+    failures = failures + expect_eq(back.length(), 4, "load returns 4 words")
+    failures = failures + expect_eq(back[0], 111, "shared word0 round-trips")
+    failures = failures + expect_eq(back[1], 222, "shared word1 round-trips")
+    failures = failures + expect_eq(back[2], 333, "shared word2 round-trips")
+    failures = failures + expect_eq(back[3], 444, "shared word3 round-trips")
+
+    # ---- store1/load1 single-word round-trip ----
+    mem.store1(Addr(value: 20), 0x5A5A)
+    failures = failures + expect_eq(mem.load1(Addr(value: 20)), 0x5A5A, "store1/load1 round-trips")
+
+    # neighbouring words untouched by the store1
+    failures = failures + expect_eq(mem.load1(Addr(value: 19)), 0, "store1 leaves prior word 0")
+    failures = failures + expect_eq(mem.load1(Addr(value: 21)), 0, "store1 leaves next word 0")
+
+    # ---- clear() zeroes the region ----
+    mem.clear()
+    failures = failures + expect_eq(mem.load1(Addr(value: 8)), 0, "clear zeroes word 8")
+    failures = failures + expect_eq(mem.load1(Addr(value: 20)), 0, "clear zeroes word 20")
+
+    # ---- default Dma reproduces the slice exactly ----
+    var src: [i64] = [10, 20, 30, 40, 50, 60]
+    var dma: Dma = dma_new()
+    var d0: [i64] = dma.run(src, 2, 3)        # slice [30,40,50]
+    failures = failures + expect_eq(d0.length(), 3, "default dma copies 3 words")
+    failures = failures + expect_eq(d0[0], 30, "default dma word0==30")
+    failures = failures + expect_eq(d0[1], 40, "default dma word1==40")
+    failures = failures + expect_eq(d0[2], 50, "default dma word2==50")
+
+    # default copy invoked directly via the fn-field too (bind-to-local form)
+    var dcopy = dma.copy
+    var dfield: [i64] = dcopy(src, 0, 2)  # [10,20]
+    failures = failures + expect_eq(dfield[0], 10, "fn-field copy word0==10")
+    failures = failures + expect_eq(dfield[1], 20, "fn-field copy word1==20")
+
+    # ---- set_copy to a lambda wrapping the corrupt DMA; first word now differs ----
+    dma.set_copy(\s, o, n: dma_copy_corrupt(s, o, n))
+    var c0: [i64] = dma.run(src, 2, 3)         # corrupt: [31,40,50]
+    failures = failures + expect_eq(c0.length(), 3, "corrupt dma copies 3 words")
+    failures = failures + expect_eq(c0[0], 31, "corrupt dma FIRST word differs (30->31)")
+    failures = failures + expect_eq(c0[1], 40, "corrupt dma word1 unchanged ==40")
+    failures = failures + expect_eq(c0[2], 50, "corrupt dma word2 unchanged ==50")
+    failures = failures + expect_eq(bool_i64(c0[0] != d0[0]), 1, "corrupt first word != default first word")
+
+    # ---- Dma as a FIELD of another struct (composed/nested fn-field) ----
+    var box: Box = box_new()
+    var b0: [i64] = box.d.run(src, 1, 2)       # default copy via nested struct: [20,30]
+    failures = failures + expect_eq(b0[0], 20, "box.d.run word0==20")
+    failures = failures + expect_eq(b0[1], 30, "box.d.run word1==30")
+    var bcopy = box.d.copy                      # nested fn-field, bound to local
+    var bfield: [i64] = bcopy(src, 4, 2)        # [50,60]
+    failures = failures + expect_eq(bfield[0], 50, "box.d.copy word0==50")
+    failures = failures + expect_eq(bfield[1], 60, "box.d.copy word1==60")
+
+    if failures == 0:
+        print "PASS shared_memcpy_selftest"
+    else:
+        print "FAIL shared_memcpy_selftest ({failures})"
+    failures

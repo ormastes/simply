@@ -1,0 +1,255 @@
+"""
+hooks — sandboxed dynamic policy-hook registry (research req 7).
+
+A PolicyHooks registry holds policy lambdas installed at RUNTIME (dynamic loading):
+GC scoring, QoS priority, hot/cold classification, and telemetry filtering. These four are
+exactly the sandboxed dynamic-policy domains req 7 admits: `gc_score` is the worked live
+consumer (the FTL GC victim selection scores its CLOSED candidates through it), and `qos`,
+`hot_cold`, and `telemetry` ship safe built-in defaults behind the same install gate, fuel
+bound, output clamps, and self-tests — the sanctioned extension surface for firmware that
+wants to override them, not dead code. Each hook is
+a PURE function of SCALAR inputs returning a HookVote{value, fuel_used} — it receives only
+copied scalar values (a typed read-only "snapshot" passed positionally) and a fuel budget,
+and holds NO handle to the FTL / NAND / journal, so it is STRUCTURALLY unable to mutate
+metadata, recovery, or commit state (the central req-7 safety property).
+
+The sandbox (see sandbox.spl) gates installs (forbidden domains rejected), bounds fuel,
+and clamps/validates a hook's decision before the firmware acts on it. For the GC hook the
+firmware enumerates its OWN trusted CLOSED candidates and only asks the hook to SCORE
+them — the hook can never name a block, so it cannot select a FREE/OPEN/BAD block (which
+would corrupt the allocator); the GC data-loss guard in reclaim_block stays unconditional.
+
+Hooks take SCALAR args, not a struct: a struct ARGUMENT passed to a lambda stored in a
+nested-field registry loses its field values under the interpreter (the struct RETURN is
+fine) — the same fn-field discipline the emu/nvme_memcpy.spl seam follows (scalar + array
+args). A fn-field MUST be set to a LAMBDA (a bare named fn returns garbage) and invoked by
+binding to a local first (`var f = me.hook; f(args)`); the setter must be a `me` method.
+"""
+
+use nvme_types.*
+use sandbox.*
+
+val HOOK_COUNTER_MAX: i64 = 1000000000000000000
+
+# ── A hook's return: a decision value + self-reported fuel consumed ───────────
+struct HookVote:
+    value:     i64
+    fuel_used: i64
+
+fn vote(value: i64, fuel_used: i64) -> HookVote:
+    HookVote(value: value, fuel_used: fuel_used)
+
+fn hook_counter_next(v: i64) -> i64:
+    if v < 0:
+        return 1
+    if v >= HOOK_COUNTER_MAX:
+        return HOOK_COUNTER_MAX
+    v + 1
+
+# ── Default (built-in) hook bodies (positional scalar args) ───────────────────
+# gc_score(block, valid, erase, fuel): greedy default scores by live-page count, so the
+# fewest-valid block is collected first (reproduces gc_select_victim).
+fn default_gc_score(block: i64, valid: i64, erase: i64, fuel: i64) -> HookVote:
+    vote(valid, 1)
+
+# qos(opcode, nblocks, nsid, age, fuel): one priority class.
+fn default_qos(opcode: i64, nblocks: i64, nsid: i64, age: i64, fuel: i64) -> HookVote:
+    vote(0, 1)
+
+# hot_cold(lba, read_count, write_count, fuel): write-heavy LBAs are hot.
+fn default_hot_cold(lba: i64, read_count: i64, write_count: i64, fuel: i64) -> HookVote:
+    var hot: i64 = 0
+    if write_count > read_count:
+        hot = 1
+    vote(hot, 1)
+
+# telemetry(kind, code, value, fuel): keep everything.
+fn default_telemetry(kind: i64, code: i64, value: i64, fuel: i64) -> HookVote:
+    vote(1, 1)
+
+# ── The registry ─────────────────────────────────────────────────────────────
+struct PolicyHooks:
+    gc_score:   fn(i64, i64, i64, i64) -> HookVote        # (block, valid, erase, fuel)
+    qos:        fn(i64, i64, i64, i64, i64) -> HookVote   # (opcode, nblocks, nsid, age, fuel)
+    hot_cold:   fn(i64, i64, i64, i64) -> HookVote        # (lba, read_count, write_count, fuel)
+    telemetry:  fn(i64, i64, i64, i64) -> HookVote        # (kind, code, value, fuel)
+    gc_installed:        i64   # 1 once a custom hook replaces the default
+    qos_installed:       i64
+    hot_cold_installed:  i64
+    telemetry_installed: i64
+    fuel_budget:         i64   # per-invocation fuel budget
+    rejected_installs:   i64   # forbidden-domain install attempts rejected at the gate
+    fuel_aborts:         i64   # votes discarded for reporting fuel over budget
+
+fn policy_hooks_new() -> PolicyHooks:
+    PolicyHooks(
+        gc_score:  \b, v, e, fu: default_gc_score(b, v, e, fu),
+        qos:       \op, nb, ns, ag, fu: default_qos(op, nb, ns, ag, fu),
+        hot_cold:  \lb, rc, wc, fu: default_hot_cold(lb, rc, wc, fu),
+        telemetry: \k, cd, vl, fu: default_telemetry(k, cd, vl, fu),
+        gc_installed: 0, qos_installed: 0, hot_cold_installed: 0, telemetry_installed: 0,
+        fuel_budget: 64, rejected_installs: 0, fuel_aborts: 0)
+
+impl PolicyHooks:
+    # ── Install gate (the loader's trust boundary) ───────────────────────────
+    # A loader calls request_install(kind) before binding a module. The forbidden
+    # metadata / recovery / commit domains are rejected here; only the allowed policy
+    # kinds proceed. (Cryptographic module signing + a static verifier are the silicon
+    # path; in-sim this gate is the trust boundary.)
+    me request_install(kind: i64) -> bool:
+        if hook_kind_allowed(kind):
+            return true
+        me.rejected_installs = hook_counter_next(me.rejected_installs)
+        false
+
+    # ── Typed installers (only the allowed kinds have one) ───────────────────
+    me install_gc_score(f: fn(i64, i64, i64, i64) -> HookVote):
+        if me.request_install(HOOK_GC_SCORE):
+            me.gc_score = f
+            me.gc_installed = 1
+
+    me install_qos(f: fn(i64, i64, i64, i64, i64) -> HookVote):
+        if me.request_install(HOOK_QOS):
+            me.qos = f
+            me.qos_installed = 1
+
+    me install_hot_cold(f: fn(i64, i64, i64, i64) -> HookVote):
+        if me.request_install(HOOK_HOT_COLD):
+            me.hot_cold = f
+            me.hot_cold_installed = 1
+
+    me install_telemetry(f: fn(i64, i64, i64, i64) -> HookVote):
+        if me.request_install(HOOK_TELEMETRY):
+            me.telemetry = f
+            me.telemetry_installed = 1
+
+    # ── Uninstall: revert to the built-in default policy ─────────────────────
+    me clear_gc_score():
+        me.gc_score = \b, v, e, fu: default_gc_score(b, v, e, fu)
+        me.gc_installed = 0
+
+    me clear_qos():
+        me.qos = \op, nb, ns, ag, fu: default_qos(op, nb, ns, ag, fu)
+        me.qos_installed = 0
+
+    me clear_hot_cold():
+        me.hot_cold = \lb, rc, wc, fu: default_hot_cold(lb, rc, wc, fu)
+        me.hot_cold_installed = 0
+
+    me clear_telemetry():
+        me.telemetry = \k, cd, vl, fu: default_telemetry(k, cd, vl, fu)
+        me.telemetry_installed = 0
+
+    # ── Sandboxed invocation ─────────────────────────────────────────────────
+    # Score one GC candidate (block index, its live-page count, its erase count). The
+    # candidate set is the caller's trusted CLOSED enumeration; the hook only ranks, it
+    # never names a block. A vote that reports fuel over budget is discarded -> the
+    # default score is used.
+    me gc_candidate_score(block: i64, valid: i64, erase: i64) -> i64:
+        if me.gc_installed == 0:
+            return default_gc_score(block, valid, erase, me.fuel_budget).value
+        var f = me.gc_score
+        val v: HookVote = f(block, valid, erase, me.fuel_budget)
+        if v.fuel_used > me.fuel_budget:
+            me.fuel_aborts = hook_counter_next(me.fuel_aborts)
+            return default_gc_score(block, valid, erase, me.fuel_budget).value
+        v.value
+
+    # Priority class for a command; the hook's value is clamped to [0, QOS_MAX_PRIORITY].
+    me qos_priority(opcode: i64, nblocks: i64, nsid: i64, age: i64) -> i64:
+        if me.qos_installed == 0:
+            return clamp_priority(default_qos(opcode, nblocks, nsid, age, me.fuel_budget).value)
+        var f = me.qos
+        val v: HookVote = f(opcode, nblocks, nsid, age, me.fuel_budget)
+        if v.fuel_used > me.fuel_budget:
+            me.fuel_aborts = hook_counter_next(me.fuel_aborts)
+            return clamp_priority(default_qos(opcode, nblocks, nsid, age, me.fuel_budget).value)
+        clamp_priority(v.value)
+
+    # Hot/cold classification; clamped to {0,1}.
+    me classify_hot(lba: i64, read_count: i64, write_count: i64) -> i64:
+        if me.hot_cold_installed == 0:
+            return clamp_bool(default_hot_cold(lba, read_count, write_count, me.fuel_budget).value)
+        var f = me.hot_cold
+        val v: HookVote = f(lba, read_count, write_count, me.fuel_budget)
+        if v.fuel_used > me.fuel_budget:
+            me.fuel_aborts = hook_counter_next(me.fuel_aborts)
+            return clamp_bool(default_hot_cold(lba, read_count, write_count, me.fuel_budget).value)
+        clamp_bool(v.value)
+
+    # Telemetry keep(1)/drop(0); clamped to {0,1}.
+    me telemetry_keep(kind: i64, code: i64, value: i64) -> i64:
+        if me.telemetry_installed == 0:
+            return clamp_bool(default_telemetry(kind, code, value, me.fuel_budget).value)
+        var f = me.telemetry
+        val v: HookVote = f(kind, code, value, me.fuel_budget)
+        if v.fuel_used > me.fuel_budget:
+            me.fuel_aborts = hook_counter_next(me.fuel_aborts)
+            return clamp_bool(default_telemetry(kind, code, value, me.fuel_budget).value)
+        clamp_bool(v.value)
+
+    me rejected_count() -> i64:
+        if me.rejected_installs < 0:
+            return 0
+        me.rejected_installs
+
+    me fuel_abort_count() -> i64:
+        if me.fuel_aborts < 0:
+            return 0
+        me.fuel_aborts
+
+# ── Self-test ─────────────────────────────────────────────────────────────────
+fn hooks_selftest() -> i64:
+    var fail: i64 = 0
+    var h: PolicyHooks = policy_hooks_new()
+
+    # Default GC score is the live-page count (greedy).
+    fail = fail + expect_eq(h.gc_candidate_score(0, 7, 2), 7, "hooks: default gc score == valid count")
+
+    # Forbidden-domain install is rejected at the gate; the counter records it.
+    fail = fail + expect_eq(bool_to_int(h.request_install(HOOK_WAL)), 0, "hooks: WAL install rejected")
+    fail = fail + expect_eq(bool_to_int(h.request_install(HOOK_RECOVERY)), 0, "hooks: recovery install rejected")
+    fail = fail + expect_eq(h.rejected_count(), 2, "hooks: rejected installs counted")
+    h.rejected_installs = -2
+    fail = fail + expect_eq(h.rejected_count(), 0, "hooks: corrupted rejected count clamps to zero")
+    fail = fail + expect_eq(bool_to_int(h.request_install(HOOK_WAL)), 0, "hooks: corrupted rejected count still rejects forbidden install")
+    fail = fail + expect_eq(h.rejected_count(), 1, "hooks: corrupted rejected count increments from zero")
+    h.rejected_installs = 2
+    h.rejected_installs = HOOK_COUNTER_MAX
+    fail = fail + expect_eq(bool_to_int(h.request_install(HOOK_WAL)), 0, "hooks: saturated rejected count still rejects forbidden install")
+    fail = fail + expect_eq(h.rejected_count(), HOOK_COUNTER_MAX, "hooks: rejected count saturates")
+    h.rejected_installs = 2
+
+    # Install a custom GC scorer (wear-aware: score by erase count) and watch it apply.
+    h.install_gc_score(\b, v, e, fu: vote(e, 1))
+    fail = fail + expect_eq(h.gc_candidate_score(0, 7, 2), 2, "hooks: custom gc score == erase count")
+
+    # A vote reporting fuel over budget is discarded -> default score used.
+    h.install_gc_score(\b, v, e, fu: vote(999, 9999))
+    fail = fail + expect_eq(h.gc_candidate_score(0, 7, 2), 7, "hooks: over-fuel vote discarded -> default")
+    fail = fail + expect_eq(h.fuel_abort_count(), 1, "hooks: fuel abort counted")
+    h.fuel_aborts = -3
+    fail = fail + expect_eq(h.fuel_abort_count(), 0, "hooks: corrupted fuel abort count clamps to zero")
+    fail = fail + expect_eq(h.gc_candidate_score(0, 7, 2), 7, "hooks: corrupted fuel abort count still discards over-fuel vote")
+    fail = fail + expect_eq(h.fuel_abort_count(), 1, "hooks: corrupted fuel abort count increments from zero")
+    h.fuel_aborts = 1
+    h.fuel_aborts = HOOK_COUNTER_MAX
+    fail = fail + expect_eq(h.gc_candidate_score(0, 7, 2), 7, "hooks: saturated fuel abort still discards over-fuel vote")
+    fail = fail + expect_eq(h.fuel_abort_count(), HOOK_COUNTER_MAX, "hooks: fuel abort count saturates")
+    h.fuel_aborts = 1
+
+    # Clear reverts to the default policy.
+    h.clear_gc_score()
+    fail = fail + expect_eq(h.gc_candidate_score(0, 7, 2), 7, "hooks: clear reverts to default")
+
+    # QoS clamp: an out-of-range priority is clamped into [0, QOS_MAX_PRIORITY].
+    h.install_qos(\op, nb, ns, ag, fu: vote(99, 1))
+    fail = fail + expect_eq(h.qos_priority(1, 1, 1, 0), QOS_MAX_PRIORITY, "hooks: qos priority clamped")
+
+    # Hot/cold + telemetry clamp to {0,1}.
+    h.install_hot_cold(\lb, rc, wc, fu: vote(42, 1))
+    fail = fail + expect_eq(h.classify_hot(5, 0, 0), 1, "hooks: hot/cold clamped to 1")
+    h.install_telemetry(\k, cd, vl, fu: vote(0, 1))
+    fail = fail + expect_eq(h.telemetry_keep(1, 2, 3), 0, "hooks: telemetry drop honored")
+
+    fail

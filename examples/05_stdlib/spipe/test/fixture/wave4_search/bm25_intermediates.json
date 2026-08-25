@@ -1,0 +1,7 @@
+{
+  "schema": "spipe-bm25-intermediates-v1",
+  "score_id": "spipe-bm25-fixed-v1",
+  "status": "not_evidence_until_js_simple_dbfs_compute_identical_vectors",
+  "required_fields": ["corpus_n","document_frequency","document_length","average_length","query_term_frequency","field_weight_milli","idf_fixed","tf_numerator","tf_denominator","term_score_fixed","document_score_fixed","public_score_milli"],
+  "invalid_cases": ["invalid_corpus_n","invalid_document_frequency","invalid_average_length","invalid_denominator","invalid_parallel_arrays","invalid_logarithm_input","score_overflow"]
+}

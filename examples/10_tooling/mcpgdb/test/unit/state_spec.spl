@@ -1,0 +1,71 @@
+"""
+# State
+
+Tests for state functionality.
+"""
+# Unit tests for mcpgdb session state helpers.
+
+use examples.mcpgdb.state.{DebugSession, MCPGDB_SESSIONS, MCPGDB_CURRENT_SESSION, MCPGDB_NEXT_SESSION_ID, next_session_id, put_session, remove_session, find_session_index, current_or_named_session, set_current_session, session_ids}
+
+fn reset_state():
+    MCPGDB_SESSIONS = []
+    MCPGDB_CURRENT_SESSION = ""
+    MCPGDB_NEXT_SESSION_ID = 1
+
+fn sample_session(session_id: text) -> DebugSession:
+    DebugSession(
+        session_id: session_id,
+        backend: "gdb",
+        state: "ready",
+        workspace_root: "/tmp/work",
+        process_pid: "123",
+        input_path: "/tmp/in",
+        output_path: "/tmp/out",
+        error_path: "/tmp/err",
+        session_dir: "/tmp/session",
+        prompt: "[mcpgdb]",
+        remote_host: "",
+        remote_port: "",
+        current_thread: "",
+        current_frame: "",
+        bootstrap_monitor: ""
+    )
+
+describe "mcpgdb state":
+    """
+    ## Mcpgdb State Tests
+
+    Validates mcpgdb state functionality.
+    """
+
+    context "session ids":
+        it "increments generated session ids":
+            reset_state()
+            expect(next_session_id()).to_equal("dbg_1")
+            expect(next_session_id()).to_equal("dbg_2")
+
+    context "registry operations":
+        it "stores and finds sessions":
+            reset_state()
+            val session = sample_session("dbg_1")
+            put_session(session)
+            expect(find_session_index("dbg_1")).to_equal(0)
+            expect(session_ids().len()).to_equal(1)
+
+        it "tracks the current session":
+            reset_state()
+            val session = sample_session("dbg_1")
+            put_session(session)
+            set_current_session("dbg_1")
+            if val current = current_or_named_session(""):
+                expect(current.session_id).to_equal("dbg_1")
+            else:
+                expect("missing").to_equal("dbg_1")
+
+        it "removes closed sessions":
+            reset_state()
+            put_session(sample_session("dbg_1"))
+            put_session(sample_session("dbg_2"))
+            remove_session("dbg_1")
+            expect(session_ids().len()).to_equal(1)
+            expect(session_ids()[0]).to_equal("dbg_2")

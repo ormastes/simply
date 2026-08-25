@@ -1,0 +1,46 @@
+"""
+task_pool_fail_closed_check - write paths fail closed when task-pool allocation is unavailable.
+
+Run: bin/simple examples/09_embedded/simpleos_nvme_fw/fw/task_pool_fail_closed_check.spl
+"""
+
+use nvme_types.*
+use hil_command.*
+use hil.*
+use nvme_admin.*
+use nvme_controller.*
+
+fn main():
+    var fail: i64 = 0
+
+    var h: Hil = hil_new()
+    h.pool.cap = 0
+    h.submit(cmd_make(1, OP_WRITE, 81, 1, 0x52))
+    h.run()
+    val hc: NvmeCpl = h.reap()
+    fail = fail + expect_eq(hc.status, SC_NS_NOT_READY, "HIL invalid task pool rejects write")
+    h.submit(cmd_make(2, OP_READ, 81, 1, 0))
+    h.run()
+    val hr: NvmeCpl = h.reap()
+    fail = fail + expect_eq(hr.data, 0, "HIL invalid task pool write leaves LBA untouched")
+
+    var c: NvmeController = nvme_controller_new()
+    c.admin_submit(admin_create_cq_cmd(3, 1, 64))
+    c.admin_submit(admin_create_sq_cmd(4, 1, 64, 1))
+    c.admin_process()
+    c.admin_reap()
+    c.admin_reap()
+    c.pool.cap = 0
+    c.io_submit(1, cmd_make(5, OP_WRITE, 71, 1, 0x44))
+    c.io_process()
+    val cc: NvmeCpl = c.io_reap(1)
+    fail = fail + expect_eq(cc.status, SC_NS_NOT_READY, "controller invalid task pool rejects IO write")
+    c.io_submit(1, cmd_make(6, OP_READ, 71, 1, 0))
+    c.io_process()
+    val cr: NvmeCpl = c.io_reap(1)
+    fail = fail + expect_eq(cr.data, 0, "controller invalid task pool write leaves LBA untouched")
+
+    if fail == 0:
+        print "TASK POOL CLOSED OK"
+    else:
+        print "TASK POOL FAIL-CLOSED FAIL ({fail})"

@@ -1,0 +1,14 @@
+{
+  "schema": "spipe-search-golden-results-v1",
+  "fixture_id": "spipe-wave4-search-golden-v1",
+  "contract": "W4-SRCH-01..27",
+  "logical_root": "sha256:8cd7ac31569e67b132a477ed1e5e66cc610a9119f0bf899b8fee26d5d27e90dd",
+  "stats": {"document_count":3,"field_stats":[{"field":"identifier","N":3,"total_length":11,"average_length_scaled":3666666},{"field":"title","N":3,"total_length":4,"average_length_scaled":1333333},{"field":"heading","N":3,"total_length":6,"average_length_scaled":2000000},{"field":"classification","N":3,"total_length":3,"average_length_scaled":1000000},{"field":"body","N":3,"total_length":5,"average_length_scaled":1666666}]},
+  "queries": [
+    {"id":"alpha-search","query_text":"alpha search","filters":[],"hits":[{"document_id":"A-ascii","score_milli":5564,"matched_fields":["title","heading","classification","body"],"source_rank":1,"explanation_hash":"sha256:79a325595560360181d111119163260ab218ae630338542ed942e36f169f1040"},{"document_id":"A-é","score_milli":5471,"matched_fields":["title","heading","classification","body"],"source_rank":2,"explanation_hash":"sha256:8cd5535ac3cbd8631371e67e3e3d7c6bc5755f9c70fcfcc3a025e03a29055bf1"}],"page_hash":"sha256:cf41a2888549e9635af5263d0a28d1bb7c057ad40a7d4f7d454f0b7ce6d23115"},
+    {"id":"identifier","query_text":"REQ-SPKC-011","filters":[],"hits":[{"document_id":"A-ascii","score_milli":7407,"matched_fields":["identifier"],"source_rank":1,"explanation_hash":"sha256:1b5afa594640af982c5074b32ed7ffc221f6a5740e3b78b21ddc2d602e6fe006"},{"document_id":"A-é","score_milli":3625,"matched_fields":["identifier"],"source_rank":2,"explanation_hash":"sha256:b18882a0f2e0a3c38773819016c7a2096ad315d7878fea621eba1fe4319a1e5a"}],"page_hash":"sha256:ffcdc0cfe7ecc62352b664404f7035331fe40c6a1e9b34e8684589382bed999a"},
+    {"id":"public-filter","query_text":"alpha","filters":[{"name":"visibility","values":["public"]}],"hits":[{"document_id":"A-ascii","score_milli":3063,"matched_fields":["title","heading","body"],"source_rank":1,"explanation_hash":"sha256:ed38dc1020e16d4241ff0491e731a8526b59554ca28e2afed5e565f9b6a17e90"},{"document_id":"A-é","score_milli":2970,"matched_fields":["title","heading","body"],"source_rank":2,"explanation_hash":"sha256:a228d6252082876516e6df4c51060114109d9b2f9ee38f47e92fd00242800b4b"}],"page_hash":"sha256:e43db193c70ccce4f8ad703b2f6851a0c4a7e63a90d95d204dd212a4f64f5bd6"}
+  ],
+  "missing_required_provider_status": "fail",
+  "not_applicable_status": "not_evidence"
+}

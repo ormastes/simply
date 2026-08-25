@@ -1,0 +1,14 @@
+use logic_policy_target_core.*
+
+fn rv32_policy_gc_cases_selftest() -> i32:
+    if _rv32_policy_gc_score(7, -7, 1, 64) != -7:
+        return 1
+    if _rv32_policy_gc_score(7, -7, 99999, 64) != 7:
+        return 1
+    if _rv32_policy_gc_victim(9, 2, 1, 1) != 1:
+        return 1
+    if _rv32_policy_gc_victim(1, 0, 1, 0) != 0:
+        return 1
+    if _rv32_policy_gc_victim(1, 0, 0, 0) != -1:
+        return 1
+    0

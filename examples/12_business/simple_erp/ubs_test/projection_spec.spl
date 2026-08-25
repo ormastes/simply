@@ -1,0 +1,42 @@
+# @cover src/kernel/projection.spl 80%
+"""
+# Ledger Projection — the balanced-ledger invariant
+
+Every journal entry must balance: signed lines sum to zero (Σ debits == Σ
+credits). This is the load-bearing invariant for a system of record. Account
+balances are projections derived from the entries, never stored copies.
+"""
+
+use std.spec
+use units.money.{money}
+use kernel.projection.{JournalEntry, line, balances, account_balance, entry_sum}
+
+describe "Ledger — balanced-entry invariant":
+    it "accepts a balanced entry (debit 100, credit 100)":
+        var lines = [line(1, money("USD", 100)), line(2, money("USD", -100))]
+        val entry = JournalEntry { id: 1, lines: lines }
+        expect(balances(entry)).to_equal(true)
+
+    it "rejects an unbalanced entry":
+        var lines = [line(1, money("USD", 100)), line(2, money("USD", -90))]
+        val entry = JournalEntry { id: 2, lines: lines }
+        expect(balances(entry)).to_equal(false)
+
+    it "treats an empty entry as trivially balanced":
+        var empty: [JournalEntry] = []
+        var lines2 = []
+        val entry = JournalEntry { id: 3, lines: lines2 }
+        expect(balances(entry)).to_equal(true)
+
+    it "rejects a cross-currency entry as non-balancing":
+        var lines = [line(1, money("USD", 100)), line(2, money("EUR", -100))]
+        val entry = JournalEntry { id: 4, lines: lines }
+        expect(balances(entry)).to_equal(false)
+
+describe "Ledger — account balance projection":
+    it "sums postings to one account":
+        var lines_a = [line(1, money("USD", 100)), line(2, money("USD", -100))]
+        var lines_b = [line(1, money("USD", 50)), line(2, money("USD", -50))]
+        var entries = [JournalEntry { id: 1, lines: lines_a }, JournalEntry { id: 2, lines: lines_b }]
+        val bal = account_balance(entries, 1, "USD")
+        expect(bal.minor).to_equal(150)

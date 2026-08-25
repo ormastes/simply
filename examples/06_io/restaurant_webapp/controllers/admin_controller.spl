@@ -1,0 +1,487 @@
+use std.web_framework.controller.{ControllerContext, HttpResponseData, ViewData, render_page, render_redirect, render_error, render_json}
+use std.web_framework.session.{session_set, session_get, session_destroy}
+use std.web_framework.flash.{flash_add}
+use std.web_framework.csrf_integration.{csrf_token_for_session, verify_csrf_token}
+use std.web_framework.form_validation.{Validator, Required, MinLength}
+use std.database.{DbValue}
+use std.nogc_sync_mut.io.time_ops.{time_now_unix_micros}
+
+use models.template.{
+    RestaurantTemplate, create_template_repository, template_validator,
+    find_all_templates, find_templates_by_type, find_template_by_id
+}
+use models.menu_group.{
+    MenuGroup, create_group_repository, group_validator,
+    find_groups_for_template, find_group_by_id
+}
+use models.menu_item.{
+    MenuItem, create_item_repository, item_validator,
+    find_items_for_group, find_item_by_id, format_price
+}
+use models.condition.{
+    MenuCondition, create_condition_repository, find_conditions_for_item
+}
+use models.additional_menu.{
+    AdditionalMenu, create_additional_repository, find_additional_for_item
+}
+
+fn require_admin(ctx: ControllerContext) -> Result<text, text>:
+    val username = session_get(ctx, "admin_username")
+    if username.?:
+        Result.ok(username.unwrap())
+    else:
+        Result.err("Not authenticated")
+
+# --- Auth ---
+
+@public
+fn action_login_form(ctx: ControllerContext) -> HttpResponseData:
+    val csrf = csrf_token_for_session(ctx)
+    val data = ViewData.new()
+        .set("title", "Admin Login")
+        .set("csrf_token", csrf)
+    render_page(ctx, "admin/login", data.to_dict())
+
+@public
+fn action_login(ctx: ControllerContext) -> HttpResponseData:
+    val csrf = ctx.form_value("csrf_token")
+    if not verify_csrf_token(ctx, csrf):
+        flash_add(ctx, "error", "Invalid form submission.")
+        return render_redirect(ctx, "/admin/login")
+
+    val username = ctx.form_value("username")
+    val password = ctx.form_value("password")
+
+    # Simple hardcoded admin check for infra testing
+    if username == "admin" and password == "admin123":
+        session_set(ctx, "admin_username", username)
+        flash_add(ctx, "success", "Welcome, admin!")
+        return render_redirect(ctx, "/admin")
+
+    flash_add(ctx, "error", "Invalid credentials.")
+    render_redirect(ctx, "/admin/login")
+
+fn action_logout(ctx: ControllerContext) -> HttpResponseData:
+    session_destroy(ctx)
+    flash_add(ctx, "success", "Logged out.")
+    render_redirect(ctx, "/admin/login")
+
+# --- Dashboard ---
+
+fn action_dashboard(ctx: ControllerContext) -> HttpResponseData:
+    val admin = require_admin(ctx)?
+    val repo = create_template_repository(ctx.db())
+    val templates = find_all_templates(repo)
+
+    val data = ViewData.new()
+        .set("title", "Admin Dashboard")
+        .set("admin_name", admin)
+        .set("template_count", "{templates.len()}")
+    render_page(ctx, "admin/dashboard", data.to_dict())
+
+# --- Template CRUD ---
+
+fn action_templates_index(ctx: ControllerContext) -> HttpResponseData:
+    val admin = require_admin(ctx)?
+    val repo = create_template_repository(ctx.db())
+    val templates = find_all_templates(repo)
+
+    val data = ViewData.new()
+        .set("title", "Templates")
+        .set("csrf_token", csrf_token_for_session(ctx))
+    render_page(ctx, "admin/templates_index", data.to_dict())
+
+fn action_template_new(ctx: ControllerContext) -> HttpResponseData:
+    val admin = require_admin(ctx)?
+    val data = ViewData.new()
+        .set("title", "New Template")
+        .set("csrf_token", csrf_token_for_session(ctx))
+    render_page(ctx, "admin/template_form", data.to_dict())
+
+fn action_template_create(ctx: ControllerContext) -> HttpResponseData:
+    val admin = require_admin(ctx)?
+    val csrf = ctx.form_value("csrf_token")
+    if not verify_csrf_token(ctx, csrf):
+        flash_add(ctx, "error", "Invalid form submission.")
+        return render_redirect(ctx, "/admin/templates/new")
+
+    val name = ctx.form_value("name")
+    val description = ctx.form_value("description")
+    val ttype = ctx.form_value("template_type")
+
+    val validator = template_validator()
+    val fields = Dict<text, text>.new()
+    fields.set("name", name)
+    val result = validator.validate(fields)
+    if not result.is_valid:
+        flash_add(ctx, "error", result.first_error())
+        return render_redirect(ctx, "/admin/templates/new")
+
+    val repo = create_template_repository(ctx.db())
+    val now = "{time_now_unix_micros()}"
+    val t = RestaurantTemplate(
+        id: 0,
+        name: name,
+        description: description,
+        template_type: if ttype == "": "restaurant" else: ttype,
+        is_default: false,
+        created_at: now,
+        updated_at: now
+    )
+    repo.save(t)?
+
+    flash_add(ctx, "success", "Template created.")
+    render_redirect(ctx, "/admin/templates")
+
+fn action_template_edit(ctx: ControllerContext) -> HttpResponseData:
+    val admin = require_admin(ctx)?
+    val id = ctx.params.get("id").unwrap_or("0").parse_i64().unwrap_or(0)
+    val repo = create_template_repository(ctx.db())
+    val t = find_template_by_id(repo, id)?
+
+    val data = ViewData.new()
+        .set("title", "Edit Template")
+        .set("csrf_token", csrf_token_for_session(ctx))
+        .set("template_id", "{t.id}")
+        .set("template_name", t.name)
+        .set("template_description", t.description)
+        .set("template_type", t.template_type)
+    render_page(ctx, "admin/template_form", data.to_dict())
+
+fn action_template_update(ctx: ControllerContext) -> HttpResponseData:
+    val admin = require_admin(ctx)?
+    val csrf = ctx.form_value("csrf_token")
+    if not verify_csrf_token(ctx, csrf):
+        flash_add(ctx, "error", "Invalid form submission.")
+        return render_redirect(ctx, "/admin/templates")
+
+    val id = ctx.params.get("id").unwrap_or("0").parse_i64().unwrap_or(0)
+    val repo = create_template_repository(ctx.db())
+    val t = find_template_by_id(repo, id)?
+
+    val name = ctx.form_value("name")
+    val description = ctx.form_value("description")
+    val ttype = ctx.form_value("template_type")
+
+    val updated = RestaurantTemplate(
+        id: t.id,
+        name: if name == "": t.name else: name,
+        description: description,
+        template_type: if ttype == "": t.template_type else: ttype,
+        is_default: t.is_default,
+        created_at: t.created_at,
+        updated_at: "{time_now_unix_micros()}"
+    )
+    repo.update(updated)?
+
+    flash_add(ctx, "success", "Template updated.")
+    render_redirect(ctx, "/admin/templates")
+
+fn action_template_delete(ctx: ControllerContext) -> HttpResponseData:
+    val admin = require_admin(ctx)?
+    val csrf = ctx.form_value("csrf_token")
+    if not verify_csrf_token(ctx, csrf):
+        flash_add(ctx, "error", "Invalid form submission.")
+        return render_redirect(ctx, "/admin/templates")
+
+    val id = ctx.params.get("id").unwrap_or("0").parse_i64().unwrap_or(0)
+    val repo = create_template_repository(ctx.db())
+    repo.delete(id)?
+
+    flash_add(ctx, "success", "Template deleted.")
+    render_redirect(ctx, "/admin/templates")
+
+# --- Group CRUD ---
+
+fn action_groups_index(ctx: ControllerContext) -> HttpResponseData:
+    val admin = require_admin(ctx)?
+    val template_id = ctx.params.get("template_id").unwrap_or("0").parse_i64().unwrap_or(0)
+    val trepo = create_template_repository(ctx.db())
+    val t = find_template_by_id(trepo, template_id)?
+
+    val grepo = create_group_repository(ctx.db())
+    val groups = find_groups_for_template(grepo, template_id)
+
+    val data = ViewData.new()
+        .set("title", "Groups - {t.name}")
+        .set("template_id", "{template_id}")
+        .set("template_name", t.name)
+        .set("csrf_token", csrf_token_for_session(ctx))
+    render_page(ctx, "admin/groups_index", data.to_dict())
+
+fn action_group_create(ctx: ControllerContext) -> HttpResponseData:
+    val admin = require_admin(ctx)?
+    val csrf = ctx.form_value("csrf_token")
+    val template_id = ctx.params.get("template_id").unwrap_or("0").parse_i64().unwrap_or(0)
+
+    if not verify_csrf_token(ctx, csrf):
+        flash_add(ctx, "error", "Invalid form submission.")
+        return render_redirect(ctx, "/admin/templates/{template_id}/groups")
+
+    val name = ctx.form_value("name")
+    val description = ctx.form_value("description")
+    val sort_order = ctx.form_value("sort_order").parse_i64().unwrap_or(0)
+
+    val repo = create_group_repository(ctx.db())
+    val g = MenuGroup(
+        id: 0,
+        template_id: template_id,
+        name: name,
+        description: description,
+        sort_order: sort_order,
+        created_at: "{time_now_unix_micros()}"
+    )
+    repo.save(g)?
+
+    flash_add(ctx, "success", "Group created.")
+    render_redirect(ctx, "/admin/templates/{template_id}/groups")
+
+fn action_group_update(ctx: ControllerContext) -> HttpResponseData:
+    val admin = require_admin(ctx)?
+    val csrf = ctx.form_value("csrf_token")
+    if not verify_csrf_token(ctx, csrf):
+        flash_add(ctx, "error", "Invalid form submission.")
+        return render_redirect(ctx, "/admin/templates")
+
+    val id = ctx.params.get("id").unwrap_or("0").parse_i64().unwrap_or(0)
+    val repo = create_group_repository(ctx.db())
+    val g = find_group_by_id(repo, id)?
+
+    val name = ctx.form_value("name")
+    val description = ctx.form_value("description")
+    val sort_order = ctx.form_value("sort_order").parse_i64().unwrap_or(g.sort_order)
+
+    val updated = MenuGroup(
+        id: g.id,
+        template_id: g.template_id,
+        name: if name == "": g.name else: name,
+        description: description,
+        sort_order: sort_order,
+        created_at: g.created_at
+    )
+    repo.update(updated)?
+
+    flash_add(ctx, "success", "Group updated.")
+    render_redirect(ctx, "/admin/templates/{g.template_id}/groups")
+
+fn action_group_delete(ctx: ControllerContext) -> HttpResponseData:
+    val admin = require_admin(ctx)?
+    val csrf = ctx.form_value("csrf_token")
+    if not verify_csrf_token(ctx, csrf):
+        flash_add(ctx, "error", "Invalid form submission.")
+        return render_redirect(ctx, "/admin/templates")
+
+    val id = ctx.params.get("id").unwrap_or("0").parse_i64().unwrap_or(0)
+    val repo = create_group_repository(ctx.db())
+    val g = find_group_by_id(repo, id)?
+    val template_id = g.template_id
+    repo.delete(id)?
+
+    flash_add(ctx, "success", "Group deleted.")
+    render_redirect(ctx, "/admin/templates/{template_id}/groups")
+
+# --- Item CRUD ---
+
+fn action_items_index(ctx: ControllerContext) -> HttpResponseData:
+    val admin = require_admin(ctx)?
+    val group_id = ctx.params.get("group_id").unwrap_or("0").parse_i64().unwrap_or(0)
+    val grepo = create_group_repository(ctx.db())
+    val g = find_group_by_id(grepo, group_id)?
+
+    val irepo = create_item_repository(ctx.db())
+    val items = find_items_for_group(irepo, group_id)
+
+    val data = ViewData.new()
+        .set("title", "Items - {g.name}")
+        .set("group_id", "{group_id}")
+        .set("group_name", g.name)
+        .set("template_id", "{g.template_id}")
+        .set("csrf_token", csrf_token_for_session(ctx))
+    render_page(ctx, "admin/items_index", data.to_dict())
+
+fn action_item_create(ctx: ControllerContext) -> HttpResponseData:
+    val admin = require_admin(ctx)?
+    val csrf = ctx.form_value("csrf_token")
+    val group_id = ctx.params.get("group_id").unwrap_or("0").parse_i64().unwrap_or(0)
+
+    if not verify_csrf_token(ctx, csrf):
+        flash_add(ctx, "error", "Invalid form submission.")
+        return render_redirect(ctx, "/admin/groups/{group_id}/items")
+
+    val name = ctx.form_value("name")
+    val description = ctx.form_value("description")
+    val price = ctx.form_value("price").parse_i64().unwrap_or(0)
+    val sort_order = ctx.form_value("sort_order").parse_i64().unwrap_or(0)
+
+    val now = "{time_now_unix_micros()}"
+    val repo = create_item_repository(ctx.db())
+    val item = MenuItem(
+        id: 0,
+        group_id: group_id,
+        name: name,
+        description: description,
+        price: price,
+        available: true,
+        sort_order: sort_order,
+        created_at: now,
+        updated_at: now
+    )
+    repo.save(item)?
+
+    flash_add(ctx, "success", "Item created.")
+    render_redirect(ctx, "/admin/groups/{group_id}/items")
+
+fn action_item_edit(ctx: ControllerContext) -> HttpResponseData:
+    val admin = require_admin(ctx)?
+    val id = ctx.params.get("id").unwrap_or("0").parse_i64().unwrap_or(0)
+    val repo = create_item_repository(ctx.db())
+    val item = find_item_by_id(repo, id)?
+
+    val crepo = create_condition_repository(ctx.db())
+    val conditions = find_conditions_for_item(crepo, id)
+
+    val arepo = create_additional_repository(ctx.db())
+    val additionals = find_additional_for_item(arepo, id)
+
+    val data = ViewData.new()
+        .set("title", "Edit Item - {item.name}")
+        .set("item_id", "{item.id}")
+        .set("item_name", item.name)
+        .set("item_description", item.description)
+        .set("item_price", "{item.price}")
+        .set("item_price_display", format_price(item.price))
+        .set("group_id", "{item.group_id}")
+        .set("csrf_token", csrf_token_for_session(ctx))
+    render_page(ctx, "admin/item_edit", data.to_dict())
+
+fn action_item_update(ctx: ControllerContext) -> HttpResponseData:
+    val admin = require_admin(ctx)?
+    val csrf = ctx.form_value("csrf_token")
+    if not verify_csrf_token(ctx, csrf):
+        flash_add(ctx, "error", "Invalid form submission.")
+        return render_redirect(ctx, "/admin/templates")
+
+    val id = ctx.params.get("id").unwrap_or("0").parse_i64().unwrap_or(0)
+    val repo = create_item_repository(ctx.db())
+    val item = find_item_by_id(repo, id)?
+
+    val name = ctx.form_value("name")
+    val description = ctx.form_value("description")
+    val price = ctx.form_value("price").parse_i64().unwrap_or(item.price)
+    val available = ctx.form_value("available") == "1"
+
+    val updated = MenuItem(
+        id: item.id,
+        group_id: item.group_id,
+        name: if name == "": item.name else: name,
+        description: description,
+        price: price,
+        available: available,
+        sort_order: item.sort_order,
+        created_at: item.created_at,
+        updated_at: "{time_now_unix_micros()}"
+    )
+    repo.update(updated)?
+
+    flash_add(ctx, "success", "Item updated.")
+    render_redirect(ctx, "/admin/groups/{item.group_id}/items")
+
+fn action_item_delete(ctx: ControllerContext) -> HttpResponseData:
+    val admin = require_admin(ctx)?
+    val csrf = ctx.form_value("csrf_token")
+    if not verify_csrf_token(ctx, csrf):
+        flash_add(ctx, "error", "Invalid form submission.")
+        return render_redirect(ctx, "/admin/templates")
+
+    val id = ctx.params.get("id").unwrap_or("0").parse_i64().unwrap_or(0)
+    val repo = create_item_repository(ctx.db())
+    val item = find_item_by_id(repo, id)?
+    val group_id = item.group_id
+    repo.delete(id)?
+
+    flash_add(ctx, "success", "Item deleted.")
+    render_redirect(ctx, "/admin/groups/{group_id}/items")
+
+# --- Conditions ---
+
+fn action_condition_create(ctx: ControllerContext) -> HttpResponseData:
+    val admin = require_admin(ctx)?
+    val csrf = ctx.form_value("csrf_token")
+    val item_id = ctx.params.get("item_id").unwrap_or("0").parse_i64().unwrap_or(0)
+
+    if not verify_csrf_token(ctx, csrf):
+        flash_add(ctx, "error", "Invalid form submission.")
+        return render_redirect(ctx, "/admin/items/{item_id}/edit")
+
+    val ctype = ctx.form_value("condition_type")
+    val cvalue = ctx.form_value("condition_value")
+
+    val repo = create_condition_repository(ctx.db())
+    val cond = MenuCondition(
+        id: 0,
+        item_id: item_id,
+        condition_type: ctype,
+        condition_value: cvalue,
+        created_at: "{time_now_unix_micros()}"
+    )
+    repo.save(cond)?
+
+    flash_add(ctx, "success", "Condition added.")
+    render_redirect(ctx, "/admin/items/{item_id}/edit")
+
+fn action_condition_delete(ctx: ControllerContext) -> HttpResponseData:
+    val admin = require_admin(ctx)?
+    val csrf = ctx.form_value("csrf_token")
+    if not verify_csrf_token(ctx, csrf):
+        flash_add(ctx, "error", "Invalid form submission.")
+        return render_redirect(ctx, "/admin/templates")
+
+    val id = ctx.params.get("id").unwrap_or("0").parse_i64().unwrap_or(0)
+    val repo = create_condition_repository(ctx.db())
+    repo.delete(id)?
+
+    flash_add(ctx, "success", "Condition removed.")
+    render_redirect(ctx, "/admin/templates")
+
+# --- Additional Menus ---
+
+fn action_additional_create(ctx: ControllerContext) -> HttpResponseData:
+    val admin = require_admin(ctx)?
+    val csrf = ctx.form_value("csrf_token")
+    val item_id = ctx.params.get("item_id").unwrap_or("0").parse_i64().unwrap_or(0)
+
+    if not verify_csrf_token(ctx, csrf):
+        flash_add(ctx, "error", "Invalid form submission.")
+        return render_redirect(ctx, "/admin/items/{item_id}/edit")
+
+    val name = ctx.form_value("name")
+    val description = ctx.form_value("description")
+    val price = ctx.form_value("price").parse_i64().unwrap_or(0)
+
+    val repo = create_additional_repository(ctx.db())
+    val a = AdditionalMenu(
+        id: 0,
+        parent_item_id: item_id,
+        name: name,
+        description: description,
+        price: price,
+        created_at: "{time_now_unix_micros()}"
+    )
+    repo.save(a)?
+
+    flash_add(ctx, "success", "Additional menu item added.")
+    render_redirect(ctx, "/admin/items/{item_id}/edit")
+
+fn action_additional_delete(ctx: ControllerContext) -> HttpResponseData:
+    val admin = require_admin(ctx)?
+    val csrf = ctx.form_value("csrf_token")
+    if not verify_csrf_token(ctx, csrf):
+        flash_add(ctx, "error", "Invalid form submission.")
+        return render_redirect(ctx, "/admin/templates")
+
+    val id = ctx.params.get("id").unwrap_or("0").parse_i64().unwrap_or(0)
+    val repo = create_additional_repository(ctx.db())
+    repo.delete(id)?
+
+    flash_add(ctx, "success", "Additional item removed.")
+    render_redirect(ctx, "/admin/templates")

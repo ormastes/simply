@@ -1,0 +1,12 @@
+target/
+build/
+dist/
+*.o
+*.a
+*.so
+*.dylib
+.DS_Store
+*.smf
+models/
+*.safetensors
+*.pack/

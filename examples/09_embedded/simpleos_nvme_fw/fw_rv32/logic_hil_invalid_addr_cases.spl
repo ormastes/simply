@@ -1,0 +1,22 @@
+use logic_hil_core.*
+
+fn rv32_hil_invalid_addr_cases_selftest() -> i32:
+    if rv32_hil_validate(0, 1, -1, 1, 0) == 0:
+        return 1
+    if rv32_hil_validate(0, 1, 0, 0, 0) == 0:
+        return 1
+    if rv32_hil_validate(0, 1, 3072, 1, 0) == 0:
+        return 1
+    if rv32_hil_validate(0, 1, 3071, 2, 0) == 0:
+        return 1
+    if rv32_hil_validate(0, 0, 1, 0, 0) == 0:
+        return 1
+    if rv32_hil_validate(0, 0, 0, 1, 0) == 0:
+        return 1
+    if rv32_hil_validate(0, 2, 0, 1, 99) == 0:
+        return 1
+    if rv32_hil_validate(0, 8, 0, 1, 99) == 0:
+        return 1
+    if rv32_hil_validate(0, 9, 0, 1, 99) == 0:
+        return 1
+    0

@@ -1,0 +1,466 @@
+# T32 CLI — Interactive shell mode
+# REPL loop for TRACE32 session interaction.
+# All verbs route through bridge.spl (shared execution) + render.spl (formatting).
+
+extern fn rt_stdin_read_line() -> text
+
+use app.t32_cli.types.{T32BridgeResult, T32HistoryEntry}
+use app.t32_cli.bridge.{bridge_sessions_list, bridge_session_open, bridge_session_resume, bridge_session_info, bridge_core_list, bridge_core_select, bridge_cmd_run, bridge_cmm_run, bridge_eval, bridge_window_list, bridge_window_open, bridge_window_capture, bridge_window_describe, bridge_screenshot, bridge_action_invoke_with_request, t32_action_request_id, bridge_action_list, bridge_field_get, bridge_field_set, bridge_history_tail, bridge_resources_list, bridge_resource_read, bridge_setup_headless, bridge_area_read, bridge_cmm_commands, bridge_cmm_validate, bridge_status_snapshot, bridge_error_check, bridge_job_list, bridge_job_get, bridge_job_cancel, bridge_job_result, bridge_dialog_parse, bridge_dialog_get, bridge_dialog_set, bridge_dialog_click}
+use app.t32_cli.render.{render_result, render_error}
+use app.t32_cli.bridge_access.{T32_ACTION_MAX_ARGS, t32_action_argument_is_safe}
+use app.mcp_t32.session_state.{MCP_T32_CURRENT_SESSION, MCP_T32_CURRENT_CORE}
+use app.t32_cli.error_codes.{t32_err_unknown_shell_cmd}
+
+# Shell history
+var SHELL_HISTORY: [T32HistoryEntry] = []
+
+# Start the interactive T32 shell
+fn start_t32_shell():
+    print "TRACE32 CLI Shell"
+    print "Type 'help' for commands, 'quit' to exit."
+    print ""
+
+    var running = true
+    while running:
+        val prompt = shell_prompt()
+        print_no_newline(prompt)
+        val line_raw = rt_stdin_read_line() ?? ""
+        val line = trim_line(line_raw)
+
+        if line == "":
+            continue
+
+        if line == "quit" or line == "exit":
+            print "Goodbye."
+            running = false
+            continue
+
+        val result = shell_dispatch(line)
+        if result != "":
+            print result
+
+        # Record in history
+        val entry = T32HistoryEntry.create(line, result, MCP_T32_CURRENT_SESSION, MCP_T32_CURRENT_CORE)
+        SHELL_HISTORY.push(entry)
+
+# Build the shell prompt showing current session and core
+fn shell_prompt() -> text:
+    var session_part = "(none)"
+    if MCP_T32_CURRENT_SESSION != "":
+        session_part = MCP_T32_CURRENT_SESSION
+
+    var core_part = ""
+    if MCP_T32_CURRENT_CORE != "":
+        core_part = ":{MCP_T32_CURRENT_CORE}"
+
+    "{session_part}{core_part}> "
+
+# --- Bridge result helper ---
+
+fn bridge_to_text(result: Result<T32BridgeResult, text>) -> text:
+    match result:
+        Ok(r): render_result(r)
+        Err(e): render_error(e)
+
+# --- Dispatch ---
+
+fn shell_dispatch(line: text) -> text:
+    val parts = split_shell(line)
+    if parts.len() == 0:
+        return ""
+
+    val cmd = parts[0]
+    var args: [text] = []
+    var i = 1
+    while i < parts.len():
+        args.push(parts[i])
+        i = i + 1
+
+    match cmd:
+        "help": shell_help()
+        "session": shell_session(args)
+        "sessions": bridge_to_text(bridge_sessions_list())
+        "use": shell_use(args)
+        "info": shell_info(args)
+        "cores": bridge_to_text(bridge_core_list(""))
+        "core": shell_core(args)
+        "windows": bridge_to_text(bridge_window_list())
+        "show": shell_show(args)
+        "open": shell_open(args)
+        "describe": shell_describe(args)
+        "set": shell_set(args)
+        "do": shell_do(args)
+        "cmm": shell_cmm(args)
+        "screenshot": shell_screenshot(args)
+        "history": shell_history_cmd(args)
+        "cmd": shell_cmd(args)
+        "eval": shell_eval(args)
+        "status": bridge_to_text(bridge_status_snapshot())
+        "resources": bridge_to_text(bridge_resources_list())
+        "resource": shell_resource(args)
+        "headless": shell_headless(args)
+        "area": shell_area(args)
+        "cmm-commands": shell_cmm_commands(args)
+        "cmm-validate": shell_cmm_validate(args)
+        "jobs": shell_jobs(args)
+        "dialog": shell_dialog(args)
+        "error-check": bridge_to_text(bridge_error_check())
+        _: t32_err_unknown_shell_cmd(cmd)
+
+# --- Help ---
+
+fn shell_help() -> text:
+    var out = "Available commands:\n"
+    out = out + "\n  Session:\n"
+    out = out + "  session open [host] [port] [name] [arch]  Open and select a session\n"
+    out = out + "  session resume <id>  Resume an in-process session\n"
+    out = out + "  sessions              List all sessions\n"
+    out = out + "  use <id>              Switch active session\n"
+    out = out + "  info <id>             Show session details\n"
+    out = out + "  cores                 List cores in current session\n"
+    out = out + "  core <id>             Switch active core\n"
+    out = out + "\n  Execution:\n"
+    out = out + "  cmd <command> [--force]  Run PRACTICE command\n"
+    out = out + "  cmm <script> [opts]   Run CMM script\n"
+    out = out + "  eval <expression>     Evaluate TRACE32 expression\n"
+    out = out + "\n  Window:\n"
+    out = out + "  windows               List all windows\n"
+    out = out + "  show <name>           Capture window content\n"
+    out = out + "  open <name>           Open a window\n"
+    out = out + "  describe <name>       Describe window (actions, fields)\n"
+    out = out + "  screenshot <win> [path]  Save window screenshot\n"
+    out = out + "\n  Field/Action:\n"
+    out = out + "  set <field> <value>   Set a field value\n"
+    out = out + "  do <action> [args] --confirm  Execute an action\n"
+    out = out + "\n  Observability:\n"
+    out = out + "  status                Show CPU run state\n"
+    out = out + "  history [count]       Show command history\n"
+    out = out + "  resources             List MCP resources\n"
+    out = out + "  resource <uri>        Read resource by URI\n"
+    out = out + "  error-check           Check TRACE32 error state\n"
+    out = out + "\n  Headless/CMM:\n"
+    out = out + "  headless [options]    One-shot headless setup\n"
+    out = out + "  area [name] [--clear] Read AREA buffer\n"
+    out = out + "  cmm-commands [opts]   Query command database\n"
+    out = out + "  cmm-validate <src>    Validate CMM headless safety\n"
+    out = out + "\n  Jobs:\n"
+    out = out + "  jobs [list|get|cancel|result] [args]\n"
+    out = out + "\n  Dialog:\n"
+    out = out + "  dialog [parse|get|set|click] [args]\n"
+    out = out + "\n  quit                  Exit shell"
+    out
+
+# --- Session/Core ---
+
+fn shell_session(args: [text]) -> text:
+    if args.len() == 0:
+        return "Usage: session <open|resume> [args]"
+    if args[0] == "resume":
+        if args.len() != 2: return "Usage: session resume <session_id>"
+        return bridge_to_text(bridge_session_resume(args[1]))
+    if args[0] != "open" or args.len() > 5:
+        return "Usage: session open [host] [port] [name] [arch]"
+    val host = if args.len() > 1: args[1] else: "localhost"
+    if not t32_action_argument_is_safe(host): return "Error: invalid session host"
+    if args.len() > 3 and not t32_action_argument_is_safe(args[3]): return "Error: invalid session name"
+    if args.len() > 4 and not t32_action_argument_is_safe(args[4]): return "Error: invalid session architecture"
+    val port = if args.len() > 2: shell_parse_int(args[2]) else: 20000
+    if port <= 0: return "Error: invalid session port"
+    val name = if args.len() > 3: args[3] else: ""
+    val arch = if args.len() > 4: args[4] else: "unknown"
+    bridge_to_text(bridge_session_open(host, port, name, arch))
+
+fn shell_use(args: [text]) -> text:
+    if args.len() == 0:
+        return "Usage: use <session_id>"
+    bridge_to_text(bridge_session_resume(args[0]))
+
+fn shell_info(args: [text]) -> text:
+    if args.len() == 0:
+        return "Usage: info <session_id>"
+    bridge_to_text(bridge_session_info(args[0]))
+
+fn shell_core(args: [text]) -> text:
+    if args.len() == 0:
+        return "Usage: core <core_id>"
+    bridge_to_text(bridge_core_select(args[0]))
+
+# --- Window ---
+
+fn shell_show(args: [text]) -> text:
+    if args.len() == 0:
+        return "Usage: show <window_key>"
+    bridge_to_text(bridge_window_capture(args[0]))
+
+fn shell_open(args: [text]) -> text:
+    if args.len() == 0:
+        return "Usage: open <window_key>"
+    bridge_to_text(bridge_window_open(args[0]))
+
+fn shell_describe(args: [text]) -> text:
+    if args.len() == 0:
+        return "Usage: describe <window_key>"
+    bridge_to_text(bridge_window_describe(args[0]))
+
+fn shell_screenshot(args: [text]) -> text:
+    if args.len() == 0:
+        return "Usage: screenshot <window_key> [output_path]"
+    val window_key = args[0]
+    var output_path = "{window_key}.png"
+    if args.len() > 1:
+        output_path = args[1]
+    bridge_to_text(bridge_screenshot(window_key, output_path))
+
+# --- Field/Action ---
+
+fn shell_set(args: [text]) -> text:
+    if args.len() < 2:
+        return "Usage: set <field_key> <value>"
+    bridge_to_text(bridge_field_set(args[0], args[1]))
+
+fn shell_do(args: [text]) -> text:
+    if args.len() == 0:
+        return "Usage: do <action_key> [args] --confirm"
+    var confirmed = false
+    var values: [text] = []
+    for arg in args:
+        if arg == "--confirm":
+            confirmed = true
+        else:
+            values.push(arg)
+    if not confirmed:
+        return "Error: explicit confirmation is required"
+    if values.len() == 0:
+        return "Usage: do <action_key> [args] --confirm"
+    if values.len().to_i64() > T32_ACTION_MAX_ARGS + 1:
+        return "Error: action accepts at most " + str(T32_ACTION_MAX_ARGS) + " argument"
+    val extra = if values.len() > 1: values[1] else: ""
+    bridge_to_text(bridge_action_invoke_with_request(values[0], extra, t32_action_request_id(), 5000, true))
+
+# --- Execution ---
+
+fn shell_cmd(args: [text]) -> text:
+    if args.len() == 0:
+        return "Usage: cmd <command> [--force]"
+    val command = args[0]
+    var force = false
+    for a in args:
+        if a == "--force":
+            force = true
+    bridge_to_text(bridge_cmd_run(command, force))
+
+fn shell_cmm(args: [text]) -> text:
+    if args.len() == 0:
+        return "Usage: cmm <script_path> [--wait] [--timeout=<ms>] [--capture-area] [--force]"
+    val script = args[0]
+    var wait = false
+    var capture_area = false
+    var force = false
+    var timeout: i64 = 0
+    for a in args:
+        if a == "--wait":
+            wait = true
+        elif a == "--capture-area":
+            capture_area = true
+        elif a == "--force":
+            force = true
+        elif a.starts_with("--timeout="):
+            timeout = shell_parse_int(a.slice(10, a.len()))
+    bridge_to_text(bridge_cmm_run(script, wait, timeout, capture_area, force))
+
+fn shell_eval(args: [text]) -> text:
+    if args.len() == 0:
+        return "Usage: eval <expression>"
+    val expr = shell_join(args)
+    bridge_to_text(bridge_eval(expr))
+
+# --- Observability ---
+
+fn shell_history_cmd(args: [text]) -> text:
+    val count = if args.len() > 0: shell_parse_int(args[0]) else: 20
+    bridge_to_text(bridge_history_tail(count))
+
+fn shell_resource(args: [text]) -> text:
+    if args.len() == 0:
+        return "Usage: resource <uri>"
+    bridge_to_text(bridge_resource_read(args[0]))
+
+# --- Headless ---
+
+fn shell_headless(args: [text]) -> text:
+    var area_name = "A000"
+    var semihost = true
+    var error_handler = true
+    for a in args:
+        if a.starts_with("--area="):
+            area_name = a.slice(7, a.len())
+        elif a == "--no-semihost":
+            semihost = false
+        elif a == "--no-error-handler":
+            error_handler = false
+    bridge_to_text(bridge_setup_headless(area_name, semihost, error_handler))
+
+fn shell_area(args: [text]) -> text:
+    var name = "A000"
+    var clear = false
+    for a in args:
+        if a == "--clear":
+            clear = true
+        elif not a.starts_with("--"):
+            name = a
+    bridge_to_text(bridge_area_read(name, clear))
+
+fn shell_cmm_commands(args: [text]) -> text:
+    var group = ""
+    var search = ""
+    for a in args:
+        if a.starts_with("--group="):
+            group = a.slice(8, a.len())
+        elif a.starts_with("--search="):
+            search = a.slice(9, a.len())
+    bridge_to_text(bridge_cmm_commands(group, search))
+
+fn shell_cmm_validate(args: [text]) -> text:
+    if args.len() == 0:
+        return "Usage: cmm-validate <source> [--mode=<headless|interactive>]"
+    val source = args[0]
+    var mode = "headless"
+    for a in args:
+        if a.starts_with("--mode="):
+            mode = a.slice(7, a.len())
+    bridge_to_text(bridge_cmm_validate(source, mode))
+
+# --- Jobs ---
+
+fn shell_jobs(args: [text]) -> text:
+    if args.len() == 0 or args[0] == "list":
+        var session_filter = ""
+        for a in args:
+            if a.starts_with("--session="):
+                session_filter = a.slice(10, a.len())
+        return bridge_to_text(bridge_job_list(session_filter))
+
+    val sub = args[0]
+    match sub:
+        "get":
+            if args.len() < 2:
+                return "Usage: jobs get <job_id>"
+            bridge_to_text(bridge_job_get(args[1]))
+        "cancel":
+            if args.len() < 2:
+                return "Usage: jobs cancel <job_id>"
+            bridge_to_text(bridge_job_cancel(args[1]))
+        "result":
+            if args.len() < 2:
+                return "Usage: jobs result <job_id>"
+            bridge_to_text(bridge_job_result(args[1]))
+        _: "Unknown jobs subcommand: {sub}. Use: list, get, cancel, result"
+
+# --- Dialog ---
+
+fn shell_dialog(args: [text]) -> text:
+    if args.len() == 0:
+        return "Usage: dialog <parse|get|set|click> <args>"
+
+    val sub = args[0]
+    match sub:
+        "parse":
+            if args.len() < 2:
+                return "Usage: dialog parse <source>"
+            bridge_to_text(bridge_dialog_parse(args[1]))
+        "get":
+            if args.len() < 2:
+                return "Usage: dialog get <label>"
+            var query_type = "string"
+            for a in args:
+                if a.starts_with("--type="):
+                    query_type = a.slice(7, a.len())
+            bridge_to_text(bridge_dialog_get(args[1], query_type))
+        "set":
+            if args.len() < 2:
+                return "Usage: dialog set <label> [value] [--action=<set|select|deselect|disable|enable>]"
+            var value = ""
+            if args.len() > 2 and not args[2].starts_with("--"):
+                value = args[2]
+            var action = "set"
+            for a in args:
+                if a.starts_with("--action="):
+                    action = a.slice(9, a.len())
+            bridge_to_text(bridge_dialog_set(args[1], action, value))
+        "click":
+            if args.len() < 2:
+                return "Usage: dialog click <label>"
+            var capture_area = false
+            var timeout: i64 = 0
+            for a in args:
+                if a == "--capture-area":
+                    capture_area = true
+                elif a.starts_with("--timeout="):
+                    timeout = shell_parse_int(a.slice(10, a.len()))
+            bridge_to_text(bridge_dialog_click(args[1], capture_area, timeout))
+        _: "Unknown dialog subcommand: {sub}. Use: parse, get, set, click"
+
+# --- Helpers ---
+
+fn split_shell(line: text) -> [text]:
+    var parts: [text] = []
+    var start = -1
+    var i = 0
+    while i < line.len():
+        val ch = line[i]
+        if (ch == ' ' or ch == '\t'):
+            if start >= 0:
+                val part = line.slice(start, i)
+                parts.push(part)
+                start = -1
+        else:
+            if start < 0:
+                start = i
+        i = i + 1
+    if start >= 0:
+        val part = line.slice(start, line.len())
+        parts.push(part)
+    parts
+
+fn trim_line(s: text) -> text:
+    var start = 0
+    while start < s.len():
+        val ch = s[start]
+        if (ch != ' ' and ch != '\t' and ch != '\r' and ch != '\n'):
+            break
+        start = start + 1
+
+    var end_idx = s.len()
+    while end_idx > start:
+        val ch = s[end_idx - 1]
+        if (ch != ' ' and ch != '\t' and ch != '\r' and ch != '\n'):
+            break
+        end_idx = end_idx - 1
+
+    if start >= end_idx:
+        return ""
+    s.slice(start, end_idx)
+
+fn print_no_newline(s: text):
+    print s
+
+fn shell_parse_int(s: text) -> i64:
+    var result: i64 = 0
+    var i = 0
+    while i < s.len():
+        val ch = s[i]
+        var digit = ch.to_int() - 48
+        if digit >= 0 and digit <= 9:
+            result = result * 10 + digit
+        i = i + 1
+    result
+
+fn shell_join(args: [text]) -> text:
+    if args.len() == 0:
+        return ""
+    var result = args[0]
+    var i = 1
+    while i < args.len():
+        result = result + " " + args[i]
+        i = i + 1
+    result

@@ -1,0 +1,348 @@
+#![allow(unnamed_duplicate_typed_args)]
+@allow(unnamed_duplicate_typed_args)
+# mcpgdb MCP — persistent backend helpers
+
+extern fn rt_dir_remove_all(path: text) -> bool
+extern fn rt_file_read_text_at(path: text, offset: i64, size: i64) -> text
+extern fn rt_env_cwd() -> text
+
+use std.io_runtime.{read_file, write_file, file_exists, process_run, dir_create, file_delete, file_size}
+use examples.mcpgdb.json_helpers.{shell_bin, shell_quote, shell_sleep, find_binary, LB, RB, jp, js, jo0}
+use examples.mcpgdb.state.{DebugSession, WorkspaceState, MCPGDB_WORKSPACE, MCPGDB_OPEN_FILES}
+
+fn cwd_path() -> text:
+    val cwd = rt_env_cwd()
+    if cwd != "":
+        return cwd
+    "."
+
+fn choose_workspace_root(root: text) -> text:
+    if root != "":
+        return root
+    cwd_path()
+
+fn gdb_binary() -> text:
+    find_binary("GDB_BINARY", ["gdb", "gdb-multiarch"])
+
+fn lldb_binary() -> text:
+    find_binary("LLDB_BINARY", ["lldb"])
+
+fn clangd_binary() -> text:
+    find_binary("CLANGD_BINARY", ["clangd"])
+
+fn ps_is_alive(pid: text) -> bool:
+    if pid == "":
+        return false
+    val (_stdout, _stderr, code) = process_run(shell_bin(), ["-c", "ps -p " + shell_quote(pid) + " >/dev/null 2>&1"])
+    code == 0
+
+fn session_prompt(session_id: text) -> text:
+    "[mcpgdb:" + session_id + "] "
+
+fn debugger_launch_command(session: DebugSession) -> text:
+    if session.backend == "lldb":
+        val lldb = lldb_binary()
+        if lldb == "":
+            return ""
+        return shell_quote(lldb) + " --no-lldbinit"
+    val gdb = gdb_binary()
+    if gdb == "":
+        return ""
+    shell_quote(gdb) + " --quiet --nx"
+
+fn init_debugger_session(session: DebugSession) -> DebugSession:
+    var updated = session
+    val prompt = session_prompt(session.session_id)
+    updated.prompt = prompt
+    if session.backend == "lldb":
+        val _r = run_session_command(updated, "settings set prompt " + prompt, true)
+        val _r2 = run_session_command(updated, "settings set auto-confirm true", true)
+        return updated
+    val _r3 = run_session_command(updated, "set pagination off", true)
+    val _r4 = run_session_command(updated, "set confirm off", true)
+    val _r5 = run_session_command(updated, "set prompt " + prompt, true)
+    updated
+
+fn create_debugger_process(session: DebugSession) -> (DebugSession, text):
+    var updated = session
+    dir_create(updated.session_dir, true)
+    val launch = debugger_launch_command(updated)
+    if launch == "":
+        return (updated, "required debugger binary not found for backend " + updated.backend)
+    val cmd = "rm -f " + shell_quote(updated.input_path) + " " + shell_quote(updated.output_path) + " " + shell_quote(updated.error_path)
+        + " ; mkfifo " + shell_quote(updated.input_path)
+        + " ; : > " + shell_quote(updated.output_path)
+        + " ; : > " + shell_quote(updated.error_path)
+        + " ; nohup " + launch + " < " + shell_quote(updated.input_path)
+        + " > " + shell_quote(updated.output_path)
+        + " 2> " + shell_quote(updated.error_path)
+        + " < /dev/null & echo $!"
+    val (stdout, stderr, code) = process_run(shell_bin(), ["-c", cmd])
+    if code != 0:
+        return (updated, "failed to launch debugger: " + stderr.trim())
+    updated.process_pid = stdout.trim()
+    if updated.process_pid == "":
+        return (updated, "failed to capture debugger pid")
+    shell_sleep("0.10")
+    if not ps_is_alive(updated.process_pid):
+        return (updated, "debugger process exited immediately")
+    updated = init_debugger_session(updated)
+    updated.state = "ready"
+    (updated, "")
+
+fn send_fifo_line(fifo_path: text, line: text) -> text:
+    val (stdout, stderr, code) =
+        process_run(shell_bin(), ["-c", "printf '%s\\n' " + shell_quote(line) + " > " + shell_quote(fifo_path)])
+    if code != 0:
+        if stderr.trim() != "":
+            return stderr.trim()
+        return stdout.trim()
+    ""
+
+fn read_output_delta(path: text, offset: i64) -> text:
+    val current = file_size(path)
+    if current <= offset:
+        return ""
+    rt_file_read_text_at(path, offset, current - offset) ?? ""
+
+fn strip_prompt(output: text, prompt: text) -> text:
+    var result = output
+    if result.contains(prompt):
+        val idx_opt = result.last_index_of(prompt)
+        match idx_opt:
+            Some(idx):
+                result = result.substring(0, idx)
+            nil: pass
+    result.trim()
+
+fn run_session_command(session: DebugSession, command: text, allow_timeout: bool) -> text:
+    if session.process_pid == "" or not ps_is_alive(session.process_pid):
+        return LB() + jp("status", js("error")) + "," + jp("message", js("session process is not alive")) + RB()
+    val before = file_size(session.output_path)
+    val err_text = send_fifo_line(session.input_path, command)
+    if err_text != "":
+        return LB() + jp("status", js("error")) + "," + jp("message", js(err_text)) + RB()
+    var attempt = 0
+    var chunk = ""
+    while attempt < 30:
+        shell_sleep("0.05")
+        chunk = read_output_delta(session.output_path, before)
+        if chunk != "" and (session.prompt == "" or chunk.contains(session.prompt)):
+            break
+        attempt = attempt + 1
+    if chunk == "" and not allow_timeout:
+        val stderr_text = read_file(session.error_path) ?? ""
+        return LB() + jp("status", js("error")) + "," + jp("message", js("no backend response")) + "," + jp("stderr", js(stderr_text.trim())) + RB()
+    val clean = strip_prompt(chunk, session.prompt)
+    var result = LB()
+    result = result + jp("status", js("ok"))
+    result = result + "," + jp("command", js(command))
+    result = result + "," + jp("output", js(clean))
+    result = result + RB()
+    result
+
+fn build_session_dir(session_id: text) -> text:
+    "/tmp/mcpgdb_" + session_id
+
+fn make_session(session_id: text, backend: text, workspace_root: text) -> DebugSession:
+    val session_dir = build_session_dir(session_id)
+    DebugSession(
+        session_id: session_id,
+        backend: backend,
+        state: "starting",
+        workspace_root: workspace_root,
+        process_pid: "",
+        input_path: session_dir + "/stdin.fifo",
+        output_path: session_dir + "/stdout.log",
+        error_path: session_dir + "/stderr.log",
+        session_dir: session_dir,
+        prompt: "",
+        remote_host: "",
+        remote_port: "",
+        current_thread: "",
+        current_frame: "",
+        bootstrap_monitor: ""
+    )
+
+fn stop_session_process(session: DebugSession):
+    if session.process_pid != "":
+        process_run(shell_bin(), ["-c", "kill " + shell_quote(session.process_pid) + " >/dev/null 2>&1 || true"])
+    rt_dir_remove_all(session.session_dir)
+
+fn detect_compile_commands_dir(root: text) -> text:
+    val direct = root + "/compile_commands.json"
+    if file_exists(direct):
+        return root
+    val build = root + "/build/compile_commands.json"
+    if file_exists(build):
+        return root + "/build"
+    ""
+
+fn next_clangd_request_id() -> text:
+    val id = str(MCPGDB_WORKSPACE.clangd_request_seq)
+    MCPGDB_WORKSPACE.clangd_request_seq = MCPGDB_WORKSPACE.clangd_request_seq + 1
+    id
+
+fn clangd_uri(path: text) -> text:
+    if path.starts_with("/"):
+        return "file://" + path
+    "file://" + cwd_path() + "/" + path
+
+fn start_clangd_workspace(root: text, compile_dir: text) -> text:
+    val binary = clangd_binary()
+    if binary == "":
+        return "clangd binary not found"
+    val dir = "/tmp/mcpgdb_clangd_" + root.replace("/", "_")
+    dir_create(dir, true)
+    val input_path = dir + "/stdin.fifo"
+    val output_path = dir + "/stdout.log"
+    val error_path = dir + "/stderr.log"
+    var cdir = compile_dir
+    if cdir == "":
+        cdir = detect_compile_commands_dir(root)
+    var arg_text = shell_quote(binary) + " --background-index"
+    if cdir != "":
+        arg_text = arg_text + " --compile-commands-dir=" + shell_quote(cdir)
+    val cmd = "rm -f " + shell_quote(input_path) + " " + shell_quote(output_path) + " " + shell_quote(error_path)
+        + " ; mkfifo " + shell_quote(input_path)
+        + " ; : > " + shell_quote(output_path)
+        + " ; : > " + shell_quote(error_path)
+        + " ; nohup " + arg_text + " < " + shell_quote(input_path) + " > " + shell_quote(output_path) + " 2> " + shell_quote(error_path) + " < /dev/null & echo $!"
+    val (stdout, stderr, code) = process_run(shell_bin(), ["-c", cmd])
+    if code != 0:
+        return "failed to launch clangd: " + stderr.trim()
+    MCPGDB_WORKSPACE.root = root
+    MCPGDB_WORKSPACE.compile_commands_dir = cdir
+    MCPGDB_WORKSPACE.clangd_binary = binary
+    MCPGDB_WORKSPACE.clangd_pid = stdout.trim()
+    MCPGDB_WORKSPACE.clangd_input_path = input_path
+    MCPGDB_WORKSPACE.clangd_output_path = output_path
+    MCPGDB_WORKSPACE.clangd_error_path = error_path
+    MCPGDB_WORKSPACE.clangd_dir = dir
+    MCPGDB_WORKSPACE.clangd_request_seq = 1
+    MCPGDB_WORKSPACE.clangd_output_offset = 0
+    MCPGDB_OPEN_FILES = []
+    shell_sleep("0.10")
+    if not ps_is_alive(MCPGDB_WORKSPACE.clangd_pid):
+        return "clangd process exited immediately"
+    ""
+
+fn stop_clangd_workspace():
+    if MCPGDB_WORKSPACE.clangd_pid != "":
+        process_run(shell_bin(), ["-c", "kill " + shell_quote(MCPGDB_WORKSPACE.clangd_pid) + " >/dev/null 2>&1 || true"])
+    if MCPGDB_WORKSPACE.clangd_dir != "":
+        rt_dir_remove_all(MCPGDB_WORKSPACE.clangd_dir)
+    MCPGDB_WORKSPACE = WorkspaceState(
+        root: "",
+        compile_commands_dir: "",
+        clangd_binary: "",
+        clangd_pid: "",
+        clangd_input_path: "",
+        clangd_output_path: "",
+        clangd_error_path: "",
+        clangd_dir: "",
+        clangd_request_seq: 1,
+        clangd_output_offset: 0
+    )
+    MCPGDB_OPEN_FILES = []
+
+fn send_clangd_message(body: text) -> text:
+    val header = "Content-Length: " + str(body.len()) + "\r\n\r\n" + body
+    val (stdout, stderr, code) =
+        process_run(shell_bin(), ["-c", "printf '%s' " + shell_quote(header) + " > " + shell_quote(MCPGDB_WORKSPACE.clangd_input_path)])
+    if code != 0:
+        if stderr.trim() != "":
+            return stderr.trim()
+        return stdout.trim()
+    ""
+
+fn parse_content_length_header(header: text) -> i64:
+    if not header.starts_with("Content-Length:"):
+        return -1
+    val value = header.replace("Content-Length:", "").trim()
+    int(value) ?? -1
+
+fn read_clangd_until_id(request_id: text, timeout_ticks: i64) -> text:
+    var attempts = 0
+    while attempts < timeout_ticks:
+        shell_sleep("0.05")
+        val chunk = read_output_delta(MCPGDB_WORKSPACE.clangd_output_path, MCPGDB_WORKSPACE.clangd_output_offset)
+        if chunk != "":
+            MCPGDB_WORKSPACE.clangd_output_offset = file_size(MCPGDB_WORKSPACE.clangd_output_path)
+            val msg = find_lsp_message_for_id(chunk, request_id)
+            if msg != "":
+                return msg
+        attempts = attempts + 1
+    ""
+
+fn find_lsp_message_for_id(buffer: text, request_id: text) -> text:
+    var cursor = 0
+    while cursor < buffer.len():
+        val header_idx_opt = buffer.substring(cursor).index_of("Content-Length:")
+        var header_idx = -1
+        match header_idx_opt:
+            Some(i): header_idx = cursor + i
+            nil: return ""
+        val sep_idx_opt = buffer.substring(header_idx).index_of("\r\n\r\n")
+        var sep_idx = -1
+        match sep_idx_opt:
+            Some(i): sep_idx = header_idx + i
+            nil: return ""
+        val header = buffer.substring(header_idx, sep_idx)
+        val length = parse_content_length_header(header)
+        if length < 0:
+            return ""
+        val body_start = sep_idx + 4
+        val body_end = body_start + length
+        if body_end > buffer.len():
+            return ""
+        val body = buffer.substring(body_start, body_end)
+        if body.contains("\"id\":" + request_id) or body.contains("\"id\": " + request_id):
+            return body
+        cursor = body_end
+    ""
+
+fn ensure_file_opened(path: text):
+    val uri = clangd_uri(path)
+    for open_path in MCPGDB_OPEN_FILES:
+        if open_path == path:
+            return
+    val text = read_file(path) ?? ""
+    val params = LB()
+        + jp("textDocument", LB()
+            + jp("uri", js(uri))
+            + "," + jp("languageId", js("cpp"))
+            + "," + jp("version", "1")
+            + "," + jp("text", js(text))
+            + RB())
+        + RB()
+    val body = LB()
+        + jp("jsonrpc", js("2.0"))
+        + "," + jp("method", js("textDocument/didOpen"))
+        + "," + jp("params", params)
+        + RB()
+    val _err = send_clangd_message(body)
+    MCPGDB_OPEN_FILES.push(path)
+
+fn clangd_initialize(root: text) -> text:
+    val request_id = next_clangd_request_id()
+    val params = LB()
+        + jp("processId", "null")
+        + "," + jp("rootUri", js(clangd_uri(root)))
+        + "," + jp("capabilities", jo0())
+        + RB()
+    val body = LB()
+        + jp("jsonrpc", js("2.0"))
+        + "," + jp("id", request_id)
+        + "," + jp("method", js("initialize"))
+        + "," + jp("params", params)
+        + RB()
+    val err = send_clangd_message(body)
+    if err != "":
+        return err
+    val response = read_clangd_until_id(request_id, 40)
+    if response == "":
+        return "clangd initialize timeout"
+    val init_body = LB() + jp("jsonrpc", js("2.0")) + "," + jp("method", js("initialized")) + "," + jp("params", jo0()) + RB()
+    val _err2 = send_clangd_message(init_body)
+    ""

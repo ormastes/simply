@@ -1,0 +1,189 @@
+# logic_ipc_layout_core — single source of truth for the wave-3 4-core IPC shared-
+# memory word layout (design contract: doc/05_design/hardware/nvme_fw_multicore/
+# fourcore_ipc_index_handle_design.md §3 region map, §4 rings, §5 buf pool).
+# Pure scalar i64/i32 fns only (fw_rv32 freestanding style: no arrays, no heap,
+# no module-level val/const initializers — see const_drift_check.spl header).
+# Both fw_rv32 (rv32 boot path, via the asm-stub shm accessor) and the host-only
+# *_check.spl harnesses import this file so layout never drifts between them.
+
+# ── header words (0..3) ─────────────────────────────────────────────────────
+fn ipc_gate_idx() -> i64:
+    0
+
+fn ipc_census_idx() -> i64:
+    1
+
+fn ipc_err_count_idx() -> i64:
+    2
+
+fn ipc_reserved_idx() -> i64:
+    3
+
+fn gate_magic() -> i64:
+    0x4E564D45
+
+# NULL sentinel — used throughout this file and by every fw_rv32/host consumer
+# of IPC indices. Never a bare -1 (design doc §2 rule 3).
+fn ipc_null_idx() -> i64:
+    -1
+
+# ── ring shape (§4) ──────────────────────────────────────────────────────────
+fn ring_depth() -> i64:
+    8
+
+fn msg_words() -> i64:
+    4
+
+fn ring_hdr_words() -> i64:
+    4
+
+fn ring_words() -> i64:
+    36
+
+fn ring_count() -> i64:
+    6
+
+# ── ring ids (§4) ─────────────────────────────────────────────────────────────
+fn r_hil2ftl() -> i64:
+    0
+
+fn r_ftl2hil() -> i64:
+    1
+
+fn r_ftl2fil() -> i64:
+    2
+
+fn r_fil2ftl() -> i64:
+    3
+
+fn r_fil2nand() -> i64:
+    4
+
+fn r_nand2fil() -> i64:
+    5
+
+# ── ring region addressing (fail-closed bounds checks) ───────────────────────
+fn ring_id_valid(r: i64) -> i32:
+    if r < 0:
+        return 0
+    if r >= ring_count():
+        return 0
+    1
+
+# first ring's base word == ipc_reserved_idx() + 1 == 4 (single source of truth
+# for the "rings start right after the 4 header words" fact).
+fn ring_region_start_idx() -> i64:
+    ipc_reserved_idx() + 1
+
+fn ring_base(r: i64) -> i64:
+    if ring_id_valid(r) == 0:
+        return ipc_null_idx()
+    ring_region_start_idx() + r * ring_words()
+
+fn ring_head_idx(r: i64) -> i64:
+    val base: i64 = ring_base(r)
+    if base == ipc_null_idx():
+        return ipc_null_idx()
+    base + 0
+
+fn ring_tail_idx(r: i64) -> i64:
+    val base: i64 = ring_base(r)
+    if base == ipc_null_idx():
+        return ipc_null_idx()
+    base + 1
+
+fn ring_drop_idx(r: i64) -> i64:
+    val base: i64 = ring_base(r)
+    if base == ipc_null_idx():
+        return ipc_null_idx()
+    base + 2
+
+# word index of `word` (0..MSG_WORDS-1) of the payload slot that free-running
+# counter `counter` maps to in ring `r`. Fail-closed: invalid ring id, invalid
+# word offset, or a negative counter all return IPC_NULL_IDX.
+fn ring_slot_idx(r: i64, counter: i64, word: i64) -> i64:
+    val base: i64 = ring_base(r)
+    if base == ipc_null_idx():
+        return ipc_null_idx()
+    if word < 0:
+        return ipc_null_idx()
+    if word >= msg_words():
+        return ipc_null_idx()
+    if counter < 0:
+        return ipc_null_idx()
+    val slot: i64 = counter & (ring_depth() - 1)
+    base + ring_hdr_words() + slot * msg_words() + word
+
+# ── buf pool (§5): fixed 16-slot pool, header + NEXT[16] + DATA[16] ──────────
+fn buf_pool_base() -> i64:
+    220
+
+fn buf_pool_capacity() -> i64:
+    16
+
+fn buf_pool_free_head_idx() -> i64:
+    buf_pool_base() + 0
+
+fn buf_pool_alloc_count_idx() -> i64:
+    buf_pool_base() + 1
+
+fn buf_pool_next_base_idx() -> i64:
+    buf_pool_base() + 2
+
+fn buf_pool_data_base_idx() -> i64:
+    buf_pool_base() + 18
+
+fn buf_slot_valid(slot: i64) -> i32:
+    if slot < 0:
+        return 0
+    if slot >= buf_pool_capacity():
+        return 0
+    1
+
+fn buf_pool_next_idx(slot: i64) -> i64:
+    if buf_slot_valid(slot) == 0:
+        return ipc_null_idx()
+    buf_pool_next_base_idx() + slot
+
+fn buf_pool_data_idx(slot: i64) -> i64:
+    if buf_slot_valid(slot) == 0:
+        return ipc_null_idx()
+    buf_pool_data_base_idx() + slot
+
+# ── NAND-emulation region (core3 only, §3) ───────────────────────────────────
+fn nand_state_base() -> i64:
+    256
+
+fn nand_data_base() -> i64:
+    4352
+
+# ── COROSTATE region (wave-4 statement-like coroutine/state-machine
+# discipline; design contract: doc/05_design/hardware/nvme_fw_coroutine/
+# coroutine_statemachine_design.md §1). One word per core (core 0..3 =
+# HIL/FTL/FIL/NAND). Appended at the END of the map: no landed base moves,
+# existing drift oracles (ipc_drift_check.spl) stay valid. ──────────────────
+fn corostate_base() -> i64:
+    8448
+
+# Fail-closed bounds check (design §1): only core 0..3 map to a real
+# corostate word; anything else (including negative core ids) is IPC_NULL_IDX.
+fn corostate_idx(core: i64) -> i64:
+    if core < 0:
+        return ipc_null_idx()
+    if core > 3:
+        return ipc_null_idx()
+    corostate_base() + core
+
+# ── whole-region constants ────────────────────────────────────────────────────
+fn ipc_shm_words() -> i64:
+    8452
+
+fn spin_max() -> i64:
+    1000000
+
+fn shm_idx_valid(idx: i64) -> i32:
+    if idx < 0:
+        return 0
+    if idx >= ipc_shm_words():
+        return 0
+    1

@@ -1,0 +1,72 @@
+# Restaurant Lane — table orders on the shared guarded-write framework
+#
+# Owns the MenuItem/TableOrder shapes, the forward-only order state machine,
+# and split-bill/tip math. Writes go through framework.gate_write with action
+# "restaurant.write" so the session -> rbac -> validation -> idempotency order
+# is enforced once.
+
+use framework.guarded.{Tenant, Actor, Session, WriteResult, gate_write}
+use std.nogc_sync_mut.enterprise_store.store.{EnterpriseStore}
+
+struct MenuItem:
+    val id: i64
+    val name: text
+    val price: i64
+    val available: bool
+
+# Domain validity: identity present, name filled, non-negative price.
+fn validate_menu_item(item: MenuItem) -> bool:
+    return (item.id > 0 and item.name.len() > 0 and item.price >= 0)
+
+struct TableOrder:
+    val id: i64
+    val table_no: i64
+    val item_ids: [i64]
+    val status: text
+    val total: i64
+
+# Domain validity: identity present, seated at a real table, at least one item,
+# non-negative total.
+fn validate_table_order(order: TableOrder) -> bool:
+    return (order.id > 0 and order.table_no > 0 and order.item_ids.length() > 0 and order.total >= 0)
+
+# Sum the price of every available menu item referenced by the order.
+fn order_total(items: [MenuItem], item_ids: [i64]) -> i64:
+    var total = 0
+    for item_id in item_ids:
+        for item in items:
+            if item.id == item_id and item.available:
+                total = total + item.price
+    return total
+
+# Forward-only transitions: open -> kitchen -> served -> closed. Any other
+# transition is rejected by returning the order unchanged.
+fn send_to_kitchen(order: TableOrder) -> TableOrder:
+    if order.status != "open":
+        return order
+    return TableOrder { id: order.id, table_no: order.table_no, item_ids: order.item_ids, status: "kitchen", total: order.total }
+
+fn serve(order: TableOrder) -> TableOrder:
+    if order.status != "kitchen":
+        return order
+    return TableOrder { id: order.id, table_no: order.table_no, item_ids: order.item_ids, status: "served", total: order.total }
+
+fn close_order(order: TableOrder) -> TableOrder:
+    if order.status != "served":
+        return order
+    return TableOrder { id: order.id, table_no: order.table_no, item_ids: order.item_ids, status: "closed", total: order.total }
+
+# Even split of the total across `ways` diners, rounded up so the house is
+# never short a minor unit.
+fn split_bill(total: i64, ways: i64) -> i64:
+    if ways <= 0:
+        return total
+    return (total + ways - 1) / ways
+
+# Tip on the total at the given whole-number percent.
+fn tip_amount(total: i64, percent: i64) -> i64:
+    return total * percent / 100
+
+# The lane's single write entry point.
+fn submit_order_write(session: Session, tenant: Tenant, user: Actor, order: TableOrder, key: text, store: EnterpriseStore) -> WriteResult:
+    return gate_write(store, session, tenant, user, "restaurant.write", validate_table_order(order), key)

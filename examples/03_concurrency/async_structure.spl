@@ -1,0 +1,114 @@
+# Async Structure Demo - Shows API without requiring execution
+#
+# This demo shows the async API structure and types without
+# requiring full interpreter support for function fields.
+
+use std.async_core.*
+use std.async_embedded.*
+use std.async_sffi.*
+
+fn main():
+    print "=========================================="
+    print "Simple Async Runtime - Structure Demo"
+    print "=========================================="
+
+    demo_types()
+    demo_constants()
+    demo_sffi()
+    demo_structures()
+
+    print ""
+    print "=========================================="
+    print "Structure Demo Complete!"
+    print "=========================================="
+    print ""
+    print "Note: Full execution requires:"
+    print "  - Function field calls (task.poll_fn())"
+    print "  - Coroutine suspend/resume"
+    print "  - Test runner for SPipe tests"
+
+fn demo_types():
+    print ""
+    print "=== Core Types ==="
+
+    # Poll type
+    val ready = Poll.Ready(42)
+    val pending = Poll.Pending
+    print "  Poll.Ready(42): {ready}"
+    print "  Poll.Pending: {pending}"
+
+    # TaskState
+    print "  TaskState.Pending: {TaskState.Pending}"
+    print "  TaskState.Running: {TaskState.Running}"
+    print "  TaskState.Completed: {TaskState.Completed}"
+
+    # Priority
+    print "  Priority.Critical: {Priority.Critical}"
+    print "  Priority.High: {Priority.High}"
+    print "  Priority.Normal: {Priority.Normal}"
+    print "  Priority.Low: {Priority.Low}"
+    print "  Priority.Idle: {Priority.Idle}"
+
+fn demo_constants():
+    print ""
+    print "=== Configuration ==="
+    print "  MAX_TASKS: {MAX_TASKS}"
+    print "  MAX_FUTURES: {MAX_FUTURES}"
+    print "  DEFAULT_MAX_TASKS: {DEFAULT_MAX_TASKS}"
+    print "  DEFAULT_MAX_FUTURES: {DEFAULT_MAX_FUTURES}"
+
+fn demo_sffi():
+    print ""
+    print "=== SFFI Functions (Pure Simple) ==="
+
+    # Task ID allocation
+    val id1 = task_alloc_id()
+    val id2 = task_alloc_id()
+    val id3 = task_alloc_id()
+    print "  Allocated task IDs: {id1}, {id2}, {id3}"
+
+    # Waker operations
+    waker_signal(0, id1)
+    print "  Signaled waker for task {id1}"
+
+    val has_wake = waker_check(id1)
+    print "  Task {id1} has wake: {has_wake}"
+
+    waker_clear(id1)
+    val after_clear = waker_check(id1)
+    print "  After clear: {after_clear}"
+
+fn demo_structures():
+    print ""
+    print "=== Data Structures ==="
+
+    # EmbeddedFuture
+    val future_ready = EmbeddedFuture.ready(100)
+    val future_pending = EmbeddedFuture.pending()
+    print "  EmbeddedFuture.ready(100): {future_ready.is_ready()}"
+    print "  EmbeddedFuture.pending(): {future_pending.is_ready()}"
+
+    # EmbeddedJoinSet
+    var join_set = EmbeddedJoinSet.new()
+    print "  EmbeddedJoinSet capacity: {join_set.capacity()}"
+    print "  EmbeddedJoinSet empty: {join_set.is_empty()}"
+    print "  EmbeddedJoinSet full: {join_set.is_full()}"
+
+    # EmbeddedFuturesUnordered
+    var futures = EmbeddedFuturesUnordered.new()
+    print "  FuturesUnordered capacity: {futures.capacity()}"
+    print "  FuturesUnordered length: {futures.len()}"
+
+    # EmbeddedScheduler
+    var scheduler = EmbeddedScheduler.new()
+    print "  EmbeddedScheduler tasks: {scheduler.task_count()}"
+    print "  EmbeddedScheduler idle: {scheduler.is_idle()}"
+    print "  EmbeddedScheduler active: {scheduler.active_count()}"
+
+    # Priority conversion
+    val pri_val = Priority.High.to_i32()
+    val pri_back = Priority.from_i32(pri_val)
+    print "  Priority.High.to_i32(): {pri_val}"
+    print "  Priority.from_i32({pri_val}): {pri_back}"
+
+main()

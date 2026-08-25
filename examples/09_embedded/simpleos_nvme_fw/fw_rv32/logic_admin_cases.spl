@@ -1,0 +1,12 @@
+use logic_admin_fw_cases.*
+use logic_admin_id_cases.*
+use logic_admin_smart_cases.*
+
+fn rv32_admin_cases_selftest() -> i32:
+    if rv32_admin_smart_cases_selftest() != 0:
+        return 1
+    if rv32_admin_id_cases_selftest() != 0:
+        return 1
+    if rv32_admin_fw_cases_selftest() != 0:
+        return 1
+    0

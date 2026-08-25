@@ -1,0 +1,9 @@
+plugin:
+  name: spipe
+  version: 0.1.0
+  description: Reusable SPipe feature-development process module
+  cli: cli/spipe.js
+  mcp: mcp/server.js
+  setup:
+    unix: scripts/setup-spipe-links.shs
+    windows: scripts/setup-spipe-links.ps1

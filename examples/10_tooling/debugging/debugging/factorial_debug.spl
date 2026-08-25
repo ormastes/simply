@@ -1,0 +1,35 @@
+# Factorial Example - Demonstrates Debugging
+#
+# Try these debugging scenarios:
+# 1. Set breakpoint on line 13 (inside factorial function)
+# 2. Run with F5
+# 3. Use Step Into (F11) to follow recursion
+# 4. Inspect variables: n, result
+# 5. View call stack to see recursive calls
+
+fn factorial(n: i64) -> i64:
+    # Set breakpoint here to see each recursive call
+    if n <= 1:
+        return 1
+    else:
+        val result = n * factorial(n - 1)
+        return result  # Inspect 'result' value here
+
+fn main():
+    print "Factorial Calculator"
+    print "===================="
+
+    # Try different values
+    val numbers = [5, 10, 15]
+
+    for num in numbers:
+        # Set breakpoint here to inspect loop iteration
+        val result = factorial(num)
+        print "factorial({num}) = {result}"
+
+    # Demonstrate variable inspection
+    val x = 42
+    val y = x * 2
+    val z = y + 10  # Set breakpoint here, inspect x, y, z
+
+    print "\nDebugging complete!"

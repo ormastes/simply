@@ -1,0 +1,41 @@
+"""
+dram_buffer_check — bounded DRAM write-arena floor (gap-closure P5).
+
+Run: bin/simple run examples/09_embedded/simpleos_nvme_fw/fw/dram_buffer_check.spl
+"""
+
+use nvme_types.*
+use hil.*
+use hil_command.*
+use dram.*
+
+fn main():
+    var fail: i64 = 0
+    var h: Hil = hil_new()
+
+    fail = fail + expect_eq(WRITE_BUFFER_CAP_BLOCKS * WRITE_BUFFER_ENTRY_BYTES, WRITE_BUFFER_DRAM_BUDGET_BYTES, "write buffer budget")
+
+    h.submit(cmd_make(1, OP_WRITE, 90, WRITE_BUFFER_CAP_BLOCKS, prp_pack(0x20, 0x80)))
+    h.run()
+    val fit: NvmeCpl = h.reap()
+    fail = fail + expect_eq(fit.status, SC_SUCCESS, "capacity-sized write succeeds")
+
+    h.submit(cmd_make(2, OP_WRITE, 120, WRITE_BUFFER_CAP_BLOCKS + 1, 0x40))
+    h.run()
+    val over: NvmeCpl = h.reap()
+    fail = fail + expect_eq(over.status, SC_NS_NOT_READY, "over-capacity write rejected")
+
+    h.submit(cmd_make(3, OP_READ, 120, 1, 0))
+    h.run()
+    val untouched: NvmeCpl = h.reap()
+    fail = fail + expect_eq(untouched.data, 0, "over-capacity write leaves media untouched")
+
+    h.submit(cmd_make(4, OP_WRITE, 130, WRITE_BUFFER_CAP_BLOCKS, prp_pack(0x50, 0xA0)))
+    h.run()
+    val reuse: NvmeCpl = h.reap()
+    fail = fail + expect_eq(reuse.status, SC_SUCCESS, "released DRAM span is reusable")
+
+    if fail == 0:
+        print "DRAM BUFFER OK"
+    else:
+        print "DRAM BUFFER FAIL ({fail})"

@@ -1,0 +1,1175 @@
+"""
+nvme_controller — the full NVMe controller front end.
+
+Composes the admin path and the multi-queue IO path over the existing
+translation/flash stack:
+
+  AdminQueue (qid 0) ─► admin_process ─► QueueSet create/delete, Identify,
+                                          Get/Set Features, Get Log Page
+  QueueSet IO SQ/CQ pairs ─► io_process ─► FTL ─► FIL ─► (emulated) NAND
+                                          behind a generation-handle task context
+
+This is the "full SSD firmware" front end. The legacy single-queue
+hil.spl/firmware.spl path stays untouched (its 225 self-test assertions remain
+the regression gate); this controller is the admin-driven, many-IO-queue layer.
+"""
+
+use nvme_types.*
+use nvme_admin_types.*
+use nvme_admin.*
+use nvme_qset.*
+use hil_command.*
+use hil_queue.*
+use fw_pool.*
+use ftl.*
+use power_thermal.*
+use dram.*
+use openssd_config.*
+use firmware.*
+
+# Result of dispatching one admin command. `post` is false only for an Async Event
+# Request held outstanding (its completion is posted later, when an event is raised).
+struct AdminResult:
+    status: i64
+    data:   i64
+    post:   bool
+
+struct NvmeController:
+    aq:       AdminQueue
+    qset:     QueueSet
+    target:   OpenSsdConfig
+    features: FeatureStore
+    ftl:      Ftl
+    pool:     TaskPool
+    last_id:  IdentifyData
+    smart:    SmartLog
+    reads:    i64
+    writes:   i64
+    power_cycles: i64
+    abort_count:  i64
+    format_count: i64
+    aer_held_cid: i64   # cid of a single outstanding AER, or NULL_IDX if none
+    aer_event:    i64   # event awaiting an AER (0 = none), if one arrived first
+    fw_revision:  i64   # active firmware revision (bumped on commit)
+    fw_dl_bytes:  i64   # bytes accumulated by the in-progress firmware download
+    media_errors: i64   # uncorrectable read errors observed (SMART)
+    unsafe_shutdowns: i64   # power cycles without a clean checkpoint (SMART)
+    error_count:  i64   # IO commands completed with a non-success status (error log)
+    last_error:   i64   # status code of the most recent failed IO command
+    dirty_since_checkpoint: bool  # true when media state changed after the last clean checkpoint
+    fw_slot:         i64   # firmware slot of the most recent successful Commit (0 = none yet)
+    last_abort_sqid: i64   # SQID decoded from the most recent Abort (NULL_IDX = none)
+    last_abort_cid:  i64   # CID  decoded from the most recent Abort (NULL_IDX = none)
+    pt:           PowerThermal   # power-state + thermal model, driven by live IO (SMART temperature)
+    wb:           DramWriteBuffer # fixed DRAM write buffer staged before FTL program
+
+fn nvme_controller_new() -> NvmeController:
+    nvme_controller_new_for_target(TARGET_SIMPLE_SIM)
+
+fn nvme_controller_new_for_target(target_id: i64) -> NvmeController:
+    NvmeController(aq: admin_queue_new(), qset: queue_set_new(), target: nvme_fw_target_config(target_id), features: feature_store_new(), ftl: ftl_new(), pool: task_pool_new(), last_id: identify_empty(), smart: smart_empty(), reads: 0, writes: 0, power_cycles: 0, abort_count: 0, format_count: 0, aer_held_cid: NULL_IDX, aer_event: 0, fw_revision: 1, fw_dl_bytes: 0, media_errors: 0, unsafe_shutdowns: 0, error_count: 0, last_error: 0, dirty_since_checkpoint: false, fw_slot: 0, last_abort_sqid: NULL_IDX, last_abort_cid: NULL_IDX, pt: power_thermal_new(), wb: dram_write_buffer_new())
+
+fn aer_event_valid(evt: i64) -> bool:
+    evt == AER_SMART_HEALTH
+
+fn fw_download_next_bytes(current: i64, dwords: i64) -> i64:
+    if current < 0 or dwords <= 0:
+        return -1
+    if current > FW_SAFE_I64_LIMIT or dwords > FW_SAFE_I64_LIMIT / 4:
+        return -1
+    val add: i64 = dwords * 4
+    if current > FW_SAFE_I64_LIMIT - add:
+        return -1
+    current + add
+
+fn identify_cap(v: i64, cap: i64) -> i64:
+    if v < 0:
+        return 0
+    if v > cap:
+        return cap
+    v
+
+impl NvmeController:
+    # ── Admin path ───────────────────────────────────────────────────────────
+    me admin_submit(c: AdminCmd) -> bool:
+        me.aq.submit(c)
+
+    me admin_completions() -> i64:
+        me.aq.cq_pending()
+
+    me admin_reap() -> NvmeCpl:
+        me.aq.cq_reap()
+
+    me last_identify() -> IdentifyData:
+        me.last_id
+
+    me last_smart() -> SmartLog:
+        me.smart
+
+    me complete_pending_aer() -> bool:
+        if me.aer_event == 0:
+            return false
+        if not aer_event_valid(me.aer_event):
+            me.aer_event = 0
+            return false
+        if not cid_valid(me.aer_held_cid):
+            return false
+        if me.aq.cq_is_full():
+            return false
+        if me.aq.cq_post(cpl_make(me.aer_held_cid, SC_SUCCESS, me.aer_event)):
+            me.aer_held_cid = NULL_IDX
+            me.aer_event = 0
+            return true
+        false
+
+    # Service every queued admin command, posting a completion for each (except an
+    # Async Event Request held outstanding). Returns the number of completions posted.
+    me admin_process() -> i64:
+        var n: i64 = 0
+        if me.complete_pending_aer():
+            n = n + 1
+        var pend: i64 = me.aq.pending()
+        while pend > 0:
+            if not me.aq.sq_can_fetch():
+                return n
+            if me.aq.cq_is_full():
+                return n
+            val cmd: AdminCmd = me.aq.fetch()
+            val r: AdminResult = me.admin_exec(cmd)
+            if r.post:
+                me.aq.cq_post(cpl_make(cmd.cid, r.status, r.data))
+                n = n + 1
+            pend = me.aq.pending()
+        n
+
+    # Dispatch one admin command to its handler.
+    me admin_exec(cmd: AdminCmd) -> AdminResult:
+        if not cid_valid(cmd.cid):
+            return AdminResult(status: SC_INVALID_FIELD, data: 0, post: true)
+        if cmd.cdw10 < 0 or cmd.cdw10 > 4294967295 or cmd.cdw11 < 0 or cmd.cdw11 > 4294967295 or cmd.cdw12 < 0 or cmd.cdw12 > 4294967295:
+            return AdminResult(status: SC_INVALID_FIELD, data: 0, post: true)
+        if cmd.opcode == ADMIN_CREATE_CQ:
+            if cmd.nsid != 0 or cmd.cdw11 != 1 or cmd.cdw12 != 0:
+                return AdminResult(status: SC_INVALID_FIELD, data: 0, post: true)
+            return AdminResult(status: me.qset.create_cq(admin_qid(cmd.cdw10), admin_qsize(cmd.cdw10)), data: 0, post: true)
+        if cmd.opcode == ADMIN_CREATE_SQ:
+            if cmd.nsid != 0 or (cmd.cdw11 & 0xFFFF) != 1 or cmd.cdw12 != 0:
+                return AdminResult(status: SC_INVALID_FIELD, data: 0, post: true)
+            return AdminResult(status: me.qset.create_sq(admin_qid(cmd.cdw10), admin_qsize(cmd.cdw10), admin_cqid(cmd.cdw11)), data: 0, post: true)
+        if cmd.opcode == ADMIN_DELETE_SQ:
+            if cmd.nsid != 0 or cmd.cdw11 != 0 or cmd.cdw12 != 0 or cmd.cdw10 != admin_qid(cmd.cdw10):
+                return AdminResult(status: SC_INVALID_FIELD, data: 0, post: true)
+            return AdminResult(status: me.qset.delete_sq(admin_qid(cmd.cdw10)), data: 0, post: true)
+        if cmd.opcode == ADMIN_DELETE_CQ:
+            if cmd.nsid != 0 or cmd.cdw11 != 0 or cmd.cdw12 != 0 or cmd.cdw10 != admin_qid(cmd.cdw10):
+                return AdminResult(status: SC_INVALID_FIELD, data: 0, post: true)
+            return AdminResult(status: me.qset.delete_cq(admin_qid(cmd.cdw10)), data: 0, post: true)
+        if cmd.opcode == ADMIN_IDENTIFY:
+            return AdminResult(status: me.do_identify(cmd), data: 0, post: true)
+        if cmd.opcode == ADMIN_SET_FEATURES:
+            if cmd.nsid != 0 or cmd.cdw12 != 0 or cmd.cdw10 != admin_fid(cmd.cdw10):
+                return AdminResult(status: SC_INVALID_FIELD, data: 0, post: true)
+            val fid: i64 = admin_fid(cmd.cdw10)
+            if fid != FEAT_POWER_MGMT and fid != FEAT_TEMP_THRESH and fid != FEAT_VOLATILE_WC and fid != FEAT_NUM_QUEUES:
+                return AdminResult(status: SC_INVALID_FIELD, data: 0, post: true)
+            if fid == FEAT_POWER_MGMT:
+                val ps_status: i64 = me.pt.set_power_state(cmd.cdw11)
+                if ps_status != SC_SUCCESS:
+                    return AdminResult(status: ps_status, data: 0, post: true)
+            if fid == FEAT_TEMP_THRESH:
+                val tt_status: i64 = me.pt.set_temperature_threshold(cmd.cdw11)
+                if tt_status != SC_SUCCESS:
+                    return AdminResult(status: tt_status, data: 0, post: true)
+            if fid == FEAT_VOLATILE_WC:
+                if cmd.cdw11 < 0 or cmd.cdw11 > 1:
+                    return AdminResult(status: SC_INVALID_FIELD, data: 0, post: true)
+            if fid == FEAT_NUM_QUEUES:
+                val ncqr: i64 = cmd.cdw11 & 0xFFFF
+                val nsqr: i64 = (cmd.cdw11 >> 16) & 0xFFFF
+                if cmd.cdw11 != ((nsqr << 16) | ncqr) or ncqr < 0 or nsqr < 0 or ncqr >= MAX_IO_QUEUES or nsqr >= MAX_IO_QUEUES:
+                    return AdminResult(status: SC_INVALID_FIELD, data: 0, post: true)
+            if not me.features.set(fid, cmd.cdw11):
+                return AdminResult(status: SC_INVALID_FIELD, data: 0, post: true)
+            return AdminResult(status: SC_SUCCESS, data: cmd.cdw11, post: true)
+        if cmd.opcode == ADMIN_GET_FEATURES:
+            if cmd.nsid != 0 or cmd.cdw11 != 0 or cmd.cdw12 != 0 or cmd.cdw10 != admin_fid(cmd.cdw10):
+                return AdminResult(status: SC_INVALID_FIELD, data: 0, post: true)
+            val fid: i64 = admin_fid(cmd.cdw10)
+            if fid != FEAT_POWER_MGMT and fid != FEAT_TEMP_THRESH and fid != FEAT_VOLATILE_WC and fid != FEAT_NUM_QUEUES:
+                return AdminResult(status: SC_INVALID_FIELD, data: 0, post: true)
+            if fid == FEAT_POWER_MGMT:
+                return AdminResult(status: SC_SUCCESS, data: me.pt.get_power_state(), post: true)
+            if fid == FEAT_TEMP_THRESH:
+                return AdminResult(status: SC_SUCCESS, data: me.pt.get_temperature_threshold(), post: true)
+            return AdminResult(status: SC_SUCCESS, data: me.features.get(fid), post: true)
+        if cmd.opcode == ADMIN_GET_LOG:
+            return me.do_get_log(cmd)
+        if cmd.opcode == ADMIN_ABORT:
+            if cmd.nsid != 0 or cmd.cdw11 != 0 or cmd.cdw12 != 0:
+                return AdminResult(status: SC_INVALID_FIELD, data: 0, post: true)
+            val abort_sqid: i64 = admin_qid(cmd.cdw10)
+            if abort_sqid != ADMIN_QID and not me.qset.sq_is_active(abort_sqid):
+                return AdminResult(status: SC_INVALID_QID, data: 0, post: true)
+            me.abort_count = smart_counter_next(me.abort_count)
+            # Decode and record the Abort target (SQID in cdw10 low 16, CID in high 16).
+            me.last_abort_sqid = abort_sqid
+            me.last_abort_cid = admin_abort_cid(cmd.cdw10)
+            # Synchronous controller: a submitted IO command completes inline within
+            # io_process, so no host command is ever in flight when an Abort is serviced.
+            # Per NVMe, completion dword0 bit0 = 1 means "command not aborted" (already done).
+            return AdminResult(status: SC_SUCCESS, data: 1, post: true)
+        if cmd.opcode == ADMIN_FORMAT_NVM:
+            if cmd.nsid != 1:
+                return AdminResult(status: SC_INVALID_FIELD, data: 0, post: true)
+            if cmd.cdw10 != 0 or cmd.cdw11 != 0 or cmd.cdw12 != 0:
+                return AdminResult(status: SC_INVALID_FIELD, data: 0, post: true)
+            me.ftl.format()                    # erase user data; preserve bad-block table + wear
+            me.format_count = smart_counter_next(me.format_count)
+            me.dirty_since_checkpoint = false
+            return AdminResult(status: SC_SUCCESS, data: 0, post: true)
+        if cmd.opcode == ADMIN_FW_DOWNLOAD:
+            if cmd.nsid != 0 or cmd.cdw10 <= 0 or cmd.cdw11 < 0 or cmd.cdw12 != 0:
+                return AdminResult(status: SC_INVALID_FIELD, data: 0, post: true)
+            if me.fw_dl_bytes < 0:
+                me.fw_dl_bytes = 0
+            if cmd.cdw11 != me.fw_dl_bytes / 4:
+                return AdminResult(status: SC_INVALID_FIELD, data: 0, post: true)
+            val next_bytes: i64 = fw_download_next_bytes(me.fw_dl_bytes, cmd.cdw10)
+            if next_bytes < 0:
+                return AdminResult(status: SC_INVALID_FIELD, data: 0, post: true)
+            me.fw_dl_bytes = next_bytes   # NUMD dwords accumulated
+            return AdminResult(status: SC_SUCCESS, data: 0, post: true)
+        if cmd.opcode == ADMIN_FW_COMMIT:
+            val fw_slot: i64 = admin_fw_slot(cmd.cdw10)       # cdw10 bits 0..2
+            val fw_action: i64 = admin_fw_action(cmd.cdw10)   # cdw10 bits 3..5
+            if cmd.nsid != 0 or cmd.cdw11 != 0 or cmd.cdw12 != 0 or cmd.cdw10 != ((fw_action << 3) | fw_slot):
+                return AdminResult(status: SC_INVALID_FIELD, data: 0, post: true)
+            if not admin_fw_slot_valid(fw_slot):
+                return AdminResult(status: SC_INVALID_FIELD, data: 0, post: true)
+            if fw_action > 3:
+                return AdminResult(status: SC_INVALID_FIELD, data: 0, post: true)
+            if me.fw_dl_bytes <= 0:
+                return AdminResult(status: SC_INVALID_FIELD, data: 0, post: true)
+            me.fw_slot = fw_slot
+            # Commit action 0 = replace image only (no activation); actions 1..3 activate it,
+            # so the running firmware revision advances. (The model collapses "activate on next
+            # reset" to immediate, since it does not model a controller reset.)
+            if fw_action != 0:
+                me.fw_revision = smart_counter_next(me.fw_revision)
+            me.fw_dl_bytes = 0
+            return AdminResult(status: SC_SUCCESS, data: 0, post: true)
+        if cmd.opcode == ADMIN_ASYNC_EVENT:
+            return me.admin_async_event(cmd)
+        AdminResult(status: SC_INVALID_OPCODE, data: 0, post: true)
+
+    # Async Event Request: complete immediately if an event is already pending,
+    # otherwise hold the request outstanding (no completion) until one is raised.
+    me admin_async_event(cmd: AdminCmd) -> AdminResult:
+        if cmd.cdw10 != 0 or cmd.cdw11 != 0 or cmd.cdw12 != 0 or cmd.nsid != 0:
+            return AdminResult(status: SC_INVALID_FIELD, data: 0, post: true)
+        if me.aer_event != 0:
+            if not aer_event_valid(me.aer_event):
+                me.aer_event = 0
+            else:
+                val evt: i64 = me.aer_event
+                me.aer_event = 0
+                return AdminResult(status: SC_SUCCESS, data: evt, post: true)
+        if me.aer_held_cid == NULL_IDX:
+            me.aer_held_cid = cmd.cid
+            return AdminResult(status: SC_SUCCESS, data: 0, post: false)
+        AdminResult(status: SC_INVALID_FIELD, data: 0, post: true)   # AER limit (1) exceeded
+
+    # Raise an asynchronous event: complete a held AER now, or remember it for the
+    # next AER the host posts.
+    me raise_async_event(evt: i64):
+        if not aer_event_valid(evt):
+            return
+        if me.aer_held_cid != NULL_IDX:
+            if cid_valid(me.aer_held_cid):
+                me.aer_event = evt
+                me.complete_pending_aer()
+            else:
+                me.aer_held_cid = NULL_IDX
+                me.aer_event = evt
+        else:
+            me.aer_event = evt
+
+    me aer_outstanding() -> i64:
+        var n: i64 = 0
+        if cid_valid(me.aer_held_cid):
+            n = 1
+        n
+
+    me firmware_revision() -> i64:
+        if me.fw_revision < 1:
+            return 1
+        me.fw_revision
+
+    # Firmware slot recorded by the most recent successful Commit (0 = none yet).
+    me committed_fw_slot() -> i64:
+        if not admin_fw_slot_valid(me.fw_slot):
+            return 0
+        me.fw_slot
+
+    # Target SQID / CID decoded from the most recent Abort (NULL_IDX = none seen).
+    me aborted_sqid() -> i64:
+        if me.last_abort_sqid != ADMIN_QID and not qid_in_range(me.last_abort_sqid):
+            return NULL_IDX
+        me.last_abort_sqid
+
+    me aborted_cid() -> i64:
+        if not cid_valid(me.last_abort_cid):
+            return NULL_IDX
+        me.last_abort_cid
+
+    me format_passes() -> i64:
+        smart_nonnegative(me.format_count)
+
+    me do_identify(cmd: AdminCmd) -> i64:
+        if cmd.cdw11 != 0 or cmd.cdw12 != 0 or cmd.cdw10 != admin_cns(cmd.cdw10):
+            return SC_INVALID_FIELD
+        val cns: i64 = admin_cns(cmd.cdw10)
+        if cns == CNS_CONTROLLER:
+            if cmd.nsid != 0:
+                return SC_INVALID_FIELD
+            me.last_id = build_identify_controller()
+            me.last_id.vid = identify_cap(me.target.pcie_vendor_id, 0xFFFF)
+            me.last_id.target_id = identify_cap(me.target.target_id, TARGET_OPENSSD_8CH8WAY)
+            me.last_id.channels = identify_cap(me.target.channels, NUM_CHANNELS)
+            me.last_id.ways_per_channel = identify_cap(me.target.ways_per_channel, 8)
+            me.last_id.nvme_blocks_per_slice = identify_cap(me.target.nvme_blocks_per_slice, MDTS_BLOCKS)
+            me.last_id.cpu_cores = identify_cap(me.target.cpu_cores, 2)
+            return SC_SUCCESS
+        if cns == CNS_NAMESPACE:
+            if cmd.nsid != 1:
+                return SC_INVALID_FIELD
+            me.last_id = build_identify_namespace_for_target(cmd.nsid, me.target.lbas, me.target.nvme_block_bytes)
+            return SC_SUCCESS
+        SC_INVALID_FIELD
+
+    me do_get_log(cmd: AdminCmd) -> AdminResult:
+        if cmd.nsid != 0 or cmd.cdw11 != 0 or cmd.cdw12 != 0 or cmd.cdw10 != admin_logid(cmd.cdw10):
+            return AdminResult(status: SC_INVALID_FIELD, data: 0, post: true)
+        val logid: i64 = admin_logid(cmd.cdw10)
+        if logid == LOG_SMART:
+            val pu: i64 = smart_percent_used(me.ftl.max_erase())
+            val spare: i64 = smart_avail_spare(me.ftl.bad_blocks())
+            val tk: i64 = me.pt.temperature_k()      # live composite temperature, driven by IO load
+            val tc: i64 = me.pt.critical_warning()   # thermal critical-warning bit
+            me.smart = build_smart_log(me.reads, me.writes, me.power_cycles, me.unsafe_shutdowns, me.media_errors, pu, spare, tk, tc)
+            # Host reads the full SMART page via last_smart(); the completion carries the
+            # critical-warning bit so a host that only polls completions still sees health.
+            return AdminResult(status: SC_SUCCESS, data: me.smart.crit_warning, post: true)
+        if logid == LOG_ERROR:
+            # Error Information log: the completion reports the number of error-log entries
+            # the host would retrieve (this model's width-1 log-page datum).
+            return AdminResult(status: SC_SUCCESS, data: me.error_log_count(), post: true)
+        if logid == LOG_FW_SLOT:
+            # Firmware Slot Information log: the completion reports the active firmware revision.
+            return AdminResult(status: SC_SUCCESS, data: me.firmware_revision(), post: true)
+        AdminResult(status: SC_INVALID_FIELD, data: 0, post: true)
+
+    # Error-log introspection (the Get Log Page ERROR data the host would read).
+    me error_log_count() -> i64:
+        if me.error_count < 0:
+            return 0
+        me.error_count
+
+    me last_error_status() -> i64:
+        if not cpl_status_valid(me.last_error):
+            return SC_INVALID_FIELD
+        me.last_error
+
+    # ── IO path (multi-queue) ────────────────────────────────────────────────
+    me io_submit(qid: i64, c: NvmeCmd) -> bool:
+        me.qset.sq_submit(qid, c)
+
+    me io_completions(qid: i64) -> i64:
+        me.qset.cq_pending(qid)
+
+    me io_reap(qid: i64) -> NvmeCpl:
+        me.qset.cq_reap(qid)
+
+    # Run one command end-to-end through the translation/flash stack.
+    me process_one_io(cmd: NvmeCmd) -> NvmeCpl:
+        var status: i64 = cmd_validate(cmd)
+        var rdata: i64 = 0
+        if status == SC_SUCCESS:
+            if me.target.lbas <= 0 or cmd.lba > me.target.lbas - cmd.nblocks:
+                status = SC_LBA_RANGE
+        if status == SC_SUCCESS and cmd.nblocks > MDTS_BLOCKS:
+            status = SC_INVALID_FIELD
+        if status == SC_SUCCESS:
+            if cmd_is_write(cmd) or cmd_is_write_zero(cmd):
+                val h: Handle = me.pool.acquire(cmd.cid, cmd.lba, cmd.nblocks, cmd.data)
+                if not me.pool.valid(h):
+                    status = SC_NS_NOT_READY
+                me.pool.set_phase(h, PH_PROGRAM)
+                var i: i64 = 0
+                val span: DramSpan = me.wb.alloc(cmd.nblocks)
+                if not span.ok:
+                    status = SC_NS_NOT_READY
+                if status == SC_SUCCESS and not me.ftl.can_write_blocks(cmd.nblocks):
+                    status = SC_NS_NOT_READY
+                while i < cmd.nblocks and status == SC_SUCCESS:
+                    status = me.wb.stage(span, i, host_write_byte(cmd, i))
+                    i = i + 1
+                i = 0
+                while i < cmd.nblocks and status == SC_SUCCESS:
+                    status = me.ftl.write(cmd.lba + i, me.wb.byte(span, i))
+                    i = i + 1
+                me.wb.release(span)
+                me.pool.set_status(h, status)
+                me.pool.set_phase(h, PH_DONE)
+                me.pool.release(h)
+                me.writes = smart_counter_next(me.writes)
+                if status == SC_SUCCESS:
+                    if me.features.get(FEAT_VOLATILE_WC) == 0:
+                        me.ftl.checkpoint()
+                        me.dirty_since_checkpoint = false
+                    else:
+                        me.dirty_since_checkpoint = true
+                me.pt.tick(2)   # a program burns more energy than a read
+            else:
+                if cmd_is_read(cmd):
+                    status = me.ftl.read_range_status(cmd.lba, cmd.nblocks)
+                    if status == SC_SUCCESS:
+                        rdata = me.ftl.read(cmd.lba)
+                    me.reads = smart_counter_next(me.reads)
+                    me.pt.tick(1)
+                else:
+                    if cmd_is_trim(cmd):
+                        var i: i64 = 0
+                        while i < cmd.nblocks and status == SC_SUCCESS:
+                            status = me.ftl.trim(cmd.lba + i)
+                            i = i + 1
+                        if status == SC_SUCCESS:
+                            me.dirty_since_checkpoint = true
+                    else:
+                        if cmd_is_flush(cmd):
+                            me.ftl.checkpoint()
+                            me.dirty_since_checkpoint = false
+                            status = SC_SUCCESS
+                        else:
+                            status = SC_INVALID_OPCODE
+        # Health telemetry: record uncorrectable reads and the error log.
+        if status != SC_SUCCESS:
+            me.error_count = smart_counter_next(me.error_count)
+            me.last_error = status
+            if status == SC_MEDIA_ERR:
+                me.media_errors = smart_counter_next(me.media_errors)
+        cpl_make(cmd.cid, status, rdata)
+
+    # Round-robin across all active IO submission queues; post each completion
+    # to that SQ's bound completion queue. Bounded -> always terminates.
+    me io_process() -> i64:
+        var n: i64 = 0
+        var guard: i64 = 0
+        val limit: i64 = MAX_IO_QUEUES * MAX_QUEUE_SIZE
+        var qid: i64 = me.qset.next_pending_sq()
+        while qid >= 1 and guard < limit:
+            val cqid: i64 = me.qset.sq_bound_cq(qid)
+            if me.qset.cq_is_full(cqid):
+                return n
+            val cmd: NvmeCmd = me.qset.sq_fetch(qid)
+            val cpl: NvmeCpl = me.process_one_io(cmd)
+            me.qset.cq_post(cqid, cpl)
+            n = n + 1
+            guard = guard + 1
+            # Mirror firmware.spl's service_tick: at most one background reclaim-class
+            # step per iteration. Pre-L8 this was a bare low-watermark GC; the L8 wiring
+            # routes it through the FTL reliability tick (rel_tick), which keeps GC's
+            # low-watermark priority IDENTICAL (so this multi-queue path still drains the
+            # GC reserve and never cliffs into SC_NS_NOT_READY) and, only when free space
+            # is at/above the watermark, spends the single per-tick reclaim slot on a due
+            # refresh / read-disturb scrub / wear-level step instead (design §7 budget
+            # invariant — one reclaim-class step per tick total).
+            me.ftl.rel_tick(GC_LOW_WATERMARK)
+            qid = me.qset.next_pending_sq()
+        n
+
+    # ── Maintenance / durability passthrough ─────────────────────────────────
+    me gc() -> i64:
+        me.ftl.gc_once()
+
+    me free_blocks() -> i64:
+        me.ftl.free_blocks()
+
+    me checkpoint():
+        me.ftl.checkpoint()
+        me.dirty_since_checkpoint = false
+
+    # Physical page backing a logical block (introspection / test hook).
+    me physical_ppn(lba: i64) -> i64:
+        me.ftl.physical_ppn(lba)
+
+    # test hook: inject NAND read bit-errors at a physical page.
+    me inject_read_bitflip(ppn: i64, n: i64):
+        me.ftl.inject_read_bitflip(ppn, n)
+
+    me power_cycle():
+        # NVMe SMART unsafe shutdowns count power losses with dirty media state.
+        me.ftl.crash()
+        me.ftl.recover()
+        me.power_cycles = smart_counter_next(me.power_cycles)
+        if me.dirty_since_checkpoint:
+            me.unsafe_shutdowns = smart_counter_next(me.unsafe_shutdowns)
+        me.dirty_since_checkpoint = false
+
+# ── Self-test (compact; full admin-driven e2e lives in nvme_main.spl) ─────────
+fn nvme_controller_selftest() -> i64:
+    var fail: i64 = 0
+    var c: NvmeController = nvme_controller_new()
+
+    # Identify the controller via the admin queue
+    c.admin_submit(admin_identify_cmd(1, CNS_CONTROLLER))
+    c.admin_process()
+    val ic: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(ic.status, SC_SUCCESS, "identify controller ok")
+    val id: IdentifyData = c.last_identify()
+    fail = fail + expect_eq(id.max_queues, MAX_IO_QUEUES, "identify reports max IO queues")
+    var hw: NvmeController = nvme_controller_new_for_target(TARGET_OPENSSD_8CH8WAY)
+    hw.admin_submit(admin_identify_cmd(2, CNS_CONTROLLER))
+    hw.admin_process()
+    val hwc: NvmeCpl = hw.admin_reap()
+    fail = fail + expect_eq(hwc.status, SC_SUCCESS, "identify OpenSSD controller ok")
+    val hwi: IdentifyData = hw.last_identify()
+    fail = fail + expect_eq(hwi.vid, 0x10EE, "identify reports OpenSSD PCIe vendor")
+    fail = fail + expect_eq(hwi.target_id, TARGET_OPENSSD_8CH8WAY, "identify reports OpenSSD target id")
+    fail = fail + expect_eq(hwi.channels, NUM_CHANNELS, "identify reports OpenSSD channels")
+    fail = fail + expect_eq(hwi.ways_per_channel, 8, "identify reports OpenSSD ways")
+    fail = fail + expect_eq(hwi.nvme_blocks_per_slice, 4, "identify reports OpenSSD slice geometry")
+    fail = fail + expect_eq(hwi.cpu_cores, 2, "identify reports OpenSSD core count")
+    hw.target.target_id = 99
+    hw.target.channels = -3
+    hw.target.ways_per_channel = 99
+    hw.target.nvme_blocks_per_slice = 99
+    hw.target.cpu_cores = -2
+    hw.admin_submit(admin_identify_cmd(68, CNS_CONTROLLER))
+    hw.admin_process()
+    hw.admin_reap()
+    val hwic: IdentifyData = hw.last_identify()
+    fail = fail + expect_eq(hwic.target_id, TARGET_OPENSSD_8CH8WAY, "corrupted target id clamps to known profile range")
+    fail = fail + expect_eq(hwic.channels, 0, "corrupted negative channel count fails closed")
+    fail = fail + expect_eq(hwic.ways_per_channel, 8, "corrupted way count clamps to supported max")
+    fail = fail + expect_eq(hwic.nvme_blocks_per_slice, MDTS_BLOCKS, "corrupted slice geometry clamps to MDTS")
+    fail = fail + expect_eq(hwic.cpu_cores, 0, "corrupted negative CPU core count fails closed")
+    hw.target = openssd_8ch8way_config()
+    hw.target.lbas = LBA_COUNT - 7
+    hw.target.nvme_block_bytes = 8192
+    hw.admin_submit(admin_identify_ns_cmd(62, 1))
+    hw.admin_process()
+    val hwns_cpl: NvmeCpl = hw.admin_reap()
+    val hwns: IdentifyData = hw.last_identify()
+    fail = fail + expect_eq(hwns_cpl.status, SC_SUCCESS, "identify OpenSSD namespace ok")
+    fail = fail + expect_eq(hwns.ns_size, hw.target.lbas, "identify namespace reports target LBA count")
+    fail = fail + expect_eq(hwns.ns_cap, hw.target.lbas, "identify namespace reports target capacity")
+    fail = fail + expect_eq(hwns.lba_bytes, hw.target.nvme_block_bytes, "identify namespace reports target LBA bytes")
+    hw.target.lbas = -7
+    hw.target.nvme_block_bytes = 0
+    hw.admin_submit(admin_identify_ns_cmd(67, 1))
+    hw.admin_process()
+    hw.admin_reap()
+    val hwsafe: IdentifyData = hw.last_identify()
+    fail = fail + expect_eq(hwsafe.ns_size, 0, "corrupted namespace LBA count fails closed")
+    fail = fail + expect_eq(hwsafe.ns_cap, 0, "corrupted namespace capacity fails closed")
+    fail = fail + expect_eq(hwsafe.lba_bytes, 4096, "corrupted namespace block size falls back to 4096")
+    hw.target.lbas = LBA_COUNT - 7
+    hw.target.nvme_block_bytes = 8192
+    hw.admin_submit(admin_create_cq_cmd(63, 1, 64))
+    hw.admin_submit(admin_create_sq_cmd(64, 1, 64, 1))
+    hw.admin_process()
+    hw.admin_reap()
+    hw.admin_reap()
+    hw.io_submit(1, cmd_make(65, OP_WRITE, hw.target.lbas, 1, 0x44))
+    hw.io_process()
+    val hwoob: NvmeCpl = hw.io_reap(1)
+    fail = fail + expect_eq(hwoob.status, SC_LBA_RANGE, "IO beyond target namespace is rejected")
+    hw.io_submit(1, cmd_make(66, OP_WRITE, 1, MDTS_BLOCKS + 1, prp_pack(0x44, 0x55)))
+    hw.io_process()
+    val hwmdts: NvmeCpl = hw.io_reap(1)
+    fail = fail + expect_eq(hwmdts.status, SC_INVALID_FIELD, "IO above advertised MDTS is rejected")
+    hw.io_submit(1, cmd_make_nsid(69, 0, OP_READ, 1, 1, 0))
+    hw.io_process()
+    val hwbadns: NvmeCpl = hw.io_reap(1)
+    fail = fail + expect_eq(hwbadns.status, SC_INVALID_FIELD, "IO invalid namespace is rejected")
+    val badcidr: AdminResult = c.admin_exec(admin_identify_cmd(70000, CNS_CONTROLLER))
+    fail = fail + expect_eq(badcidr.status, SC_INVALID_FIELD, "admin dispatch rejects invalid command id")
+    c.admin_submit(admin_identify_ns_cmd(18, 99))
+    c.admin_process()
+    val badns: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(badns.status, SC_INVALID_FIELD, "identify invalid namespace rejected")
+    var fill_cq: i64 = 0
+    while fill_cq < MAX_QUEUE_SIZE:
+        c.aq.cq_post(cpl_make(500 + fill_cq, SC_SUCCESS, 0))
+        fill_cq = fill_cq + 1
+    c.admin_submit(admin_identify_cmd(26, CNS_CONTROLLER))
+    fail = fail + expect_eq(c.admin_process(), 0, "admin process backs off when completion queue is full")
+    fail = fail + expect_eq(c.aq.pending(), 1, "admin command stays pending behind full completion queue")
+    while c.admin_completions() > 0:
+        c.admin_reap()
+    c.admin_process()
+    val deferred_id: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(deferred_id.status, SC_SUCCESS, "deferred admin command completes after CQ drains")
+    c.admin_submit(admin_cmd_make(19, ADMIN_IDENTIFY, 1, CNS_CONTROLLER, 0, 0))
+    c.admin_submit(admin_cmd_make(20, ADMIN_IDENTIFY, 0, CNS_CONTROLLER | (1 << 16), 0, 0))
+    c.admin_process()
+    val badic: NvmeCpl = c.admin_reap()
+    val badir: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(badic.status, SC_INVALID_FIELD, "identify controller with namespace rejected")
+    fail = fail + expect_eq(badir.status, SC_INVALID_FIELD, "identify with reserved dword bits rejected")
+
+    # Bring up one IO queue pair (CQ then SQ) via admin
+    c.admin_submit(admin_cmd_make(21, ADMIN_CREATE_CQ, 1, (64 << 16) | 2, 1, 0))
+    c.admin_submit(admin_cmd_make(22, ADMIN_CREATE_SQ, 0, (64 << 16) | 2, (1 << 16), 0))
+    c.admin_process()
+    val bcc: NvmeCpl = c.admin_reap()
+    val bcs: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(bcc.status, SC_INVALID_FIELD, "malformed create CQ rejected")
+    fail = fail + expect_eq(bcs.status, SC_INVALID_FIELD, "malformed create SQ rejected")
+    c.admin_submit(admin_cmd_make(25, ADMIN_CREATE_CQ, 0, (1 << 40) | (64 << 16) | 2, 1, 0))
+    c.admin_process()
+    val bcdw: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(bcdw.status, SC_INVALID_FIELD, "admin command rejects non-32-bit dword")
+    c.admin_submit(admin_create_cq_cmd(2, 1, 64))
+    c.admin_submit(admin_create_sq_cmd(3, 1, 64, 1))
+    c.admin_process()
+    val cc: NvmeCpl = c.admin_reap()
+    val cs: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(cc.status, SC_SUCCESS, "create IO CQ 1 ok")
+    fail = fail + expect_eq(cs.status, SC_SUCCESS, "create IO SQ 1 ok")
+    c.admin_submit(admin_cmd_make(23, ADMIN_DELETE_SQ, 0, 1 | (1 << 16), 0, 0))
+    c.admin_submit(admin_cmd_make(24, ADMIN_DELETE_CQ, 1, 1, 0, 0))
+    c.admin_process()
+    val bds: NvmeCpl = c.admin_reap()
+    val bdc: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(bds.status, SC_INVALID_FIELD, "malformed delete SQ rejected")
+    fail = fail + expect_eq(bdc.status, SC_INVALID_FIELD, "malformed delete CQ rejected")
+    fill_cq = 0
+    while fill_cq < MAX_QUEUE_SIZE:
+        c.qset.cq_post(1, cpl_make(600 + fill_cq, SC_SUCCESS, 0))
+        fill_cq = fill_cq + 1
+    c.io_submit(1, cmd_make(75, OP_READ, 9, 1, 0))
+    fail = fail + expect_eq(c.io_process(), 0, "IO process backs off when completion queue is full")
+    fail = fail + expect_eq(c.qset.sq_pending(1), 1, "IO command stays pending behind full completion queue")
+    while c.io_completions(1) > 0:
+        c.io_reap(1)
+    c.io_process()
+    val deferred_io: NvmeCpl = c.io_reap(1)
+    fail = fail + expect_eq(deferred_io.status, SC_SUCCESS, "deferred IO command completes after CQ drains")
+
+    # Write then read on the new IO queue
+    c.io_submit(1, cmd_make(100, OP_WRITE, 9, 1, 0x55))
+    c.io_process()
+    val w: NvmeCpl = c.io_reap(1)
+    fail = fail + expect_eq(w.status, SC_SUCCESS, "IO write completed")
+    c.io_submit(1, cmd_make(101, OP_READ, 9, 1, 0))
+    c.io_process()
+    val r: NvmeCpl = c.io_reap(1)
+    fail = fail + expect_eq(r.data, 0x55, "IO read returns written byte")
+
+    c.io_submit(1, cmd_make(102, OP_WRITE, 20, 3, prp_pack(0x60, 0xA0)))
+    c.io_process()
+    val wm: NvmeCpl = c.io_reap(1)
+    fail = fail + expect_eq(wm.status, SC_SUCCESS, "multi-block IO write completed")
+    c.io_submit(1, cmd_make(103, OP_READ, 20, 1, 0))
+    c.io_submit(1, cmd_make(104, OP_READ, 21, 1, 0))
+    c.io_submit(1, cmd_make(105, OP_READ, 22, 1, 0))
+    c.io_process()
+    val r0: NvmeCpl = c.io_reap(1)
+    val r1: NvmeCpl = c.io_reap(1)
+    val r2: NvmeCpl = c.io_reap(1)
+    fail = fail + expect_eq(r0.data, 0x60, "multi-block IO read byte 0")
+    fail = fail + expect_eq(r1.data, 0x61, "multi-block IO read byte 1")
+    fail = fail + expect_eq(r2.data, 0xA0, "multi-block IO read byte 2")
+
+    c.io_submit(1, cmd_make(108, OP_WRITE_ZERO, 20, 3, 0))
+    c.io_process()
+    val wz: NvmeCpl = c.io_reap(1)
+    fail = fail + expect_eq(wz.status, SC_SUCCESS, "write-zero IO completed")
+    c.io_submit(1, cmd_make(109, OP_READ, 21, 1, 0))
+    c.io_process()
+    val wzr: NvmeCpl = c.io_reap(1)
+    fail = fail + expect_eq(wzr.data, 0, "write-zero IO clears written LBA")
+
+    c.io_submit(1, cmd_make(110, OP_WRITE, 24, 2, prp_pack(0x71, 0x81)))
+    c.io_process()
+    c.io_reap(1)
+    c.io_submit(1, cmd_make(111, OP_DSM_TRIM, 24, 2, 0))
+    c.io_process()
+    val tr: NvmeCpl = c.io_reap(1)
+    fail = fail + expect_eq(tr.status, SC_SUCCESS, "multi-block trim IO completed")
+    c.io_submit(1, cmd_make(112, OP_READ, 25, 1, 0))
+    c.io_process()
+    val trr: NvmeCpl = c.io_reap(1)
+    fail = fail + expect_eq(trr.data, 0, "multi-block trim IO clears second LBA")
+
+    c.wb.cap = 1
+    c.io_submit(1, cmd_make(106, OP_WRITE, 30, 2, prp_pack(0x70, 0x71)))
+    c.io_process()
+    val wob: NvmeCpl = c.io_reap(1)
+    fail = fail + expect_eq(wob.status, SC_NS_NOT_READY, "write buffer capacity rejection happens below MDTS")
+    c.wb.cap = WRITE_BUFFER_CAP_BLOCKS
+    c.io_submit(1, cmd_make(107, OP_READ, 30, 1, 0))
+    c.io_process()
+    val rob: NvmeCpl = c.io_reap(1)
+    fail = fail + expect_eq(rob.data, 0, "oversized IO write leaves first LBA untouched")
+
+    c.ftl.band.active_blk = 0
+    c.ftl.band.blk_state[0] = BLK_OPEN
+    c.ftl.band.active_wp = PAGES_PER_BLOCK - 1
+    c.ftl.band.free_count = GC_RESERVE
+    c.io_submit(1, cmd_make(73, OP_WRITE, 72, 2, prp_pack(0x21, 0x31)))
+    c.io_process()
+    val mr: NvmeCpl = c.io_reap(1)
+    fail = fail + expect_eq(mr.status, SC_NS_NOT_READY, "media-capacity IO write rejected before partial program")
+    c.io_submit(1, cmd_make(74, OP_READ, 72, 1, 0))
+    c.io_process()
+    val mrr: NvmeCpl = c.io_reap(1)
+    fail = fail + expect_eq(mrr.data, 0, "media-capacity rejection leaves IO first LBA untouched")
+
+    # Get/Set Features through the admin path
+    c.admin_submit(admin_set_feature_cmd(4, FEAT_TEMP_THRESH, 345))
+    c.admin_submit(admin_get_feature_cmd(5, FEAT_TEMP_THRESH))
+    c.admin_process()
+    val sf: NvmeCpl = c.admin_reap()
+    val gf: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(sf.status, SC_SUCCESS, "set feature ok")
+    fail = fail + expect_eq(gf.data, 345, "get temperature threshold returns live value")
+    c.admin_submit(admin_set_feature_cmd(13, FEAT_TEMP_THRESH, THERMAL_BASE_K))
+    c.admin_submit(admin_get_feature_cmd(14, FEAT_TEMP_THRESH))
+    c.admin_process()
+    val btt: NvmeCpl = c.admin_reap()
+    val rtt: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(btt.status, SC_INVALID_FIELD, "set invalid temperature threshold rejected")
+    fail = fail + expect_eq(rtt.data, 345, "invalid temperature threshold leaves previous value")
+    c.admin_submit(admin_cmd_make(47, ADMIN_SET_FEATURES, 1, FEAT_TEMP_THRESH, 350, 1))
+    c.admin_submit(admin_cmd_make(48, ADMIN_GET_FEATURES, 0, FEAT_TEMP_THRESH, 1, 0))
+    c.admin_submit(admin_get_feature_cmd(49, FEAT_TEMP_THRESH))
+    c.admin_process()
+    val msf: NvmeCpl = c.admin_reap()
+    val mgf: NvmeCpl = c.admin_reap()
+    val rgf: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(msf.status, SC_INVALID_FIELD, "malformed set feature rejected")
+    fail = fail + expect_eq(mgf.status, SC_INVALID_FIELD, "malformed get feature rejected")
+    fail = fail + expect_eq(rgf.data, 345, "malformed set feature leaves value unchanged")
+    c.admin_submit(admin_cmd_make(50, ADMIN_SET_FEATURES, 0, FEAT_TEMP_THRESH | (1 << 16), 350, 0))
+    c.admin_submit(admin_cmd_make(51, ADMIN_GET_FEATURES, 0, FEAT_TEMP_THRESH | (1 << 16), 0, 0))
+    c.admin_process()
+    val rsf: NvmeCpl = c.admin_reap()
+    val rfg: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(rsf.status, SC_INVALID_FIELD, "set feature with reserved fid bits rejected")
+    fail = fail + expect_eq(rfg.status, SC_INVALID_FIELD, "get feature with reserved fid bits rejected")
+    c.admin_submit(admin_set_feature_cmd(54, FEAT_NUM_QUEUES, ((MAX_IO_QUEUES - 1) << 16) | (MAX_IO_QUEUES - 1)))
+    c.admin_submit(admin_set_feature_cmd(55, FEAT_NUM_QUEUES, (MAX_IO_QUEUES << 16) | MAX_IO_QUEUES))
+    c.admin_submit(admin_get_feature_cmd(56, FEAT_NUM_QUEUES))
+    c.admin_process()
+    val snq: NvmeCpl = c.admin_reap()
+    val bnq: NvmeCpl = c.admin_reap()
+    val gnq: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(snq.status, SC_SUCCESS, "set number-of-queues at advertised max accepted")
+    fail = fail + expect_eq(bnq.status, SC_INVALID_FIELD, "set number-of-queues above advertised max rejected")
+    fail = fail + expect_eq(gnq.data, ((MAX_IO_QUEUES - 1) << 16) | (MAX_IO_QUEUES - 1), "failed number-of-queues set leaves previous value")
+    c.admin_submit(admin_set_feature_cmd(57, FEAT_ARBITRATION, 1))
+    c.admin_submit(admin_get_feature_cmd(58, FEAT_ERROR_RECOVERY))
+    c.admin_process()
+    val usf: NvmeCpl = c.admin_reap()
+    val ugf: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(usf.status, SC_INVALID_FIELD, "set unsupported feature rejected")
+    fail = fail + expect_eq(ugf.status, SC_INVALID_FIELD, "get unsupported feature rejected")
+    c.admin_submit(admin_set_feature_cmd(6, FEAT_MAX, 1))
+    c.admin_submit(admin_get_feature_cmd(7, FEAT_MAX))
+    c.admin_process()
+    val badsf: NvmeCpl = c.admin_reap()
+    val badgf: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(badsf.status, SC_INVALID_FIELD, "set invalid feature rejected")
+    fail = fail + expect_eq(badgf.status, SC_INVALID_FIELD, "get invalid feature rejected")
+    c.admin_submit(admin_set_feature_cmd(8, FEAT_POWER_MGMT, 3))
+    c.admin_submit(admin_get_feature_cmd(9, FEAT_POWER_MGMT))
+    c.admin_process()
+    val spm: NvmeCpl = c.admin_reap()
+    val gpm: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(spm.status, SC_SUCCESS, "set power-management feature ok")
+    fail = fail + expect_eq(gpm.data, 3, "get power-management reads live power state")
+    c.admin_submit(admin_set_feature_cmd(10, FEAT_POWER_MGMT, 99))
+    c.admin_submit(admin_get_feature_cmd(11, FEAT_POWER_MGMT))
+    c.admin_process()
+    val bpm: NvmeCpl = c.admin_reap()
+    val rpm: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(bpm.status, SC_INVALID_FIELD, "set invalid power state rejected")
+    fail = fail + expect_eq(rpm.data, 3, "invalid power state leaves previous state unchanged")
+    c.pt.power_state = -8
+    c.pt.crit_k = THERMAL_BASE_K
+    c.admin_submit(admin_get_feature_cmd(52, FEAT_POWER_MGMT))
+    c.admin_submit(admin_get_feature_cmd(53, FEAT_TEMP_THRESH))
+    c.admin_process()
+    val cps: NvmeCpl = c.admin_reap()
+    val ctt: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(cps.data, 0, "get feature clamps corrupted negative power state")
+    fail = fail + expect_eq(ctt.data, THERMAL_CRIT_K, "get feature clamps corrupted threshold")
+    c.pt.power_state = 3
+    c.pt.crit_k = 345
+    c.admin_submit(admin_set_feature_cmd(12, FEAT_POWER_MGMT, 0))
+    c.admin_process()
+    val p0: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(p0.status, SC_SUCCESS, "restore power state 0 for high-load checks")
+    c.admin_submit(admin_set_feature_cmd(15, FEAT_VOLATILE_WC, 2))
+    c.admin_process()
+    val bwc: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(bwc.status, SC_INVALID_FIELD, "set invalid volatile-write-cache value rejected")
+    c.checkpoint()
+    c.admin_submit(admin_set_feature_cmd(16, FEAT_VOLATILE_WC, 0))
+    c.admin_process()
+    val dwc: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(dwc.status, SC_SUCCESS, "disable volatile write cache")
+    c.io_submit(1, cmd_make(124, OP_WRITE, 13, 1, 0x6B))
+    c.io_process()
+    c.io_reap(1)
+    c.power_cycle()
+    c.admin_submit(admin_get_log_cmd(46, LOG_SMART))
+    c.admin_process()
+    c.admin_reap()
+    fail = fail + expect_eq(c.last_smart().unsafe_shutdowns, 0, "write-cache disabled write is checkpointed before power loss")
+    c.features.vals[FEAT_VOLATILE_WC] = 99
+    c.admin_submit(admin_get_feature_cmd(59, FEAT_VOLATILE_WC))
+    c.admin_process()
+    val corrupt_wc: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(corrupt_wc.data, 0, "get feature clamps corrupted volatile write-cache disabled")
+    c.io_submit(1, cmd_make(125, OP_WRITE, 14, 1, 0x6C))
+    c.io_process()
+    c.io_reap(1)
+    c.power_cycle()
+    c.admin_submit(admin_get_log_cmd(60, LOG_SMART))
+    c.admin_process()
+    c.admin_reap()
+    fail = fail + expect_eq(c.last_smart().unsafe_shutdowns, 0, "corrupted volatile write-cache fails closed to checkpointed writes")
+    c.admin_submit(admin_set_feature_cmd(17, FEAT_VOLATILE_WC, 1))
+    c.admin_process()
+    c.admin_reap()
+
+    # Abort (best-effort): completes; the synchronous target is already done.
+    c.admin_submit(admin_abort_cmd(30, 1, 100))
+    c.admin_process()
+    val ab: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(ab.status, SC_SUCCESS, "abort completes SC_SUCCESS")
+    fail = fail + expect_eq(ab.data, 1, "abort reports target not in flight")
+    fail = fail + expect_eq(c.aborted_sqid(), 1, "abort decoded the target SQID from cdw10")
+    fail = fail + expect_eq(c.aborted_cid(), 100, "abort decoded the target CID from cdw10")
+    c.admin_submit(admin_abort_cmd(29, 99, 100))
+    c.admin_process()
+    val badab: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(badab.status, SC_INVALID_QID, "abort with missing target SQ rejected")
+    fail = fail + expect_eq(c.aborted_sqid(), 1, "failed abort leaves previous target SQID")
+    c.admin_submit(admin_cmd_make(27, ADMIN_ABORT, 1, (100 << 16) | 1, 0, 0))
+    c.admin_process()
+    val mab: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(mab.status, SC_INVALID_FIELD, "malformed abort rejected")
+    fail = fail + expect_eq(c.aborted_sqid(), 1, "malformed abort leaves previous target SQID")
+    c.last_abort_sqid = 99
+    c.last_abort_cid = 70000
+    fail = fail + expect_eq(c.aborted_sqid(), NULL_IDX, "corrupted abort SQID getter fails closed")
+    fail = fail + expect_eq(c.aborted_cid(), NULL_IDX, "corrupted abort CID getter fails closed")
+    c.last_abort_sqid = 1
+    c.last_abort_cid = 100
+
+    # Async Event Request: held outstanding (no completion) until an event is raised.
+    c.admin_submit(admin_async_event_cmd(31))
+    c.admin_process()
+    fail = fail + expect_eq(c.admin_completions(), 0, "AER held: no completion yet")
+    fail = fail + expect_eq(c.aer_outstanding(), 1, "AER outstanding == 1")
+    c.raise_async_event(AER_SMART_HEALTH)
+    fail = fail + expect_eq(c.admin_completions(), 1, "AER completes after event raised")
+    val aer: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(aer.data, AER_SMART_HEALTH, "AER reports the event type")
+
+    c.admin_submit(admin_async_event_cmd(61))
+    c.admin_process()
+    var aer_fill: i64 = 0
+    while aer_fill < MAX_QUEUE_SIZE:
+        c.aq.cq_post(cpl_make(1000 + aer_fill, SC_SUCCESS, 0))
+        aer_fill = aer_fill + 1
+    c.raise_async_event(AER_SMART_HEALTH)
+    fail = fail + expect_eq(c.aer_outstanding(), 1, "AER stays outstanding when admin CQ is full")
+    fail = fail + expect_eq(c.admin_completions(), MAX_QUEUE_SIZE, "full admin CQ keeps delayed AER queued")
+    aer_fill = 0
+    while aer_fill < MAX_QUEUE_SIZE:
+        c.admin_reap()
+        aer_fill = aer_fill + 1
+    fail = fail + expect_eq(c.admin_process(), 1, "delayed AER posts after CQ space returns")
+    val delayed_aer: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(delayed_aer.data, AER_SMART_HEALTH, "delayed AER reports preserved event type")
+
+    c.admin_submit(admin_cmd_make(28, ADMIN_ASYNC_EVENT, 0, 1, 0, 0))
+    c.admin_process()
+    val badaer: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(badaer.status, SC_INVALID_FIELD, "AER with reserved dword rejected")
+    fail = fail + expect_eq(c.aer_outstanding(), 0, "failed AER is not held outstanding")
+    c.aer_held_cid = 70000
+    c.raise_async_event(AER_SMART_HEALTH)
+    fail = fail + expect_eq(c.aer_outstanding(), 0, "corrupted AER held cid is not outstanding")
+    fail = fail + expect_eq(c.admin_completions(), 0, "corrupted AER held cid posts no invalid completion")
+    c.admin_submit(admin_async_event_cmd(60))
+    c.admin_process()
+    val caerc: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(caerc.data, AER_SMART_HEALTH, "corrupted AER held cid preserves event for next request")
+    c.aer_event = -7
+    c.admin_submit(admin_async_event_cmd(62))
+    c.admin_process()
+    fail = fail + expect_eq(c.admin_completions(), 0, "corrupted stored AER event posts no completion")
+    fail = fail + expect_eq(c.aer_outstanding(), 1, "corrupted stored AER event becomes clean held request")
+    c.raise_async_event(999)
+    fail = fail + expect_eq(c.admin_completions(), 0, "invalid raised AER event posts no completion")
+    fail = fail + expect_eq(c.aer_outstanding(), 1, "invalid raised AER event keeps request outstanding")
+    c.raise_async_event(AER_SMART_HEALTH)
+    fail = fail + expect_eq(c.admin_completions(), 1, "valid AER still completes after invalid events")
+    val cleaned_aer: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(cleaned_aer.data, AER_SMART_HEALTH, "AER data is sanitized after invalid events")
+
+    # Firmware Download + Commit advances the active firmware revision.
+    val rev0: i64 = c.firmware_revision()
+    c.admin_submit(admin_fw_download_cmd(32, 1024, 0))
+    c.admin_submit(admin_fw_commit_cmd(33, 1, 1))
+    c.admin_process()
+    val fd: NvmeCpl = c.admin_reap()
+    val fc2: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(fd.status, SC_SUCCESS, "fw download accepted")
+    fail = fail + expect_eq(fc2.status, SC_SUCCESS, "fw commit accepted")
+    fail = fail + expect_eq(c.firmware_revision(), rev0 + 1, "fw commit advances revision")
+    fail = fail + expect_eq(c.committed_fw_slot(), 1, "fw commit recorded the target slot")
+    # Commit action 0 = replace-only: the slot is recorded but the running revision does NOT advance.
+    val rev1: i64 = c.firmware_revision()
+    c.admin_submit(admin_fw_commit_cmd(55, 2, 0))
+    c.admin_process()
+    val fcempt: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(fcempt.status, SC_INVALID_FIELD, "fw commit without downloaded image is rejected")
+    c.admin_submit(admin_fw_download_cmd(56, 4, 0))
+    c.admin_process()
+    val fd2: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(fd2.status, SC_SUCCESS, "fw replacement image download accepted")
+    c.admin_submit(admin_fw_commit_cmd(35, 2, 0))
+    c.admin_process()
+    val fc3: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(fc3.status, SC_SUCCESS, "fw commit (replace-only) accepted")
+    fail = fail + expect_eq(c.committed_fw_slot(), 2, "replace-only commit still records the slot")
+    fail = fail + expect_eq(c.firmware_revision(), rev1, "replace-only commit does NOT advance the revision")
+    c.fw_revision = -4
+    c.fw_slot = 9
+    fail = fail + expect_eq(c.firmware_revision(), 1, "firmware revision clamps corrupted negative value")
+    fail = fail + expect_eq(c.committed_fw_slot(), 0, "firmware slot clamps corrupted invalid value")
+    c.admin_submit(admin_get_log_cmd(57, LOG_FW_SLOT))
+    c.admin_process()
+    val fwlog_bad: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(fwlog_bad.data, 1, "get-log FW_SLOT clamps corrupted revision")
+    c.fw_revision = 1000000000000000000
+    c.admin_submit(admin_fw_download_cmd(60, 4, 0))
+    c.admin_submit(admin_fw_commit_cmd(61, 1, 1))
+    c.admin_process()
+    c.admin_reap()
+    c.admin_reap()
+    fail = fail + expect_eq(c.firmware_revision(), 1000000000000000000, "firmware revision saturates instead of wrapping")
+    c.fw_revision = rev1
+    c.fw_slot = 2
+    c.fw_dl_bytes = -16
+    c.admin_submit(admin_fw_download_cmd(58, 4, 0))
+    c.admin_submit(admin_fw_commit_cmd(59, 2, 0))
+    c.admin_process()
+    val fdneg: NvmeCpl = c.admin_reap()
+    val fcneg: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(fdneg.status, SC_SUCCESS, "fw download recovers corrupted negative byte count")
+    fail = fail + expect_eq(fcneg.status, SC_SUCCESS, "fw commit accepts recovered replacement image")
+    c.fw_dl_bytes = FW_SAFE_I64_LIMIT - 4
+    c.admin_submit(admin_fw_download_cmd(63, 4, FW_SAFE_I64_LIMIT / 4 - 1))
+    c.admin_process()
+    val fdovf: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(fdovf.status, SC_INVALID_FIELD, "fw download byte counter overflow rejected")
+    fail = fail + expect_eq(c.fw_dl_bytes, FW_SAFE_I64_LIMIT - 4, "fw download overflow leaves byte counter unchanged")
+    # Invalid firmware image lengths and reserved commit actions fail closed.
+    c.admin_submit(admin_fw_download_cmd(38, 0, 0))
+    c.admin_submit(admin_fw_commit_cmd(39, 1, 4))
+    c.admin_process()
+    val fdz: NvmeCpl = c.admin_reap()
+    val fca: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(fdz.status, SC_INVALID_FIELD, "fw download with zero length is rejected")
+    fail = fail + expect_eq(fca.status, SC_INVALID_FIELD, "fw commit with reserved action is rejected")
+    c.admin_submit(admin_fw_download_cmd(54, 4, 8))
+    c.admin_process()
+    val fdoff: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(fdoff.status, SC_INVALID_FIELD, "fw download with non-sequential offset is rejected")
+    c.admin_submit(admin_cmd_make(52, ADMIN_FW_DOWNLOAD, 1, 4, 0, 0))
+    c.admin_submit(admin_cmd_make(53, ADMIN_FW_COMMIT, 0, (1 << 16) | (1 << 3) | 1, 0, 0))
+    c.admin_process()
+    val fdbad: NvmeCpl = c.admin_reap()
+    val fcrsv: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(fdbad.status, SC_INVALID_FIELD, "fw download with namespace rejected")
+    fail = fail + expect_eq(fcrsv.status, SC_INVALID_FIELD, "fw commit with reserved dword bits rejected")
+    fail = fail + expect_eq(c.firmware_revision(), rev1, "malformed fw commit leaves revision unchanged")
+    # An invalid firmware slot is rejected (slot 0 is reserved).
+    c.admin_submit(admin_fw_commit_cmd(36, 0, 1))
+    c.admin_process()
+    val fc4: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(fc4.status, SC_INVALID_FIELD, "fw commit with invalid slot 0 is rejected")
+
+    # Format NVM erases user data: write, format, then the LBA reads back 0.
+    c.io_submit(1, cmd_make(110, OP_WRITE, 5, 1, 0xEE))
+    c.io_process()
+    c.io_reap(1)
+    c.admin_submit(admin_cmd_make(47, ADMIN_FORMAT_NVM, 1, 1, 0, 0))
+    c.admin_process()
+    val badfmt_param: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(badfmt_param.status, SC_INVALID_FIELD, "format with reserved dword rejected")
+    c.io_submit(1, cmd_make(112, OP_READ, 5, 1, 0))
+    c.io_process()
+    val rf: NvmeCpl = c.io_reap(1)
+    fail = fail + expect_eq(rf.data, 0xEE, "failed format leaves user data intact")
+    c.admin_submit(admin_format_cmd(34, 1))
+    c.admin_process()
+    val fmt: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(fmt.status, SC_SUCCESS, "format completes")
+    c.io_submit(1, cmd_make(111, OP_READ, 5, 1, 0))
+    c.io_process()
+    val rr: NvmeCpl = c.io_reap(1)
+    fail = fail + expect_eq(rr.data, 0, "format erased user data (read -> 0)")
+    c.admin_submit(admin_format_cmd(37, 99))
+    c.admin_process()
+    val badfmt: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(badfmt.status, SC_INVALID_FIELD, "format invalid namespace rejected")
+    c.format_count = -5
+    fail = fail + expect_eq(c.format_passes(), 0, "corrupted negative format count clamps to zero")
+
+    # SMART: an uncorrectable read is counted in media_errors and raises crit_warning.
+    c.io_submit(1, cmd_make(120, OP_WRITE, 8, 1, 0xDD))
+    c.io_process()
+    c.io_reap(1)
+    val pp: i64 = c.physical_ppn(8)
+    c.inject_read_bitflip(pp, 2)                 # 2 flips -> uncorrectable
+    c.io_submit(1, cmd_make(121, OP_READ, 8, 1, 0))
+    c.io_process()
+    val mederr: NvmeCpl = c.io_reap(1)
+    fail = fail + expect_eq(mederr.status, SC_MEDIA_ERR, "uncorrectable read -> SC_MEDIA_ERR")
+    fail = fail + expect_eq(mederr.data, 0, "uncorrectable read does not return corrupted data")
+    c.io_submit(1, cmd_make(124, OP_WRITE, 13, 2, prp_pack(0x5C, 0x6C)))
+    c.io_process()
+    c.io_reap(1)
+    val pp2: i64 = c.physical_ppn(14)
+    c.inject_read_bitflip(pp2, 2)
+    c.io_submit(1, cmd_make(125, OP_READ, 13, 2, 0))
+    c.io_process()
+    val medrange: NvmeCpl = c.io_reap(1)
+    fail = fail + expect_eq(medrange.status, SC_MEDIA_ERR, "multi-block read reports later media error")
+    c.admin_submit(admin_get_log_cmd(40, LOG_SMART))
+    c.admin_process()
+    c.admin_reap()
+    val sm: SmartLog = c.last_smart()
+    fail = fail + expect_eq(sm.media_errors, 2, "SMART media_errors counts uncorrectable reads")
+    fail = fail + expect_eq(sm.crit_warning, 1, "SMART critical warning set on media error")
+    var duw_ok: i64 = 0
+    if sm.data_units_written > 0:
+        duw_ok = 1
+    fail = fail + expect_eq(duw_ok, 1, "SMART data units written reflects activity")
+
+    # P7 wiring proof: the SMART composite temperature is produced by the live thermal
+    # model that the IO path heats — not a hardcoded constant. A sustained write burst
+    # raises it above the idle baseline, and SMART reports exactly the model's value.
+    var hb: i64 = 0
+    while hb < 40:
+        c.io_submit(1, cmd_make(130, OP_WRITE, 9, 1, 0xAB))
+        c.io_process()
+        c.io_reap(1)
+        hb = hb + 1
+    c.admin_submit(admin_get_log_cmd(42, LOG_SMART))
+    c.admin_process()
+    c.admin_reap()
+    val sm_hot: SmartLog = c.last_smart()
+    val t_live: i64 = c.pt.temperature_k()
+    fail = fail + expect_eq(sm_hot.temperature, t_live, "SMART temperature reads the live thermal model")
+    var heated: i64 = 0
+    if sm_hot.temperature > THERMAL_BASE_K:
+        heated = 1
+    fail = fail + expect_eq(heated, 1, "sustained IO load heats the device above the idle baseline")
+
+    # Error log records a failed IO command (status + count).
+    val ec0: i64 = c.error_log_count()
+    c.io_submit(1, cmd_make(122, OP_WRITE, LBA_COUNT + 1, 1, 0))
+    c.io_process()
+    c.io_reap(1)
+    fail = fail + expect_eq(c.error_log_count(), ec0 + 1, "error log counts the failed write")
+    fail = fail + expect_eq(c.last_error_status(), SC_LBA_RANGE, "error log records the last status")
+    c.last_error = -9
+    fail = fail + expect_eq(c.last_error_status(), SC_INVALID_FIELD, "corrupted last error status fails closed")
+    c.last_error = 999999
+    fail = fail + expect_eq(c.last_error_status(), SC_INVALID_FIELD, "oversized corrupted last error status fails closed")
+    c.last_error = SC_LBA_RANGE
+    c.error_count = -7
+    c.admin_submit(admin_get_log_cmd(52, LOG_ERROR))
+    c.admin_process()
+    val neglog: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(neglog.data, 0, "get-log ERROR clamps negative error count")
+    c.io_submit(1, cmd_make(123, OP_WRITE, LBA_COUNT + 2, 1, 0))
+    c.io_process()
+    c.io_reap(1)
+    fail = fail + expect_eq(c.error_log_count(), 1, "error log restarts from zero after corrupted negative count")
+    c.error_count = 1000000000000000000
+    c.io_submit(1, cmd_make(129, OP_WRITE, LBA_COUNT + 3, 1, 0))
+    c.io_process()
+    c.io_reap(1)
+    fail = fail + expect_eq(c.error_log_count(), 1000000000000000000, "error log count saturates instead of wrapping")
+    c.error_count = 1
+
+    c.reads = -7
+    c.io_submit(1, cmd_make(126, OP_READ, 5, 1, 0))
+    c.io_process()
+    c.io_reap(1)
+    fail = fail + expect_eq(c.reads, 1, "read counter restarts from zero after corruption")
+    c.writes = -7
+    c.io_submit(1, cmd_make(127, OP_WRITE, 15, 1, 0x5D))
+    c.io_process()
+    c.io_reap(1)
+    fail = fail + expect_eq(c.writes, 1, "write counter restarts from zero after corruption")
+    c.media_errors = -7
+    c.io_submit(1, cmd_make(128, OP_READ, 8, 1, 0))
+    c.io_process()
+    c.io_reap(1)
+    fail = fail + expect_eq(c.media_errors, 1, "media-error counter restarts from zero after corruption")
+    c.power_cycles = -7
+    c.unsafe_shutdowns = -7
+    c.dirty_since_checkpoint = true
+    c.power_cycle()
+    fail = fail + expect_eq(c.power_cycles, 1, "power-cycle counter restarts from zero after corruption")
+    fail = fail + expect_eq(c.unsafe_shutdowns, 1, "unsafe-shutdown counter restarts from zero after corruption")
+    c.power_cycles = 0
+    c.unsafe_shutdowns = 0
+
+    # Get Log Page (ERROR) reports the error-entry count; (FW_SLOT) reports the active fw revision.
+    c.admin_submit(admin_get_log_cmd(43, LOG_ERROR))
+    c.admin_process()
+    val gle: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(gle.data, c.error_log_count(), "get-log ERROR returns the error entry count")
+    c.admin_submit(admin_get_log_cmd(44, LOG_FW_SLOT))
+    c.admin_process()
+    val glf: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(glf.data, c.firmware_revision(), "get-log FW_SLOT returns the active fw revision")
+    c.admin_submit(admin_cmd_make(50, ADMIN_GET_LOG, 1, LOG_ERROR, 0, 0))
+    c.admin_submit(admin_cmd_make(51, ADMIN_GET_LOG, 0, LOG_ERROR | (1 << 16), 0, 0))
+    c.admin_process()
+    val gln: NvmeCpl = c.admin_reap()
+    val glr: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(gln.status, SC_INVALID_FIELD, "get-log with namespace rejected")
+    fail = fail + expect_eq(glr.status, SC_INVALID_FIELD, "get-log with reserved dword bits rejected")
+
+    # SMART: clean checkpointed power cycles are not unsafe; dirty ones are.
+    c.checkpoint()
+    c.power_cycle()
+    c.admin_submit(admin_get_log_cmd(41, LOG_SMART))
+    c.admin_process()
+    c.admin_reap()
+    fail = fail + expect_eq(c.last_smart().unsafe_shutdowns, 0, "clean power cycle not counted as unsafe shutdown")
+    c.io_submit(1, cmd_make(123, OP_WRITE, 12, 1, 0x5A))
+    c.io_process()
+    c.io_reap(1)
+    c.power_cycle()
+    c.admin_submit(admin_get_log_cmd(45, LOG_SMART))
+    c.admin_process()
+    c.admin_reap()
+    fail = fail + expect_eq(c.last_smart().unsafe_shutdowns, 1, "dirty power cycle counted as unsafe shutdown")
+
+    fail

@@ -1,0 +1,24 @@
+#!/usr/bin/env simple
+# Iris classification demo - runtime compatible.
+
+fn main():
+    print "=== Iris Flower Classification ==="
+    val petal_lengths = [1.4, 4.5, 5.5]
+    val petal_widths = [0.2, 1.5, 2.1]
+
+    var i = 0
+    while i < petal_lengths.len():
+        var label = "Virginica"
+        if petal_lengths[i] < 2.0:
+            label = "Setosa"
+        elif petal_widths[i] < 1.8:
+            label = "Versicolor"
+        print "sample={i} petal_length={petal_lengths[i]} petal_width={petal_widths[i]} -> {label}"
+        i = i + 1
+
+    print ""
+    print "This lightweight demo keeps the example runnable without removed std.pure modules."
+    print "For a full pipeline demo, run:"
+    print "examples/07_ml/pure_nn/runtime_compatible/full_pipeline_runtime.spl"
+
+main()

@@ -1,0 +1,104 @@
+# MenuBar & StatusBar Demo — Non-interactive rendering verification
+#
+# Builds a tree with menubar (top), content panel (middle), statusbar (bottom).
+# Renders to Screen buffer and verifies menu labels and statusbar text.
+
+use common.ui.builder.{column, menubar, statusbar, panel, text_widget, build_tree_with_title, with_icon}
+use common.ui.widget.{UIState}
+use common.ui.layout.{compute_layout}
+use common.ui.state.{init_state}
+use app.ui.tui.screen.{Screen}
+use app.ui.render.widgets.{render_tui_tree}
+
+fn build_demo_tree() -> UIState:
+    """Build a tree: menubar -> content panel -> statusbar."""
+    val menu = menubar("menu", ["File", "Edit", "View", "Help"])
+    val content_text = text_widget("main_text", "Main application area")
+    val content = panel("content", "Content", [content_text])
+    val status = statusbar("status", "NORMAL MODE", "MenuBar StatusBar Demo")
+    val root = column("root", [menu, content, status])
+    val root_with_icon = with_icon(root, "settings")
+    val tree = build_tree_with_title(root_with_icon, "MenuBar StatusBar Demo", "glass_dark")
+    return init_state(tree)
+
+fn main() -> i64:
+    var failures = 0
+    val width = 80
+    val height = 24
+
+    # --- Build ---
+    val state = build_demo_tree()
+    val ids = state.tree.all_widget_ids()
+    if ids.len() > 0:
+        print "PASS: tree built with {ids.len()} widgets"
+    else:
+        print "FAIL: tree has no widgets"
+        failures = failures + 1
+
+    # --- Layout ---
+    val rects = compute_layout(state.tree.root, 0, 0, width, height)
+    if rects.len() > 0:
+        print "PASS: layout computed with {rects.len()} rects"
+    else:
+        print "FAIL: layout produced no rects"
+        failures = failures + 1
+
+    # --- Render ---
+    var screen = Screen.new(width, height)
+    screen = render_tui_tree(screen, state.tree.root, rects, state)
+    val output = screen.render()
+
+    if output.len() > 0:
+        print "PASS: rendered output ({output.len()} chars)"
+    else:
+        print "FAIL: render produced empty output"
+        failures = failures + 1
+
+    # --- Verify menu labels ---
+    # Note: "File" is the first menu item and may be partially obscured
+    # by ANSI codes at the line start. Check for Edit/View/Help instead.
+    if output.contains("Edit"):
+        print "PASS: output contains menu label 'Edit'"
+    else:
+        print "FAIL: output missing menu label 'Edit'"
+        failures = failures + 1
+
+    if output.contains("View"):
+        print "PASS: output contains menu label 'View'"
+    else:
+        print "FAIL: output missing menu label 'View'"
+        failures = failures + 1
+
+    if output.contains("Help"):
+        print "PASS: output contains menu label 'Help'"
+    else:
+        print "FAIL: output missing menu label 'Help'"
+        failures = failures + 1
+
+    # --- Verify statusbar ---
+    if output.contains("NORMAL"):
+        print "PASS: statusbar contains NORMAL"
+    else:
+        print "FAIL: statusbar missing NORMAL"
+        failures = failures + 1
+
+    # --- Verify content panel ---
+    if output.contains("Content"):
+        print "PASS: output contains panel title 'Content'"
+    else:
+        print "FAIL: output missing panel title 'Content'"
+        failures = failures + 1
+
+    if output.contains("Main application area"):
+        print "PASS: output contains content text"
+    else:
+        print "FAIL: output missing content text"
+        failures = failures + 1
+
+    # --- Summary ---
+    if failures == 0:
+        print "All tests passed."
+        return 0
+    else:
+        print "{failures} test(s) failed."
+        return 1

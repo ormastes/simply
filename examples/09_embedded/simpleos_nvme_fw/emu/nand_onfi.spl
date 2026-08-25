@@ -1,0 +1,324 @@
+"""
+nand_onfi — RAM-backed ONFI NAND array for the pure-Simple NVMe emulator.
+
+Models a 2ch x 2bank x 2plane x 2block x 8page array (128 physical pages, geometry
+from nvme_ct) behind a real ONFI bus handshake: address/command/data are latched per
+channel, and the 2nd command byte dispatched through `onfi_exec` is what actually
+touches the media. The FTL drives the high-level `program` / `read_page` / `erase`
+seam, which internally walks the ONFI bus of `ppn_channel(ppn)`.
+
+DISCIPLINE (see nvme_ct header + emu gotchas): media is flat `[i64]` (raw i64, no
+newtype arithmetic); program scalars (lba/seq) are routed through scalar latch fields
+so no multi-param method stores a scalar straight into an array; array writes happen
+in the single-arg `onfi_exec`.
+"""
+
+use nvme_ct.*
+
+# ── ONFI command bytes (host <-> NAND bus) ────────────────────────────────────
+val ONFI_READ_1ST:  i64 = 0x00
+val ONFI_READ_2ND:  i64 = 0x30
+val ONFI_PROG_1ST:  i64 = 0x80
+val ONFI_PROG_2ND:  i64 = 0x10
+val ONFI_ERASE_1ST: i64 = 0x60
+val ONFI_ERASE_2ND: i64 = 0xD0
+val ONFI_STATUS:    i64 = 0x70
+val ONFI_RESET:     i64 = 0xFF
+
+# ── NAND result codes ─────────────────────────────────────────────────────────
+val NAND_OK:         i64 = 0
+val NAND_ECC_FIXED:  i64 = 1
+val NAND_ECC_FAIL:   i64 = 2
+val NAND_PROG_FAIL:  i64 = 3
+val NAND_ERASE_FAIL: i64 = 4
+val NAND_BAD_BLOCK:  i64 = 5
+
+# ── Read-out record (page payload + out-of-band metadata + ECC verdict) ───────
+struct NandReadResult:
+    words: [i64]
+    lba:   Lba
+    seq:   i64
+    code:  i64
+
+# ── RAM-backed media + per-channel ONFI bus state ─────────────────────────────
+struct NandArray:
+    data:       [i64]   # NUM_PAGES * WORDS_PER_PAGE
+    oob_lba:    [i64]   # NUM_PAGES (UNMAP when unwritten)
+    oob_seq:    [i64]   # NUM_PAGES
+    programmed: [i64]   # NUM_PAGES (1 once written; enforces no-overwrite)
+    bad_block:  [i64]   # NUM_BLOCKS
+    erase_cnt:  [i64]   # NUM_BLOCKS
+    page_err:   [i64]   # NUM_PAGES (bit-error count -> ECC verdict)
+    ch_cmd:     [i64]   # CHANNELS — latched command byte
+    ch_addr:    [i64]   # CHANNELS — latched physical page number
+    ch_status:  [i64]   # CHANNELS — last exec status
+    prog_fail:  [i64]   # NUM_BLOCKS — one-shot program-fault inject
+    erase_fail: [i64]   # NUM_BLOCKS — one-shot erase-fault inject
+    lat_words:  [i64]   # WORDS_PER_PAGE — latched program payload
+    rd_words:   [i64]   # WORDS_PER_PAGE — latched read-out payload
+    lat_lba:    i64     # latched program lba (scalar latch, dodges gotcha 5)
+    lat_seq:    i64     # latched program seq
+    rd_lba:     i64     # latched read-out lba
+    rd_seq:     i64     # latched read-out seq
+    rd_code:    i64     # latched read-out ECC verdict
+
+fn nand_fill(n: i64, v: i64) -> [i64]:
+    var a: [i64] = []
+    var i = 0
+    while i < n:
+        a = a.push(v)
+        i = i + 1
+    a
+
+fn nand_array_new() -> NandArray:
+    NandArray(
+        data: nand_fill(NUM_PAGES * WORDS_PER_PAGE, 0),
+        oob_lba: nand_fill(NUM_PAGES, UNMAP),
+        oob_seq: nand_fill(NUM_PAGES, 0),
+        programmed: nand_fill(NUM_PAGES, 0),
+        bad_block: nand_fill(NUM_BLOCKS, 0),
+        erase_cnt: nand_fill(NUM_BLOCKS, 0),
+        page_err: nand_fill(NUM_PAGES, 0),
+        ch_cmd: nand_fill(CHANNELS, 0),
+        ch_addr: nand_fill(CHANNELS, 0),
+        ch_status: nand_fill(CHANNELS, 0),
+        prog_fail: nand_fill(NUM_BLOCKS, 0),
+        erase_fail: nand_fill(NUM_BLOCKS, 0),
+        lat_words: nand_fill(WORDS_PER_PAGE, 0),
+        rd_words: nand_fill(WORDS_PER_PAGE, 0),
+        lat_lba: 0,
+        lat_seq: 0,
+        rd_lba: 0,
+        rd_seq: 0,
+        rd_code: 0
+    )
+
+impl NandArray:
+    # ── Low-level ONFI bus (per channel) ──────────────────────────────────────
+    me onfi_cmd(ch: Ch, op: i64):
+        me.ch_cmd[ch.value] = op
+
+    me onfi_addr(ch: Ch, ppn: Ppn):
+        me.ch_addr[ch.value] = ppn.value
+
+    # Latch the program payload. lba/seq go into SCALAR latch fields (gotcha 5);
+    # the words array is copied element-wise out of the arg (reads are safe).
+    me onfi_din(ch: Ch, words: [i64], lba: Lba, seq: i64):
+        me.lat_lba = lba.value
+        me.lat_seq = seq
+        var i = 0
+        while i < WORDS_PER_PAGE:
+            me.lat_words[i] = words.get(i)
+            i = i + 1
+
+    # The 2nd command byte dispatches into the media. Single arg -> all array
+    # writes pull their values from latch fields, never from a scalar param.
+    me onfi_exec(ch: Ch):
+        val c = ch.value
+        val op = me.ch_cmd.get(c)
+        val ppn = me.ch_addr.get(c)
+        val bi = ppn / PAGES_PER_BLOCK
+        if op == ONFI_PROG_2ND:
+            if me.bad_block.get(bi) != 0:
+                me.ch_status[c] = NAND_BAD_BLOCK
+            elif me.prog_fail.get(bi) != 0:
+                me.prog_fail[bi] = 0
+                me.ch_status[c] = NAND_PROG_FAIL
+            elif me.programmed.get(ppn) != 0:
+                me.ch_status[c] = NAND_PROG_FAIL
+            else:
+                val base = ppn * WORDS_PER_PAGE
+                var i = 0
+                while i < WORDS_PER_PAGE:
+                    me.data[base + i] = me.lat_words.get(i)
+                    i = i + 1
+                me.oob_lba[ppn] = me.lat_lba
+                me.oob_seq[ppn] = me.lat_seq
+                me.programmed[ppn] = 1
+                me.ch_status[c] = NAND_OK
+        elif op == ONFI_READ_2ND:
+            val base = ppn * WORDS_PER_PAGE
+            var i = 0
+            while i < WORDS_PER_PAGE:
+                me.rd_words[i] = me.data.get(base + i)
+                i = i + 1
+            me.rd_lba = me.oob_lba.get(ppn)
+            me.rd_seq = me.oob_seq.get(ppn)
+            val pe = me.page_err.get(ppn)
+            var code = pe
+            if pe >= 2:
+                code = NAND_ECC_FAIL
+            me.rd_code = code
+            me.ch_status[c] = NAND_OK
+        elif op == ONFI_ERASE_2ND:
+            if me.bad_block.get(bi) != 0:
+                me.ch_status[c] = NAND_BAD_BLOCK
+            elif me.erase_fail.get(bi) != 0:
+                me.erase_fail[bi] = 0
+                me.ch_status[c] = NAND_ERASE_FAIL
+            else:
+                val first = bi * PAGES_PER_BLOCK
+                var p = 0
+                while p < PAGES_PER_BLOCK:
+                    val pg = first + p
+                    val wbase = pg * WORDS_PER_PAGE
+                    var w = 0
+                    while w < WORDS_PER_PAGE:
+                        me.data[wbase + w] = 0
+                        w = w + 1
+                    me.oob_lba[pg] = UNMAP
+                    me.oob_seq[pg] = 0
+                    me.programmed[pg] = 0
+                    me.page_err[pg] = 0
+                    p = p + 1
+                me.erase_cnt[bi] = me.erase_cnt.get(bi) + 1
+                me.ch_status[c] = NAND_OK
+
+    me onfi_status(ch: Ch) -> i64:
+        me.ch_status.get(ch.value)
+
+    me onfi_dout(ch: Ch) -> NandReadResult:
+        var w: [i64] = []
+        var i = 0
+        while i < WORDS_PER_PAGE:
+            w = w.push(me.rd_words.get(i))
+            i = i + 1
+        NandReadResult(words: w, lba: Lba(value: me.rd_lba), seq: me.rd_seq, code: me.rd_code)
+
+    # ── High-level seam (what the FTL calls) ──────────────────────────────────
+    me program(ppn: Ppn, lba: Lba, seq: i64, words: [i64]) -> i64:
+        val ch = ppn_channel(ppn)
+        me.onfi_cmd(ch, ONFI_PROG_1ST)
+        me.onfi_addr(ch, ppn)
+        me.onfi_din(ch, words, lba, seq)
+        me.onfi_cmd(ch, ONFI_PROG_2ND)
+        me.onfi_exec(ch)
+        me.onfi_status(ch)
+
+    me read_page(ppn: Ppn) -> NandReadResult:
+        val ch = ppn_channel(ppn)
+        me.onfi_cmd(ch, ONFI_READ_1ST)
+        me.onfi_addr(ch, ppn)
+        me.onfi_cmd(ch, ONFI_READ_2ND)
+        me.onfi_exec(ch)
+        me.onfi_dout(ch)
+
+    me erase(block_index: i64) -> i64:
+        val first = block_first_ppn(block_index)
+        val ch = ppn_channel(first)
+        me.onfi_cmd(ch, ONFI_ERASE_1ST)
+        me.onfi_addr(ch, first)
+        me.onfi_cmd(ch, ONFI_ERASE_2ND)
+        me.onfi_exec(ch)
+        me.onfi_status(ch)
+
+    me erase_count(block_index: i64) -> i64:
+        me.erase_cnt.get(block_index)
+
+    me set_bad(block_index: i64):
+        me.bad_block[block_index] = 1
+
+    me inject_prog_fail(block_index: i64):
+        me.prog_fail[block_index] = 1
+
+    me inject_erase_fail(block_index: i64):
+        me.erase_fail[block_index] = 1
+
+    me inject_read_bitflip(ppn: Ppn, n: i64):
+        me.page_err[ppn.value] = n
+
+# ── Self-test ─────────────────────────────────────────────────────────────────
+fn nand_array_selftest() -> i64:
+    var fails = 0
+
+    # --- Direct ONFI-latch assertions (localize gotcha-5 / address corruption) ---
+    # ppn=67 lives in channel 1 (67/64); value chosen so x8 (=536) would be visible.
+    var lat = nand_array_new()
+    lat.onfi_addr(Ch(value: 1), Ppn(value: 67))
+    fails = fails + expect_eq(lat.ch_addr.get(1), 67, "onfi_addr latches ppn into ch1")
+    fails = fails + expect_eq(lat.ch_addr.get(0), 0, "onfi_addr leaves ch0 untouched")
+    lat.onfi_cmd(Ch(value: 1), ONFI_PROG_1ST)
+    fails = fails + expect_eq(lat.ch_cmd.get(1), ONFI_PROG_1ST, "onfi_cmd latches op into ch1")
+    var dw: [i64] = []
+    dw = dw.push(101)
+    dw = dw.push(102)
+    dw = dw.push(103)
+    dw = dw.push(104)
+    lat.onfi_din(Ch(value: 1), dw, Lba(value: 42), 3)
+    fails = fails + expect_eq(lat.lat_lba, 42, "onfi_din latches lba (no x8)")
+    fails = fails + expect_eq(lat.lat_seq, 3, "onfi_din latches seq (no x8)")
+    fails = fails + expect_eq(lat.lat_words.get(0), 101, "onfi_din latches w0")
+    fails = fails + expect_eq(lat.lat_words.get(3), 104, "onfi_din latches w3")
+
+    # --- Channel independence: distinct data to ch0 (ppn 5) and ch1 (ppn 70) ---
+    var nv = nand_array_new()
+    var w0: [i64] = []
+    w0 = w0.push(11)
+    w0 = w0.push(12)
+    w0 = w0.push(13)
+    w0 = w0.push(14)
+    fails = fails + expect_eq(nv.program(Ppn(value: 5), Lba(value: 50), 7, w0), NAND_OK, "program ch0 ppn5")
+    var w1: [i64] = []
+    w1 = w1.push(21)
+    w1 = w1.push(22)
+    w1 = w1.push(23)
+    w1 = w1.push(24)
+    fails = fails + expect_eq(nv.program(Ppn(value: 70), Lba(value: 90), 9, w1), NAND_OK, "program ch1 ppn70")
+
+    val r0 = nv.read_page(Ppn(value: 5))
+    fails = fails + expect_eq(r0.words.get(0), 11, "ch0 word0 round-trip")
+    fails = fails + expect_eq(r0.words.get(1), 12, "ch0 word1 round-trip")
+    fails = fails + expect_eq(r0.words.get(3), 14, "ch0 word3 round-trip")
+    fails = fails + expect_eq(r0.lba.value, 50, "ch0 lba round-trip")
+    fails = fails + expect_eq(r0.seq, 7, "ch0 seq round-trip (x8 would show)")
+    fails = fails + expect_eq(r0.code, NAND_OK, "ch0 ecc clean")
+    val r1 = nv.read_page(Ppn(value: 70))
+    fails = fails + expect_eq(r1.words.get(0), 21, "ch1 word0 round-trip")
+    fails = fails + expect_eq(r1.words.get(3), 24, "ch1 word3 round-trip")
+    fails = fails + expect_eq(r1.lba.value, 90, "ch1 lba round-trip")
+    fails = fails + expect_eq(r1.seq, 9, "ch1 seq round-trip")
+    # ch0 still intact after ch1 program -> channels are independent
+    val r0b = nv.read_page(Ppn(value: 5))
+    fails = fails + expect_eq(r0b.words.get(0), 11, "ch0 intact after ch1 write")
+
+    # --- No-overwrite of a programmed page ---
+    fails = fails + expect_eq(nv.program(Ppn(value: 5), Lba(value: 99), 1, w1), NAND_PROG_FAIL, "no-overwrite -> PROG_FAIL")
+    val r0c = nv.read_page(Ppn(value: 5))
+    fails = fails + expect_eq(r0c.lba.value, 50, "rejected overwrite keeps old data")
+
+    # --- Erase clears the block + bumps erase count ---
+    val ec_before = nv.erase_count(0)
+    fails = fails + expect_eq(nv.erase(0), NAND_OK, "erase block0 ok")
+    fails = fails + expect_eq(nv.erase_count(0), ec_before + 1, "erase bumps count")
+    val r0d = nv.read_page(Ppn(value: 5))
+    fails = fails + expect_eq(r0d.words.get(0), 0, "erase clears page data")
+    fails = fails + expect_eq(r0d.lba.value, UNMAP, "erase resets oob to UNMAP")
+    fails = fails + expect_eq(nv.program(Ppn(value: 5), Lba(value: 55), 8, w0), NAND_OK, "reprogram after erase")
+
+    # --- Bad block: program + erase rejected (block 2, ppn 16) ---
+    nv.set_bad(2)
+    fails = fails + expect_eq(nv.program(Ppn(value: 16), Lba(value: 1), 1, w0), NAND_BAD_BLOCK, "bad-block program rejected")
+    fails = fails + expect_eq(nv.erase(2), NAND_BAD_BLOCK, "bad-block erase rejected")
+
+    # --- One-shot program fault then recovery (block 3, ppn 24) ---
+    nv.inject_prog_fail(3)
+    fails = fails + expect_eq(nv.program(Ppn(value: 24), Lba(value: 2), 2, w0), NAND_PROG_FAIL, "injected prog fault")
+    fails = fails + expect_eq(nv.program(Ppn(value: 24), Lba(value: 2), 2, w0), NAND_OK, "prog recovers after one-shot")
+
+    # --- One-shot erase fault then recovery (block 4) ---
+    nv.inject_erase_fail(4)
+    fails = fails + expect_eq(nv.erase(4), NAND_ERASE_FAIL, "injected erase fault")
+    fails = fails + expect_eq(nv.erase(4), NAND_OK, "erase recovers after one-shot")
+
+    # --- Read bit-flip -> ECC verdict (block 5, ppn 40) ---
+    fails = fails + expect_eq(nv.program(Ppn(value: 40), Lba(value: 40), 4, w0), NAND_OK, "program ppn40 for ecc test")
+    nv.inject_read_bitflip(Ppn(value: 40), 1)
+    fails = fails + expect_eq(nv.read_page(Ppn(value: 40)).code, NAND_ECC_FIXED, "1 bitflip -> ECC fixed")
+    nv.inject_read_bitflip(Ppn(value: 40), 2)
+    fails = fails + expect_eq(nv.read_page(Ppn(value: 40)).code, NAND_ECC_FAIL, "2 bitflips -> ECC fail")
+
+    if fails == 0:
+        print "NAND_ONFI_SELFTEST PASS"
+    else:
+        print "NAND_ONFI_SELFTEST FAIL ({fails})"
+    fails

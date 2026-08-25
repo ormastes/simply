@@ -1,0 +1,52 @@
+# VHDL Example: 8-bit Counter with Reset
+#
+# Demonstrates:
+# - Entity/architecture generation
+# - Clocked process with async reset
+# - Unsigned type mapping
+#
+# Expected VHDL output: examples/09_embedded/vhdl/builder/golden/counter.vhd
+# Run: bin/simple run examples/09_embedded/vhdl/builder/counter.spl
+
+use compiler.backend.vhdl_type_mapper.VhdlTypeMapper
+use compiler.backend.vhdl.vhdl_builder.VhdlBuilder
+
+fn main():
+    val mapper = VhdlTypeMapper__create()
+    var builder = VhdlBuilder__create("counter")
+
+    # Library header
+    builder.emit_library_header()
+
+    # Entity declaration
+    builder.emit_entity_begin("counter")
+    builder.emit_port_begin()
+    builder.emit_port("clk", "in", mapper.bit_type(), false)
+    builder.emit_port("rst", "in", mapper.bit_type(), false)
+    builder.emit_port("en", "in", mapper.bit_type(), false)
+    builder.emit_port("count", "out", mapper.map_unsigned(8), true)
+    builder.emit_port_end()
+    builder.emit_entity_end("counter")
+
+    # Architecture
+    builder.emit_architecture_begin("counter", "rtl")
+    builder.emit_signal_decl("count_reg", mapper.map_unsigned(8), Some("(others => '0')"))
+    builder.emit_architecture_body_begin()
+
+    # Clocked process with async reset
+    builder.emit_clocked_process_begin(Some("count_proc"), "clk", Some("rst"))
+    builder.emit_process_body_begin()
+    builder.emit_if_begin("rst = '1'")
+    builder.emit_signal_assign("count_reg", "(others => '0')")
+    builder.emit_elsif("rising_edge(clk)")
+    builder.emit_if_begin("en = '1'")
+    builder.emit_signal_assign("count_reg", "count_reg + 1")
+    builder.emit_if_end()
+    builder.emit_if_end()
+    builder.emit_process_end(Some("count_proc"))
+
+    # Output assignment
+    builder.emit_signal_assign("count", "count_reg")
+    builder.emit_architecture_end("rtl")
+
+    print builder.build()

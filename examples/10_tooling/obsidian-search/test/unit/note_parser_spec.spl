@@ -1,0 +1,117 @@
+# Unit tests for note_parser module
+
+use src.core.note_parser.{parse_frontmatter, extract_wikilinks, extract_tags, extract_tasks, chunk_by_heading, NoteMeta, WikiLink, Task, Chunk}
+
+describe "NoteParse":
+    """Tests for Obsidian markdown note parsing"""
+
+    context "parse_frontmatter":
+        """Extracting YAML-like frontmatter between --- fences"""
+
+        it "extracts title from frontmatter":
+            val content = "---\ntitle: My Note\n---\n\n# Content"
+            val meta = parse_frontmatter(content)
+            expect(meta.title).to_equal("My Note")
+
+        it "extracts tags from frontmatter list":
+            val content = "---\ntags: [project, active]\n---\n\nBody"
+            val meta = parse_frontmatter(content)
+            expect(meta.tags.len()).to_equal(2)
+            expect(meta.tags[0]).to_equal("project")
+            expect(meta.tags[1]).to_equal("active")
+
+        it "extracts aliases from frontmatter":
+            val content = "---\ntitle: API Design Guide\naliases: [api-guide, api-reference]\n---\n"
+            val meta = parse_frontmatter(content)
+            expect(meta.aliases.len()).to_equal(2)
+            expect(meta.aliases[0]).to_equal("api-guide")
+
+        it "falls back to first heading when no title in frontmatter":
+            val content = "# My Heading\n\nSome text"
+            val meta = parse_frontmatter(content)
+            expect(meta.title).to_equal("My Heading")
+
+        it "handles empty content":
+            val meta = parse_frontmatter("")
+            expect(meta.title).to_equal("")
+            expect(meta.tags.len()).to_equal(0)
+
+    context "extract_wikilinks":
+        """Extracting [[target]] and [[target|alias]] links"""
+
+        it "extracts simple wikilinks":
+            val content = "See [[project-alpha]] for details."
+            val links = extract_wikilinks(content)
+            expect(links.len()).to_equal(1)
+            expect(links[0].target).to_equal("project-alpha")
+            expect(links[0].alias).to_equal("")
+
+        it "extracts wikilinks with aliases":
+            val content = "Check [[api-design|the API docs]]."
+            val links = extract_wikilinks(content)
+            expect(links.len()).to_equal(1)
+            expect(links[0].target).to_equal("api-design")
+            expect(links[0].alias).to_equal("the API docs")
+
+        it "extracts multiple wikilinks":
+            val content = "Links: [[note-a]], [[note-b]], [[note-c]]"
+            val links = extract_wikilinks(content)
+            expect(links.len()).to_equal(3)
+
+        it "handles no wikilinks":
+            val links = extract_wikilinks("No links here.")
+            expect(links.len()).to_equal(0)
+
+    context "extract_tags":
+        """Extracting #tag patterns from content"""
+
+        it "extracts inline tags":
+            val content = "This is #meeting and #standup related"
+            val tags = extract_tags(content)
+            expect(tags.len()).to_equal(2)
+            expect(tags[0]).to_equal("meeting")
+            expect(tags[1]).to_equal("standup")
+
+        it "does not extract headings as tags":
+            val content = "## Heading\n#tag here"
+            val tags = extract_tags(content)
+            expect(tags.len()).to_equal(1)
+            expect(tags[0]).to_equal("tag")
+
+        it "handles no tags":
+            val tags = extract_tags("No tags here")
+            expect(tags.len()).to_equal(0)
+
+    context "extract_tasks":
+        """Extracting checkbox tasks"""
+
+        it "extracts open tasks":
+            val content = "- [ ] Do something\n- [ ] Do another thing"
+            val tasks = extract_tasks(content)
+            expect(tasks.len()).to_equal(2)
+            expect(tasks[0].status).to_equal("open")
+            expect(tasks[0].text_content).to_equal("Do something")
+
+        it "extracts done tasks":
+            val content = "- [x] Completed task"
+            val tasks = extract_tasks(content)
+            expect(tasks.len()).to_equal(1)
+            expect(tasks[0].status).to_equal("done")
+
+        it "extracts mixed tasks":
+            val content = "- [ ] Open task\n- [x] Done task\n- [ ] Another open"
+            val tasks = extract_tasks(content)
+            expect(tasks.len()).to_equal(3)
+
+    context "chunk_by_heading":
+        """Splitting content into heading-scoped chunks"""
+
+        it "creates chunks for each heading":
+            val content = "# Title\n\nIntro text\n\n## Section A\n\nContent A\n\n## Section B\n\nContent B"
+            val chunks = chunk_by_heading(content)
+            expect(chunks.len()).to_be_greater_than(1)
+
+        it "captures heading path":
+            val content = "# Main\n\nText\n\n## Sub\n\nMore text"
+            val chunks = chunk_by_heading(content)
+            expect(chunks.len()).to_be_greater_than(0)

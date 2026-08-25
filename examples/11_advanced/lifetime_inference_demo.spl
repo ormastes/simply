@@ -1,0 +1,65 @@
+# Lifetime Inference Demo
+# This file demonstrates the lifetime inference system in Simple.
+# Run: simple gen-lean memory-safety --file doc/examples/lifetime_inference_demo.spl
+
+# Simple function with no lifetime concerns - uses named args to avoid lint warning
+fn add(a: i32, b: i32) -> i32:
+    a + b
+
+# Function with local variables - lifetimes are tracked
+fn calculate() -> i32:
+    val x: i32 = 10
+    val y: i32 = x * 2
+    val z: i32 = y + x
+    z
+
+# Nested blocks - each block gets its own lifetime scope
+fn nested_scopes() -> i32:
+    val outer: i32 = 1
+    if outer > 0:
+        val inner: i32 = 2
+        inner + outer
+    else:
+        outer
+
+# Struct with methods - self has parameter lifetime
+struct Point:
+    x: i32
+    y: i32
+
+impl Point:
+    fn magnitude_squared() -> i32:
+        self.x * self.x + self.y * self.y
+
+    fn translate(dx: i32, dy: i32) -> Point:
+        Point(x: self.x + dx, y: self.y + dy)
+
+# Class with mutable state
+class Counter:
+    count: i32
+
+    fn new() -> Counter:
+        Counter(count: 0)
+
+    fn increment():
+        self.count = self.count + 1
+
+    fn get() -> i32:
+        self.count
+
+# Loop with variable tracking
+fn sum_to_n(n: i32) -> i32:
+    var sum: i32 = 0
+    var i: i32 = 0
+    while i < n:
+        sum = sum + i
+        i = i + 1
+    sum
+
+# Main entry point
+fn main() -> i32:
+    val result: i32 = add(a=1, b=2)
+    val calc: i32 = calculate()
+    val nested: i32 = nested_scopes()
+    val total: i32 = sum_to_n(10)
+    result + calc + nested + total

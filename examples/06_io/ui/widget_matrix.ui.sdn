@@ -1,0 +1,161 @@
+app:
+    title: "Widget Matrix"
+    theme: glass_dark
+
+layout:
+    type: vbox
+    id: root
+    children:
+        menu:
+            type: menubar
+            id: menu
+            items:
+                0:
+                    label: "File"
+                    children:
+                        0:
+                            label: "Open"
+                            action: "file.open"
+                        1:
+                            label: "Save"
+                            action: "file.save"
+                1:
+                    label: "Help"
+                    children:
+                        0:
+                            label: "About"
+                            action: "help.about"
+        header:
+            type: panel
+            id: header
+            title: "Dashboard"
+            children:
+                title_text:
+                    type: text
+                    id: title_text
+                    content: "Widget coverage sample"
+                progress:
+                    type: progress
+                    id: progress
+                    value: 42
+        tabs:
+            type: tabs
+            id: tabs
+            children:
+                0:
+                    type: text
+                    id: tab_overview
+                    label: "Overview"
+                1:
+                    type: text
+                    id: tab_settings
+                    label: "Settings"
+        main:
+            type: hbox
+            id: main
+            children:
+                nav_panel:
+                    type: panel
+                    id: nav_panel
+                    width: 240
+                    title: "Navigation"
+                    children:
+                        nav_list:
+                            type: list
+                            id: nav_list
+                            items:
+                                0:
+                                    label: "Home"
+                                1:
+                                    label: "Reports"
+                                2:
+                                    label: "Settings"
+                form_panel:
+                    type: panel
+                    id: form_panel
+                    title: "Form"
+                    children:
+                        command_input:
+                            type: input
+                            id: command_input
+                            placeholder: "Search commands"
+                        name_field:
+                            type: textfield
+                            id: name_field
+                            value: "alice"
+                            placeholder: "User name"
+                        sync_checkbox:
+                            type: checkbox
+                            id: sync_checkbox
+                            label: "Enable sync"
+                            checked: true
+                        mode_dropdown:
+                            type: dropdown
+                            id: mode_dropdown
+                            children:
+                                0:
+                                    type: text
+                                    id: mode_auto
+                                    label: "Auto"
+                                1:
+                                    type: text
+                                    id: mode_manual
+                                    label: "Manual"
+                        actions:
+                            type: hbox
+                            id: actions
+                            children:
+                                save_button:
+                                    type: button
+                                    id: save_button
+                                    label: "Save"
+                                    action: "save"
+                                cancel_button:
+                                    type: button
+                                    id: cancel_button
+                                    label: "Cancel"
+                                    action: "cancel"
+                        divider:
+                            type: divider
+                            id: divider
+                data_panel:
+                    type: panel
+                    id: data_panel
+                    title: "Assets"
+                    children:
+                        assets_table:
+                            type: table
+                            id: assets_table
+                            children:
+                                0:
+                                    type: text
+                                    id: asset_row_0
+                                    label: "alpha | ready"
+                                1:
+                                    type: text
+                                    id: asset_row_1
+                                    label: "beta | paused"
+                        logo:
+                            type: image
+                            id: logo
+                            src: "/static/logo.png"
+                            alt: "Simple Logo"
+                        help_tip:
+                            type: tooltip
+                            id: help_tip
+                            target: "save_button"
+                            content: "Save current changes"
+                        confirm_dialog:
+                            type: dialog
+                            id: confirm_dialog
+                            title: "Confirm Save"
+                            children:
+                                confirm_text:
+                                    type: text
+                                    id: confirm_text
+                                    content: "Apply pending changes?"
+        status:
+            type: statusbar
+            id: status
+            left: "{app.mode}"
+            right: "Ready"

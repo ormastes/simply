@@ -1,0 +1,76 @@
+"""
+wear_scrub_check — static wear-leveling + read-disturb scrub regression.
+
+  A. Read-disturb scrub: a block hammered with reads past READ_DISTURB_THRESHOLD is
+     reclaimed by scrub_once (its live data rewritten fresh, clearing disturb), and the
+     data survives. A second scrub finds nothing (the counter was reset).
+
+  B. Static wear leveling: cold data parked in block 0 keeps it at erase-count 0 while a
+     hot region churns other blocks. Once the erase spread exceeds WL_THRESHOLD,
+     wear_level_once reclaims the coldest block so it rejoins the write rotation — and the
+     cold data survives the relocation.
+
+Run: bin/simple run examples/09_embedded/simpleos_nvme_fw/fw/wear_scrub_check.spl
+"""
+
+use nvme_types.*
+use ftl.*
+
+fn main():
+    var fail: i64 = 0
+
+    # ── A. read-disturb scrub ────────────────────────────────────────────────
+    var ftl: Ftl = ftl_new()
+    var j: i64 = 0
+    while j < PAGES_PER_BLOCK:           # fill block 0 with LBA 100..163
+        ftl.write(100 + j, 200 + j)
+        j = j + 1
+    ftl.write(900, 0x55)                 # close block 0
+    var i: i64 = 0
+    while i <= READ_DISTURB_THRESHOLD:   # hammer reads on one block past the threshold
+        ftl.read(100)
+        i = i + 1
+    val scrubbed: i64 = ftl.scrub_once()
+    var sok: i64 = 0
+    if scrubbed != UNMAP:
+        sok = 1
+    print "scrub_once -> {scrubbed}"
+    fail = fail + expect_eq(sok, 1, "scrub reclaims a heavily-read block")
+    fail = fail + expect_eq(ftl.read(100), 200, "data survives read-disturb scrub")
+    fail = fail + expect_eq(ftl.read(163), 263, "all live data survives scrub")
+    fail = fail + expect_eq(ftl.scrub_once(), UNMAP, "no scrub needed after the counter reset")
+
+    # ── B. static wear leveling ──────────────────────────────────────────────
+    var f2: Ftl = ftl_new()
+    var c: i64 = 0
+    while c < PAGES_PER_BLOCK:            # cold data: LBA 0..63 -> block 0, never rewritten
+        f2.write(c, 1000 + c)
+        c = c + 1
+    f2.write(2500, 0xC0)                  # close block 0 (in-range LBA)
+    var h0: i64 = 0
+    while h0 < PAGES_PER_BLOCK:           # pre-write the hot region once (fresh)
+        f2.write(2000 + h0, h0)
+        h0 = h0 + 1
+    var guard: i64 = 0
+    while f2.max_erase() <= WL_THRESHOLD and guard < 100:
+        var h: i64 = 0
+        while h < PAGES_PER_BLOCK:        # overwrite the hot region -> stale -> GC victim
+            f2.write(2000 + h, guard * 1000 + h)
+            h = h + 1
+        f2.gc_once()
+        guard = guard + 1
+    print "after churn: max_erase = {f2.max_erase()} (guard {guard}); cold block erase = {f2.erase_count(0)}"
+    fail = fail + expect_eq(f2.read(0), 1000, "cold data intact before wear-level")
+    val leveled: i64 = f2.wear_level_once()
+    var lok: i64 = 0
+    if leveled != UNMAP:
+        lok = 1
+    print "wear_level_once -> {leveled}"
+    fail = fail + expect_eq(lok, 1, "wear-level reclaims the coldest block")
+    fail = fail + expect_eq(f2.read(0), 1000, "cold data survives wear-leveling relocation")
+    fail = fail + expect_eq(f2.read(63), 1063, "all cold data survives wear-leveling")
+
+    if fail == 0:
+        print "WEAR/SCRUB OK"
+    else:
+        print "WEAR/SCRUB FAIL ({fail})"

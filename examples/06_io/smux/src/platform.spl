@@ -1,0 +1,188 @@
+# Platform Detection
+# Detects OS, terminal emulator, and platform capabilities.
+
+use std.io_runtime.{env_get, process_run, file_exists}
+
+# ============================================================================
+# Platform Enum
+# ============================================================================
+
+enum Platform:
+    Linux
+    MacOS
+    Windows
+    Android
+    IOS
+    Unknown
+
+    fn name() -> text:
+        match self:
+            Platform.Linux => "linux"
+            Platform.MacOS => "macos"
+            Platform.Windows => "windows"
+            Platform.Android => "android"
+            Platform.IOS => "ios"
+            Platform.Unknown => "unknown"
+
+    fn is_mobile() -> bool:
+        match self:
+            Platform.Android => true
+            Platform.IOS => true
+            _ => false
+
+    fn is_desktop() -> bool:
+        match self:
+            Platform.Linux => true
+            Platform.MacOS => true
+            Platform.Windows => true
+            _ => false
+
+# ============================================================================
+# Terminal App Detection
+# ============================================================================
+
+enum TermApp:
+    Termux
+    AShell
+    ISH
+    ITerm
+    WindowsTerminal
+    Tmux
+    Alacritty
+    Kitty
+    WezTerm
+    Unknown
+
+    fn name() -> text:
+        match self:
+            TermApp.Termux => "termux"
+            TermApp.AShell => "a-shell"
+            TermApp.ISH => "ish"
+            TermApp.ITerm => "iterm"
+            TermApp.WindowsTerminal => "windows-terminal"
+            TermApp.Tmux => "tmux"
+            TermApp.Alacritty => "alacritty"
+            TermApp.Kitty => "kitty"
+            TermApp.WezTerm => "wezterm"
+            TermApp.Unknown => "unknown"
+
+    fn supports_nerd_font() -> bool:
+        match self:
+            TermApp.ITerm => true
+            TermApp.Alacritty => true
+            TermApp.Kitty => true
+            TermApp.WezTerm => true
+            _ => false
+
+# ============================================================================
+# Platform Capabilities
+# ============================================================================
+
+struct PlatformInfo:
+    platform: Platform
+    term_app: TermApp
+    has_tmux: bool
+    has_stty: bool
+    term_type: text
+
+# ============================================================================
+# Detection Functions
+# ============================================================================
+
+fn detect_platform() -> Platform:
+    # Check Android first (it also has linux uname)
+    val android_root = env_get("ANDROID_ROOT")
+    if android_root != "" and android_root != nil:
+        return Platform.Android
+    val prefix = env_get("PREFIX")
+    if prefix != "" and prefix != nil:
+        if prefix.contains("com.termux"):
+            return Platform.Android
+
+    # Check iOS
+    if rt_file_exists("/var/mobile"):
+        return Platform.IOS
+    val ishell = env_get("ISHELL")
+    if ishell != "" and ishell != nil:
+        return Platform.IOS
+
+    # Use uname for OS detection
+    val (uname_out, uname_err, uname_code) = rt_process_run("uname", ["-s"])
+    if uname_code == 0:
+        val os_name = uname_out.trim().to_lower()
+        if os_name.contains("linux"):
+            return Platform.Linux
+        if os_name.contains("darwin"):
+            return Platform.MacOS
+
+    # Check Windows
+    val windir = env_get("WINDIR")
+    if windir != "" and windir != nil:
+        return Platform.Windows
+    val os_env = env_get("OS")
+    if os_env != "" and os_env != nil:
+        if os_env.contains("Windows"):
+            return Platform.Windows
+
+    return Platform.Unknown
+
+fn detect_terminal_app() -> TermApp:
+    # Check tmux first
+    val tmux_env = env_get("TMUX")
+    if tmux_env != "" and tmux_env != nil:
+        return TermApp.Tmux
+
+    # Check Termux
+    val prefix = env_get("PREFIX")
+    if prefix != "" and prefix != nil:
+        if prefix.contains("com.termux"):
+            return TermApp.Termux
+
+    # Check various terminal env vars
+    val term_program = env_get("TERM_PROGRAM")
+    if term_program != "" and term_program != nil:
+        if term_program == "iTerm.app":
+            return TermApp.ITerm
+        if term_program == "WezTerm":
+            return TermApp.WezTerm
+
+    val kitty_pid = env_get("KITTY_PID")
+    if kitty_pid != "" and kitty_pid != nil:
+        return TermApp.Kitty
+
+    val alacritty = env_get("ALACRITTY_WINDOW_ID")
+    if alacritty != "" and alacritty != nil:
+        return TermApp.Alacritty
+
+    val wt_session = env_get("WT_SESSION")
+    if wt_session != "" and wt_session != nil:
+        return TermApp.WindowsTerminal
+
+    # Check for a-Shell / iSH
+    val ishell = env_get("ISHELL")
+    if ishell != "" and ishell != nil:
+        return TermApp.AShell
+
+    return TermApp.Unknown
+
+fn detect_platform_info() -> PlatformInfo:
+    val platform = detect_platform()
+    val term_app = detect_terminal_app()
+
+    # Check tmux availability
+    val (tmux_out, tmux_err, tmux_code) = rt_process_run("tmux", ["-V"])
+    val has_tmux = tmux_code == 0
+
+    # Check stty availability
+    val (stty_out, stty_err, stty_code) = rt_process_run("stty", ["--version"])
+    val has_stty = stty_code == 0 or stty_code == 1  # stty --version may return 1
+
+    val term_type = env_get("TERM")
+
+    PlatformInfo(
+        platform: platform,
+        term_app: term_app,
+        has_tmux: has_tmux,
+        has_stty: has_stty,
+        term_type: if term_type != nil: term_type else: ""
+    )

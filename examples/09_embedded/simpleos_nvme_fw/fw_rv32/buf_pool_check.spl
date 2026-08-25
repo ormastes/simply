@@ -1,0 +1,210 @@
+"""
+buf_pool_check — host-only absolute-oracle checks for logic_buf_pool_core.spl
+(wave-3 4-core IPC design contract: doc/05_design/hardware/nvme_fw_multicore/
+fourcore_ipc_index_handle_design.md §5 buf pool).
+
+Deliberately NOT part of the boot-linked import graph (same convention as
+const_drift_check.spl / ipc_ring_check.spl): logic.spl / entry.spl never
+`use buf_pool_check`.
+
+The full-cycle simulation (_check_full_alloc_free_cycle) uses host [i64]
+arrays to stand in for the shm NEXT[]/FREE_HEAD/ALLOC_COUNT words — legal
+here because this file is host-only (same exemption const_drift_check.spl
+relies on for its fw/nvme_types.spl import; fw_rv32's no-array rule applies
+only to the freestanding boot-linked graph).
+
+Run: bin/simple run examples/09_embedded/simpleos_nvme_fw/fw_rv32/buf_pool_check.spl
+Gate: prints "BUF POOL CHECK PASS" and exits 0; exits 1 (with a FAIL line) on
+any failing oracle, so the process rc is meaningful for CI/harness gating.
+"""
+
+extern fn exit(code: i64)
+
+use logic_ipc_layout_core.*
+use logic_buf_pool_core.*
+
+# ── init free-list values: 1,2,...,15,-1 ──────────────────────────────────────
+fn _check_init_next_vals() -> i32:
+    var i: i64 = 0
+    while i < buf_pool_capacity() - 1:
+        if buf_pool_init_next_val(i) != i + 1:
+            return 1
+        i = i + 1
+    if buf_pool_init_next_val(buf_pool_capacity() - 1) != ipc_null_idx():
+        return 1
+    # out-of-range slots are also bounds-checked, fail-closed
+    if buf_pool_init_next_val(-1) != ipc_null_idx():
+        return 1
+    if buf_pool_init_next_val(buf_pool_capacity()) != ipc_null_idx():
+        return 1
+    0
+
+# ── alloc from head=0 yields slot 0 ───────────────────────────────────────────
+fn _check_alloc_from_fresh_head() -> i32:
+    if buf_alloc_verdict(0, 0) != 0:
+        return 1
+    if buf_alloc_verdict(5, 3) != 5:
+        return 1
+    0
+
+# ── alloc when free_head==-1 (pool empty) rejected ────────────────────────────
+fn _check_alloc_empty_pool_rejected() -> i32:
+    if buf_alloc_verdict(ipc_null_idx(), 0) != ipc_null_idx():
+        return 1
+    0
+
+# ── alloc when alloc_count >= capacity rejected (defensive, at-capacity) ─────
+fn _check_alloc_at_capacity_rejected() -> i32:
+    if buf_alloc_verdict(3, buf_pool_capacity()) != ipc_null_idx():
+        return 1
+    if buf_alloc_verdict(3, buf_pool_capacity() + 1) != ipc_null_idx():
+        return 1
+    0
+
+# ── free with next_val != BUF_IN_USE rejected (double-free) ──────────────────
+fn _check_free_double_free_rejected() -> i32:
+    # slot 4 claims to already be on the free list (next_val=7, not BUF_IN_USE)
+    val v: i64 = buf_free_verdict(4, 7, 0, 5)
+    if buf_free_verdict_ok(v) != 0:
+        return 1
+    if buf_free_verdict_err(v) != buf_free_err_double_free():
+        return 1
+    0
+
+# ── free of out-of-range slot rejected ────────────────────────────────────────
+fn _check_free_out_of_range_rejected() -> i32:
+    val v_neg: i64 = buf_free_verdict(-1, BUF_IN_USE(), 0, 5)
+    if buf_free_verdict_ok(v_neg) != 0:
+        return 1
+    if buf_free_verdict_err(v_neg) != buf_free_err_bounds():
+        return 1
+    val v_hi: i64 = buf_free_verdict(buf_pool_capacity(), BUF_IN_USE(), 0, 5)
+    if buf_free_verdict_ok(v_hi) != 0:
+        return 1
+    if buf_free_verdict_err(v_hi) != buf_free_err_bounds():
+        return 1
+    0
+
+# ── free when nothing is outstanding (alloc_count<=0) rejected ───────────────
+fn _check_free_nothing_outstanding_rejected() -> i32:
+    val v: i64 = buf_free_verdict(2, BUF_IN_USE(), ipc_null_idx(), 0)
+    if buf_free_verdict_ok(v) != 0:
+        return 1
+    if buf_free_verdict_err(v) != buf_free_err_double_free():
+        return 1
+    0
+
+# ── free accepted for a properly-allocated slot ───────────────────────────────
+fn _check_free_accepted() -> i32:
+    val v: i64 = buf_free_verdict(9, BUF_IN_USE(), 3, 2)
+    if buf_free_verdict_ok(v) != 1:
+        return 1
+    if v != 1:
+        return 1
+    0
+
+# ── full 16-alloc + 16-free cycle: count returns to 0, free-list complete ────
+fn _check_full_alloc_free_cycle() -> i32:
+    val cap: i64 = buf_pool_capacity()
+    var next: [i64] = [buf_pool_init_next_val(i) for i in 0..cap]
+    var free_head: i64 = 0
+    var alloc_count: i64 = 0
+
+    # 16 allocs must succeed in order 0..15 and drain the pool.
+    var i: i64 = 0
+    while i < cap:
+        val verdict: i64 = buf_alloc_verdict(free_head, alloc_count)
+        if verdict != i:
+            return 1
+        val slot: i64 = verdict
+        val new_head: i64 = next[slot]
+        next[slot] = BUF_IN_USE()
+        free_head = new_head
+        alloc_count = alloc_count + 1
+        i = i + 1
+
+    if free_head != ipc_null_idx():
+        return 1
+    if alloc_count != cap:
+        return 1
+    # 17th alloc (pool exhausted) must be rejected.
+    if buf_alloc_verdict(free_head, alloc_count) != ipc_null_idx():
+        return 1
+
+    # Free all 16 slots back (same order 0..15).
+    i = 0
+    while i < cap:
+        val verdict: i64 = buf_free_verdict(i, next[i], free_head, alloc_count)
+        if buf_free_verdict_ok(verdict) != 1:
+            return 1
+        next[i] = free_head
+        free_head = i
+        alloc_count = alloc_count - 1
+        i = i + 1
+
+    if alloc_count != 0:
+        return 1
+
+    # Walk the free list from free_head; must visit all `cap` slots exactly
+    # once (free-list complete, no cycle/loss). Bounded walk: fail-closed if
+    # it doesn't terminate within cap+1 steps.
+    var visited: [i64] = [0 for i in 0..cap]
+    var cursor: i64 = free_head
+    var steps: i64 = 0
+    while cursor != ipc_null_idx():
+        if steps > cap:
+            return 1
+        if buf_slot_valid(cursor) == 0:
+            return 1
+        if visited[cursor] != 0:
+            return 1
+        visited[cursor] = 1
+        cursor = next[cursor]
+        steps = steps + 1
+
+    var total: i64 = 0
+    var j: i64 = 0
+    while j < cap:
+        total = total + visited[j]
+        j = j + 1
+    if total != cap:
+        return 1
+    0
+
+fn buf_pool_check_selftest() -> i32:
+    if _check_init_next_vals() != 0:
+        print "  FAIL: init free-list values 1..15,-1"
+        return 1
+    if _check_alloc_from_fresh_head() != 0:
+        print "  FAIL: alloc from fresh head yields free_head"
+        return 1
+    if _check_alloc_empty_pool_rejected() != 0:
+        print "  FAIL: alloc rejected when free_head == IPC_NULL_IDX"
+        return 1
+    if _check_alloc_at_capacity_rejected() != 0:
+        print "  FAIL: alloc rejected when alloc_count >= capacity"
+        return 1
+    if _check_free_double_free_rejected() != 0:
+        print "  FAIL: free rejected on double-free (next_val != BUF_IN_USE)"
+        return 1
+    if _check_free_out_of_range_rejected() != 0:
+        print "  FAIL: free rejected on out-of-range slot"
+        return 1
+    if _check_free_nothing_outstanding_rejected() != 0:
+        print "  FAIL: free rejected when alloc_count <= 0"
+        return 1
+    if _check_free_accepted() != 0:
+        print "  FAIL: free accepted for a properly-allocated slot"
+        return 1
+    if _check_full_alloc_free_cycle() != 0:
+        print "  FAIL: full 16-alloc + 16-free cycle"
+        return 1
+    0
+
+fn main():
+    val fail = buf_pool_check_selftest()
+    if fail == 0:
+        print "BUF POOL CHECK PASS"
+    else:
+        print "BUF POOL CHECK FAIL"
+        exit(1)

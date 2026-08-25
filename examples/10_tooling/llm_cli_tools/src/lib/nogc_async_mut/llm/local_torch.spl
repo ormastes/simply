@@ -1,0 +1,98 @@
+#![allow(unnamed_duplicate_typed_args)]
+# LLM Caret - Local Torch Model
+#
+# Runs local HuggingFace transformers model via Python subprocess.
+# Uses temp files for prompt/output to avoid shell quoting issues.
+
+extern fn rt_process_run(cmd: text, args: [text]) -> (text, text, i64)
+extern fn rt_file_write_text(path: text, content: text) -> bool
+extern fn rt_file_read_text(path: text) -> text
+extern fn rt_file_delete(path: text) -> bool
+extern fn rt_time_now_unix_micros() -> i64
+
+# ============================================================================
+# Response struct
+# ============================================================================
+
+struct LocalResponse:
+    content: text
+    model: text
+    error: text
+    is_error: bool
+
+# ============================================================================
+# Python script generation
+# ============================================================================
+
+fn build_torch_script(model_path: text, prompt_file: text, output_file: text, max_tokens: i64) -> text:
+    var tokens = max_tokens
+    if tokens <= 0:
+        tokens = 256
+    var script = "import sys\n"
+    script = script + "try:\n"
+    script = script + "    from transformers import AutoModelForCausalLM, AutoTokenizer\n"
+    script = script + "    import torch\n"
+    script = script + "    with open('" + prompt_file + "', 'r') as f:\n"
+    script = script + "        prompt = f.read()\n"
+    script = script + "    tokenizer = AutoTokenizer.from_pretrained('" + model_path + "')\n"
+    script = script + "    model = AutoModelForCausalLM.from_pretrained('" + model_path + "', torch_dtype=torch.float16, device_map='auto')\n"
+    script = script + "    inputs = tokenizer(prompt, return_tensors='pt').to(model.device)\n"
+    script = script + "    with torch.no_grad():\n"
+    script = script + "        outputs = model.generate(**inputs, max_new_tokens=" + tokens.to_text() + ")\n"
+    script = script + "    result = tokenizer.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)\n"
+    script = script + "    with open('" + output_file + "', 'w') as f:\n"
+    script = script + "        f.write(result)\n"
+    script = script + "except Exception as e:\n"
+    script = script + "    sys.stderr.write(str(e))\n"
+    script = script + "    sys.exit(1)\n"
+    script
+
+# ============================================================================
+# Send request via Python subprocess
+# ============================================================================
+
+fn local_torch_send(python_path: text, model_path: text, prompt: text, max_tokens: i64) -> LocalResponse:
+    if model_path == "":
+        return LocalResponse(
+            content: "",
+            model: "",
+            error: "model_path not configured",
+            is_error: true
+        )
+    # Create temp files
+    val ts = rt_time_now_unix_micros()
+    val prompt_file = "/tmp/llm_caret_prompt_" + ts.to_text() + ".txt"
+    val output_file = "/tmp/llm_caret_output_" + ts.to_text() + ".txt"
+    val script_file = "/tmp/llm_caret_script_" + ts.to_text() + ".py"
+    # Write prompt
+    rt_file_write_text(prompt_file, prompt)
+    # Write script
+    val script = build_torch_script(model_path, prompt_file, output_file, max_tokens)
+    rt_file_write_text(script_file, script)
+    # Run Python
+    var py = python_path
+    if py == "":
+        py = "python3"
+    val result = rt_process_run(py, [script_file])
+    val stderr = result.1 ?? ""
+    val exit_code = result.2
+    # Cleanup
+    rt_file_delete(prompt_file)
+    rt_file_delete(script_file)
+    if exit_code != 0:
+        rt_file_delete(output_file)
+        return LocalResponse(
+            content: "",
+            model: model_path,
+            error: "Python error: " + stderr,
+            is_error: true
+        )
+    # Read output
+    val output = rt_file_read_text(output_file) ?? ""
+    rt_file_delete(output_file)
+    LocalResponse(
+        content: output,
+        model: model_path,
+        error: "",
+        is_error: false
+    )

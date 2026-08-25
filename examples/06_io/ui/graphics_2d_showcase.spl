@@ -1,0 +1,694 @@
+# graphics_2d_showcase.spl — canonical standalone Engine2D primitive gallery.
+#
+# Headless: bin/simple run examples/06_io/ui/graphics_2d_showcase.spl
+# Window:   bin/simple run examples/06_io/ui/graphics_2d_showcase_gui.spl
+
+use std.gpu.engine2d.engine.{Engine2D}
+use std.io.window_winit.{WinitInput, winit_loop_new, winit_loop_free, winit_window_new, winit_window_free, winit_present_rgba, winit_poll_input}
+use std.nogc_sync_mut.concurrent.thread.{thread_sleep}
+use std.io_runtime.{env_get, file_write}
+use std.nogc_sync_mut.io.time_ops.{time_now_micros}
+use std.common.encoding.font_registry.{selected_font_asset_candidates, selected_font_asset_identity}
+use common.ui.wm_app_process_contract.{graphics_2d_showcase_window_title}
+use std.gpu.engine2d.simd_kernels.{native_pixel_rows_enabled, active_arch_text, active_feature_text}
+use std.nogc_sync_mut.game2d.render.draw_batcher.{DrawBatcher}
+use std.nogc_sync_mut.game2d.render.image.{Image}
+use std.nogc_sync_mut.game2d.backend.headless.{HeadlessBackend}
+use std.nogc_sync_mut.engine.render.command.{RenderCommandBuffer}
+use std.nogc_sync_mut.engine.sprite.sprite.{Sprite}
+use std.common.engine.ids.{TextureId}
+use std.common.engine.units.{ZIndex}
+use std.common.engine.rect.{Rect2}
+use std.common.engine.color.{EngineColor}
+
+# Design-space reference dimensions (scaling denominators). The gallery is
+# authored at 800x600 and scaled up to the resolved render resolution.
+val W: i32 = 800
+val H: i32 = 600
+val BG: u32 = 0xFF101522u32
+val PANEL: u32 = 0xFF1B2435u32
+val WHITE: u32 = 0xFFF3F6FCu32
+val BLUE: u32 = 0xFF3B82F6u32
+val CYAN: u32 = 0xFF22D3EEu32
+val GREEN: u32 = 0xFF22C55Eu32
+val AMBER: u32 = 0xFFF59E0Bu32
+val RED: u32 = 0xFFEF4444u32
+val PURPLE: u32 = 0xFFA855F7u32
+
+# Shared showcase render-defaults convention:
+#   SHOWCASE_RESOLUTION: unset/"4k" => 3840x2160 (DEFAULT); "8k" => 7680x4320;
+#                        "WxH" (e.g. "1920x1080") => that exact size.
+#   SHOWCASE_DPI:        default 300; output-density metadata/evidence. The
+#                        resolution already names backing pixels, so DPI must
+#                        not scale geometry a second time.
+# Full 4K/8K rendering is compiled-lane-gated — the interpreter lane is far too
+# slow for millions of software-rasterized pixels. Verify parameterization at a
+# small rung (e.g. SHOWCASE_RESOLUTION=320x240).
+val SHOWCASE_RESOLUTION_ENV: text = "SHOWCASE_RESOLUTION"
+val SHOWCASE_DPI_ENV: text = "SHOWCASE_DPI"
+val GUI_EVENT_EVIDENCE_ENV: text = "SIMPLE_GUI_EVENT_EVIDENCE_PATH"
+val GUI_EXIT_AFTER_INTERACTION_ENV: text = "SIMPLE_GUI_EXIT_AFTER_INTERACTION"
+
+# Level-gated stage trace (default OFF). Set SIMPLE_SHOWCASE_TRACE=1 to localize
+# where a slow/blocked headless run is spending its time. Retained per the log
+# retention policy: these are level-gated probes, not one-off dumps.
+# See doc/07_guide/infra/logging/log_retention_policy.md
+val SHOWCASE_TRACE_ENV: text = "SIMPLE_SHOWCASE_TRACE"
+val SHOWCASE_PERF_4K_ENV: text = "SHOWCASE_4K_PERF"
+val SHOWCASE_PERF_8K_ENV: text = "SHOWCASE_8K_PERF"
+val SHOWCASE_PERF_ENV: text = "SHOWCASE_PERF"
+val SHOWCASE_PERF_FRAMES_ENV: text = "SHOWCASE_PERF_FRAMES"
+val SHOWCASE_PERF_WARMUP_ENV: text = "SHOWCASE_PERF_WARMUP"
+val SHOWCASE_SIMD_INFO_ENV: text = "SHOWCASE_SIMD_INFO"
+
+fn showcase_trace_enabled() -> bool:
+    (env_get(SHOWCASE_TRACE_ENV) ?? "") == "1"
+
+# NOTE: the parameter cannot be named `on` — a bare `on` identifier is captured
+# by the AOP pointcut grammar and fails the whole file with "expected pointcut
+# expression 'pc{...}', found Newline". Filed:
+# doc/08_tracking/bug/aop_on_hard_keyword_blocks_identifier_2026-07-25.md
+fn showcase_trace(enabled: bool, stage: text) -> bool:
+    if enabled:
+        print "graphics_2d_trace={stage}"
+    enabled
+
+fn showcase_selected_backend() -> text:
+    val raw = (env_get("SIMPLE_GUI_BACKEND") ?? "").trim().lower()
+    if raw == "":
+        return "software"
+    raw
+
+class ShowcaseSize:
+    width: i32
+    height: i32
+
+fn parse_dim_int(s: text, default: i32) -> i32:
+    val trimmed = s.trim()
+    val n = trimmed.len()
+    if n == 0:
+        return default
+    val zero = "0".to_i64()
+    var result: i64 = 0
+    var i = 0
+    while i < n:
+        val digit = trimmed.char_at(i).to_i64() - zero
+        if digit < 0 or digit > 9:
+            return default
+        result = result * 10 + digit
+        i = i + 1
+    return result.to_i32()
+
+fn resolve_showcase_dimensions() -> ShowcaseSize:
+    val raw = (env_get(SHOWCASE_RESOLUTION_ENV) ?? "").trim()
+    if raw == "" or raw == "4k" or raw == "4K":
+        return ShowcaseSize(width: 3840, height: 2160)
+    if raw == "8k" or raw == "8K":
+        return ShowcaseSize(width: 7680, height: 4320)
+    var parts = raw.split("x")
+    if parts.len() != 2:
+        parts = raw.split("X")
+    if parts.len() == 2:
+        val w = parse_dim_int(parts[0], 0)
+        val h = parse_dim_int(parts[1], 0)
+        if w > 0 and h > 0:
+            return ShowcaseSize(width: w, height: h)
+    return ShowcaseSize(width: 3840, height: 2160)
+
+fn resolve_showcase_dpi() -> i32:
+    val raw = (env_get(SHOWCASE_DPI_ENV) ?? "").trim()
+    if raw == "":
+        return 300
+    val d = parse_dim_int(raw, 300)
+    if d < 1:
+        return 300
+    d
+
+fn parse_bool_env(name: text) -> bool:
+    (env_get(name) ?? "") == "1" or (env_get(name) ?? "") == "true"
+
+fn parse_perf_frames(default_frames: i64) -> i64:
+    val raw = (env_get(SHOWCASE_PERF_FRAMES_ENV) ?? "").trim()
+    if raw == "":
+        return default_frames
+    raw.parse_i64() ?? default_frames
+
+fn parse_perf_warmup(default_warmup: i64) -> i64:
+    val raw = (env_get(SHOWCASE_PERF_WARMUP_ENV) ?? "").trim()
+    if raw == "":
+        return default_warmup
+    raw.parse_i64() ?? default_warmup
+
+# Coordinate/size scaling from 800x600 design space to render_w x render_h.
+fn sx(v: i32, rw: i32) -> i32:
+    v * rw / W
+fn sy(v: i32, rh: i32) -> i32:
+    v * rh / H
+# Stroke / text / detail scale follows backing-pixel resolution only.
+# `SHOWCASE_DPI` is output-density metadata, not another geometry multiplier.
+fn sd(v: i32, rw: i32, dpi: i32) -> i32:
+    val r = v * rw / W
+    if r < 1:
+        return 1
+    r
+
+fn gpu_backend_requested(name: text) -> bool:
+    name == "metal" or name == "vulkan" or name == "cuda" or
+        name == "rocm" or name == "directx" or name == "opencl" or
+        name == "opengl" or name == "webgpu" or name == "intel" or
+        name == "qualcomm" or name == "virtio_gpu"
+
+fn checker_pixels() -> [u32]:
+    [RED, AMBER, GREEN, CYAN, BLUE, PURPLE, WHITE, PANEL,
+     CYAN, BLUE, PURPLE, RED, AMBER, GREEN, PANEL, WHITE]
+
+fn showcase_mask(rw: i32, rh: i32) -> [u8]:
+    var mask: [u8] = [0u8; rw * rh]
+    val xlo = sx(610, rw)
+    val xhi = sx(780, rw)
+    val ylo = sy(350, rh)
+    val yhi = sy(430, rh)
+    var y = 0
+    while y < rh:
+        var x = 0
+        while x < rw:
+            if x >= xlo and x < xhi and y >= ylo and y < yhi:
+                mask[y * rw + x] = 255u8
+            x = x + 1
+        y = y + 1
+    mask
+
+fn label(mut e: Engine2D, rw: i32, rh: i32, dpi: i32, x: i32, y: i32, value: text) -> Engine2D:
+    # Return-threaded like draw_showcase below (param-detach class).
+    e.draw_text_bg(sx(x, rw), sy(y, rh), value, WHITE, 0xCC101522u32, sd(12, rw, dpi))
+    e
+
+# Returns the engine: paints made through a class PARAM are lost to the
+# caller on the deployed interpreter lane (param handle detaches; mut alone
+# does not write back) — the showcase read back an unpainted engine and
+# printed nonzero=0 (root-caused via checkpoint bisect 2026-07-18). Thread
+# the engine back explicitly.
+fn draw_showcase(mut e: Engine2D, rw: i32, rh: i32, dpi: i32, tr: bool, include_mask: bool) -> Engine2D:
+    showcase_trace(tr, "draw_begin")
+    e.clear(BG)
+    showcase_trace(tr, "cleared")
+    e.draw_text(sx(20, rw), sy(12, rh), "Simple Engine2D — complete primitive showcase", WHITE, sd(18, rw, dpi))
+
+    # Rectangles, outlines, rounded geometry, and line families.
+    e.draw_rect_filled(sx(18, rw), sy(48, rh), sx(245, rw), sy(150, rh), PANEL)
+    e = label(e, rw, rh, dpi, 28, 55, "RECT / LINE")
+    e.draw_rect(sx(30, rw), sy(80, rh), sx(55, rw), sy(38, rh), BLUE)
+    e.draw_rect_filled(sx(94, rw), sy(80, rh), sx(55, rw), sy(38, rh), CYAN)
+    e.draw_rect_thick(sx(158, rw), sy(80, rh), sx(55, rw), sy(38, rh), GREEN, sd(4, rw, dpi))
+    e.draw_rounded_rect(sx(30, rw), sy(130, rh), sx(80, rw), sy(45, rh), sx(12, rw), PURPLE)
+    e.draw_rounded_rect_outline(sx(122, rw), sy(130, rh), sx(92, rw), sy(45, rh), sx(12, rw), AMBER, sd(3, rw, dpi))
+    e.draw_line(sx(30, rw), sy(185, rh), sx(215, rw), sy(185, rh), RED, sd(3, rw, dpi))
+    e.draw_polyline([sx(30, rw), sx(65, rw), sx(100, rw), sx(140, rw), sx(180, rw), sx(215, rw)], [sy(190, rh), sy(178, rh), sy(194, rh), sy(176, rh), sy(193, rh), sy(180, rh)], 6, CYAN, sd(2, rw, dpi))
+
+    # Circles, ellipses, arcs, triangles, polygon, and cubic bezier.
+    e.draw_rect_filled(sx(276, rw), sy(48, rh), sx(250, rw), sy(245, rh), PANEL)
+    e = label(e, rw, rh, dpi, 286, 55, "CURVES / SHAPES")
+    e.draw_circle(sx(310, rw), sy(105, rh), sx(25, rw), BLUE)
+    e.draw_circle_filled(sx(375, rw), sy(105, rh), sx(25, rw), GREEN)
+    e.draw_circle_thick(sx(440, rw), sy(105, rh), sx(25, rw), AMBER, sd(5, rw, dpi))
+    e.draw_ellipse(sx(320, rw), sy(165, rh), sx(35, rw), sy(20, rh), CYAN)
+    e.draw_ellipse_filled(sx(405, rw), sy(165, rh), sx(35, rw), sy(20, rh), PURPLE)
+    e.draw_arc(sx(480, rw), sy(165, rh), sx(30, rw), 30, 300, RED, sd(4, rw, dpi))
+    e.draw_triangle_filled(sx(295, rw), sy(225, rh), sx(345, rw), sy(190, rh), sx(365, rw), sy(245, rh), BLUE)
+    e.draw_triangle_outline(sx(375, rw), sy(245, rh), sx(410, rw), sy(195, rh), sx(450, rw), sy(245, rh), WHITE, sd(3, rw, dpi))
+    e.draw_polygon_filled([sx(465, rw), sx(495, rw), sx(520, rw), sx(505, rw), sx(475, rw)], [sy(205, rh), sy(190, rh), sy(215, rh), sy(248, rh), sy(245, rh)], 5, GREEN)
+    e.draw_bezier(sx(290, rw), sy(275, rh), sx(345, rw), sy(235, rh), sx(430, rw), sy(315, rh), sx(510, rw), sy(270, rh), AMBER, sd(3, rw, dpi))
+    showcase_trace(tr, "shapes_done")
+
+    # Vertical, horizontal, and radial gradients.
+    e.draw_rect_filled(sx(539, rw), sy(48, rh), sx(243, rw), sy(245, rh), PANEL)
+    e = label(e, rw, rh, dpi, 549, 55, "GRADIENT / EFFECT")
+    e.draw_gradient_rect(sx(551, rw), sy(82, rh), sx(65, rw), sy(70, rh), BLUE, PURPLE)
+    e.draw_gradient_rect_h(sx(626, rw), sy(82, rh), sx(65, rw), sy(70, rh), GREEN, CYAN)
+    e.draw_radial_gradient(sx(739, rw), sy(117, rh), sx(38, rw), WHITE, RED)
+    e.draw_shadow_rect(sx(558, rw), sy(180, rh), sx(85, rw), sy(55, rh), sx(8, rw), sy(8, rh), sd(8, rw, dpi), 0xAA000000u32)
+    e.draw_rect_filled(sx(558, rw), sy(180, rh), sx(85, rw), sy(55, rh), BLUE)
+    e.draw_gradient_rect(sx(660, rw), sy(177, rh), sx(105, rw), sy(62, rh), CYAN, PURPLE)
+    e.draw_blur_rect(sx(680, rw), sy(192, rh), sx(65, rw), sy(32, rh), sd(5, rw, dpi))
+    e.draw_rect_blend(sx(558, rw), sy(252, rh), sx(65, rw), sy(25, rh), 0x887C3AEDu32)
+    e.draw_rect_blend_mode(sx(635, rw), sy(252, rh), sx(65, rw), sy(25, rh), 0xAA22C55Eu32, 1)
+    showcase_trace(tr, "gradients_done")
+
+    # Generated image operations and text backgrounds. draw_image/draw_image_blend
+    # take the source dimensions (4x4) as w/h — those stay unscaled; only the
+    # destination position scales. draw_image_scaled scales its dst_w/dst_h.
+    e.draw_rect_filled(sx(18, rw), sy(307, rh), sx(365, rw), sy(130, rh), PANEL)
+    e = label(e, rw, rh, dpi, 28, 315, "IMAGE / TEXT")
+    val image = checker_pixels()
+    e.draw_image(sx(30, rw), sy(345, rh), 4, 4, image)
+    e.draw_image_blend(sx(65, rw), sy(345, rh), 4, 4, image)
+    e.draw_image_scaled(sx(105, rw), sy(345, rh), sx(64, rw), sy(64, rh), 4, 4, image)
+    e.draw_image_transform(sx(185, rw), sy(345, rh), 4, 4, 256, 64, 0, 256, 0, 0, image)
+    e.draw_text(sx(235, rw), sy(350, rh), "glyph text", GREEN, sd(14, rw, dpi))
+    e.draw_text_bg(sx(235, rw), sy(380, rh), "text background", WHITE, BLUE, sd(14, rw, dpi))
+    showcase_trace(tr, "image_text_done")
+
+    # Clip is visibly confined to the cyan frame.
+    e.draw_rect_filled(sx(397, rw), sy(307, rh), sx(180, rw), sy(130, rh), PANEL)
+    e = label(e, rw, rh, dpi, 407, 315, "CLIP")
+    e.draw_rect(sx(414, rw), sy(346, rh), sx(142, rw), sy(70, rh), CYAN)
+    e.set_clip(sx(416, rw), sy(348, rh), sx(138, rw), sy(66, rh))
+    e.draw_circle_filled(sx(416, rw), sy(380, rh), sx(55, rw), RED)
+    e.draw_rect_filled(sx(480, rw), sy(340, rh), sx(100, rw), sy(85, rh), PURPLE)
+    e.clear_clip()
+    showcase_trace(tr, "clip_done")
+
+    # Full-frame alpha mask confines this draw to the lower-right mask region.
+    e.draw_rect_filled(sx(591, rw), sy(307, rh), sx(191, rw), sy(130, rh), PANEL)
+    e = label(e, rw, rh, dpi, 601, 315, "MASK")
+    if include_mask:
+        showcase_trace(tr, "mask_build_begin")
+        val mask = showcase_mask(rw, rh)
+        showcase_trace(tr, "mask_build_done")
+        e.set_mask(mask, rw, rh)
+    e.draw_gradient_rect_h(sx(600, rw), sy(350, rh), sx(180, rw), sy(80, rh), AMBER, RED)
+    e.clear_mask()
+    showcase_trace(tr, "mask_done")
+
+    # Engine-to-engine composition. The child keeps its native 80x60 size (its
+    # internal draws are child-local); only its placement scales.
+    var child = Engine2D.create_with_backend_fast(80, 60, "software")
+    child.clear(0x00000000u32)
+    child.draw_rounded_rect(5, 5, 70, 50, 10, BLUE)
+    child.draw_circle_filled(40, 30, 16, AMBER)
+    child.present()
+    e.draw_rect_filled(sx(18, rw), sy(452, rh), sx(570, rw), sy(125, rh), PANEL)
+    e = label(e, rw, rh, dpi, 28, 460, "ENGINE COMPOSITION / OPACITY")
+    e.draw_engine(sx(38, rw), sy(495, rh), child)
+    e.draw_engine_opacity(sx(138, rw), sy(495, rh), child, 450)
+    child.shutdown()
+
+    # game2d draw batcher: animated sprite over a tilemap. Six fixed steps of
+    # a bouncing sprite plus a 4x3 tinted tilemap are batched per frame via
+    # DrawBatcher (sorted by z/texture, batch stats tracked), rasterized in a
+    # game2d HeadlessBackend, and the FINAL animation frame is blitted here.
+    e.draw_rect_filled(sx(591, rw), sy(452, rh), sx(191, rw), sy(125, rh), PANEL)
+    e = label(e, rw, rh, dpi, 601, 460, "GAME2D BATCH")
+    e = draw_game2d_sprite_segment(e, rw, rh, tr)
+    showcase_trace(tr, "game2d_batch_done")
+    showcase_trace(tr, "draw_end")
+    e
+
+# Animated sprite/tilemap segment exercising the game2d DrawBatcher.
+# Return-threaded like draw_showcase (param-detach class).
+fn draw_game2d_sprite_segment(mut e: Engine2D, rw: i32, rh: i32, tr: bool) -> Engine2D:
+    val seg_w: i64 = 96
+    val seg_h: i64 = 72
+    var backend = HeadlessBackend.create(seg_w, seg_h)
+    var batcher = DrawBatcher.create()
+    val tile_img = Image.from_sprite(
+        Sprite.create(TextureId(raw: 1), Rect2(x: 0.0, y: 0.0, width: 16.0, height: 16.0)), 16, 16)
+    val hero_img = Image.from_sprite(
+        Sprite.create(TextureId(raw: 2), Rect2(x: 0.0, y: 0.0, width: 12.0, height: 12.0)), 12, 12)
+    val tile_a = EngineColor(r: 0.13, g: 0.25, b: 0.42, a: 1.0)
+    val tile_b = EngineColor(r: 0.18, g: 0.55, b: 0.45, a: 1.0)
+    val hero = EngineColor(r: 0.96, g: 0.62, b: 0.10, a: 1.0)
+    var step: i64 = 0
+    while step < 6:
+        backend.clear_buffer(EngineColor(r: 0.06, g: 0.08, b: 0.13, a: 1.0))
+        batcher.begin_frame()
+        var ty: i64 = 0
+        while ty < 3:
+            var tx: i64 = 0
+            while tx < 4:
+                val tint = if (tx + ty) % 2 == 0: tile_a else: tile_b
+                val dst = Rect2(x: (tx * 24) as f64, y: (24 + ty * 16) as f64, width: 24.0, height: 16.0)
+                batcher.submit_tinted(tile_img, dst, tint, ZIndex(value: 0))
+                tx = tx + 1
+            ty = ty + 1
+        # Bouncing sprite: deterministic 6-step arc across the tilemap.
+        val bounce = if step % 3 == 0: 0 else: if step % 3 == 1: 8 else: 4
+        val hero_dst = Rect2(x: (6 + step * 14) as f64, y: (10 + bounce) as f64, width: 12.0, height: 12.0)
+        batcher.submit_tinted(hero_img, hero_dst, hero, ZIndex(value: 1))
+        var buf = RenderCommandBuffer.create()
+        batcher.end_frame(buf)
+        backend.gb_execute_commands(buf)
+        step = step + 1
+    val stats = batcher.last_stats()
+    print "game2d_batch: {stats.summary()}"
+    # Blit the final animation frame. Headless packs ABGR; Engine2D consumes
+    # ARGB — swap R/B during conversion so panel colors are true.
+    val n = backend.fb.len()
+    val px: [u32] = [0; n]
+    var i: i64 = 0
+    while i < n:
+        val w = backend.fb[i]
+        val a = (w / 16777216) & 0xff
+        val b = (w / 65536) & 0xff
+        val g = (w / 256) & 0xff
+        val r = w & 0xff
+        px[i] = ((a * 16777216) + (r * 65536) + (g * 256) + b) as u32
+        i = i + 1
+    e.draw_image(sx(640, rw), sy(485, rh), seg_w as i32, seg_h as i32, px)
+    showcase_trace(tr, "game2d_batch_blit_done")
+    e
+
+fn pack_rgb(pixels: [u32]) -> [i64]:
+    var packed: [i64] = [0i64; pixels.len()]
+    var i = 0
+    while i < pixels.len():
+        packed[i] = pixels[i].to_i64() & 0xFFFFFF
+        i = i + 1
+    packed
+
+fn should_close(input: WinitInput) -> bool:
+    if input.close:
+        return true
+    for key in input.keys:
+        if key == 27 or key == 81 or key == 113:
+            return true
+    false
+
+fn semantic_sample_differences(pixels: [u32], rw: i32, rh: i32) -> i32:
+    # Exact interiors of five independently rendered primitives, scaled from
+    # design space to the render resolution (stride = rw). Adjacent samples
+    # must differ, preventing a uniform/background-only frame from satisfying
+    # the showcase evidence contract.
+    val samples = [pixels[sy(90, rh) * rw + sx(100, rw)], pixels[sy(105, rh) * rw + sx(375, rw)],
+                   pixels[sy(200, rh) * rw + sx(570, rw)], pixels[sy(165, rh) * rw + sx(405, rw)],
+                   pixels[sy(590, rh) * rw + sx(790, rw)]]
+    var differences = 0
+    var i = 1
+    while i < samples.len():
+        if samples[i] != samples[i - 1]:
+            differences = differences + 1
+        i = i + 1
+    differences
+
+fn write_gui_event_evidence(path: text, backend: text, source: text, backend_handle: i64,
+                            initial_checksum: i64, interaction_checksum: i64,
+                            keyboard_events: i64, pointer_events: i64,
+                            click_events: i64, interaction_revision: i64) -> bool:
+    if path == "":
+        return true
+    file_write(path,
+        "graphics_2d_event_backend={backend}\n" +
+        "graphics_2d_event_source={source}\n" +
+        "graphics_2d_event_backend_handle={backend_handle}\n" +
+        "graphics_2d_event_initial_checksum={initial_checksum}\n" +
+        "graphics_2d_event_interaction_checksum={interaction_checksum}\n" +
+        "graphics_2d_event_keyboard_events={keyboard_events}\n" +
+        "graphics_2d_event_pointer_events={pointer_events}\n" +
+        "graphics_2d_event_click_events={click_events}\n" +
+        "graphics_2d_event_interaction_revision={interaction_revision}\n")
+
+fn run_graphics_2d_showcase(gui: bool, backend: text) -> i64:
+    val run_perf_4k = parse_bool_env(SHOWCASE_PERF_4K_ENV)
+    val run_perf_8k = parse_bool_env(SHOWCASE_PERF_8K_ENV)
+    val run_perf = parse_bool_env(SHOWCASE_PERF_ENV)
+    if run_perf_4k:
+        return run_graphics_2d_showcase_4k_perf_probe(backend)
+    if run_perf_8k:
+        return run_graphics_2d_showcase_8k_perf_probe(backend)
+    if run_perf:
+        val size = resolve_showcase_dimensions()
+        return run_graphics_2d_showcase_perf_probe(
+            size.width, size.height, backend, parse_perf_frames(60), "graphics_2d_perf")
+
+    val tr = showcase_trace_enabled()
+    showcase_trace(tr, "entry")
+    val size = resolve_showcase_dimensions()
+    val render_w = size.width
+    val render_h = size.height
+    val dpi = resolve_showcase_dpi()
+    var engine = if backend == "software": Engine2D.create_offscreen(render_w, render_h) else: Engine2D.create_with_backend_fast(render_w, render_h, backend)
+    showcase_trace(tr, "engine_created")
+    val actual = engine.backend_name()
+    # Use the first pinned, checksum-identified selected face. This is the
+    # canonical trusted sans default and gives the live showcase actual vector
+    # glyph rasterization plus transient backend atlas-composite evidence.
+    val font_candidate = selected_font_asset_candidates()[0]
+    val expected_font_identity = selected_font_asset_identity(font_candidate)
+    showcase_trace(tr, "font_candidate_resolved")
+    val font_loaded = engine.load_font(font_candidate.local_path)
+    showcase_trace(tr, "font_loaded")
+    engine = draw_showcase(engine, render_w, render_h, dpi, tr, true)
+    showcase_trace(tr, "draw_showcase_returned")
+    # A deliberately new glyph set gives one cold rasterization followed by
+    # one warm cache hit. Drawing at the same coordinates keeps the visual
+    # result stable while proving that the second pass reused glyph material.
+    val font_stats_before = engine.font_cache_stats()
+    engine.draw_text(
+        sx(250, render_w), sy(535, render_h),
+        "QZJ~ VECTOR", WHITE, sd(14, render_w, dpi))
+    val font_stats_cold = engine.font_cache_stats()
+    engine.draw_text(
+        sx(250, render_w), sy(535, render_h),
+        "QZJ~ VECTOR", WHITE, sd(14, render_w, dpi))
+    val font_stats_warm = engine.font_cache_stats()
+    showcase_trace(tr, "font_cache_probe_done")
+    val loaded_fonts = engine.fonts()
+    val loaded_font_identity = loaded_fonts.current_font_identity()
+    engine.install_font_renderer(loaded_fonts)
+    val font_execution_target = engine.font_execution_target()
+    val font_execution_attempts = engine.font_execution_attempts().join(",")
+    val font_backend_attempt_succeeded = if gpu_backend_requested(backend):
+        font_execution_target == backend
+    else:
+        font_execution_target == "cpu"
+    val font_cold_rasterizations = font_stats_cold.rasterizations - font_stats_before.rasterizations
+    val font_warm_rasterizations = font_stats_warm.rasterizations - font_stats_cold.rasterizations
+    val font_warm_hits = font_stats_warm.hits - font_stats_cold.hits
+    # Read the exact dirty device frame before present refreshes the backend's
+    # host cache. The following present still exercises the production path,
+    # while this receipt retains the originating Vulkan/Metal handle.
+    showcase_trace(tr, "readback_begin")
+    val readback = engine.read_pixels_with_source()
+    showcase_trace(tr, "readback_done")
+    engine.present()
+    showcase_trace(tr, "present_done")
+    var nonzero = 0
+    for pixel in readback.pixels:
+        if pixel != 0u32:
+            nonzero = nonzero + 1
+    showcase_trace(tr, "nonzero_scan_done")
+    val semantic_differences = semantic_sample_differences(readback.pixels, render_w, render_h)
+    val gpu_requested = gpu_backend_requested(backend)
+    print "graphics_2d_requested_backend={backend}"
+    print "graphics_2d_backend={actual}"
+    print "graphics_2d_source={readback.source}"
+    print "graphics_2d_backend_handle={readback.backend_handle}"
+    print "graphics_2d_vulkan_fallback_reason={engine.vulkan_cpu_fallback_reason()}"
+    print "graphics_2d_checksum={readback.checksum}"
+    print "graphics_2d_nonzero={nonzero}"
+    print "graphics_2d_semantic_differences={semantic_differences}"
+    print "graphics_2d_dimensions={render_w}x{render_h}"
+    print "graphics_2d_dpi={dpi}"
+    print "graphics_2d_pixels={readback.pixel_count}"
+    print "graphics_2d_font_loaded={font_loaded}"
+    print "graphics_2d_font_expected_identity={expected_font_identity}"
+    print "graphics_2d_font_identity={loaded_font_identity}"
+    print "graphics_2d_font_cold_rasterizations={font_cold_rasterizations}"
+    print "graphics_2d_font_warm_rasterizations={font_warm_rasterizations}"
+    print "graphics_2d_font_warm_hits={font_warm_hits}"
+    print "graphics_2d_font_execution_target={font_execution_target}"
+    print "graphics_2d_font_execution_attempts={font_execution_attempts}"
+    print "graphics_2d_font_backend_attempt_succeeded={font_backend_attempt_succeeded}"
+    if (actual != backend or readback.pixel_count != (render_w * render_h).to_i64() or
+            readback.checksum == 0 or nonzero == 0 or semantic_differences < 4):
+        engine.shutdown()
+        return 1
+    if (not font_loaded or loaded_font_identity != expected_font_identity or
+            font_cold_rasterizations <= 0 or font_warm_rasterizations != 0 or
+            font_warm_hits <= 0 or not font_backend_attempt_succeeded):
+        engine.shutdown()
+        return 1
+    if gpu_requested and (readback.source != "device_readback" or readback.backend_handle <= 0):
+        engine.shutdown()
+        return 1
+
+    if not gui:
+        engine.shutdown()
+        return 0
+
+    val lp = winit_loop_new()
+    if not lp.is_valid:
+        engine.shutdown()
+        return 1
+    val win = winit_window_new(lp, render_w.to_i64(), render_h.to_i64(), graphics_2d_showcase_window_title(backend))
+    if not win.is_valid:
+        winit_loop_free(lp)
+        engine.shutdown()
+        return 1
+    val packed = pack_rgb(readback.pixels)
+    winit_present_rgba(win, render_w.to_i64(), render_h.to_i64(), packed)
+    val event_evidence_path = env_get(GUI_EVENT_EVIDENCE_ENV) ?? ""
+    val exit_after_interaction = (env_get(GUI_EXIT_AFTER_INTERACTION_ENV) ?? "") == "1"
+    var keyboard_events: i64 = 0
+    var pointer_events: i64 = 0
+    var click_events: i64 = 0
+    var interaction_revision: i64 = 0
+    var interaction_checksum = readback.checksum
+    var interaction_complete = false
+    if not write_gui_event_evidence(
+            event_evidence_path, actual, readback.source, readback.backend_handle,
+            readback.checksum, interaction_checksum, keyboard_events,
+            pointer_events, click_events, interaction_revision):
+        winit_window_free(win)
+        winit_loop_free(lp)
+        engine.shutdown()
+        return 1
+    var running = true
+    while running:
+        val input = winit_poll_input(lp)
+        running = not should_close(input)
+        val keyboard_delta = input.keys.len().to_i64()
+        val pointer_delta = input.mouse_moves
+        val click_delta = input.click_buttons.len().to_i64()
+        keyboard_events = keyboard_events + keyboard_delta
+        pointer_events = pointer_events + pointer_delta
+        click_events = click_events + click_delta
+        # Host delivery may split the same input into different poll batches.
+        # Render one fixed completion state after all categories arrive so
+        # Vulkan and Metal produce identical interaction pixels.
+        if (not interaction_complete and keyboard_events > 0 and
+                pointer_events > 0 and click_events > 0):
+            interaction_revision = 1
+            engine.draw_rect_filled(
+                sx(610, render_w), sy(495, render_h),
+                sx(165, render_w), sy(70, render_h), GREEN)
+            engine.draw_text(
+                sx(625, render_w), sy(515, render_h),
+                "INPUT OK", WHITE, sd(14, render_w, dpi))
+            val interaction_readback = engine.read_pixels_with_source()
+            engine.present()
+            interaction_checksum = interaction_readback.checksum
+            val interaction_packed = pack_rgb(interaction_readback.pixels)
+            winit_present_rgba(
+                win, render_w.to_i64(), render_h.to_i64(), interaction_packed)
+            if (interaction_readback.source != readback.source or
+                    interaction_readback.backend_handle != readback.backend_handle or
+                    interaction_checksum == readback.checksum or
+                    not write_gui_event_evidence(
+                        event_evidence_path, actual, interaction_readback.source,
+                        interaction_readback.backend_handle, readback.checksum,
+                        interaction_checksum, keyboard_events, pointer_events,
+                        click_events, interaction_revision)):
+                running = false
+                winit_window_free(win)
+                winit_loop_free(lp)
+                engine.shutdown()
+                return 1
+            print "graphics_2d_event_revision={interaction_revision}"
+            print "graphics_2d_event_checksum={interaction_checksum}"
+            interaction_complete = true
+            if exit_after_interaction:
+                running = false
+        thread_sleep(16)
+    winit_window_free(win)
+    winit_loop_free(lp)
+    engine.shutdown()
+    0
+
+fn run_graphics_2d_showcase_4k_perf_probe(backend: text) -> i64:
+    run_graphics_2d_showcase_perf_probe(3840, 2160, backend, parse_perf_frames(60), "graphics_2d_perf_4k")
+
+fn run_graphics_2d_showcase_8k_perf_probe(backend: text) -> i64:
+    run_graphics_2d_showcase_perf_probe(7680, 4320, backend, parse_perf_frames(60), "graphics_2d_perf_8k")
+
+fn frame_percentile_ns(values: [i64], percentile: i32) -> i64:
+    if values.len() == 0:
+        return 0
+    var sorted = values
+    var i = 1
+    while i < sorted.len():
+        val key = sorted[i]
+        var j = i - 1
+        while j >= 0 and sorted[j] > key:
+            sorted[j + 1] = sorted[j]
+            j = j - 1
+        sorted[j + 1] = key
+        i = i + 1
+    var index = (percentile * sorted.len()) / 100
+    if index >= sorted.len():
+        index = sorted.len() - 1
+    sorted[index]
+
+fn pixel_stats(pixels: [u32]) -> (i64, i64):
+    var nonzero = 0i64
+    var checksum = 0i64
+    var i = 0
+    val n = pixels.len()
+    while i < n:
+        val pixel = pixels[i]
+        if pixel != 0u32:
+            nonzero = nonzero + 1
+        checksum = checksum + (pixel.to_i64() & 0xFFFFFFFF)
+        i = i + 1
+    (nonzero, checksum)
+
+fn run_graphics_2d_showcase_perf_probe(w: i32, h: i32, backend: text, frames: i64, prefix: text) -> i64:
+    val requested_backend = if backend == "": "software" else: backend
+    val include_mask = not parse_bool_env("SHOWCASE_SKIP_MASK")
+    val skip_font_probe = parse_bool_env("SHOWCASE_SKIP_FONT_PROBE")
+    val warmup_frames = parse_perf_warmup(12)
+    val target_frames = parse_perf_frames(frames)
+    val dpi = resolve_showcase_dpi()
+    var engine = Engine2D.create_with_backend_fast(w, h, requested_backend)
+    val actual = engine.backend_name()
+    if not skip_font_probe:
+        # Load one deterministic font candidate for consistent glyph coverage.
+        val font_candidate = selected_font_asset_candidates()[0]
+        _ = engine.load_font(font_candidate.local_path)
+    engine = draw_showcase(engine, w, h, dpi, false, include_mask)
+    # Present once before timing so the timed window is strictly stable-present.
+    engine.present()
+    var warmup = 0
+    while warmup < warmup_frames:
+        engine.present()
+        warmup = warmup + 1
+    val frame_start_us = time_now_micros()
+    var frame = 0i64
+    var frame_samples: [i64] = []
+    while frame < target_frames:
+        val sample_start_us = time_now_micros()
+        engine.present()
+        frame_samples.push((time_now_micros() - sample_start_us) * 1000)
+        frame = frame + 1
+    val frame_elapsed_ns = (time_now_micros() - frame_start_us) * 1000
+    val frame_p50_ns = frame_percentile_ns(frame_samples, 50)
+    val frame_p95_ns = frame_percentile_ns(frame_samples, 95)
+    val readback = engine.read_pixels_with_source()
+    val stats = pixel_stats(readback.pixels)
+    val nonzero = stats.0
+    val checksum = stats.1
+    print "{prefix}_width={w}"
+    print "{prefix}_height={h}"
+    print "{prefix}_frames={target_frames}"
+    print "{prefix}_frame_elapsed_ns={frame_elapsed_ns}"
+    print "{prefix}_warmup_frames={warmup_frames}"
+    print "{prefix}_frame_sample_count={frame_samples.len()}"
+    print "{prefix}_frame_p50_ns={frame_p50_ns}"
+    print "{prefix}_frame_p95_ns={frame_p95_ns}"
+    print "{prefix}_redraw_frames=1"
+    print "{prefix}_render_mode=retained-static-frame"
+    print "{prefix}_pixels={readback.pixel_count}"
+    print "{prefix}_nonzero_pixels={nonzero}"
+    print "{prefix}_checksum={checksum}"
+    print "{prefix}_readback_mode={readback.source}"
+    print "{prefix}_readback_source={readback.source}"
+    print "{prefix}_backend={actual}"
+    print "{prefix}_requested_backend={requested_backend}"
+    print "{prefix}_simd_rows_enabled={native_pixel_rows_enabled()}"
+    print "{prefix}_simd_arch={active_arch_text()}"
+    print "{prefix}_simd_feature={active_feature_text()}"
+    print "{prefix}_status={if readback.pixel_count == (w * h).to_i64() and nonzero > 0 and actual != "": "pass" else: "fail"}"
+    if parse_bool_env(SHOWCASE_SIMD_INFO_ENV):
+        if not native_pixel_rows_enabled():
+            print "{prefix}_simd_guidance=set SIMPLE_2D_BACKEND=cpu_simd for x86_64/aarch64/riscv if available and rebuild with scalar fallback removed for this lane"
+    engine.shutdown()
+    return if readback.pixel_count == (w * h).to_i64() and nonzero > 0:
+        0
+    else:
+        1
+
+
+fn main() -> i64:
+    run_graphics_2d_showcase(false, showcase_selected_backend())
+
+export run_graphics_2d_showcase

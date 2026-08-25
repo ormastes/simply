@@ -1,0 +1,245 @@
+#![allow(unnamed_duplicate_typed_args)]
+# LLM Caret - Claude CLI Wrapper (PRIMARY)
+#
+# Wraps the Claude CLI binary as a subprocess.
+# Two pure functions (fully testable without Claude binary):
+#   - build_claude_args: maps config to CLI flags
+#   - parse_claude_json_response: parses JSON output
+# One impure function (integration):
+#   - claude_cli_send: calls rt_process_run
+
+extern fn rt_process_run(cmd: text, args: [text]) -> (text, text, i64)
+
+use common.text.{escape_json}
+use std.nogc_async_mut.mcp.helpers.{Q, LB, RB}
+use std.nogc_async_mut.llm.json_helpers.{_unwrap_idx, extract_json_string, extract_json_value, extract_json_int, extract_json_bool}
+
+# ============================================================================
+# Response struct (inline for import safety)
+# ============================================================================
+
+struct CliResponse:
+    content: text
+    model: text
+    session_id: text
+    stop_reason: text
+    input_tokens: i64
+    output_tokens: i64
+    error: text
+    is_error: bool
+    raw: text
+
+struct CliStreamEvent:
+    event_type: text
+    content: text
+    session_id: text
+    model: text
+    stop_reason: text
+    input_tokens: i64
+    output_tokens: i64
+
+# ============================================================================
+# Pure Function: build_claude_args
+# ============================================================================
+
+fn build_claude_args(prompt: text, model: text, output_format: text, system_prompt: text, session_id: text, max_turns: i64, max_tokens: i64, json_schema: text, tools: [text], extra_args: [text], verbose: bool) -> [text]:
+    var args: [text] = []
+    # Skip permission prompts by default
+    args = args + ["--dangerously-skip-permissions"]
+    # Prompt (required for one-shot)
+    args = args + ["-p", prompt]
+    # Output format
+    if output_format != "":
+        args = args + ["--output-format", output_format]
+    else:
+        args = args + ["--output-format", "json"]
+    # Model
+    if model != "":
+        args = args + ["--model", model]
+    # System prompt
+    if system_prompt != "":
+        args = args + ["--system-prompt", system_prompt]
+    # Session resume
+    if session_id != "":
+        args = args + ["--resume", session_id]
+    # Max turns
+    if max_turns > 0:
+        args = args + ["--max-turns", max_turns.to_text()]
+    # Max tokens (via extra args since claude CLI uses --max-tokens for some versions)
+    if max_tokens > 0:
+        args = args + ["--max-tokens", max_tokens.to_text()]
+    # JSON schema
+    if json_schema != "":
+        args = args + ["--json-schema", json_schema]
+    # Tools
+    for tool in tools:
+        args = args + ["--allowedTools", tool]
+    # Verbose
+    if verbose:
+        args = args + ["--verbose"]
+    # Extra args (appended at end)
+    for arg in extra_args:
+        if arg != "":
+            args = args + [arg]
+    args
+
+# Simplified builder using module config defaults
+fn build_claude_args_simple(prompt: text) -> [text]:
+    build_claude_args(prompt, "", "", "", "", 0, 0, "", [], [], false)
+
+# ============================================================================
+# Pure Function: parse_claude_json_response
+# ============================================================================
+
+fn parse_claude_json_response(raw: text) -> CliResponse:
+    if raw.trim() == "":
+        return CliResponse(
+            content: "",
+            model: "",
+            session_id: "",
+            stop_reason: "",
+            input_tokens: 0,
+            output_tokens: 0,
+            error: "empty response",
+            is_error: true,
+            raw: ""
+        )
+    # Extract fields from JSON output
+    val result_text = extract_json_string(raw, "result")
+    val model_text = extract_json_string(raw, "model")
+    val session = extract_json_string(raw, "session_id")
+    val is_err = extract_json_bool(raw, "is_error")
+    val stop = extract_json_string(raw, "stop_reason")
+    val in_tok = extract_json_int(raw, "input_tokens")
+    val out_tok = extract_json_int(raw, "output_tokens")
+    # Handle usage sub-object for tokens
+    var final_in_tok = in_tok
+    var final_out_tok = out_tok
+    if in_tok == 0:
+        final_in_tok = extract_json_int(raw, "input_tokens_used")
+    if out_tok == 0:
+        final_out_tok = extract_json_int(raw, "output_tokens_used")
+    var error_text = ""
+    if is_err:
+        error_text = result_text
+        if error_text == "":
+            error_text = extract_json_string(raw, "error")
+    var final_stop = stop
+    if final_stop == "":
+        final_stop = "end_turn"
+    if is_err:
+        final_stop = "error"
+    CliResponse(
+        content: result_text,
+        model: model_text,
+        session_id: session,
+        stop_reason: final_stop,
+        input_tokens: final_in_tok,
+        output_tokens: final_out_tok,
+        error: error_text,
+        is_error: is_err,
+        raw: raw
+    )
+
+# ============================================================================
+# Pure Function: parse_claude_stream_line
+# ============================================================================
+
+fn parse_claude_stream_line(line: text) -> CliStreamEvent:
+    val trimmed = line.trim()
+    if trimmed == "":
+        return CliStreamEvent(
+            event_type: "empty",
+            content: "",
+            session_id: "",
+            model: "",
+            stop_reason: "",
+            input_tokens: 0,
+            output_tokens: 0
+        )
+    val etype = extract_json_string(trimmed, "type")
+    var content_val = ""
+    var sid = ""
+    var mdl = ""
+    var stop_val = ""
+    var in_tok = 0
+    var out_tok = 0
+    if etype == "content_block_delta":
+        content_val = extract_json_string(trimmed, "text")
+    elif etype == "message_stop":
+        stop_val = extract_json_string(trimmed, "stop_reason")
+        if stop_val == "":
+            stop_val = "end_turn"
+    elif etype == "message_start":
+        mdl = extract_json_string(trimmed, "model")
+        sid = extract_json_string(trimmed, "session_id")
+    var final_etype = etype
+    if final_etype == "":
+        # Fallback: check for "result" field (final summary line)
+        val has_result = extract_json_string(trimmed, "result")
+        if has_result != "":
+            final_etype = "result"
+            content_val = has_result
+        else:
+            final_etype = "unknown"
+    CliStreamEvent(
+        event_type: final_etype,
+        content: content_val,
+        session_id: sid,
+        model: mdl,
+        stop_reason: stop_val,
+        input_tokens: in_tok,
+        output_tokens: out_tok
+    )
+
+# ============================================================================
+# Impure Function: claude_cli_send
+# ============================================================================
+
+fn claude_cli_send(cli_path: text, prompt: text, model: text, system_prompt: text, session_id: text, max_turns: i64, max_tokens: i64, json_schema: text, tools: [text], extra_args: [text]) -> CliResponse:
+    val args = build_claude_args(prompt, model, "json", system_prompt, session_id, max_turns, max_tokens, json_schema, tools, extra_args, false)
+    val result = rt_process_run(cli_path, args)
+    val stdout = result.0 ?? ""
+    val stderr = result.1 ?? ""
+    val exit_code = result.2
+    if exit_code != 0:
+        var err_msg = "claude CLI exited with code " + exit_code.to_text()
+        if stderr != "":
+            err_msg = err_msg + ": " + stderr
+        return CliResponse(
+            content: "",
+            model: "",
+            session_id: "",
+            stop_reason: "error",
+            input_tokens: 0,
+            output_tokens: 0,
+            error: err_msg,
+            is_error: true,
+            raw: stdout
+        )
+    parse_claude_json_response(stdout)
+
+# Stream execution: returns list of parsed NDJSON events
+fn claude_cli_stream(cli_path: text, prompt: text, model: text, system_prompt: text, session_id: text, max_turns: i64) -> [CliStreamEvent]:
+    val args = build_claude_args(prompt, model, "stream-json", system_prompt, session_id, max_turns, 0, "", [], [], false)
+    val result = rt_process_run(cli_path, args)
+    val stdout = result.0 ?? ""
+    val exit_code = result.2
+    var events: [CliStreamEvent] = []
+    if exit_code != 0:
+        events = events + [CliStreamEvent(
+            event_type: "error",
+            content: "claude CLI exited with code " + exit_code.to_text(),
+            session_id: "",
+            model: "",
+            stop_reason: "error",
+            input_tokens: 0,
+            output_tokens: 0
+        )]
+        return events
+    val lines = stdout.split("\n")
+    for line in lines:
+        if line.trim() != "":
+            val evt = parse_claude_stream_line(line)
+            events = events + [evt]
+    events

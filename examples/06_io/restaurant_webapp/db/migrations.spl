@@ -1,0 +1,251 @@
+use std.database.{Database, Migration, MigrationRunner}
+
+fn create_migrations() -> List<Migration>:
+    val migrations = List<Migration>.new()
+
+    migrations.push(Migration(
+        id: "001_create_admin_users",
+        description: "Create admin users table",
+        up_sql: """
+            CREATE TABLE IF NOT EXISTS admin_users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'admin',
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            INSERT OR IGNORE INTO admin_users (username, password_hash, role)
+            VALUES ('admin', '$2b$12$default_hash_replace_me', 'superadmin');
+        """,
+        down_sql: "DROP TABLE IF EXISTS admin_users;"
+    ))
+
+    migrations.push(Migration(
+        id: "002_create_templates",
+        description: "Create restaurant/store templates",
+        up_sql: """
+            CREATE TABLE IF NOT EXISTS templates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                template_type TEXT NOT NULL DEFAULT 'restaurant',
+                is_default INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_templates_type ON templates(template_type);
+        """,
+        down_sql: """
+            DROP INDEX IF EXISTS idx_templates_type;
+            DROP TABLE IF EXISTS templates;
+        """
+    ))
+
+    migrations.push(Migration(
+        id: "003_create_menu_groups",
+        description: "Create menu groups/categories",
+        up_sql: """
+            CREATE TABLE IF NOT EXISTS menu_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                template_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (template_id) REFERENCES templates(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_menu_groups_template ON menu_groups(template_id, sort_order);
+        """,
+        down_sql: """
+            DROP INDEX IF EXISTS idx_menu_groups_template;
+            DROP TABLE IF EXISTS menu_groups;
+        """
+    ))
+
+    migrations.push(Migration(
+        id: "004_create_menu_items",
+        description: "Create menu items",
+        up_sql: """
+            CREATE TABLE IF NOT EXISTS menu_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                price INTEGER NOT NULL DEFAULT 0,
+                available INTEGER NOT NULL DEFAULT 1,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (group_id) REFERENCES menu_groups(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_menu_items_group ON menu_items(group_id, sort_order);
+        """,
+        down_sql: """
+            DROP INDEX IF EXISTS idx_menu_items_group;
+            DROP TABLE IF EXISTS menu_items;
+        """
+    ))
+
+    migrations.push(Migration(
+        id: "005_create_menu_conditions",
+        description: "Create conditional availability rules for menu items",
+        up_sql: """
+            CREATE TABLE IF NOT EXISTS menu_conditions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_id INTEGER NOT NULL,
+                condition_type TEXT NOT NULL,
+                condition_value TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (item_id) REFERENCES menu_items(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_menu_conditions_item ON menu_conditions(item_id);
+        """,
+        down_sql: """
+            DROP INDEX IF EXISTS idx_menu_conditions_item;
+            DROP TABLE IF EXISTS menu_conditions;
+        """
+    ))
+
+    migrations.push(Migration(
+        id: "006_create_additional_menus",
+        description: "Create additional menu items (extras tied to a main item)",
+        up_sql: """
+            CREATE TABLE IF NOT EXISTS additional_menus (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                parent_item_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                price INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (parent_item_id) REFERENCES menu_items(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_additional_menus_parent ON additional_menus(parent_item_id);
+        """,
+        down_sql: """
+            DROP INDEX IF EXISTS idx_additional_menus_parent;
+            DROP TABLE IF EXISTS additional_menus;
+        """
+    ))
+
+    migrations.push(Migration(
+        id: "007_create_orders",
+        description: "Create orders table",
+        up_sql: """
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                table_number TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                items_json TEXT NOT NULL DEFAULT '[]',
+                subtotal INTEGER NOT NULL DEFAULT 0,
+                tax INTEGER NOT NULL DEFAULT 0,
+                total INTEGER NOT NULL DEFAULT 0,
+                payment_method TEXT NOT NULL DEFAULT '',
+                payment_status TEXT NOT NULL DEFAULT 'unpaid',
+                notes TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
+            CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at);
+        """,
+        down_sql: """
+            DROP INDEX IF EXISTS idx_orders_created;
+            DROP INDEX IF EXISTS idx_orders_status;
+            DROP TABLE IF EXISTS orders;
+        """
+    ))
+
+    migrations.push(Migration(
+        id: "008_seed_default_templates",
+        description: "Seed default restaurant and store templates",
+        up_sql: """
+            INSERT INTO templates (name, description, template_type, is_default)
+            VALUES
+                ('Default Restaurant', 'Standard restaurant menu with appetizers, mains, desserts, drinks', 'restaurant', 1),
+                ('Default Store', 'Standard store catalog with categories and items', 'store', 1);
+
+            INSERT INTO menu_groups (template_id, name, description, sort_order)
+            SELECT t.id, g.name, g.description, g.sort_order
+            FROM templates t,
+            (SELECT 'Appetizers' as name, 'Starters and small bites' as description, 1 as sort_order
+             UNION ALL SELECT 'Main Course', 'Entrees and main dishes', 2
+             UNION ALL SELECT 'Desserts', 'Sweet treats and desserts', 3
+             UNION ALL SELECT 'Drinks', 'Beverages and cocktails', 4) g
+            WHERE t.name = 'Default Restaurant';
+
+            INSERT INTO menu_groups (template_id, name, description, sort_order)
+            SELECT t.id, g.name, g.description, g.sort_order
+            FROM templates t,
+            (SELECT 'Featured' as name, 'Featured products' as description, 1 as sort_order
+             UNION ALL SELECT 'Regular Items', 'Standard catalog items', 2
+             UNION ALL SELECT 'Sale', 'Items on sale', 3) g
+            WHERE t.name = 'Default Store';
+        """,
+        down_sql: """
+            DELETE FROM menu_groups WHERE template_id IN (SELECT id FROM templates WHERE is_default = 1);
+            DELETE FROM templates WHERE is_default = 1;
+        """
+    ))
+
+    migrations.push(Migration(
+        id: "009_create_payments",
+        description: "Create payments table for credit card processing",
+        up_sql: """
+            CREATE TABLE IF NOT EXISTS payments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id INTEGER NOT NULL,
+                method TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                amount INTEGER NOT NULL DEFAULT 0,
+                card_last_four TEXT NOT NULL DEFAULT '',
+                transaction_id TEXT NOT NULL DEFAULT '',
+                gateway_response TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_payments_order ON payments(order_id);
+            CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status);
+        """,
+        down_sql: """
+            DROP INDEX IF EXISTS idx_payments_status;
+            DROP INDEX IF EXISTS idx_payments_order;
+            DROP TABLE IF EXISTS payments;
+        """
+    ))
+
+    migrations.push(Migration(
+        id: "010_create_delivery_requests",
+        description: "Create delivery requests table",
+        up_sql: """
+            CREATE TABLE IF NOT EXISTS delivery_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id INTEGER NOT NULL,
+                customer_name TEXT NOT NULL DEFAULT '',
+                customer_phone TEXT NOT NULL DEFAULT '',
+                customer_email TEXT NOT NULL DEFAULT '',
+                address TEXT NOT NULL DEFAULT '',
+                delivery_notes TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'requested',
+                estimated_time TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_delivery_order ON delivery_requests(order_id);
+            CREATE INDEX IF NOT EXISTS idx_delivery_status ON delivery_requests(status);
+        """,
+        down_sql: """
+            DROP INDEX IF EXISTS idx_delivery_status;
+            DROP INDEX IF EXISTS idx_delivery_order;
+            DROP TABLE IF EXISTS delivery_requests;
+        """
+    ))
+
+    migrations
+
+fn run_migrations(db: Database) -> Result<(), text>:
+    val runner = MigrationRunner(db: db)
+    val migrations = create_migrations()
+    for migration in migrations:
+        runner.apply(migration)?
+    Result.ok(())

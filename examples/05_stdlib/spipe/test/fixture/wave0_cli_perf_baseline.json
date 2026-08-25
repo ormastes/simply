@@ -1,0 +1,21 @@
+{
+  "qualifiedAt": "2026-08-25T05:10:00Z",
+  "source": "HEAD pre-Wave-1 monolithic cli/spipe.js behavior snapshot",
+  "repositoryRevision": "b399050e041",
+  "machine": {
+    "platform": "linux",
+    "arch": "x64",
+    "cpu": "AMD Ryzen Threadripper 1950X 16-Core Processor",
+    "node": "v22.23.1"
+  },
+  "corpus": "SPipe module plus an empty temporary host for doctor",
+  "method": "80 sequential dependency-free node process spawns of the HEAD monolithic source per command; wall-clock performance.now; P95 nearest-rank; stdout/stderr discarded; moduleRoot rebound to the checkout for the retained source",
+  "qualificationSamples": 80,
+  "testSamples": 80,
+  "maximumRegressionRatio": 1.10,
+  "p95Milliseconds": {
+    "version": 92.489,
+    "help": 91.056,
+    "doctor": 114.199
+  }
+}

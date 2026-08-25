@@ -1,0 +1,79 @@
+{
+  "schema": "spipe-unicode-table-manifest-v1",
+  "unicode_version": "17.0.0",
+  "upstream": {
+    "repository": "https://github.com/unicode-org/unicodetools",
+    "commit": "2c1309ab2ac1de5c62f09089c8ed6bf6f1d37920",
+    "path": "unicodetools/data/ucd/17.0.0"
+  },
+  "license": {
+    "spdx": "Unicode-3.0",
+    "file": "examples/05_stdlib/spipe/tools/unicode/UNICODE-LICENSE.txt"
+  },
+  "generator": {
+    "version": 1,
+    "file": "examples/05_stdlib/spipe/tools/unicode/generate_unicode_tables.mjs",
+    "sha256": "22732b052cc89aac98847873f72120bc10ab2582e1146dd4cc1aadab6cc580f8",
+    "command": "node examples/05_stdlib/spipe/tools/unicode/generate_unicode_tables.mjs"
+  },
+  "sources": [
+    {
+      "name": "UnicodeData.txt",
+      "sha256": "2e1efc1dcb59c575eedf5ccae60f95229f706ee6d031835247d843c11d96470c",
+      "bytes": 2198209
+    },
+    {
+      "name": "DerivedCoreProperties.txt",
+      "sha256": "24c7fed1195c482faaefd5c1e7eb821c5ee1fb6de07ecdbaa64b56a99da22c08",
+      "bytes": 1134783
+    },
+    {
+      "name": "PropList.txt",
+      "sha256": "130dcddcaadaf071008bdfce1e7743e04fdfbc910886f017d9f9ac931d8c64dd",
+      "bytes": 145465
+    },
+    {
+      "name": "SpecialCasing.txt",
+      "sha256": "efc25faf19de21b92c1194c111c932e03d2a5eaf18194e33f1156e96de4c9588",
+      "bytes": 17049
+    },
+    {
+      "name": "CaseFolding.txt",
+      "sha256": "ff8d8fefbf123574205085d6714c36149eb946d717a0c585c27f0f4ef58c4183",
+      "bytes": 87539
+    },
+    {
+      "name": "CompositionExclusions.txt",
+      "sha256": "2f239196ef3b5b61db5cc476e9bd80f534d15aa1b74e1be1dea5d042a344c85f",
+      "bytes": 9007
+    },
+    {
+      "name": "NormalizationTest.txt",
+      "sha256": "5019ffd530751a741900c849c0e010332f142a3612234639bd200b82138a87db",
+      "bytes": 2827429
+    }
+  ],
+  "generated": [
+    {
+      "file": "examples/05_stdlib/spipe/src/search/generated/unicode_17_0_0.js",
+      "sha256": "439e75817775eb1250e28ffb6028f19fce03bef5a6cbe0aefe96023a414336cd",
+      "bytes": 129002
+    },
+    {
+      "file": "src/lib/common/search/generated/unicode_17_0_0.spl",
+      "sha256": "85f86cf09a78027c70fe2668db25b27e8a321e10fb0fbed8cc6a5b5f96680c4e",
+      "bytes": 116205
+    }
+  ],
+  "contracts": {
+    "normalization": "NFC",
+    "case_conversion": "Default Lowercase Conversion",
+    "case_folding_used": false,
+    "token_properties": [
+      "Alphabetic",
+      "Decimal_Number",
+      "Mark",
+      "LOW_LINE"
+    ]
+  }
+}

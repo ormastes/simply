@@ -1,0 +1,101 @@
+# logic_nand_region_core — pure NAND-region model math for core3 (wave-3
+# design contract: doc/05_design/hardware/nvme_fw_multicore/
+# fourcore_ipc_index_handle_design.md §3 region map). No shm/memory access;
+# the thin rv32/host driver performs the loads/stores the verdicts prescribe.
+#
+# Region base words (NAND_STATE_BASE=256, NAND_DATA_BASE=4352) are owned by
+# logic_ipc_layout_core.spl (L2) — imported, not redefined. Geometry counts
+# (NUM_PAGES/NUM_BLOCKS/PAGES_PER_BLOCK) are NOT part of L2's IPC layout
+# scope; they are the same drift-guarded values fw_rv32/const_drift_check.spl
+# already checks against fw/nvme_types.spl (NUM_BLOCKS=64, PAGES_PER_BLOCK=64,
+# NUM_PAGES=4096 — see logic_band_geometry_core.spl for the existing literal
+# copies). Re-declared here as named constants for readability; genuinely
+# duplicated values, flagged for the L7 drift-check extension.
+
+use logic_ipc_layout_core.*
+
+fn NUM_PAGES() -> i64:
+    4096
+
+fn NUM_BLOCKS() -> i64:
+    64
+
+fn PAGES_PER_BLOCK() -> i64:
+    64
+
+fn nand_ppn_valid(ppn: i64) -> i32:
+    if ppn < 0:
+        return 0
+    if ppn >= NUM_PAGES():
+        return 0
+    1
+
+fn nand_block_valid(block: i64) -> i32:
+    if block < 0:
+        return 0
+    if block >= NUM_BLOCKS():
+        return 0
+    1
+
+# shm word holding page `ppn`'s state (0 = erased, nonzero = programmed).
+fn nand_state_idx(ppn: i64) -> i64:
+    if nand_ppn_valid(ppn) == 0:
+        return ipc_null_idx()
+    nand_state_base() + ppn
+
+# shm word holding page `ppn`'s data payload (single-word stand-in, matching
+# fw/ convention per design §3).
+fn nand_data_idx(ppn: i64) -> i64:
+    if nand_ppn_valid(ppn) == 0:
+        return ipc_null_idx()
+    nand_data_base() + ppn
+
+fn nand_block_first_ppn(block: i64) -> i64:
+    if nand_block_valid(block) == 0:
+        return ipc_null_idx()
+    block * PAGES_PER_BLOCK()
+
+# Last ppn covered by `block` (inclusive) — with nand_block_first_ppn, this
+# gives the driver the [first, last] range to erase in a loop.
+fn nand_block_last_ppn(block: i64) -> i64:
+    if nand_block_valid(block) == 0:
+        return ipc_null_idx()
+    block * PAGES_PER_BLOCK() + PAGES_PER_BLOCK() - 1
+
+# ── page state values ─────────────────────────────────────────────────────────
+fn NAND_STATE_ERASED() -> i64:
+    0
+
+# ── program-rule verdict ──────────────────────────────────────────────────────
+fn NAND_PROGRAM_OK() -> i64:
+    0
+
+# ST_MEDIA-style error: program-over-program (writing an already-programmed
+# page without an intervening erase) is forbidden.
+fn NAND_PROGRAM_ERR_MEDIA() -> i64:
+    2
+
+fn nand_program_verdict(cur_state: i64) -> i64:
+    if cur_state == NAND_STATE_ERASED():
+        return NAND_PROGRAM_OK()
+    NAND_PROGRAM_ERR_MEDIA()
+
+# ── read-rule verdict ──────────────────────────────────────────────────────────
+# Reading an erased page is legal (no program-over-program style violation)
+# but the DATA word was never written, so it is not meaningful. The verdict
+# tells the driver whether to return the raw DATA word (NAND_READ_OK) or the
+# defined ERASED_DATA sentinel instead (NAND_READ_ERASED) — distinct from
+# ipc_null_idx(): one means "no data here", the other means "no index here".
+fn NAND_READ_OK() -> i64:
+    0
+
+fn NAND_READ_ERASED() -> i64:
+    1
+
+fn NAND_ERASED_DATA() -> i64:
+    -1
+
+fn nand_read_verdict(cur_state: i64) -> i64:
+    if cur_state == NAND_STATE_ERASED():
+        return NAND_READ_ERASED()
+    NAND_READ_OK()

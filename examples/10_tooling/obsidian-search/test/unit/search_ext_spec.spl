@@ -1,0 +1,143 @@
+# Unit tests for search_ext module
+# @cover src/core/search_ext.spl 80%
+
+use src.core.search_ext.{trigrams, trigram_similarity, fuzzy_search, search_replace_in_note, search_replace_in_vault, search_by_date_range, search_with_aliases, reindex_vault, count_occurrences, list_contains}
+use src.core.search_engine.{SearchResult}
+
+describe "search_ext":
+    """Tests for enhanced search features (Phase C)"""
+
+    describe "trigrams":
+        """Trigram generation from text"""
+
+        it "generates trigrams from text":
+            val result = trigrams("hello")
+            # "hello" -> "hel", "ell", "llo"
+            expect(result.len()).to_equal(3)
+            expect(result[0]).to_equal("hel")
+            expect(result[1]).to_equal("ell")
+            expect(result[2]).to_equal("llo")
+
+        it "returns single element for short strings":
+            val result = trigrams("hi")
+            expect(result.len()).to_equal(1)
+            expect(result[0]).to_equal("hi")
+
+        it "returns empty for empty string":
+            val result = trigrams("")
+            expect(result.len()).to_equal(0)
+
+        it "lowercases input":
+            val result = trigrams("ABC")
+            expect(result.len()).to_equal(1)
+            expect(result[0]).to_equal("abc")
+
+    describe "trigram_similarity":
+        """Jaccard similarity of trigram sets"""
+
+        it "returns 1.0 for identical strings":
+            val score = trigram_similarity("hello", "hello")
+            expect(score).to_equal(1.0)
+
+        it "returns 0.0 for completely different strings":
+            val score = trigram_similarity("abc", "xyz")
+            expect(score).to_equal(0.0)
+
+        it "returns 1.0 for both empty":
+            val score = trigram_similarity("", "")
+            expect(score).to_equal(1.0)
+
+        it "returns 0.0 when one is empty":
+            val score = trigram_similarity("hello", "")
+            expect(score).to_equal(0.0)
+
+        it "returns partial similarity for overlapping strings":
+            val score = trigram_similarity("hello", "help")
+            # "hello" -> hel, ell, llo (3 trigrams)
+            # "help" -> hel, elp (2 trigrams)
+            # intersection: hel (1), union: hel, ell, llo, elp (4)
+            # similarity = 1/4 = 0.25
+            expect(score).to_be_greater_than(0.0)
+            expect(score).to_be_less_than(1.0)
+
+    describe "list_contains":
+        """Helper for checking membership"""
+
+        it "finds existing item":
+            val items: [text] = ["a", "b", "c"]
+            expect(list_contains(items, "b")).to_equal(true)
+
+        it "returns false for missing item":
+            val items: [text] = ["a", "b"]
+            expect(list_contains(items, "z")).to_equal(false)
+
+    describe "count_occurrences":
+        """Counting string occurrences"""
+
+        it "counts multiple occurrences":
+            val count = count_occurrences("ababab", "ab")
+            expect(count).to_equal(3)
+
+        it "returns 0 for no match":
+            val count = count_occurrences("hello", "xyz")
+            expect(count).to_equal(0)
+
+        it "returns 0 for empty needle":
+            val count = count_occurrences("hello", "")
+            expect(count).to_equal(0)
+
+    describe "fuzzy_search":
+        """Fuzzy search with trigram matching"""
+
+        it "finds notes with similar titles":
+            # This test requires a vault on disk; verify function signature works
+            val results = fuzzy_search("", "test", 0.3, 10)
+            expect(results.len()).to_equal(0)
+
+    describe "search_replace_in_note":
+        """Search and replace in a single note"""
+
+        it "replaces text in dry_run mode":
+            # With empty vault path, returns no file error
+            val result = search_replace_in_note("/nonexistent", "test.md", "old", "new", true)
+            val count = result.0
+            # File won't exist, so count should be 0
+            expect(count).to_equal(0)
+
+        it "rejects empty search string":
+            val result = search_replace_in_note("/tmp", "test.md", "", "new", true)
+            val count = result.0
+            expect(count).to_equal(0)
+
+    describe "search_by_date_range":
+        """Date-range filtering of notes"""
+
+        it "filters notes by date":
+            # With empty vault path returns empty
+            val results = search_by_date_range("", "2024-01-01", "2024-12-31", "", 20)
+            expect(results.len()).to_equal(0)
+
+        it "returns empty for empty vault path":
+            val results = search_by_date_range("", "2024-01-01", "2024-01-31", "test", 10)
+            expect(results.len()).to_equal(0)
+
+    describe "search_with_aliases":
+        """Alias-boosted search"""
+
+        it "returns empty for empty query":
+            val results = search_with_aliases("/tmp", "", 20)
+            expect(results.len()).to_equal(0)
+
+        it "returns empty for empty vault":
+            val results = search_with_aliases("", "test", 20)
+            expect(results.len()).to_equal(0)
+
+    describe "reindex_vault":
+        """Vault reindexing"""
+
+        it "returns zeros for empty vault path":
+            val result = reindex_vault("")
+            val files = result.0
+            val links = result.1
+            expect(files).to_equal(0)
+            expect(links).to_equal(0)

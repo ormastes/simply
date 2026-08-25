@@ -1,0 +1,4 @@
+use logic_power_thermal_cases.*
+
+fn rv32_pt_selftest() -> i32:
+    rv32_pt_cases_selftest()

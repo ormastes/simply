@@ -1,0 +1,61 @@
+# 18. Thread Hierarchy - Tests
+#
+# Hardware-independent: launch geometry, grid-stride arithmetic, and the
+# CPU kernel emulator (cpu_kernel_run_1d) which drives the same index
+# builtins the kernels use, so we can count exactly which work-items run.
+
+use std.gpu.*
+use self.main.{create_vec, blocks_for, grid_stride_iterations}
+
+fn probe():
+    pass_dn
+
+describe "Thread Hierarchy":
+
+    describe "1D launch geometry":
+
+        it "one block covers up to 256 elements":
+            expect(blocks_for(256, 256)).to_equal(1)
+            expect(blocks_for(257, 256)).to_equal(2)
+
+        it "1024 elements need 4 blocks and run exactly 1024 work-items":
+            expect(blocks_for(1024, 256)).to_equal(4)
+            expect(cpu_kernel_run_1d(1024, 256, probe)).to_equal(1024)
+
+        it "non-aligned sizes still run exactly n work-items":
+            expect(blocks_for(1000, 256)).to_equal(4)
+            expect(cpu_kernel_run_1d(1000, 256, probe)).to_equal(1000)
+
+    describe "2D launch geometry":
+
+        it "a 64x64 matrix maps to 4x4 blocks of 16x16":
+            expect(blocks_for(64, 16)).to_equal(4)
+            expect(blocks_for(64, 16) * blocks_for(64, 16) * 256).to_equal(4096)
+
+        it "a 100x50 matrix over-provisions but covers":
+            val gx = blocks_for(100, 16)
+            val gy = blocks_for(50, 16)
+            expect(gx).to_equal(7)
+            expect(gy).to_equal(4)
+            expect(gx * 16 >= 100 and gy * 16 >= 50).to_equal(true)
+
+    describe "grid-stride loop":
+
+        it "visits every element with fewer threads than elements":
+            # 4096 elements, 32 blocks x 256 threads = 8192 threads: 1 pass
+            expect(grid_stride_iterations(4096, 32, 256)).to_equal(1)
+            # 4096 elements, 4 blocks x 256 threads = 1024 threads: 4 passes
+            expect(grid_stride_iterations(4096, 4, 256)).to_equal(4)
+
+        it "rounds partial passes up":
+            expect(grid_stride_iterations(1000, 1, 256)).to_equal(4)
+
+    describe "host helpers":
+
+        it "creates a filled vector":
+            val v = create_vec(5, 2.0)
+            expect(v.len()).to_equal(5)
+            expect(v[4]).to_equal(2.0)
+
+        it "the emulator ignores empty launches":
+            expect(cpu_kernel_run_1d(0, 256, probe)).to_equal(0)

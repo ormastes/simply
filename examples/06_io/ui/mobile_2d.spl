@@ -1,0 +1,62 @@
+# Mobile 2D demo — Simple 2D scene rendered to an HTML5 canvas for the Tauri
+# mobile webview. Builds a RenderScene of primitives (rect / circle / line /
+# text) and emits a full page via the canvas2d backend.
+#
+# Render to a viewable page:
+#   SIMPLE_EXECUTION_MODE=interpret bin/simple run examples/ui/mobile_2d.spl \
+#       tools/tauri-shell/dist/canvas.html
+# then open that file in the Tauri shell or a webview. (Interpreter mode is
+# required: the JIT path aborts on this entry with an `Unknown type: any`
+# lowering panic — see canvas2d bug note.)
+
+use common.render_scene.scene.{RenderScene, SceneCommand}
+use app.ui.render.canvas2d.{scene_to_canvas_html}
+use std.sffi.cli.{cli_get_args}
+
+use std.io_runtime.{write_file}
+
+fn build_scene() -> RenderScene:
+    var s = RenderScene.new(320, 240)
+    # Background panel
+    s = s.push(SceneCommand.fill_rect(0, 0, 320, 240, 0x101828))
+    # Title text
+    s = s.push(SceneCommand.text(16, 14, "Simple 2D on Canvas", 18, 0xF5F5F7))
+    # Red filled square
+    s = s.push(SceneCommand.fill_rect(24, 60, 70, 70, 0xE53935))
+    # Green circle
+    s = s.push(SceneCommand.circle(165, 95, 38, 0x43A047))
+    # Blue rounded-ish rect (stroke)
+    s = s.push(SceneCommand.stroke_rect(230, 60, 70, 70, 0x1E88E5, 4))
+    # Diagonal line
+    s = s.push(SceneCommand.line(24, 170, 300, 210, 0xFFB300, 5))
+    # Caption
+    s = s.push(SceneCommand.text(24, 196, "rect / circle / stroke / line", 13, 0x9AA4B2))
+    return s
+
+fn full_page(canvas_html: text) -> text:
+    var p = "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+    p = p + "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\">"
+    p = p + "<title>Simple 2D Canvas</title>"
+    p = p + "<style>body{{background:#06070c;margin:0;display:flex;flex-direction:column;align-items:center;gap:16px;padding:24px;font-family:-apple-system,sans-serif;color:#f5f5f7}}h2{{font-weight:600;font-size:17px}}</style>"
+    p = p + "</head><body><h2>Simple GUI 2D — Tauri mobile canvas backend</h2>"
+    p = p + canvas_html
+    p = p + "</body></html>"
+    return p
+
+fn main() -> i64:
+    val args = cli_get_args()
+    var out = "tools/tauri-shell/dist/canvas.html"
+    var i = 0
+    while i < args.len():
+        if args[i].ends_with(".html"):
+            out = args[i]
+        i = i + 1
+
+    val scene = build_scene()
+    val canvas_html = scene_to_canvas_html(scene, "scene_main")
+    val page = full_page(canvas_html)
+    if write_file(out, page):
+        print "Wrote {page.len()} bytes to {out} ({scene.commands.len()} draw commands)"
+        return 0
+    print "Error: failed to write {out}"
+    return 1

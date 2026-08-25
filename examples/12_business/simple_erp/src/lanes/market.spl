@@ -1,0 +1,58 @@
+# Market Lane — marketplace listings and orders on the shared guarded-write
+# framework
+#
+# Owns the Listing/MarketOrder shapes, stock/fulfillment transitions, and
+# commission math. Writes go through framework.gate_write with action
+# "market.write" so the session -> rbac -> validation -> idempotency order is
+# enforced once.
+
+use framework.guarded.{Tenant, Actor, Session, WriteResult, gate_write}
+use std.nogc_sync_mut.enterprise_store.store.{EnterpriseStore}
+
+struct Listing:
+    val id: i64
+    val seller_id: i64
+    val sku: text
+    val title: text
+    val price: i64
+    val stock: i64
+    val status: text
+
+# Domain validity: identity present, sku/title filled, non-negative money and
+# stock.
+fn validate_listing(listing: Listing) -> bool:
+    return (listing.id > 0 and listing.seller_id > 0 and listing.sku.len() > 0 and listing.title.len() > 0 and listing.price >= 0 and listing.stock >= 0)
+
+struct MarketOrder:
+    val id: i64
+    val listing_id: i64
+    val buyer_id: i64
+    val qty: i64
+    val paid: bool
+
+# Can this order be filled against this listing? Only while active, paid, and
+# within stock.
+fn can_fill(listing: Listing, order: MarketOrder) -> bool:
+    return (listing.status == "active" and order.qty > 0 and order.qty <= listing.stock and order.paid)
+
+# Fill the order against the listing, reducing stock. Closes the listing once
+# stock hits zero. Callers gate on can_fill first.
+fn fill_order(listing: Listing, order: MarketOrder) -> Listing:
+    val remaining = listing.stock - order.qty
+    var status = listing.status
+    if remaining <= 0:
+        status = "closed"
+    return Listing { id: listing.id, seller_id: listing.seller_id, sku: listing.sku, title: listing.title, price: listing.price, stock: remaining, status: status }
+
+# Marketplace commission on a fill, in the same minor-unit currency as price.
+fn commission(price: i64, qty: i64, rate_bps: i64) -> i64:
+    return price * qty * rate_bps / 10000
+
+# What the seller nets after commission.
+fn seller_payout(price: i64, qty: i64, rate_bps: i64) -> i64:
+    val gross = price * qty
+    return gross - commission(price, qty, rate_bps)
+
+# The lane's single write entry point.
+fn submit_listing_write(session: Session, tenant: Tenant, user: Actor, listing: Listing, key: text, store: EnterpriseStore) -> WriteResult:
+    return gate_write(store, session, tenant, user, "market.write", validate_listing(listing), key)

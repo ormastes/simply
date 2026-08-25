@@ -1,0 +1,198 @@
+# Tag manager — tag operations across an Obsidian vault
+#
+# Add/remove tags from individual notes, rename tags vault-wide,
+# and list all unique tags in the vault.
+
+use src.util.json_helpers.{safe_substr}
+use src.core.vault_scanner.{scan_vault, relative_path}
+use src.core.note_parser.{parse_frontmatter, extract_tags}
+use src.core.frontmatter_manager.{get_frontmatter_field, set_frontmatter_field}
+
+use std.io_runtime.{read_file, write_file}
+
+# --- Add tag to note ---
+
+/**
+Add a tag to a note's frontmatter tags array.
+If the tag already exists, the note is unchanged.
+Returns true if the file was modified, false otherwise.
+
+```sdoctest
+>>> add_tag_to_note("/vault", "note.md", "project")
+true
+```
+*/
+fn add_tag_to_note(vault_path: text, rel_path: text, tag: text) -> bool:
+    val full_path = join_path(vault_path, rel_path)
+    val content = read_file(full_path) ?? ""
+    if content == "":
+        return false
+
+    val current_tags_str = get_frontmatter_field(content, "tags")
+    var tags = parse_tag_list(current_tags_str)
+
+    # Check if tag already exists
+    for existing in tags:
+        if existing == tag:
+            return false
+
+    tags.push(tag)
+    val new_tags_value = "[" + tags.join(", ") + "]"
+    val new_content = set_frontmatter_field(content, "tags", new_tags_value)
+    write_file(full_path, new_content)
+
+# --- Remove tag from note ---
+
+/**
+Remove a tag from a note's frontmatter tags array.
+Returns true if the file was modified, false otherwise.
+
+```sdoctest
+>>> remove_tag_from_note("/vault", "note.md", "old-tag")
+true
+```
+*/
+fn remove_tag_from_note(vault_path: text, rel_path: text, tag: text) -> bool:
+    val full_path = join_path(vault_path, rel_path)
+    val content = read_file(full_path) ?? ""
+    if content == "":
+        return false
+
+    val current_tags_str = get_frontmatter_field(content, "tags")
+    var tags = parse_tag_list(current_tags_str)
+
+    var found = false
+    var new_tags: [text] = []
+    for t in tags:
+        if t == tag:
+            found = true
+        else:
+            new_tags.push(t)
+
+    if not found:
+        return false
+
+    val new_tags_value = "[" + new_tags.join(", ") + "]"
+    val new_content = set_frontmatter_field(content, "tags", new_tags_value)
+    write_file(full_path, new_content)
+
+# --- Rename tag vault-wide ---
+
+/**
+Rename a tag across ALL notes in the vault.
+Renames both frontmatter `tags:` entries and inline `#tag` occurrences.
+Returns the count of modified files.
+
+```sdoctest
+>>> rename_tag_in_vault("/vault", "old-tag", "new-tag")
+3
+```
+*/
+fn rename_tag_in_vault(vault_path: text, old_tag: text, new_tag: text) -> i64:
+    var modified_count: i64 = 0
+    val files = scan_vault(vault_path)
+
+    for file in files:
+        val content = read_file(file) ?? ""
+        if content == "":
+            continue
+
+        var changed = false
+        var new_content = content
+
+        # Rename in frontmatter tags
+        val tags_str = get_frontmatter_field(new_content, "tags")
+        if tags_str != "":
+            var tags = parse_tag_list(tags_str)
+            var tag_changed = false
+            var updated_tags: [text] = []
+            for t in tags:
+                if t == old_tag:
+                    updated_tags.push(new_tag)
+                    tag_changed = true
+                else:
+                    updated_tags.push(t)
+            if tag_changed:
+                val new_tags_value = "[" + updated_tags.join(", ") + "]"
+                new_content = set_frontmatter_field(new_content, "tags", new_tags_value)
+                changed = true
+
+        # Rename inline #tags in body
+        val old_inline = "#" + old_tag
+        val new_inline = "#" + new_tag
+        if new_content.contains(old_inline):
+            new_content = new_content.replace(old_inline, new_inline)
+            changed = true
+
+        if changed:
+            write_file(file, new_content)
+            modified_count = modified_count + 1
+
+    modified_count
+
+# --- List all unique tags ---
+
+/**
+Collect all unique tags from every note in the vault.
+Includes both frontmatter tags and inline #tag occurrences.
+
+```sdoctest
+>>> val tags = list_all_tags("/vault")
+>>> tags.len()
+5
+```
+*/
+fn list_all_tags(vault_path: text) -> [text]:
+    var all_tags: [text] = []
+    val files = scan_vault(vault_path)
+
+    for file in files:
+        val content = read_file(file) ?? ""
+        if content == "":
+            continue
+
+        # Frontmatter tags
+        val meta = parse_frontmatter(content)
+        for t in meta.tags:
+            if t != "":
+                add_unique(all_tags, t)
+
+        # Inline tags
+        val inline = extract_tags(content)
+        for t in inline:
+            if t != "":
+                add_unique(all_tags, t)
+
+    all_tags
+
+# --- Internal helpers ---
+
+fn join_path(base: text, rel: text) -> text:
+    var path = base
+    if path != "" and not path.ends_with("/"):
+        path = path + "/"
+    path + rel
+
+fn parse_tag_list(tags_str: text) -> [text]:
+    var result: [text] = []
+    if tags_str == "":
+        return result
+    var clean = tags_str.trim()
+    # Remove surrounding brackets
+    if clean.starts_with("[") and clean.ends_with("]"):
+        clean = safe_substr(clean, 1, clean.len() - 1)
+    val parts = clean.split(",")
+    for part in parts:
+        var trimmed = part.trim()
+        if trimmed.starts_with("\"") and trimmed.ends_with("\""):
+            trimmed = safe_substr(trimmed, 1, trimmed.len() - 1)
+        if trimmed != "":
+            result.push(trimmed)
+    result
+
+fn add_unique(list: [text], item: text) -> [text]:
+    for existing in list:
+        if existing == item:
+            return list
+    list.push(item)
+    list

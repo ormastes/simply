@@ -1,0 +1,780 @@
+#![allow(export_outside_init)]
+# torch Simple API (Tier 3)
+# PyTorch-like high-level API for neural networks
+#
+# This provides an idiomatic Simple API wrapping the FFI bindings.
+# Designed to feel like PyTorch from the user's perspective.
+
+use std.nogc_async_mut.torch.sffi.{
+    rt_torch_available,
+    rt_torch_version,
+    rt_torch_cuda_available,
+    rt_torch_tensor_zeros,
+    rt_torch_tensor_ones,
+    rt_torch_tensor_randn,
+    rt_torch_torchtensor_add,
+    rt_torch_torchtensor_mul,
+    rt_torch_torchtensor_matmul,
+    rt_torch_torchtensor_ndim,
+    rt_torch_torchtensor_numel,
+    rt_torch_torchtensor_shape,
+    rt_torch_torchtensor_relu,
+    rt_torch_torchtensor_sigmoid,
+    rt_torch_torchtensor_tanh,
+    rt_torch_torchtensor_cuda,
+    rt_torch_torchtensor_cpu,
+    rt_torch_torchtensor_is_cuda,
+    rt_torch_torchtensor_to_stream,
+    rt_torch_torchtensor_free,
+    rt_torch_stream_create,
+    rt_torch_torchstream_sync,
+    rt_torch_torchstream_query,
+    rt_torch_torchstream_free
+}
+
+# ============================================================================
+# Backend Detection
+# ============================================================================
+
+# Check if PyTorch C++ library (libtorch) is available
+# Returns true if torch backend is loaded, false otherwise
+#
+# Example:
+#     if torch_available():
+#         print "PyTorch version: {torch_version()}"
+#     else:
+#         print "PyTorch not found, using pure Simple tensors"
+fn torch_available() -> bool:
+    rt_torch_available()
+
+fn torch_version() -> text:
+    rt_torch_version()
+
+fn cuda_available() -> bool:
+    rt_torch_cuda_available()
+
+fn _unsupported_torch_feature(feature: text):
+    panic("torch example API '{feature}' is not implemented yet; requires additional FFI/runtime support")
+
+# ============================================================================
+# Tensor Class - PyTorch-like API
+# ============================================================================
+
+class Tensor:
+    """High-level PyTorch-like tensor wrapper.
+
+    Automatically manages memory via RAII pattern (drop() frees memory).
+    All operations return new tensors, original tensors are unchanged.
+
+    Example:
+        val t = Tensor.zeros([3, 3])
+        val t2 = t.add(t).mul(Tensor.ones([3, 3]))
+        print t2.shape()  # [3, 3]
+        print t2.numel()  # 9
+    """
+
+    handle: i64
+    owns_handle: bool
+
+    # ========================================================================
+    # Creation Operations (Factory Methods)
+    # ========================================================================
+
+    # Create tensor filled with zeros
+    #
+    # Example:
+    #     val t = Tensor.zeros([2, 3])
+    #     # Creates [[0, 0, 0], [0, 0, 0]]
+    static fn zeros(dims: [i64]) -> Tensor:
+        val handle = rt_torch_tensor_zeros(dims)
+        Tensor(handle: handle, owns_handle: true)
+
+    # Create tensor filled with ones
+    #
+    # Example:
+    #     val t = Tensor.ones([2, 2])
+    #     # Creates [[1, 1], [1, 1]]
+    static fn ones(dims: [i64]) -> Tensor:
+        val handle = rt_torch_tensor_ones(dims)
+        Tensor(handle: handle, owns_handle: true)
+
+    # Create tensor with random normal distribution (mean=0, std=1)
+    #
+    # Example:
+    #     val t = Tensor.randn([3, 3])
+    #     # Creates 3x3 tensor with random values
+    static fn randn(dims: [i64]) -> Tensor:
+        val handle = rt_torch_tensor_randn(dims)
+        Tensor(handle: handle, owns_handle: true)
+
+    # Create tensor from existing handle (internal use)
+    static fn from_handle(handle: i64) -> Tensor:
+        Tensor(handle: handle, owns_handle: true)
+
+    # ========================================================================
+    # Memory Management
+    # ========================================================================
+
+    fn drop():
+        """Automatically free memory when object goes out of scope."""
+        if self.owns_handle:
+            rt_torch_torchtensor_free(self.handle)
+
+    fn clone() -> Tensor:
+        """Create a deep copy of this tensor."""
+        val new_tensor = Tensor.zeros(self.shape())
+        val result = new_tensor.add(self)
+        result
+
+    # ========================================================================
+    # Tensor Properties
+    # ========================================================================
+
+    fn ndim() -> i64:
+        """Number of dimensions (rank)."""
+        rt_torch_torchtensor_ndim(self.handle)
+
+    fn numel() -> i64:
+        """Total number of elements."""
+        rt_torch_torchtensor_numel(self.handle)
+
+    fn shape() -> [i64]:
+        """Shape as array of dimensions."""
+        rt_torch_torchtensor_shape(self.handle)
+
+    fn size(dim: i64) -> i64:
+        """Size of specific dimension."""
+        val sh = self.shape()
+        if dim >= 0 and dim < sh.len():
+            sh[dim]
+        else:
+            0
+
+    # ========================================================================
+    # Arithmetic Operations
+    # ========================================================================
+
+    fn add(other: Tensor) -> Tensor:
+        """Element-wise addition."""
+        val result_handle = rt_torch_torchtensor_add(self.handle, other.handle)
+        Tensor.from_handle(result_handle)
+
+    fn sub(other: Tensor) -> Tensor:
+        """Element-wise subtraction (a - b = a + (-1 * b))."""
+        _unsupported_torch_feature("Tensor.sub — requires negation FFI")
+
+    fn mul(other: Tensor) -> Tensor:
+        """Element-wise multiplication."""
+        val result_handle = rt_torch_torchtensor_mul(self.handle, other.handle)
+        Tensor.from_handle(result_handle)
+
+    fn div(other: Tensor) -> Tensor:
+        """Element-wise division (a / b = a * (1/b))."""
+        _unsupported_torch_feature("Tensor.div — requires reciprocal FFI")
+
+    fn matmul(other: Tensor) -> Tensor:
+        """Matrix multiplication."""
+        val result_handle = rt_torch_torchtensor_matmul(self.handle, other.handle)
+        Tensor.from_handle(result_handle)
+
+    fn mm(other: Tensor) -> Tensor:
+        """Alias for matmul."""
+        self.matmul(other)
+
+    fn dot(other: Tensor) -> Tensor:
+        """Dot product (same as matmul for 2D)."""
+        self.matmul(other)
+
+    # ========================================================================
+    # Activation Functions
+    # ========================================================================
+
+    fn relu() -> Tensor:
+        """Rectified Linear Unit: max(0, x)."""
+        val result_handle = rt_torch_torchtensor_relu(self.handle)
+        Tensor.from_handle(result_handle)
+
+    fn sigmoid() -> Tensor:
+        """Sigmoid activation: 1 / (1 + exp(-x))."""
+        val result_handle = rt_torch_torchtensor_sigmoid(self.handle)
+        Tensor.from_handle(result_handle)
+
+    fn tanh() -> Tensor:
+        """Hyperbolic tangent activation."""
+        val result_handle = rt_torch_torchtensor_tanh(self.handle)
+        Tensor.from_handle(result_handle)
+
+    fn softmax(dim: i64) -> Tensor:
+        """Softmax activation (requires additional FFI support)."""
+        _unsupported_torch_feature("Tensor.softmax")
+
+    fn log_softmax(dim: i64) -> Tensor:
+        """Log-softmax activation (requires additional FFI support)."""
+        _unsupported_torch_feature("Tensor.log_softmax")
+
+    # ========================================================================
+    # Device Management
+    # ========================================================================
+
+    fn cuda(device_id: i64) -> Tensor:
+        """Move tensor to CUDA device."""
+        val device_i32: i32 = device_id
+        val result_handle = rt_torch_torchtensor_cuda(self.handle, device_i32)
+        Tensor.from_handle(result_handle)
+
+    fn cpu() -> Tensor:
+        """Move tensor to CPU."""
+        val result_handle = rt_torch_torchtensor_cpu(self.handle)
+        Tensor.from_handle(result_handle)
+
+    fn is_cuda() -> bool:
+        """Check if tensor is on CUDA device."""
+        rt_torch_torchtensor_is_cuda(self.handle)
+
+    fn to_device(device: text) -> Tensor:
+        """Move to device by name ('cuda' or 'cpu')."""
+        if device == "cuda":
+            self.cuda(0)
+        else:
+            self.cpu()
+
+    # ========================================================================
+    # Autograd Operations (Stubs for Future Implementation)
+    # ========================================================================
+
+    fn backward():
+        """Compute gradients (requires autograd FFI support)."""
+        _unsupported_torch_feature("Tensor.backward")
+
+    fn zero_grad():
+        """Zero out gradients (requires autograd FFI support)."""
+        _unsupported_torch_feature("Tensor.zero_grad")
+
+    fn requires_grad(value: bool) -> Tensor:
+        """Set requires_grad flag (requires autograd FFI support)."""
+        _unsupported_torch_feature("Tensor.requires_grad")
+
+    fn detach() -> Tensor:
+        """Detach from computation graph (requires autograd FFI support)."""
+        _unsupported_torch_feature("Tensor.detach")
+
+    # ========================================================================
+    # Reshaping Operations (Stubs for Future Implementation)
+    # ========================================================================
+
+    fn view(dims: [i64]) -> Tensor:
+        """Reshape tensor (requires additional FFI support)."""
+        _unsupported_torch_feature("Tensor.view")
+
+    fn reshape(dims: [i64]) -> Tensor:
+        """Reshape tensor (requires additional FFI support)."""
+        _unsupported_torch_feature("Tensor.reshape")
+
+    fn transpose(dim0: i64, dim1: i64) -> Tensor:
+        """Transpose two dimensions (requires additional FFI support)."""
+        _unsupported_torch_feature("Tensor.transpose")
+
+    fn permute(dims: [i64]) -> Tensor:
+        """Permute dimensions (requires additional FFI support)."""
+        _unsupported_torch_feature("Tensor.permute")
+
+    fn squeeze(dim: i64) -> Tensor:
+        """Remove dimension of size 1 (requires additional FFI support)."""
+        _unsupported_torch_feature("Tensor.squeeze")
+
+    fn unsqueeze(dim: i64) -> Tensor:
+        """Add dimension of size 1 (requires additional FFI support)."""
+        _unsupported_torch_feature("Tensor.unsqueeze")
+
+
+# ============================================================================
+# Neural Network Layers
+# ============================================================================
+
+class Linear:
+    """Fully connected linear layer: y = xW^T + b
+
+    Example:
+        val layer = Linear.create(128, 64)
+        val x = Tensor.randn([32, 128])
+        val y = layer.forward(x)
+        print y.shape()  # [32, 64]
+    """
+
+    in_features: i64
+    out_features: i64
+    weight: Tensor
+    bias: Tensor
+    has_bias: bool
+
+    static fn create(in_features: i64, out_features: i64) -> Linear:
+        Linear.create_with_bias(in_features, out_features, true)
+
+    static fn create_with_bias(in_features: i64, out_features: i64, use_bias: bool) -> Linear:
+        val weight = Tensor.randn([out_features, in_features])
+        var bias_tensor = Tensor.zeros([out_features])
+        if use_bias:
+            bias_tensor = Tensor.randn([out_features])
+        Linear(
+            in_features: in_features,
+            out_features: out_features,
+            weight: weight,
+            bias: bias_tensor,
+            has_bias: use_bias
+        )
+
+    fn forward(x: Tensor) -> Tensor:
+        """Forward pass: y = xW^T + b."""
+        _unsupported_torch_feature("Linear.forward — blocked by missing transpose FFI")
+
+    fn parameters() -> [Tensor]:
+        """Return list of trainable parameters."""
+        if self.has_bias:
+            [self.weight, self.bias]
+        else:
+            [self.weight]
+
+
+class Conv2d:
+    """2D Convolutional layer
+
+    Example:
+        val layer = Conv2d.create(3, 64, 3, 1, 1)
+        val x = Tensor.randn([1, 3, 224, 224])
+        val y = layer.forward(x)
+        print y.shape()  # [1, 64, 224, 224]
+    """
+
+    in_channels: i64
+    out_channels: i64
+    kernel_size: i64
+    stride: i64
+    padding: i64
+    weight: Tensor
+    bias: Tensor
+
+    static fn create(in_channels: i64, out_channels: i64, kernel_size: i64, stride: i64, padding: i64) -> Conv2d:
+        val weight = Tensor.randn([out_channels, in_channels, kernel_size, kernel_size])
+        val bias = Tensor.randn([out_channels])
+        Conv2d(
+            in_channels: in_channels,
+            out_channels: out_channels,
+            kernel_size: kernel_size,
+            stride: stride,
+            padding: padding,
+            weight: weight,
+            bias: bias
+        )
+
+    fn forward(x: Tensor) -> Tensor:
+        """Forward pass (requires conv2d FFI support)."""
+        _unsupported_torch_feature("Conv2d.forward")
+
+    fn parameters() -> [Tensor]:
+        """Return list of trainable parameters."""
+        [self.weight, self.bias]
+
+
+class MaxPool2d:
+    """2D Max pooling layer
+
+    Example:
+        val pool = MaxPool2d.create(2, 2)
+        val x = Tensor.randn([1, 64, 112, 112])
+        val y = pool.forward(x)
+        print y.shape()  # [1, 64, 56, 56]
+    """
+
+    kernel_size: i64
+    stride: i64
+
+    static fn create(kernel_size: i64, stride: i64) -> MaxPool2d:
+        MaxPool2d(kernel_size: kernel_size, stride: stride)
+
+    fn forward(x: Tensor) -> Tensor:
+        """Forward pass (requires maxpool2d FFI support)."""
+        _unsupported_torch_feature("MaxPool2d.forward")
+
+
+class BatchNorm2d:
+    """2D Batch normalization layer
+
+    Example:
+        val bn = BatchNorm2d.create(64)
+        val x = Tensor.randn([32, 64, 28, 28])
+        val y = bn.forward(x)
+        print y.shape()  # [32, 64, 28, 28]
+    """
+
+    num_features: i64
+    running_mean: Tensor
+    running_var: Tensor
+    weight: Tensor
+    bias: Tensor
+    eps: i64
+    momentum: i64
+
+    static fn create(num_features: i64) -> BatchNorm2d:
+        val running_mean = Tensor.zeros([num_features])
+        val running_var = Tensor.ones([num_features])
+        val weight = Tensor.ones([num_features])
+        val bias = Tensor.zeros([num_features])
+        BatchNorm2d(
+            num_features: num_features,
+            running_mean: running_mean,
+            running_var: running_var,
+            weight: weight,
+            bias: bias,
+            eps: 0,
+            momentum: 0
+        )
+
+    fn forward(x: Tensor) -> Tensor:
+        """Forward pass (requires batchnorm FFI support)."""
+        _unsupported_torch_feature("BatchNorm2d.forward")
+
+    fn parameters() -> [Tensor]:
+        """Return list of trainable parameters."""
+        [self.weight, self.bias]
+
+
+class Dropout:
+    """Dropout regularization layer
+
+    Example:
+        val dropout = Dropout.create(0)
+        val x = Tensor.randn([32, 128])
+        val y = dropout.forward(x)
+    """
+
+    p: i64
+    training: bool
+
+    static fn create(p: i64) -> Dropout:
+        Dropout(p: p, training: true)
+
+    fn forward(x: Tensor) -> Tensor:
+        """Forward pass (requires dropout FFI support)."""
+        _unsupported_torch_feature("Dropout.forward")
+
+    me train():
+        """Set to training mode."""
+        self.training = true
+
+    me eval():
+        """Set to evaluation mode."""
+        self.training = false
+
+
+# ============================================================================
+# Loss Functions
+# ============================================================================
+
+class MSELoss:
+    """Mean Squared Error loss
+
+    Example:
+        val criterion = MSELoss.create()
+        val pred = Tensor.randn([32, 10])
+        val target = Tensor.randn([32, 10])
+        val loss = criterion.forward(pred, target)
+    """
+
+    static fn create() -> MSELoss:
+        MSELoss()
+
+    fn forward(pred: Tensor, target: Tensor) -> Tensor:
+        """Compute MSE loss from tensor arithmetic."""
+        _unsupported_torch_feature("MSELoss.forward — blocked by missing Tensor.sub")
+
+
+class CrossEntropyLoss:
+    """Cross-entropy loss for classification
+
+    Example:
+        val criterion = CrossEntropyLoss.create()
+        val logits = Tensor.randn([32, 10])
+        val targets = Tensor.zeros([32])
+        val loss = criterion.forward(logits, targets)
+    """
+
+    static fn create() -> CrossEntropyLoss:
+        CrossEntropyLoss()
+
+    fn forward(logits: Tensor, targets: Tensor) -> Tensor:
+        """Compute cross-entropy loss (requires additional FFI support)."""
+        _unsupported_torch_feature("CrossEntropyLoss.forward")
+
+
+# ============================================================================
+# Optimizers
+# ============================================================================
+
+class SGD:
+    """Stochastic Gradient Descent optimizer
+
+    Example:
+        val model_params = [weight1, weight2, bias]
+        val optimizer = SGD.create(model_params, 0, 0)
+        optimizer.step()
+        optimizer.zero_grad()
+    """
+
+    parameters: [Tensor]
+    lr: i64
+    momentum: i64
+    velocities: [Tensor]
+
+    static fn create(parameters: [Tensor], lr: i64, momentum: i64) -> SGD:
+        var velocities_list = []
+        var i = 0
+        while i < parameters.len():
+            val param = parameters[i]
+            val velocity = Tensor.zeros(param.shape())
+            velocities_list = velocities_list + [velocity]
+            i = i + 1
+        SGD(
+            parameters: parameters,
+            lr: lr,
+            momentum: momentum,
+            velocities: velocities_list
+        )
+
+    fn step():
+        """Update parameters (requires autograd FFI support)."""
+        _unsupported_torch_feature("SGD.step")
+
+    fn zero_grad():
+        """Zero out all gradients."""
+        _unsupported_torch_feature("SGD.zero_grad — blocked by missing autograd")
+
+
+class Adam:
+    """Adam optimizer
+
+    Example:
+        val optimizer = Adam.create(model_params, 0, 0, 0)
+        optimizer.step()
+        optimizer.zero_grad()
+    """
+
+    parameters: [Tensor]
+    lr: i64
+    beta1: i64
+    beta2: i64
+    eps: i64
+    m: [Tensor]
+    v: [Tensor]
+    t: i64
+
+    static fn create(parameters: [Tensor], lr: i64, beta1: i64, beta2: i64) -> Adam:
+        var m_list = []
+        var v_list = []
+        var i = 0
+        while i < parameters.len():
+            val param = parameters[i]
+            val m_tensor = Tensor.zeros(param.shape())
+            val v_tensor = Tensor.zeros(param.shape())
+            m_list = m_list + [m_tensor]
+            v_list = v_list + [v_tensor]
+            i = i + 1
+        Adam(
+            parameters: parameters,
+            lr: lr,
+            beta1: beta1,
+            beta2: beta2,
+            eps: 0,
+            m: m_list,
+            v: v_list,
+            t: 0
+        )
+
+    fn step():
+        """Update parameters (requires autograd FFI support)."""
+        _unsupported_torch_feature("Adam.step")
+
+    fn zero_grad():
+        """Zero out all gradients."""
+        _unsupported_torch_feature("Adam.zero_grad")
+
+
+class RMSprop:
+    """RMSprop optimizer
+
+    Example:
+        val optimizer = RMSprop.create(model_params, 0, 0, 0)
+        optimizer.step()
+        optimizer.zero_grad()
+    """
+
+    parameters: [Tensor]
+    lr: i64
+    alpha: i64
+    eps: i64
+    v: [Tensor]
+
+    static fn create(parameters: [Tensor], lr: i64, alpha: i64, eps: i64) -> RMSprop:
+        var v_list = []
+        var i = 0
+        while i < parameters.len():
+            val param = parameters[i]
+            val v_tensor = Tensor.zeros(param.shape())
+            v_list = v_list + [v_tensor]
+            i = i + 1
+        RMSprop(
+            parameters: parameters,
+            lr: lr,
+            alpha: alpha,
+            eps: eps,
+            v: v_list
+        )
+
+    fn step():
+        """Update parameters (requires autograd FFI support)."""
+        _unsupported_torch_feature("RMSprop.step")
+
+    fn zero_grad():
+        """Zero out all gradients."""
+        _unsupported_torch_feature("RMSprop.zero_grad")
+
+
+# ============================================================================
+# CUDA Stream Wrapper
+# ============================================================================
+
+class Stream:
+    """CUDA stream for asynchronous operations
+
+    Example:
+        val stream = Stream.create(0)
+        val t = Tensor.randn([100, 100])
+        val t_gpu = t.to_stream(0, stream)
+        stream.sync()
+    """
+
+    handle: i64
+    owns_handle: bool
+    device_id: i64
+
+    static fn create(device_id: i64) -> Stream:
+        val device_i32: i32 = device_id
+        val handle = rt_torch_stream_create(device_i32)
+        Stream(handle: handle, owns_handle: true, device_id: device_id)
+
+    fn drop():
+        """Automatically free memory when object goes out of scope."""
+        if self.owns_handle:
+            rt_torch_torchstream_free(self.handle)
+
+    fn synchronize():
+        """Synchronize stream (wait for all operations to complete)."""
+        rt_torch_torchstream_sync(self.handle)
+
+    fn query() -> bool:
+        """Check if all operations in stream have completed."""
+        rt_torch_torchstream_query(self.handle)
+
+
+# ============================================================================
+# Sequential Container
+# ============================================================================
+
+class Sequential:
+    """Sequential container for chaining layers
+
+    Example:
+        val model = Sequential.create()
+        model.add_layer_linear(Linear.create(784, 128))
+        model.add_layer_linear(Linear.create(128, 10))
+        val x = Tensor.randn([32, 784])
+        val y = model.forward(x)
+        print y.shape()  # [32, 10]
+    """
+
+    layers_linear: [Linear]
+    layers_conv2d: [Conv2d]
+
+    static fn create() -> Sequential:
+        Sequential(layers_linear: [], layers_conv2d: [])
+
+    me add_layer_linear(layer: Linear):
+        """Add a Linear layer."""
+        self.layers_linear = self.layers_linear + [layer]
+
+    me add_layer_conv2d(layer: Conv2d):
+        """Add a Conv2d layer."""
+        self.layers_conv2d = self.layers_conv2d + [layer]
+
+    fn forward(x: Tensor) -> Tensor:
+        """Forward pass through all layers."""
+        var output = x
+        var i = 0
+        while i < self.layers_linear.len():
+            output = self.layers_linear[i].forward(output)
+            i = i + 1
+        var j = 0
+        while j < self.layers_conv2d.len():
+            output = self.layers_conv2d[j].forward(output)
+            j = j + 1
+        output
+
+    fn parameters() -> [Tensor]:
+        """Get all trainable parameters."""
+        var all_params = []
+        var i = 0
+        while i < self.layers_linear.len():
+            val layer_params = self.layers_linear[i].parameters()
+            all_params = all_params + layer_params
+            i = i + 1
+        var j = 0
+        while j < self.layers_conv2d.len():
+            val layer_params = self.layers_conv2d[j].parameters()
+            all_params = all_params + layer_params
+            j = j + 1
+        all_params
+
+
+# ============================================================================
+# Utility Functions
+# ============================================================================
+
+fn no_grad(f: fn()) -> void:
+    """Context manager for disabling gradient computation (requires autograd FFI support)."""
+    _unsupported_torch_feature("no_grad")
+
+fn set_seed(seed: i64):
+    """Set random seed for reproducibility (requires additional FFI support)."""
+    _unsupported_torch_feature("set_seed")
+
+fn manual_seed(seed: i64):
+    """Alias for set_seed."""
+    set_seed(seed)
+
+
+# ============================================================================
+# Exports
+# ============================================================================
+
+export Tensor
+export Linear
+export Conv2d
+export MaxPool2d
+export BatchNorm2d
+export Dropout
+export MSELoss
+export CrossEntropyLoss
+export SGD
+export Adam
+export RMSprop
+export Stream
+export Sequential
+export torch_available
+export torch_version
+export cuda_available
+export no_grad
+export set_seed
+export manual_seed
+
+# Alias for backward compatibility
+val TorchTensorWrapper = Tensor
+export TorchTensorWrapper

@@ -1,0 +1,64 @@
+# @cover src/dimensions/permission.spl 70%
+"""
+# Cross-cutting Dimensions
+
+Smoke coverage for the dimension slices every module composes against:
+capability-bounded permission (the agent-safety primitive), append-only audit,
+approval gating, jurisdiction tax, effective-dating, and contextual threads.
+"""
+
+use std.spec
+use dimensions.permission.{empty_caps, grant, has_capability}
+use dimensions.audit.{new_trail, record, trail_length}
+use dimensions.approval.{gate, requires_approval, approved}
+use dimensions.location.{jurisdiction, tax_on}
+use dimensions.time.{effective, in_effect}
+use dimensions.comms.{thread, note, note_count}
+
+describe "Permission — capability-bounded effects":
+    it "grants and checks an effect":
+        var caps = empty_caps()
+        caps = grant(caps, "read:AR")
+        caps = grant(caps, "write:dunning")
+        expect(has_capability(caps, "read:AR")).to_equal(true)
+
+    it "denies an ungranted effect (agent cannot touch payroll)":
+        var caps = empty_caps()
+        caps = grant(caps, "read:AR")
+        expect(has_capability(caps, "write:payroll")).to_equal(false)
+
+describe "Audit — append-only trail":
+    it "records actions in order":
+        var trail = new_trail()
+        trail = record(trail, "clerk", "post.journal", 1)
+        trail = record(trail, "agent", "send.dunning", 1)
+        expect(trail_length(trail)).to_equal(2)
+
+describe "Approval — threshold gating":
+    it "requires approval above the threshold":
+        val g = gate(100000, "manager")
+        expect(requires_approval(g, 150000)).to_equal(true)
+        expect(approved(g, 150000, "clerk")).to_equal(false)
+        expect(approved(g, 150000, "manager")).to_equal(true)
+
+    it "auto-approves below the threshold":
+        val g = gate(100000, "manager")
+        expect(approved(g, 500, "clerk")).to_equal(true)
+
+describe "Location — data-driven tax":
+    it "applies a basis-point rate":
+        val j = jurisdiction("DE", "standard", 1900)
+        expect(tax_on(j, 10000)).to_equal(1900)
+
+describe "Time — effective dating":
+    it "is in effect from its start, open-ended":
+        val rec = effective(100, "v1")
+        expect(in_effect(rec, 150)).to_equal(true)
+        expect(in_effect(rec, 50)).to_equal(false)
+
+describe "Comms — contextual thread":
+    it "attaches notes to an entity":
+        var t = thread(7)
+        t = note(t, "shipped")
+        t = note(t, "invoiced")
+        expect(note_count(t)).to_equal(2)

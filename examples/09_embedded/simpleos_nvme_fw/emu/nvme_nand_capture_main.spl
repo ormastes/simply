@@ -1,0 +1,80 @@
+"""
+nvme_nand_capture_main — capture a NAND data change THROUGH the EMU nvme interface.
+
+Proves a host write actually mutates the physical NAND page (erased zeros -> data)
+and that a host read returns that same NAND data. Uses the read-only introspection
+accessors (dbg_next_free_ppn / dbg_physical_ppn / dbg_nand_words) to peek at the
+physical page before and after the write, then reads back through the full host path.
+
+This file HAS a `fn main()` — it is a capture demo entrypoint.
+"""
+
+use nvme_ct.*
+use nvme_shared.*
+use nvme_memcpy.*
+use nand_onfi.*
+use ftl_emu.*
+use nvme_host.*
+use nvme_device.*
+
+fn main() -> i64:
+    var fails: i64 = 0
+    print "=== NVMe NAND data-change capture through the EMU interface ==="
+
+    var emu: NvmeEmu = nvme_emu_new()
+
+    # The physical page the next write will land on.
+    val P: i64 = emu.dbg_next_free_ppn()
+
+    # BEFORE the write the page is erased -> all zeros.
+    val b = emu.dbg_nand_words(P)
+    print "NAND-BEFORE ppn={P} words={b.get(0)},{b.get(1)},{b.get(2)},{b.get(3)}"
+
+    # Host-write LBA 5 with a known 4-word payload, then let the device process it.
+    var w: [i64] = []
+    w = w.push(161)   # 0xA1
+    w = w.push(178)   # 0xB2
+    w = w.push(195)   # 0xC3
+    w = w.push(212)   # 0xD4
+    emu.host_write(Cid(value: 1), Lba(value: 5), Addr(value: 16), w)
+    emu.dev_step()
+    emu.host_reap()
+
+    # The write must have landed on page P.
+    val mapped: i64 = emu.dbg_physical_ppn(Lba(value: 5))
+    fails = fails + expect_eq(mapped, P, "LBA5 mapped to page P")
+
+    # AFTER the write the physical page holds the data.
+    val a = emu.dbg_nand_words(P)
+    print "NAND-AFTER ppn={P} words={a.get(0)},{a.get(1)},{a.get(2)},{a.get(3)}"
+
+    # Read LBA 5 back through the full host<->device path.
+    emu.host_read_submit(Cid(value: 2), Lba(value: 5), Addr(value: 32))
+    emu.dev_step()
+    emu.host_reap()
+    val r = emu.host_fetch_data(Addr(value: 32), WORDS_PER_PAGE)
+    print "NAND-READBACK lba=5 words={r.get(0)},{r.get(1)},{r.get(2)},{r.get(3)}"
+
+    # ── assertions ────────────────────────────────────────────────────────────
+    # BEFORE all zero
+    fails = fails + expect_eq(b.get(0), 0, "before word0 == 0")
+    fails = fails + expect_eq(b.get(1), 0, "before word1 == 0")
+    fails = fails + expect_eq(b.get(2), 0, "before word2 == 0")
+    fails = fails + expect_eq(b.get(3), 0, "before word3 == 0")
+    # AFTER == data
+    fails = fails + expect_eq(a.get(0), 161, "after word0 == 161")
+    fails = fails + expect_eq(a.get(1), 178, "after word1 == 178")
+    fails = fails + expect_eq(a.get(2), 195, "after word2 == 195")
+    fails = fails + expect_eq(a.get(3), 212, "after word3 == 212")
+    # READBACK == AFTER (host read returns the NAND data)
+    fails = fails + expect_eq(r.get(0), a.get(0), "readback word0 == NAND word0")
+    fails = fails + expect_eq(r.get(1), a.get(1), "readback word1 == NAND word1")
+    fails = fails + expect_eq(r.get(2), a.get(2), "readback word2 == NAND word2")
+    fails = fails + expect_eq(r.get(3), a.get(3), "readback word3 == NAND word3")
+
+    if fails == 0:
+        print "NAND DATA CHANGE CAPTURED (write: zeros -> data; read matches)"
+        print "NVME NAND CAPTURE PASS"
+    else:
+        print "NVME NAND CAPTURE FAIL ({fails})"
+    fails

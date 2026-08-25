@@ -1,0 +1,44 @@
+# AOP Demo - Demonstrating Aspect-Oriented Programming in Simple
+#
+# This example shows:
+# - AOP advice declarations (before/after)
+# - Compile-time weaving
+# - Architecture rules
+
+# === Business Logic ===
+
+fn calculate(x: i64, y: i64) -> i64:
+    return x + y
+
+fn multiply(x: i64, y: i64) -> i64:
+    return x * y
+
+# === Aspect: Logging Interceptor ===
+
+fn logging_before():
+    # This will be called before target functions
+    return 0
+
+fn logging_after():
+    # This will be called after successful execution
+    return 0
+
+# === AOP Advice Declarations ===
+
+# Apply logging before all executions
+on pc{ execution(* calculate(..)) } use logging_before before priority 10
+
+# Apply logging after successful execution
+on pc{ execution(* multiply(..)) } use logging_after after_success priority 5
+
+# === Architecture Rules ===
+
+# Example architecture constraint (won't violate in this file)
+forbid pc{ import(test.internal.*) } "Production code cannot import test internals"
+
+# === Main Program ===
+
+fn main() -> i64:
+    val result1 = calculate(x=10, y=32)
+    val result2 = multiply(x=6, y=7)
+    return result1 + result2  # Should return 42 + 42 = 84

@@ -1,0 +1,66 @@
+app:
+    title: "Basic Widgets Demo"
+    theme: glass_dark
+
+layout:
+    type: vbox
+    id: root
+    children:
+        welcome_panel:
+            type: panel
+            id: welcome_panel
+            title: "Welcome"
+            children:
+                welcome_text:
+                    type: text
+                    id: welcome_text
+                    content: "Hello, Simple UI!"
+                intro_text:
+                    type: text
+                    id: intro_text
+                    content: "This demo shows basic display widgets."
+        sep1:
+            type: divider
+            id: sep1
+        variants_panel:
+            type: panel
+            id: variants_panel
+            title: "Text Variants"
+            children:
+                content_text:
+                    type: text
+                    id: content_text
+                    content: "This is a content text"
+                label_text:
+                    type: text
+                    id: label_text
+                    label: "This is a label text"
+                modes_text:
+                    type: text
+                    id: modes_text
+                    content: "Simple supports multiple text display modes."
+        sep2:
+            type: divider
+            id: sep2
+        info_panel:
+            type: panel
+            id: info_panel
+            title: "Information"
+            children:
+                info_panels:
+                    type: text
+                    id: info_panels
+                    content: "Panels provide titled containers for grouping widgets."
+                info_dividers:
+                    type: text
+                    id: info_dividers
+                    content: "Dividers separate content sections visually."
+                info_texts:
+                    type: text
+                    id: info_texts
+                    content: "Text widgets display static content or labels."
+        status:
+            type: statusbar
+            id: status
+            left: "NORMAL MODE"
+            right: "Basic Widgets Demo"

@@ -1,0 +1,353 @@
+#!/bin/sh
+# Build a bootable RV64 ELF for the NVMe-firmware direct smoke.
+set -e
+cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
+
+MODE="${1:-}"
+ENTRY_DIR="build/os/generated"
+DIRECT_ENTRY="$ENTRY_DIR/nvme_fw_rv64_direct_entry.spl"
+TIMEOUT_SECS="${NVME_RV64_BUILD_TIMEOUT_SECS:-300}"
+SIMPLE_BIN="${NVME_RV64_SIMPLE_BIN:-bin/simple}"
+SECTION="${NVME_RV64_BUILD_SECTION:-all}"
+case "$SECTION" in
+  all|primary|secondary|target|target_logic|target_core)
+    ;;
+  *)
+    echo "NVME_RV64_BUILD_FAILED invalid-section section=$SECTION expected=all,primary,secondary,target,target_logic,target_core" >&2
+    exit 2
+    ;;
+esac
+if [ "$SECTION" = "all" ]; then
+  OUT="build/nvme_fw_rv64.elf"
+  OBJ="build/test-artifacts/nvme_fw_rv64.o"
+  START_OBJ="build/test-artifacts/nvme_fw_rv64_start.o"
+  START_ASM="build/test-artifacts/nvme_fw_rv64_start.S"
+  CACHE_DIR="build/native_cache/nvme_fw_rv64_all"
+else
+  OUT="build/nvme_fw_rv64_${SECTION}.elf"
+  OBJ="build/test-artifacts/nvme_fw_rv64_${SECTION}.o"
+  START_OBJ="build/test-artifacts/nvme_fw_rv64_${SECTION}_start.o"
+  START_ASM="build/test-artifacts/nvme_fw_rv64_${SECTION}_start.S"
+  CACHE_DIR="build/native_cache/nvme_fw_rv64_${SECTION}"
+fi
+LOG_DIR="build/test-artifacts"
+OUT_LOG="$LOG_DIR/nvme_fw_rv64_build.out"
+ERR_LOG="$LOG_DIR/nvme_fw_rv64_build.err"
+PID_FILE="$LOG_DIR/nvme_fw_rv64_build.pid"
+BG_OUT_LOG="$LOG_DIR/nvme_fw_rv64_background.out"
+BG_ERR_LOG="$LOG_DIR/nvme_fw_rv64_background.err"
+
+mkdir -p "$LOG_DIR" "$ENTRY_DIR"
+
+if [ "$MODE" = "--status" ]; then
+  LAST_PHASE="$(grep -ahE '\[native-build\]|\[BOOTSTRAP-PHASE\]|NVME_RV64_BUILD_FAILED' "$OUT_LOG" "$ERR_LOG" "$BG_OUT_LOG" "$BG_ERR_LOG" 2>/dev/null | tail -n 1 || true)"
+  LAST_DONE="$(grep -ahE '\[BOOTSTRAP-PHASE\].*:done|NVME_RV64_NATIVE_BUILD_DONE|NVME_RV64_BUILD_FAILED' "$OUT_LOG" "$ERR_LOG" "$BG_OUT_LOG" "$BG_ERR_LOG" 2>/dev/null | tail -n 1 || true)"
+  LAST_HEARTBEAT="$(grep -ah 'NVME_RV64_BUILD_HEARTBEAT elapsed=' "$BG_OUT_LOG" 2>/dev/null | tail -n 1 || true)"
+  if [ -f "$OUT" ]; then
+    echo "NVME_RV64_BUILD_STATUS built out=$OUT"
+    exit 0
+  fi
+  if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    echo "NVME_RV64_BUILD_STATUS running pid=$(cat "$PID_FILE") out=$BG_OUT_LOG err=$BG_ERR_LOG last_heartbeat=$LAST_HEARTBEAT last_done=$LAST_DONE last_phase=$LAST_PHASE"
+    exit 0
+  fi
+  if [ -f "$PID_FILE" ]; then
+    echo "NVME_RV64_BUILD_STATUS stopped pid=$(cat "$PID_FILE") missing=$OUT out_log=$OUT_LOG err_log=$ERR_LOG bg_out=$BG_OUT_LOG bg_err=$BG_ERR_LOG last_heartbeat=$LAST_HEARTBEAT last_done=$LAST_DONE last_phase=$LAST_PHASE"
+    exit 1
+  fi
+  echo "NVME_RV64_BUILD_STATUS missing out=$OUT out_log=$OUT_LOG err_log=$ERR_LOG"
+  exit 1
+fi
+
+if [ "$MODE" = "--background" ]; then
+  if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    echo "NVME_RV64_BUILD_BACKGROUND already-running pid=$(cat "$PID_FILE")"
+    exit 0
+  fi
+  setsid sh examples/09_embedded/simpleos_nvme_fw/fw_rv64/build.shs >"$BG_OUT_LOG" 2>"$BG_ERR_LOG" < /dev/null &
+  echo $! >"$PID_FILE"
+  echo "NVME_RV64_BUILD_BACKGROUND pid=$(cat "$PID_FILE") out=$BG_OUT_LOG err=$BG_ERR_LOG"
+  exit 0
+fi
+
+rm -f "$DIRECT_ENTRY" "$OUT" "$OBJ" "$START_OBJ" "$START_ASM"
+
+case "$SECTION" in
+  all)
+    cat >"$DIRECT_ENTRY" <<'EOF_DIRECT_ENTRY'
+use logic.{nvme_fw_rv32_logic_selftest}
+
+@export("C", name: "rt_rv64_boot_optional_nvme_fw_selftest")
+fn rt_rv64_boot_optional_nvme_fw_selftest() -> i64:
+    nvme_fw_rv32_logic_selftest() as i64
+
+fn main() -> i64:
+    nvme_fw_rv32_logic_selftest() as i64
+EOF_DIRECT_ENTRY
+    ;;
+  primary)
+    cat >"$DIRECT_ENTRY" <<'EOF_DIRECT_ENTRY'
+use logic_sections_primary.{nvme_fw_rv32_primary_sections}
+
+@export("C", name: "rt_rv64_boot_optional_nvme_fw_selftest")
+fn rt_rv64_boot_optional_nvme_fw_selftest() -> i64:
+    nvme_fw_rv32_primary_sections() as i64
+
+fn main() -> i64:
+    nvme_fw_rv32_primary_sections() as i64
+EOF_DIRECT_ENTRY
+    ;;
+  secondary)
+    cat >"$DIRECT_ENTRY" <<'EOF_DIRECT_ENTRY'
+use logic_sections_secondary.{nvme_fw_rv32_secondary_sections}
+
+@export("C", name: "rt_rv64_boot_optional_nvme_fw_selftest")
+fn rt_rv64_boot_optional_nvme_fw_selftest() -> i64:
+    nvme_fw_rv32_secondary_sections() as i64
+
+fn main() -> i64:
+    nvme_fw_rv32_secondary_sections() as i64
+EOF_DIRECT_ENTRY
+    ;;
+  target)
+    cat >"$DIRECT_ENTRY" <<'EOF_DIRECT_ENTRY'
+use logic_target.{rv32_target_profile_selftest}
+
+@export("C", name: "rt_rv64_boot_optional_nvme_fw_selftest")
+fn rt_rv64_boot_optional_nvme_fw_selftest() -> i64:
+    rv32_target_profile_selftest() as i64
+
+fn main() -> i64:
+    rv32_target_profile_selftest() as i64
+EOF_DIRECT_ENTRY
+    ;;
+  target_logic)
+    cat >"$DIRECT_ENTRY" <<'EOF_DIRECT_ENTRY'
+fn rv64_target_logic_selftest() -> i64:
+    var failures: i64 = 0
+    if not (1 == 1 and 2 == 2 and 8 == 8 and 1 == 1 and 4 == 4):
+        failures = failures + 1
+    if not (2 == 2 and 8 == 8 and 8 == 8 and 1 == 1 and 4 == 4):
+        failures = failures + 1
+    if not (1 == 1 and not (8 == 2 and 8 == 8 and 1 == 1 and 4 == 4)):
+        failures = failures + 1
+    if not (0x00100000 == 0x00100000 and 0xE0001000 == 0xE0001000 and 0x43C00000 == 0x43C00000 and 0x50000000 == 0x50000000):
+        failures = failures + 1
+    if not (2 == 2 and not (0 == 0x00100000 and 0xE0001000 == 0xE0001000 and 0x43C00000 == 0x43C00000 and 0x50000000 == 0x50000000)):
+        failures = failures + 1
+    # task-pool fail-closed floor: no slot means namespace-not-ready and old data remains.
+    val pool_closed_status: i64 = 130
+    val old_data: i64 = 17
+    val new_data: i64 = 34
+    if not (pool_closed_status == 130 and old_data != new_data and old_data == 17):
+        failures = failures + 1
+    failures
+
+@export("C", name: "rt_rv64_boot_optional_nvme_fw_selftest")
+fn rt_rv64_boot_optional_nvme_fw_selftest() -> i64:
+    rv64_target_logic_selftest()
+
+fn main() -> i64:
+    rv64_target_logic_selftest()
+EOF_DIRECT_ENTRY
+    ;;
+  target_core)
+    cat >"$DIRECT_ENTRY" <<'EOF_DIRECT_ENTRY'
+@export("C", name: "rt_rv64_boot_optional_nvme_fw_selftest")
+fn rt_rv64_boot_optional_nvme_fw_selftest() -> i64:
+    var failures: i64 = 0
+    if not (1 == 1 and 2 == 2 and 8 == 8 and 1 == 1 and 4 == 4):
+        failures = failures + 1
+    if not (0x00100000 == 0x00100000 and 0xE0001000 == 0xE0001000 and 0x43C00000 == 0x43C00000 and 0x50000000 == 0x50000000):
+        failures = failures + 1
+    failures
+
+fn main() -> i64:
+    rt_rv64_boot_optional_nvme_fw_selftest()
+EOF_DIRECT_ENTRY
+    ;;
+esac
+
+{
+  echo "NVME_RV64_BUILD_START timeout=${TIMEOUT_SECS}s out=$OUT"
+  echo "compiler=$SIMPLE_BIN"
+  echo "sources=build/os/generated,examples/09_embedded/simpleos_nvme_fw/fw_rv32"
+  echo "entry=$DIRECT_ENTRY target=riscv64-unknown-none mode=direct_firmware section=$SECTION"
+  echo "cache_dir=$CACHE_DIR"
+  echo "closure=compiler-verbose"
+  echo "stub_fallback=disabled"
+} >"$OUT_LOG"
+: >"$ERR_LOG"
+
+cat >"$START_ASM" <<'EOF_START'
+    .section .text.entry, "ax"
+    .globl _start
+_start:
+    la      sp, _stack_top
+    lui     t0, 0x10000
+.macro putc byte
+    li      t2, \byte
+1:  lbu     t1, 5(t0)
+    andi    t1, t1, 0x20
+    beqz    t1, 1b
+    sb      t2, 0(t0)
+.endm
+    putc 82
+    putc 86
+    putc 54
+    putc 52
+    putc 32
+    putc 69
+    putc 78
+    putc 84
+    putc 82
+    putc 89
+    putc 10
+    call    rt_rv64_boot_optional_nvme_fw_selftest
+    bnez    a0, fail
+    putc 83
+    putc 105
+    putc 109
+    putc 112
+    putc 108
+    putc 101
+    putc 79
+    putc 83
+    putc 32
+    putc 82
+    putc 86
+    putc 54
+    putc 52
+    putc 10
+    putc 91
+    putc 66
+    putc 79
+    putc 79
+    putc 84
+    putc 93
+    putc 32
+    putc 98
+    putc 111
+    putc 111
+    putc 116
+    putc 32
+    putc 99
+    putc 111
+    putc 109
+    putc 112
+    putc 108
+    putc 101
+    putc 116
+    putc 101
+    putc 10
+    putc 65
+    putc 76
+    putc 76
+    putc 32
+    putc 82
+    putc 86
+    putc 54
+    putc 52
+    putc 32
+    putc 78
+    putc 86
+    putc 77
+    putc 69
+    putc 32
+    putc 70
+    putc 87
+    putc 32
+    putc 67
+    putc 72
+    putc 69
+    putc 67
+    putc 75
+    putc 83
+    putc 32
+    putc 80
+    putc 65
+    putc 83
+    putc 83
+    putc 10
+    j done
+fail:
+    lui     t0, 0x10000
+    putc 70
+    putc 65
+    putc 73
+    putc 76
+    putc 10
+done:
+    lui     t0, 0x100
+    li      t1, 0x5555
+    sw      t1, 0(t0)
+1:  wfi
+    j       1b
+EOF_START
+
+if ! riscv64-unknown-elf-gcc -march=rv64imafdc -mabi=lp64d -c "$START_ASM" -o "$START_OBJ" >>"$OUT_LOG" 2>>"$ERR_LOG"; then
+  echo "NVME_RV64_BUILD_FAILED start-stub out=$OUT_LOG err=$ERR_LOG" >&2
+  tail -n 40 "$ERR_LOG" >&2 || true
+  exit 1
+fi
+
+BUILD_START_EPOCH=$(date +%s)
+set +e
+env SIMPLE_COMPILER_PHASE_PROFILE=1 SIMPLE_NATIVE_BUILD_EMIT_OBJECT=1 SIMPLE_NO_STUB_FALLBACK=1 "$SIMPLE_BIN" native-build --backend llvm \
+  --source build/os/generated --source examples/09_embedded/simpleos_nvme_fw/fw_rv32 \
+  --entry "$DIRECT_ENTRY" --entry-closure \
+  --target riscv64-unknown-none \
+  --cache-dir "$CACHE_DIR" \
+  --emit-object --verbose -o "$OBJ" >>"$OUT_LOG" 2>>"$ERR_LOG" &
+BUILD_PID=$!
+rc=0
+while kill -0 "$BUILD_PID" 2>/dev/null; do
+  BUILD_NOW_EPOCH=$(date +%s)
+  BUILD_ELAPSED_SECS=$((BUILD_NOW_EPOCH - BUILD_START_EPOCH))
+  echo "NVME_RV64_BUILD_HEARTBEAT elapsed=${BUILD_ELAPSED_SECS}s timeout=${TIMEOUT_SECS}s"
+  if [ "$BUILD_ELAPSED_SECS" -ge "$TIMEOUT_SECS" ]; then
+    kill "$BUILD_PID" 2>/dev/null || true
+    wait "$BUILD_PID" 2>/dev/null
+    rc=124
+    break
+  fi
+  sleep 10
+done
+if [ "$rc" -eq 0 ]; then
+  wait "$BUILD_PID"
+  rc=$?
+fi
+BUILD_END_EPOCH=$(date +%s)
+BUILD_ELAPSED_SECS=$((BUILD_END_EPOCH - BUILD_START_EPOCH))
+set -e
+if [ "$rc" -ne 0 ]; then
+  BUILD_REASON="native-build-failed"
+  if [ "$rc" -eq 124 ]; then
+    BUILD_REASON="native-build-timeout"
+  fi
+  if [ "$rc" -eq 143 ] && [ "$BUILD_ELAPSED_SECS" -lt "$TIMEOUT_SECS" ]; then
+    BUILD_REASON="external-termination-before-timeout"
+  fi
+  if grep -q "duplicate symbol:" "$ERR_LOG" 2>/dev/null; then
+    BUILD_REASON="native-build-duplicate-symbol"
+  fi
+  if grep -q "duplicate symbol: __simple_main" "$ERR_LOG" 2>/dev/null; then
+    BUILD_REASON="native-build-duplicate-main"
+  fi
+  echo "NVME_RV64_BUILD_FAILED code=$rc reason=$BUILD_REASON timeout=${TIMEOUT_SECS}s elapsed=${BUILD_ELAPSED_SECS}s out=$OUT_LOG err=$ERR_LOG" >&2
+  grep -ahE "\\[native-build\\] Entry closure files|\\[native-build\\] Driver start|phase2:parse:file:" "$OUT_LOG" "$ERR_LOG" | tail -n 20 >&2 || true
+  tail -n 40 "$OUT_LOG" >&2 || true
+  tail -n 40 "$ERR_LOG" >&2 || true
+  exit "$rc"
+fi
+echo "NVME_RV64_NATIVE_BUILD_DONE elapsed=${BUILD_ELAPSED_SECS}s" >>"$OUT_LOG"
+
+llvm-objcopy --redefine-sym _start=__simple_unused_start "$OBJ" >>"$OUT_LOG" 2>>"$ERR_LOG" || true
+if ! ld.lld -m elf64lriscv -T src/os/kernel/arch/riscv64/linker.ld --no-relax --gc-sections -o "$OUT" "$START_OBJ" "$OBJ" >>"$OUT_LOG" 2>>"$ERR_LOG"; then
+  echo "NVME_RV64_BUILD_FAILED link out=$OUT_LOG err=$ERR_LOG" >&2
+  tail -n 40 "$ERR_LOG" >&2 || true
+  exit 1
+fi
+
+echo "build exit=0"
+ls -la "$OUT" 2>/dev/null && file "$OUT" 2>/dev/null

@@ -1,0 +1,27 @@
+# UBS Dimension — Audit / Provenance
+#
+# Owns the immutable trail. In the design target this is AOP `after` advice woven
+# over every state-changing service call (doc §2.5); here it is an append-only
+# record list. Records are never updated or removed.
+
+struct AuditRecord:
+    val seq: i64
+    val who: text
+    val action: text
+    val entity: i64
+
+struct AuditTrail:
+    val records: [AuditRecord]
+
+fn new_trail() -> AuditTrail:
+    var r: [AuditRecord] = []
+    return AuditTrail { records: r }
+
+fn record(trail: AuditTrail, who: text, action: text, entity: i64) -> AuditTrail:
+    val seq = trail.records.length()
+    var r = trail.records
+    r.push(AuditRecord { seq: seq, who: who, action: action, entity: entity })
+    return AuditTrail { records: r }
+
+fn trail_length(trail: AuditTrail) -> i64:
+    return trail.records.length()

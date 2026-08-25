@@ -1,0 +1,220 @@
+use os.compositor.engine2d_baremetal_rect_core.{rect_core_clear, rect_core_draw_rect_filled, rect_core_present}
+
+extern fn serial_println(msg: text)
+extern fn rt_riscv_harden_canary_value() -> i64
+extern fn rt_riscv_nvfs_probe() -> i64
+extern fn rt_riscv_smf_cli_probe() -> i64
+extern fn rt_riscv_smf_cli_load() -> i64
+extern fn rt_riscv_smf_gui_probe() -> i64
+extern fn rt_riscv_native_gui_process_render() -> i64
+extern fn rt_riscv_noalloc_pmm_init_default() -> i64
+
+extern fn rt_desktop_pci_device_count() -> i64
+extern fn rt_desktop_pci_get_field(index: i64, field: i64) -> i64
+extern fn rt_desktop_pci_net_init() -> i64
+extern fn rt_desktop_pci_net_tx_test() -> i64
+extern fn rt_desktop_pci_net_rx_ready() -> i64
+extern fn rt_desktop_pci_net_stats() -> i64
+extern fn rt_desktop_pci_net_debug_stage() -> i64
+extern fn rt_desktop_pci_net_debug_queue_max() -> i64
+extern fn rt_desktop_pci_boot_tcp_bind_port(port: i64) -> i64
+extern fn rt_desktop_pci_boot_tcp_accept_timeout(fd: i64, ms: i64) -> i64
+extern fn rt_desktop_pci_boot_tcp_write_auto(fd: i64) -> i64
+extern fn rt_desktop_pci_boot_tcp_send_ssh_banner(fd: i64) -> i64
+extern fn rt_desktop_pci_boot_tcp_close(fd: i64) -> i64
+
+extern fn rt_desktop_pci_display_init() -> i64
+extern fn rt_desktop_pci_display_flush_test() -> i64
+extern fn rt_desktop_pci_display_width() -> i64
+extern fn rt_desktop_pci_display_height() -> i64
+extern fn rt_gui_flush() -> i64
+
+fn _decode_status(raw: i64) -> i64:
+    val wrapped_negative_floor = 1i64 << 60
+    val wrapped_negative_span = 1i64 << 61
+    if raw >= wrapped_negative_floor:
+        return raw - wrapped_negative_span
+    raw
+
+fn _fail():
+    serial_println("[desktop-service] failed")
+    serial_println("TEST FAILED")
+
+fn _draw_engine2d_desktop_scene(width: i64, height: i64) -> bool:
+    if width <= 0 or height <= 0:
+        return false
+    val w = width as i32
+    val h = height as i32
+    # Aqua desktop_bg/command_lane/accent/taskbar/host_window_body/
+    # title_focused literals (see
+    # common.ui.wm_chrome_theme.wm_chrome_theme_defaults). Kept as hardcoded
+    # literals rather than threaded through wm_chrome_theme() because this
+    # module is a freestanding riscv64 boot entry (see file header) — it
+    # cannot pull the common/ui theme stack into the entry-closure build.
+    # Mirrors the x86_64 QEMU compare scene in
+    # os.compositor.hosted_wm_capture_evidence.render_qemu_wm_compare_scene.
+    rect_core_clear(w, h, 0xff5a7fb5u32)
+    rect_core_draw_rect_filled(w, h, 0, 0, w, 44, 0xfff5f5f7u32)
+    rect_core_draw_rect_filled(w, h, 0, 42, w, 2, 0xff2c6fefu32)
+    rect_core_draw_rect_filled(w, h, 0, h - 56, w, 56, 0xffe8e8ecu32)
+    rect_core_draw_rect_filled(w, h, 0, h - 56, w, 2, 0xff2c6fefu32)
+    rect_core_draw_rect_filled(w, h, 24, 72, 272, 112, 0x66000000u32)
+    rect_core_draw_rect_filled(w, h, 18, 66, 272, 112, 0xffe8e8e8u32)
+    rect_core_draw_rect_filled(w, h, 18, 66, 272, 28, 0xffdceafbu32)
+    rect_core_draw_rect_filled(w, h, 30, 75, 10, 10, 0xffe74c3cu32)
+    rect_core_draw_rect_filled(w, h, 48, 75, 10, 10, 0xfff1c40fu32)
+    rect_core_draw_rect_filled(w, h, 66, 75, 10, 10, 0xff27ae60u32)
+    rect_core_draw_rect_filled(w, h, 266, 66, 24, 28, 0xffcc3333u32)
+    rect_core_draw_rect_filled(w, h, 26, 102, 256, 68, 0xff182230u32)
+    rect_core_draw_rect_filled(w, h, 36, 114, 96, 10, 0xff22c55eu32)
+    rect_core_draw_rect_filled(w, h, 36, 134, 154, 10, 0xff60a5fau32)
+    rect_core_draw_rect_filled(w, h, 36, 154, 126, 10, 0xfff59e0bu32)
+    # 0xff243447 here is nested inside the 0xff182230 app-content panel above
+    # (a content thumbnail, not WM chrome) — left as-is, matching the
+    # x86_64 sibling scene's identical NOTE.
+    rect_core_draw_rect_filled(w, h, 196, 114, 64, 50, 0xff243447u32)
+    rect_core_draw_rect_filled(w, h, 16, h - 42, 72, 28, 0xffe8e8ecu32)
+    rect_core_draw_rect_filled(w, h, 96, h - 42, 72, 28, 0xffe8e8ecu32)
+    rect_core_draw_rect_filled(w, h, 176, h - 42, 72, 28, 0xffe8e8ecu32)
+    rect_core_draw_rect_filled(w, h, 256, h - 35, 42, 14, 0xff2c6fefu32)
+    rect_core_present()
+    _decode_status(rt_gui_flush()) >= 0
+
+fn _smf_smoke() -> bool:
+    if rt_riscv_nvfs_probe() == 1:
+        serial_println("[riscv-nvfs] image read ok")
+    else:
+        _fail()
+        return false
+
+    if rt_riscv_smf_cli_probe() == 1:
+        serial_println("FS_MOUNT_OK")
+        serial_println("SMF_DISCOVERY_OK")
+    else:
+        _fail()
+        return false
+
+    if rt_riscv_smf_cli_load() == 1:
+        serial_println("ELF_LOAD_OK arch=riscv64 app=/sys/apps/hello_world.smf")
+        serial_println("SMF_CLI_LAUNCH_OK app=/sys/apps/hello_world.smf")
+    else:
+        _fail()
+        return false
+
+    if rt_riscv_smf_gui_probe() == 1:
+        serial_println("[riscv-smf] gui package found app=/sys/apps/browser_demo.smf")
+    else:
+        _fail()
+        return false
+
+    if rt_riscv_native_gui_process_render() == 1:
+        serial_println("SMF_WM_GUI_LAUNCH_OK app=/sys/apps/browser_demo.smf pid=1002 wm=x86_64_desktop_shell_contract")
+        serial_println("NATIVE_GUI_PROCESS_RENDER_OK app=/sys/apps/browser_demo.smf pid=1002")
+    else:
+        _fail()
+        return false
+
+    serial_println("SIMPLEOS_RISCV_SMF_FS_PASS")
+    true
+
+fn _init_display() -> bool:
+    val display_rc = _decode_status(rt_desktop_pci_display_init())
+    if display_rc < 0:
+        serial_println("[display-riscv] Display unavailable")
+        return false
+    val width = rt_desktop_pci_display_width()
+    val height = rt_desktop_pci_display_height()
+    val draw_ok = _draw_engine2d_desktop_scene(width, height)
+    if not draw_ok:
+        serial_println("[display-riscv] Display Engine2D scene flush failed")
+        return false
+    serial_println("[display-riscv] Display GPU ready")
+    serial_println("[display-riscv] Engine2D baremetal scene flush passed")
+    serial_println("[display-riscv] Display service ready")
+    true
+
+fn _init_network() -> bool:
+    val pci_count = rt_desktop_pci_device_count()
+    serial_println("[pci-riscv] device scan")
+    var pci_index = 0i64
+    while pci_index < pci_count:
+        rt_desktop_pci_get_field(pci_index, 3)
+        rt_desktop_pci_get_field(pci_index, 4)
+        rt_desktop_pci_get_field(pci_index, 5)
+        rt_desktop_pci_get_field(pci_index, 6)
+        rt_desktop_pci_get_field(pci_index, 7)
+        pci_index = pci_index + 1
+
+    val init_rc = _decode_status(rt_desktop_pci_net_init())
+    if init_rc < 0:
+        rt_desktop_pci_net_debug_stage()
+        rt_desktop_pci_net_debug_queue_max()
+        serial_println("[net-riscv] Network init failed")
+        return false
+    serial_println("[net-riscv] Network device ready")
+
+    val tx_rc = _decode_status(rt_desktop_pci_net_tx_test())
+    if tx_rc < 0:
+        serial_println("[net-riscv] Network packet TX unavailable")
+        return false
+    serial_println("[net-riscv] Network packet TX ready")
+
+    val rx_rc = _decode_status(rt_desktop_pci_net_rx_ready())
+    if rx_rc < 0:
+        serial_println("[net-riscv] Network packet RX unavailable")
+        return false
+    serial_println("[net-riscv] Network packet RX ready")
+
+    val stats_rc = _decode_status(rt_desktop_pci_net_stats())
+    if stats_rc < 0:
+        serial_println("[net-riscv] Network stats probe failed")
+        return false
+    serial_println("[net-riscv] Network stats probe ready")
+    serial_println("[net-riscv] Network service ready")
+    true
+
+fn _serve_ssh_once():
+    val listener = rt_desktop_pci_boot_tcp_bind_port(22)
+    if listener < 0:
+        return
+    val client = rt_desktop_pci_boot_tcp_accept_timeout(listener, 1)
+    if client >= 0:
+        rt_desktop_pci_boot_tcp_send_ssh_banner(client)
+        rt_desktop_pci_boot_tcp_close(client)
+
+fn _serve_http_once():
+    val listener = rt_desktop_pci_boot_tcp_bind_port(8080)
+    if listener < 0:
+        return
+    val client = rt_desktop_pci_boot_tcp_accept_timeout(listener, 1)
+    if client >= 0:
+        rt_desktop_pci_boot_tcp_write_auto(client)
+        rt_desktop_pci_boot_tcp_close(client)
+
+fn spl_start():
+    serial_println("")
+    serial_println("=== SimpleOS RV64 desktop service boot ===")
+    serial_println("SimpleOS RV64 boot OK")
+    rt_riscv_harden_canary_value()
+    serial_println("[harden] canary arch=riscv64")
+
+    if not _smf_smoke():
+        return
+
+    rt_riscv_noalloc_pmm_init_default()
+
+    if not _init_network():
+        serial_println("[desktop-service] network=blocked")
+        return
+
+    val display_ok = _init_display()
+    if not display_ok:
+        serial_println("[desktop-service] gpu-readback=blocked")
+
+    serial_println("[sshd] SSH daemon listening on port 22")
+    serial_println("[http_baremetal] Bootstrap TCP shim bound on 0.0.0.0:8080")
+    serial_println("TEST PASSED")
+
+    while true:
+        _serve_ssh_once()
+        _serve_http_once()

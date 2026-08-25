@@ -1,0 +1,172 @@
+"""
+nvme_main — full NVMe SSD firmware end-to-end (the controller acceptance gate).
+
+Drives the controller exactly as a host driver brings up a real NVMe device:
+
+  1. Identify Controller + Identify Namespace
+  2. Set Features (Number of Queues) + Get Features read-back
+  3. Create IO Completion Queue, then the Submission Queue bound to it
+  4. negative: Create IO SQ against a non-existent CQ is rejected
+  5. host IO (write + read-back) on the new IO queue
+  6. a second IO queue pair; controller round-robins across both
+  7. negative: deleting a CQ with a live SQ bound is rejected (busy)
+  8. reverse-order teardown: delete SQ, then CQ
+  9. Get Log Page (SMART/health) reflects the IO that happened
+ 10. checkpoint + power-fail + recovery: committed data survives
+
+Run: bin/simple run examples/09_embedded/simpleos_nvme_fw/fw/nvme_main.spl
+Gate: prints "ALL NVME CONTROLLER E2E CHECKS PASS" and exits 0.
+"""
+
+use nvme_types.*
+use nvme_admin_types.*
+use nvme_admin.*
+use nvme_controller.*
+
+fn main():
+    var fail: i64 = 0
+    var c: NvmeController = nvme_controller_new_for_target(TARGET_OPENSSD_8CH8WAY)
+    print "=== Full NVMe SSD firmware — controller end-to-end ==="
+    print ""
+
+    # [1] Identify Controller + Namespace
+    print "[1] Identify Controller + Namespace"
+    c.admin_submit(admin_identify_cmd(1, CNS_CONTROLLER))
+    c.admin_process()
+    val idc_cpl: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(idc_cpl.status, SC_SUCCESS, "identify controller ok")
+    val idc: IdentifyData = c.last_identify()
+    fail = fail + expect_eq(idc.kind, CNS_CONTROLLER, "identify-controller kind")
+    fail = fail + expect_eq(idc.vid, 0x10EE, "controller reports OpenSSD PCIe vendor")
+    fail = fail + expect_eq(idc.num_ns, 1, "controller reports 1 namespace")
+    fail = fail + expect_eq(idc.max_queues, MAX_IO_QUEUES, "controller reports max IO queues")
+    fail = fail + expect_eq(idc.target_id, TARGET_OPENSSD_8CH8WAY, "controller reports OpenSSD target id")
+    fail = fail + expect_eq(idc.channels, NUM_CHANNELS, "controller reports OpenSSD channels")
+    fail = fail + expect_eq(idc.ways_per_channel, 8, "controller reports OpenSSD ways")
+    fail = fail + expect_eq(idc.nvme_blocks_per_slice, 4, "controller reports OpenSSD slice geometry")
+    fail = fail + expect_eq(idc.cpu_cores, 2, "controller reports OpenSSD core count")
+    c.admin_submit(admin_identify_ns_cmd(2, 1))
+    c.admin_process()
+    val idn_cpl: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(idn_cpl.status, SC_SUCCESS, "identify namespace ok")
+    val idn: IdentifyData = c.last_identify()
+    fail = fail + expect_eq(idn.ns_size, LBA_COUNT, "namespace size == LBA_COUNT")
+    fail = fail + expect_eq(idn.lba_bytes, 4096, "namespace LBA = 4096 bytes")
+    c.admin_submit(admin_identify_ns_cmd(14, 2))
+    c.admin_process()
+    val bad_idn_cpl: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(bad_idn_cpl.status, SC_INVALID_FIELD, "identify invalid namespace rejected")
+
+    # [2] Set Features (Number of Queues) + Get Features
+    print "[2] Set / Get Features (Number of Queues)"
+    c.admin_submit(admin_set_feature_cmd(3, FEAT_NUM_QUEUES, 0x00030003))   # 4 SQ + 4 CQ (0's-based)
+    c.admin_submit(admin_get_feature_cmd(4, FEAT_NUM_QUEUES))
+    c.admin_process()
+    val setf: NvmeCpl = c.admin_reap()
+    val getf: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(setf.status, SC_SUCCESS, "set num-queues ok")
+    fail = fail + expect_eq(getf.data, 0x00030003, "get num-queues returns set value")
+
+    # [3] Create IO CQ then SQ (correct order; SQ binds to the CQ)
+    print "[3] Create IO CQ 1, then SQ 1 bound to CQ 1"
+    c.admin_submit(admin_create_cq_cmd(5, 1, 64))
+    c.admin_submit(admin_create_sq_cmd(6, 1, 64, 1))
+    c.admin_process()
+    val ccq: NvmeCpl = c.admin_reap()
+    val csq: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(ccq.status, SC_SUCCESS, "create IO CQ 1")
+    fail = fail + expect_eq(csq.status, SC_SUCCESS, "create IO SQ 1 -> CQ 1")
+
+    # [4] negative: SQ bound to a CQ that does not exist
+    print "[4] negative: create IO SQ -> missing CQ rejected"
+    c.admin_submit(admin_create_sq_cmd(7, 5, 64, 7))   # CQ 7 never created
+    c.admin_process()
+    val bad_sq: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(bad_sq.status, SC_CQ_INVALID, "SQ -> missing CQ rejected")
+
+    # [5] host IO on the new queue: write then read back
+    print "[5] host write + read-back on IO queue 1"
+    c.io_submit(1, cmd_make(1000, OP_WRITE, 42, 1, 0xD7))
+    c.io_process()
+    val w0: NvmeCpl = c.io_reap(1)
+    fail = fail + expect_eq(w0.status, SC_SUCCESS, "IO write on queue 1 ok")
+    c.io_submit(1, cmd_make(1001, OP_READ, 42, 1, 0))
+    c.io_process()
+    val r0: NvmeCpl = c.io_reap(1)
+    fail = fail + expect_eq(r0.data, 0xD7, "IO read on queue 1 returns written byte")
+
+    # [6] second IO queue pair; controller round-robins both SQs in one service
+    print "[6] second IO queue pair; round-robin service across queues 1 and 2"
+    c.admin_submit(admin_create_cq_cmd(8, 2, 64))
+    c.admin_submit(admin_create_sq_cmd(9, 2, 64, 2))
+    c.admin_process()
+    c.admin_reap()
+    c.admin_reap()
+    c.io_submit(1, cmd_make(1100, OP_WRITE, 100, 1, 0x11))
+    c.io_submit(2, cmd_make(1200, OP_WRITE, 200, 1, 0x22))
+    c.io_submit(1, cmd_make(1101, OP_WRITE, 101, 1, 0x33))
+    c.io_submit(2, cmd_make(1201, OP_WRITE, 201, 1, 0x44))
+    val serviced: i64 = c.io_process()
+    fail = fail + expect_eq(serviced, 4, "round-robin serviced all 4 across both queues")
+    fail = fail + expect_eq(c.io_completions(1), 2, "queue 1 has 2 completions")
+    fail = fail + expect_eq(c.io_completions(2), 2, "queue 2 has 2 completions")
+    # read both queues' writes back through their own queues
+    c.io_submit(1, cmd_make(1102, OP_READ, 100, 1, 0))
+    c.io_submit(2, cmd_make(1202, OP_READ, 200, 1, 0))
+    c.io_process()
+    c.io_reap(1)
+    c.io_reap(1)
+    c.io_reap(2)
+    c.io_reap(2)
+    val rq1: NvmeCpl = c.io_reap(1)
+    val rq2: NvmeCpl = c.io_reap(2)
+    fail = fail + expect_eq(rq1.data, 0x11, "queue 1 read-back correct")
+    fail = fail + expect_eq(rq2.data, 0x22, "queue 2 read-back correct")
+
+    # [7] negative: delete CQ 1 while SQ 1 still bound to it
+    print "[7] negative: delete CQ 1 with bound SQ rejected (busy)"
+    c.admin_submit(admin_delete_cq_cmd(10, 1))
+    c.admin_process()
+    val busy: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(busy.status, SC_QUEUE_BUSY, "delete bound CQ rejected")
+
+    # [8] reverse-order teardown: SQ first, then CQ
+    print "[8] teardown IO queue 1: delete SQ then CQ"
+    c.admin_submit(admin_delete_sq_cmd(11, 1))
+    c.admin_submit(admin_delete_cq_cmd(12, 1))
+    c.admin_process()
+    val dsq: NvmeCpl = c.admin_reap()
+    val dcq: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(dsq.status, SC_SUCCESS, "delete SQ 1 ok")
+    fail = fail + expect_eq(dcq.status, SC_SUCCESS, "delete CQ 1 ok")
+
+    # [9] Get Log Page (SMART) reflects the IO that happened
+    print "[9] Get Log Page (SMART / health)"
+    c.admin_submit(admin_get_log_cmd(13, LOG_SMART))
+    c.admin_process()
+    val logc: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(logc.status, SC_SUCCESS, "get SMART log ok")
+    val sm: SmartLog = c.last_smart()
+    var wrote: i64 = 0
+    if sm.data_units_written > 0:
+        wrote = 1
+    fail = fail + expect_eq(wrote, 1, "SMART shows writes occurred")
+    fail = fail + expect_eq(sm.avail_spare, 100, "SMART available spare 100%")
+
+    # [10] checkpoint + power-fail + recovery on the surviving IO queue 2
+    print "[10] checkpoint + power-fail + recovery"
+    c.checkpoint()
+    c.power_cycle()
+    c.io_submit(2, cmd_make(1300, OP_READ, 200, 1, 0))
+    c.io_submit(2, cmd_make(1301, OP_READ, 201, 1, 0))
+    c.io_process()
+    val sv200: NvmeCpl = c.io_reap(2)
+    val sv201: NvmeCpl = c.io_reap(2)
+    fail = fail + expect_eq(sv200.data, 0x22, "LBA 200 survives power cycle")
+    fail = fail + expect_eq(sv201.data, 0x44, "LBA 201 survives power cycle")
+
+    print ""
+    if fail == 0:
+        print "ALL NVME CONTROLLER E2E CHECKS PASS"
+    else:
+        print "NVME CONTROLLER E2E FAIL ({fail})"

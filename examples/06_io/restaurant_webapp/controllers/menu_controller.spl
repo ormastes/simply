@@ -1,0 +1,45 @@
+use std.web_framework.controller.{ControllerContext, HttpResponseData, ViewData, render_page, render_error}
+use std.database.{DbValue}
+
+use models.template.{
+    RestaurantTemplate, create_template_repository,
+    find_all_templates, find_template_by_id
+}
+use models.menu_group.{
+    MenuGroup, create_group_repository, find_groups_for_template
+}
+use models.menu_item.{
+    MenuItem, create_item_repository,
+    find_available_items_for_group, format_price
+}
+use models.condition.{
+    MenuCondition, create_condition_repository,
+    find_conditions_for_item, evaluate_condition
+}
+use models.additional_menu.{
+    AdditionalMenu, create_additional_repository, find_additional_for_item
+}
+
+@public
+fn action_index(ctx: ControllerContext) -> HttpResponseData:
+    val repo = create_template_repository(ctx.db())
+    val templates = find_all_templates(repo)
+
+    val data = ViewData.new()
+        .set("title", "Menu")
+    render_page(ctx, "menu/index", data.to_dict())
+
+@public
+fn action_show(ctx: ControllerContext) -> HttpResponseData:
+    val template_id = ctx.params.get("template_id").unwrap_or("0").parse_i64().unwrap_or(0)
+    val trepo = create_template_repository(ctx.db())
+    val t = find_template_by_id(trepo, template_id)?
+
+    val grepo = create_group_repository(ctx.db())
+    val groups = find_groups_for_template(grepo, template_id)
+
+    val data = ViewData.new()
+        .set("title", t.name)
+        .set("template_name", t.name)
+        .set("template_description", t.description)
+    render_page(ctx, "menu/show", data.to_dict())

@@ -1,0 +1,31 @@
+# Lean Block Demo
+# Demonstrates embedding Lean 4 code in Simple source files
+
+# Module-level lean block with inline verification code
+lean{
+-- Basic arithmetic theorem
+theorem add_zero_right : ∀ n : Nat, n + 0 = n := by
+    intro n
+    rfl
+
+-- Commutativity of addition
+theorem add_comm_example : ∀ a b : Nat, a + b = b + a := by
+    intro a b
+    omega
+
+-- Factorial specification
+def factorial_spec (n : Nat) : Nat :=
+    match n with
+    | 0 => 1
+    | n + 1 => (n + 1) * factorial_spec n
+}
+
+# Simple function
+fn factorial(n: i64) -> i64:
+    if n <= 1:
+        1
+    else:
+        n * factorial(n - 1)
+
+fn main() -> i64:
+    factorial(5)

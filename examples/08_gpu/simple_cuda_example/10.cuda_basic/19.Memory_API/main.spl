@@ -1,0 +1,178 @@
+# 19. Memory API - Device Memory Lifecycle
+#
+# The full device-memory lifecycle: allocate, upload, compute, download, free,
+# plus memset and device-to-device copy.
+#
+# C/CUDA equivalent:
+#   float *d; cudaMalloc(&d, n * sizeof(float));
+#   cudaMemcpy(d, h, n * sizeof(float), cudaMemcpyHostToDevice);
+#   scale_kernel<<<grid, block>>>(d, 2.0f, n);
+#   cudaMemcpy(h, d, n * sizeof(float), cudaMemcpyDeviceToHost);
+#   cudaMemset(d, 0, n * sizeof(float));
+#   cudaMemcpy(d2, d, n * sizeof(float), cudaMemcpyDeviceToDevice);
+#   cudaFree(d);
+#
+# Simple mapping (std.gpu):
+#   gpu_alloc(bytes) -> Result<GpuPtr, GpuError>     cudaMalloc
+#   gpu_upload_f32(ptr, [f32])                       cudaMemcpy H2D
+#   gpu_download_f32(ptr, count) -> Result<[f32], _> cudaMemcpy D2H
+#   gpu_memset(ptr, byte, bytes) / gpu_memset_f32    cudaMemset
+#   gpu_copy_f32(dst, src, count)                    cudaMemcpy D2D
+#   gpu_free(ptr)                                    cudaFree
+# A GpuPtr is untyped bytes (`device_ptr`, `size`, `is_valid`); the element
+# type lives in the typed helpers, so sizes are always given in BYTES.
+
+use std.gpu.*
+
+val F32_BYTES = 4
+
+# ============================================================================
+# Kernels
+# ============================================================================
+
+@gpu_kernel
+fn scale_kernel(data: GpuPtr, scale: f32, n: i64):
+    val idx = gpu_block_id_x() * gpu_block_dim_x() + gpu_local_id_x()
+    if idx < n:
+        gpu_store_f32(data, idx, gpu_load_f32(data, idx) * scale)
+
+@gpu_kernel
+fn add_kernel(a: GpuPtr, b: GpuPtr, c: GpuPtr, n: i64):
+    val idx = gpu_block_id_x() * gpu_block_dim_x() + gpu_local_id_x()
+    if idx < n:
+        gpu_store_f32(c, idx, gpu_load_f32(a, idx) + gpu_load_f32(b, idx))
+
+# ============================================================================
+# Pure helpers (also used by spec.spl)
+# ============================================================================
+
+fn bytes_for_f32(count: i64) -> i64:
+    count * F32_BYTES
+
+fn ramp(n: i64) -> [f32]:
+    # [0.0, 1.0, 2.0, ...]
+    [for i in 0..n: i as f32]
+
+fn filled(n: i64, value: f32) -> [f32]:
+    [for i in 0..n: value]
+
+fn blocks_for(n: i64, block_size: i64) -> i64:
+    (n + block_size - 1) / block_size
+
+# ============================================================================
+# Demos
+# ============================================================================
+
+fn demo_basic_lifecycle(n: i64) -> Result<[f32], GpuError>:
+    print "=== Demo 1: Basic Memory Lifecycle ==="
+    val host_data = ramp(n)
+    print "  Host data prepared: {n} elements"
+
+    val dev_buf = gpu_alloc(bytes_for_f32(n))?
+    print "  Device buffer allocated: {dev_buf.size} bytes ({n} f32)"
+
+    gpu_upload_f32(dev_buf, host_data)?
+    print "  Data uploaded to device"
+
+    val block_size = 256
+    scale_kernel<<<grid: (blocks_for(n, block_size), 1, 1), block: (block_size, 1, 1)>>>(dev_buf, 2.0, n)
+    gpu_sync()?
+    print "  Kernel executed: scale by 2.0"
+
+    val result = gpu_download_f32(dev_buf, n)?
+    print "  Data downloaded from device"
+
+    gpu_free(dev_buf)?
+    print "  Device buffer freed"
+    Ok(result)
+
+fn demo_memset(n: i64) -> Result<[f32], GpuError>:
+    print "=== Demo 2: gpu_memset ==="
+    val dev_buf = gpu_alloc(bytes_for_f32(n))?
+    print "  Allocated {n} f32 elements"
+
+    # cudaMemset works in BYTES; all-zero bytes is 0.0f for every element.
+    gpu_memset(dev_buf, 0, bytes_for_f32(n))?
+    print "  Memset to 0 (zero-initialized)"
+
+    val result = gpu_download_f32(dev_buf, n)?
+    gpu_free(dev_buf)?
+    Ok(result)
+
+fn demo_device_copy(n: i64) -> Result<[f32], GpuError>:
+    print "=== Demo 3: Device-to-Device Copy ==="
+    val src_dev = gpu_alloc(bytes_for_f32(n))?
+    val dst_dev = gpu_alloc(bytes_for_f32(n))?
+    gpu_upload_f32(src_dev, filled(n, 42.0))?
+    print "  Source buffer uploaded with value 42.0"
+
+    gpu_copy_f32(dst_dev, src_dev, n)?
+    print "  Copied source -> destination on device"
+
+    val result = gpu_download_f32(dst_dev, n)?
+    gpu_free(src_dev)?
+    gpu_free(dst_dev)?
+    Ok(result)
+
+fn demo_multi_buffer(n: i64) -> Result<[f32], GpuError>:
+    print "=== Demo 4: Multiple Buffers ==="
+    val a_dev = gpu_alloc(bytes_for_f32(n))?
+    val b_dev = gpu_alloc(bytes_for_f32(n))?
+    val c_dev = gpu_alloc(bytes_for_f32(n))?
+    gpu_upload_f32(a_dev, filled(n, 3.0))?
+    gpu_upload_f32(b_dev, filled(n, 7.0))?
+    print "  Uploaded two input buffers"
+
+    val block_size = 256
+    add_kernel<<<grid: (blocks_for(n, block_size), 1, 1), block: (block_size, 1, 1)>>>(a_dev, b_dev, c_dev, n)
+    gpu_sync()?
+    print "  Kernel: a + b -> c"
+
+    val result = gpu_download_f32(c_dev, n)?
+    gpu_free(a_dev)?
+    gpu_free(b_dev)?
+    gpu_free(c_dev)?
+    Ok(result)
+
+fn demo_error_handling() -> Result<text, GpuError>:
+    print "=== Demo 5: Error Handling ==="
+    val small_buf = gpu_alloc(bytes_for_f32(1024))?
+    print "  Small allocation: OK ({small_buf.size} bytes, valid={small_buf.is_valid})"
+    gpu_free(small_buf)?
+    print "  Freeing a null pointer is a no-op: {gpu_free(GpuPtr.null()).is_ok()}"
+    print "  All allocations handled via Result<T, GpuError>"
+    Ok("Error handling demo complete")
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn run() -> Result<(), GpuError>:
+    val n = 1024
+    gpu_init()?
+    gpu_set_device(0)?
+
+    val r1 = demo_basic_lifecycle(n)?
+    print "  Verify: r1[0]={r1[0]} (expect 0.0), r1[5]={r1[5]} (expect 10.0)"
+    print ""
+    val r2 = demo_memset(n)?
+    print "  Verify: r2[0]={r2[0]} (expect 0.0), r2[100]={r2[100]} (expect 0.0)"
+    print ""
+    val r3 = demo_device_copy(n)?
+    print "  Verify: r3[0]={r3[0]} (expect 42.0), r3[500]={r3[500]} (expect 42.0)"
+    print ""
+    val r4 = demo_multi_buffer(n)?
+    print "  Verify: r4[0]={r4[0]} (expect 10.0), r4[999]={r4[999]} (expect 10.0)"
+    print ""
+    val r5 = demo_error_handling()?
+    print "  {r5}"
+    print ""
+    print "All memory API demos complete."
+    Ok(())
+
+fn main():
+    match run():
+        case Ok(_):
+            print "=== Done ==="
+        case Err(e):
+            print "GPU error: {e.to_text()}"

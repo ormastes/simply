@@ -1,0 +1,103 @@
+# Exercise 27: Multi-GPU - Tests
+#
+# The split bookkeeping and CPU reference are checked without a device. The
+# device tests need one GPU for the single-lane add and two GPUs for the real
+# split and the host-staged device-to-device copy; each skips honestly when
+# the hardware is not there.
+
+use self.main.{
+    PTX, BLOCK_SIZE, GpuLane,
+    make_data, slice_of, concat, cpu_add, split_point, max_abs_diff,
+    lane_of, lane_close, add_on_lane, copy_between_devices, split_add_across_lanes
+}
+use gpu_test_helpers.{
+    gpu_setup, gpu_teardown, gpu_load_ptx, gpu_unload,
+    gpu_upload_f32s, gpu_download_f32s, gpu_free_ptr, close_enough
+}
+use std.cuda.{cuda_device_count}
+
+describe "Multi-GPU":
+
+    describe "host-side bookkeeping":
+
+        it "splits an even and an odd length at the midpoint":
+            expect(split_point(1000)).to_equal(500)
+            expect(split_point(7)).to_equal(3)
+
+        it "slice + concat round-trips the input":
+            val xs = [1.0, 2.0, 3.0, 4.0, 5.0]
+            val half = split_point(xs.len())
+            val back = concat(slice_of(xs, 0, half), slice_of(xs, half, xs.len()))
+            expect(back.len()).to_equal(5)
+            expect(close_enough(max_abs_diff(back, xs), 0.0, 0.0001)).to_equal(true)
+
+        it "cpu_add is the reference for the device add":
+            val c = cpu_add(make_data(4, 1.0), make_data(4, 2.0))
+            expect(c.len()).to_equal(4)
+            expect(close_enough(c[3], 3.0, 0.0001)).to_equal(true)
+
+        it "an unavailable lane reports an error instead of crashing":
+            val dead = lane_of(3, 0, 0)
+            expect(dead.ctx).to_equal(0)
+            expect(add_on_lane(dead, make_data(2, 1.0), make_data(2, 1.0)).is_err()).to_equal(true)
+
+    describe "one device":
+
+        it "add_on_lane matches cpu_add on device 0":
+            val ctx0 = gpu_setup(0)
+            if ctx0 == 0:
+                skip("one device", "no CUDA device")
+            val lane0 = lane_of(0, ctx0, gpu_load_ptx(PTX))
+            val a = make_data(1000, 1.5)
+            val b = make_data(1000, 2.0)
+            val c = add_on_lane(lane0, a, b).unwrap()
+            expect(c.len()).to_equal(1000)
+            expect(close_enough(max_abs_diff(c, cpu_add(a, b)), 0.0, 0.001)).to_equal(true)
+            lane_close(lane0)
+
+        it "the split runs on one lane twice when only one device exists":
+            val ctx0 = gpu_setup(0)
+            if ctx0 == 0:
+                skip("one device", "no CUDA device")
+            val lane0 = lane_of(0, ctx0, gpu_load_ptx(PTX))
+            val a = make_data(513, 1.0)
+            val b = make_data(513, 2.0)
+            val c = split_add_across_lanes(lane0, lane0, a, b).unwrap()
+            expect(c.len()).to_equal(513)
+            expect(close_enough(max_abs_diff(c, cpu_add(a, b)), 0.0, 0.001)).to_equal(true)
+            lane_close(lane0)
+
+    describe "two devices":
+
+        it "each device adds its half of the vector":
+            if cuda_device_count() < 2:
+                skip("two devices", "fewer than 2 CUDA devices")
+            val ctx0 = gpu_setup(0)
+            val lane0 = lane_of(0, ctx0, gpu_load_ptx(PTX))
+            val ctx1 = gpu_setup(1)
+            val lane1 = lane_of(1, ctx1, gpu_load_ptx(PTX))
+            expect(lane0.ctx != 0 and lane1.ctx != 0).to_equal(true)
+            val a = make_data(4096, 1.0)
+            val b = make_data(4096, 2.0)
+            val c = split_add_across_lanes(lane0, lane1, a, b).unwrap()
+            expect(c.len()).to_equal(4096)
+            expect(close_enough(max_abs_diff(c, cpu_add(a, b)), 0.0, 0.001)).to_equal(true)
+            lane_close(lane1)
+            lane_close(lane0)
+
+        it "host-staged copy moves bytes from device 0 to device 1":
+            if cuda_device_count() < 2:
+                skip("two devices", "fewer than 2 CUDA devices")
+            val ctx0 = gpu_setup(0)
+            val lane0 = lane_of(0, ctx0, gpu_load_ptx(PTX))
+            val ctx1 = gpu_setup(1)
+            val lane1 = lane_of(1, ctx1, gpu_load_ptx(PTX))
+            val src = copy_between_devices(lane1, gpu_upload_f32s([1.0, 2.0, 3.0, 4.0]), 4, lane0)
+            expect(src != 0).to_equal(true)
+            # lane0's context is current after the copy: read the copy back there
+            val back = gpu_download_f32s(src, 4)
+            expect(back.len()).to_equal(4)
+            expect(close_enough(back[3], 4.0, 0.0001)).to_equal(true)
+            gpu_free_ptr(src)
+            lane_close(lane1)
+            lane_close(lane0)

@@ -1,0 +1,9 @@
+# llm-process-gen: managed source=pipe_impl_spipe_loop_tools source_sha256=597e07db61bbeaac71c0da6fbf123a1cc0baddd381bf528258cf3c2c573a9b75 content_sha256=d23a9d2e2411bcc1b465cd0b3c1499db896a3b343a78103f44f1b7e5564f311b
+skill_tools |skill, stage|
+    spipe_loop, impl
+
+tools |id, type, name, purpose|
+    simple_cli, cli, "bin/simple", "Run targeted specs, lint, and checks in a loop"
+    simple_mcp, mcp, "Simple MCP", "Inspect related symbols and project context for failing specs"
+    simple_lsp_mcp, mcp, "Simple LSP MCP", "Resolve definitions, references, and hover for spec failures"
+    git, cli, "git", "Inspect local changes while iterating on fixes"

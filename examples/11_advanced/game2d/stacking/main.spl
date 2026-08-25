@@ -1,0 +1,69 @@
+# Stacking Tower — physics + game2d demo
+use std.nogc_sync_mut.game2d.app.run.{run}
+use std.nogc_sync_mut.game2d.input.api.{key_down}
+use std.nogc_sync_mut.game2d.input.keys.{Key}
+use std.nogc_sync_mut.game2d.render.canvas.{Canvas}
+use std.nogc_sync_mut.game2d.math.{DrawMode}
+use std.common.engine.ids.{NodeId}
+use std.common.engine.math2d.{Vec2}
+use std.common.engine.rect.{Rect2}
+use std.common.engine.color.{EngineColor}
+use std.nogc_sync_mut.engine.physics.config.{default_physics_config_2d}
+use std.nogc_sync_mut.engine.physics.world2d.{PhysicsWorld2D}
+
+fn node(i: i64) -> NodeId:
+    NodeId(raw: i)
+
+class Game:
+    world: PhysicsWorld2D
+    crate_count: i64
+
+    fn load(self):
+        pass_do_nothing
+
+    me update(self, dt: f32):
+        val _ = dt
+        if key_down(Key(32)):
+            if self.crate_count < 20:
+                val nid = self.crate_count + 1
+                val x_off = (self.crate_count * 3 % 5 - 2).to_f64() * 0.3
+                self.world.add_dynamic_body(node(nid), x_off, 8.0, 1.0)
+                self.world.add_box_collider(node(nid), 0.5, 0.5)
+                self.crate_count = self.crate_count + 1
+
+    fn fixed_update(self, step: f32):
+        self.world.step(0.016)
+
+    fn draw(self, ctx: Canvas):
+        ctx.clear(EngineColor(r: 0.5, g: 0.7, b: 0.9, a: 1.0))
+        val brown = EngineColor(r: 0.4, g: 0.25, b: 0.1, a: 1.0)
+        ctx.rect(DrawMode.Fill, Rect2(x: 50.0, y: 500.0, width: 700.0, height: 40.0), brown)
+        val orange = EngineColor(r: 0.9, g: 0.5, b: 0.1, a: 1.0)
+        var i = 1
+        while i <= self.crate_count:
+            val pos = self.world.get_position(node(i.to_i64()))
+            val sx = 400.0 + pos.x * 50.0
+            val sy = 500.0 - pos.y * 50.0
+            ctx.rect(DrawMode.Fill, Rect2(x: sx - 25.0, y: sy - 25.0, width: 50.0, height: 50.0), orange)
+            ctx.rect(DrawMode.Stroke, Rect2(x: sx - 25.0, y: sy - 25.0, width: 50.0, height: 50.0), brown)
+            i = i + 1
+        ctx.text("SPACE to drop crate", Vec2(x: 300.0, y: 20.0), EngineColor(r: 0.0, g: 0.0, b: 0.0, a: 1.0))
+
+fn setup_world() -> PhysicsWorld2D:
+    var config = default_physics_config_2d()
+    config.restitution = 0.1
+    config.friction = 0.5
+    var world = PhysicsWorld2D.create(config)
+    world.add_static_body(node(100), 0.0, 0.0)
+    world.add_box_collider(node(100), 8.0, 0.5)
+    var i = 1
+    while i <= 5:
+        val y = 1.5 + (i - 1).to_f64() * 1.2
+        val x_off = (i * 3 % 5 - 2).to_f64() * 0.1
+        world.add_dynamic_body(node(i.to_i64()), x_off, y, 1.0)
+        world.add_box_collider(node(i.to_i64()), 0.5, 0.5)
+        i = i + 1
+    world
+
+fn main():
+    run(Game(world: setup_world(), crate_count: 5), "Stacking", 800, 600)

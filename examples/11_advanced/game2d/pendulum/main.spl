@@ -1,0 +1,65 @@
+# Pendulum demo — XPBD chain of 5 particles
+use std.game2d as g
+use std.common.engine.math2d.{Vec2}
+use std.common.engine.color.{EngineColor}
+use std.nogc_sync_mut.engine.physics.solver.xpbd_solver.{XpbdWorld}
+
+class Game:
+    world: XpbdWorld
+    particle_count: i64
+
+    fn load(self):
+        pass_do_nothing
+
+    fn update(self, dt: f32):
+        val _ = dt
+
+    fn fixed_update(self, step: f32):
+        val _ = step
+        self.world.step(0.016)
+
+    fn draw(self, ctx: g.Canvas):
+        ctx.clear(EngineColor(r: 0.05, g: 0.05, b: 0.1, a: 1.0))
+        val rope_color = EngineColor(r: 0.9, g: 0.7, b: 0.2, a: 1.0)
+        val ball_color = EngineColor(r: 1.0, g: 1.0, b: 1.0, a: 1.0)
+        val pivot_color = EngineColor(r: 1.0, g: 0.3, b: 0.3, a: 1.0)
+        # Draw links between consecutive particles
+        var i: i64 = 0
+        while i < self.particle_count - 1:
+            val p1 = self.world.get_position(i)
+            val p2 = self.world.get_position(i + 1)
+            val x1 = 400.0 + p1.0 * 100.0
+            val y1 = 150.0 - p1.1 * 100.0
+            val x2 = 400.0 + p2.0 * 100.0
+            val y2 = 150.0 - p2.1 * 100.0
+            ctx.line(Vec2(x: x1, y: y1), Vec2(x: x2, y: y2), rope_color)
+            i = i + 1
+        # Draw particles
+        var j: i64 = 0
+        while j < self.particle_count:
+            val pos = self.world.get_position(j)
+            val sx = 400.0 + pos.0 * 100.0
+            val sy = 150.0 - pos.1 * 100.0
+            val color = if j == 0: pivot_color else: ball_color
+            ctx.circle(g.DrawMode.Fill, Vec2(x: sx, y: sy), 8.0, color)
+            j = j + 1
+        ctx.text("XPBD Pendulum", Vec2(x: 10.0, y: 20.0), ball_color)
+
+fn setup_pendulum() -> XpbdWorld:
+    var world = XpbdWorld.create(8)
+    # Fixed pivot at top center
+    val _p0 = world.add_fixed_particle(0.0, 0.0, 0.0)
+    # Hanging particles with slight offsets to seed swing
+    val _p1 = world.add_particle(0.3, -0.5, 0.0, 1.0)
+    val _p2 = world.add_particle(0.5, -1.0, 0.0, 1.0)
+    val _p3 = world.add_particle(0.4, -1.5, 0.0, 1.0)
+    val _p4 = world.add_particle(0.2, -2.0, 0.0, 1.0)
+    # Distance constraints between consecutive particles
+    world.add_distance_constraint(0, 1, 200.0)
+    world.add_distance_constraint(1, 2, 200.0)
+    world.add_distance_constraint(2, 3, 200.0)
+    world.add_distance_constraint(3, 4, 200.0)
+    world
+
+fn main():
+    g.run(Game(world: setup_pendulum(), particle_count: 5), "Pendulum", 800, 600)

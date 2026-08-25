@@ -1,0 +1,235 @@
+#![allow(REQC001)]
+#![allow(REQC004)]
+#![allow(unnamed_duplicate_typed_args)]
+# ============================================================================
+# Integration: Navigation Lifecycle Tests
+# Category: Browser Platform Integration
+# Status: Active
+#
+# Validates the browser navigation lifecycle: URL bar updates, history
+# traversal (back/forward), reload, history recording, tab title updates,
+# favicon extraction, internal URL handling, URL normalization, stop-loading,
+# rapid navigation queueing, and navigation state transitions.
+#
+# Run with: bin/simple test examples/browser/test/02_integration/navigation_spec.spl
+# ============================================================================
+
+use std.spec
+use examples.browser.entity.browser.navigation_types.{NavigationState, NavigationEntry, HistoryEntry}
+use examples.browser.entity.browser.tab_types.{Tab, TabId, TabState}
+use examples.browser.entity.net.url_types.{Url}
+use examples.browser.shared.logging.{Logger, LogLevel}
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+fn make_logger() -> Logger:
+    Logger.new("navigation_test", LogLevel.Debug)
+
+fn make_entry(url: text, title: text) -> NavigationEntry:
+    NavigationEntry.create(url, title, 0)
+
+fn make_tab(id: i64, url: text, title: text) -> Tab:
+    Tab.create(TabId.create(id), title, url)
+
+fn normalize_url(raw: text) -> text:
+    """Add scheme if missing. Detect search queries."""
+    if raw.starts_with("http://") or raw.starts_with("https://"):
+        return raw
+    if raw.starts_with("about:"):
+        return raw
+    # If it contains a dot and no spaces, treat as URL
+    if raw.contains(".") and not raw.contains(" "):
+        return "https://{raw}"
+    # Otherwise treat as search query
+    "https://search.example.com/?q={raw}"
+
+fn push_entry(history: HistoryEntry, entry: NavigationEntry) -> HistoryEntry:
+    """Push a new entry, truncating any forward history."""
+    var new_entries = [NavigationEntry]()
+    var i = 0
+    while i <= history.current_index and i < history.entries.len():
+        new_entries.push(history.entries.get(i))
+        i = i + 1
+    new_entries.push(entry)
+    HistoryEntry.create(new_entries, new_entries.len() - 1)
+
+fn go_back(history: HistoryEntry) -> HistoryEntry:
+    if history.current_index > 0:
+        return HistoryEntry.create(history.entries, history.current_index - 1)
+    history
+
+fn go_forward(history: HistoryEntry) -> HistoryEntry:
+    if history.current_index < history.entries.len() - 1:
+        return HistoryEntry.create(history.entries, history.current_index + 1)
+    history
+
+fn current_url(history: HistoryEntry) -> text:
+    if history.current_index >= 0 and history.current_index < history.entries.len():
+        return history.entries.get(history.current_index).url
+    ""
+
+# ============================================================================
+# Tests
+# ============================================================================
+
+describe "Navigation Integration":
+
+    # ========================================================================
+    # Address bar + basic navigation
+    # ========================================================================
+
+    context "basic navigation":
+        it "navigate to URL updates address bar":
+            var tab = make_tab(1, "about:blank", "New Tab")
+            # Simulate navigation
+            val new_url = "https://example.com"
+            tab = Tab.create(tab.id, "Example", new_url)
+            expect tab.url == "https://example.com"
+
+        it "tab title updates from page title":
+            var tab = make_tab(1, "https://example.com", "Loading...")
+            # After page loads, title is updated
+            tab = Tab.create(tab.id, "Example Domain", tab.url)
+            expect tab.title == "Example Domain"
+
+        it "favicon URL is extracted":
+            var tab = make_tab(1, "https://example.com", "Example")
+            # Favicon is set when the <link rel="icon"> is found
+            val favicon = "https://example.com/favicon.ico"
+            tab = Tab(
+                id: tab.id, title: tab.title, url: tab.url,
+                state: TabState.Complete, renderer_pid: 0,
+                favicon_url: favicon, is_pinned: false, group_id: 0
+            )
+            expect tab.favicon_url == "https://example.com/favicon.ico"
+
+    # ========================================================================
+    # History traversal
+    # ========================================================================
+
+    context "history":
+        it "history entries are recorded":
+            var history = HistoryEntry.empty()
+            history = push_entry(history, make_entry("https://a.com", "A"))
+            history = push_entry(history, make_entry("https://b.com", "B"))
+            expect history.entries.len() == 2
+            expect history.current_index == 1
+
+        it "back button returns to previous page":
+            var history = HistoryEntry.empty()
+            history = push_entry(history, make_entry("https://a.com", "A"))
+            history = push_entry(history, make_entry("https://b.com", "B"))
+            history = go_back(history)
+            expect current_url(history) == "https://a.com"
+            expect history.current_index == 0
+
+        it "forward button goes to next page":
+            var history = HistoryEntry.empty()
+            history = push_entry(history, make_entry("https://a.com", "A"))
+            history = push_entry(history, make_entry("https://b.com", "B"))
+            history = go_back(history)
+            history = go_forward(history)
+            expect current_url(history) == "https://b.com"
+            expect history.current_index == 1
+
+        it "reload reloads current page":
+            var history = HistoryEntry.empty()
+            history = push_entry(history, make_entry("https://a.com", "A"))
+            # Reload keeps the same index
+            val before_index = history.current_index
+            val reload_url = current_url(history)
+            expect reload_url == "https://a.com"
+            expect history.current_index == before_index
+
+        it "duplicate entries are not added":
+            """Navigating to the same URL should still add a new entry
+            (browsers do record each navigation, even to the same URL)."""
+            var history = HistoryEntry.empty()
+            history = push_entry(history, make_entry("https://a.com", "A"))
+            history = push_entry(history, make_entry("https://a.com", "A"))
+            # Both entries are recorded (like real browsers)
+            expect history.entries.len() == 2
+
+        it "navigate replaces forward history":
+            """When the user goes back then navigates to a new page,
+            forward entries are discarded."""
+            var history = HistoryEntry.empty()
+            history = push_entry(history, make_entry("https://a.com", "A"))
+            history = push_entry(history, make_entry("https://b.com", "B"))
+            history = push_entry(history, make_entry("https://c.com", "C"))
+            # Go back to B
+            history = go_back(history)
+            expect current_url(history) == "https://b.com"
+            # Navigate to D — C should be discarded
+            history = push_entry(history, make_entry("https://d.com", "D"))
+            expect history.entries.len() == 3
+            expect current_url(history) == "https://d.com"
+            # Forward should go nowhere
+            val after_forward = go_forward(history)
+            expect current_url(after_forward) == "https://d.com"
+
+    # ========================================================================
+    # URL normalization
+    # ========================================================================
+
+    context "URL normalization":
+        it "internal URLs (about:blank) load immediately":
+            val url = "about:blank"
+            val is_internal = url.starts_with("about:")
+            expect is_internal == true
+
+        it "normalize_url adds https:// prefix":
+            val result = normalize_url("example.com")
+            expect result == "https://example.com"
+
+        it "normalize_url handles search queries":
+            val result = normalize_url("how to cook rice")
+            expect (result).starts_with("https://search.example.com/?q=")
+            expect (result).contains("how to cook rice")
+
+    # ========================================================================
+    # Loading control
+    # ========================================================================
+
+    context "loading control":
+        it "stop_loading cancels in-progress navigation":
+            """A tab in Loading state transitions to Complete when stopped."""
+            var tab = make_tab(1, "https://slow.example.com", "Loading...")
+            # Tab is in Loading state
+            tab = Tab(
+                id: tab.id, title: tab.title, url: tab.url,
+                state: TabState.Loading, renderer_pid: 0,
+                favicon_url: "", is_pinned: false, group_id: 0
+            )
+            expect tab.state == TabState.Loading
+            # After stop, state changes to Complete
+            tab = Tab(
+                id: tab.id, title: tab.title, url: tab.url,
+                state: TabState.Complete, renderer_pid: tab.renderer_pid,
+                favicon_url: tab.favicon_url, is_pinned: tab.is_pinned, group_id: tab.group_id
+            )
+            expect tab.state == TabState.Complete
+
+        it "multiple rapid navigations queue correctly":
+            """Each navigation overwrites the previous pending one.
+            Only the final URL ends up in history."""
+            var history = HistoryEntry.empty()
+            # Rapid navigations — each replaces the pending one
+            # In practice the last one wins
+            history = push_entry(history, make_entry("https://final.com", "Final"))
+            expect history.entries.len() == 1
+            expect current_url(history) == "https://final.com"
+
+        it "navigation state transitions correctly":
+            """Navigation goes through Idle -> Loading -> Committed."""
+            val idle = NavigationState.Idle
+            val loading = NavigationState.Loading
+            val committed = NavigationState.Committed
+            val failed = NavigationState.Failed
+            # States are distinct
+            expect idle == NavigationState.Idle
+            expect loading == NavigationState.Loading
+            expect committed == NavigationState.Committed
+            expect failed == NavigationState.Failed

@@ -1,0 +1,30 @@
+app:
+    title: "Hello Simple GUI"
+    theme: glass_dark
+
+layout:
+    type: vbox
+    id: root
+    children:
+        header:
+            type: panel
+            id: header
+            title: "Simple Language GUI Demo"
+            children:
+                greeting:
+                    type: text
+                    id: greeting
+                    content: "Hello from Simple! This is a working GUI."
+                info:
+                    type: text
+                    id: info
+                    content: "Press q to quit, j/k to navigate, : for commands."
+                build_progress:
+                    type: progress
+                    id: build_progress
+                    value: 75
+        status:
+            type: statusbar
+            id: status
+            left: "NORMAL MODE"
+            right: "Hello Simple GUI"

@@ -1,0 +1,23 @@
+schema: spipe.artifact
+version: 1
+record: artifact
+identity: uid
+fields:
+  uid: opaque_uid(A)|opaque_uid(P)
+  identity_status: enum(canonical,provisional)
+  key: semantic_key
+  project_uid: opaque_uid(P)
+  revision: immutable_revision
+  kind: enum(research,requirements,plan,architecture,design,spec,guide,tracking,report,source,test,result,common_knowledge)
+  title: non_empty_text
+  canonical_path: project_relative_path
+  content_hash: sha256
+  features: sorted_unique(semantic_key)
+  components: sorted_unique(semantic_key)
+  layers: sorted_unique(semantic_key)
+  visibility: enum(public,project,private,restricted)
+  trust_scope: enum(untrusted_data,reviewed_reference,executable_policy)
+  status: enum(draft,proposed,approved,implemented,verified,stale,deprecated)
+  aliases: sorted_unique(text)
+  parser: parser_descriptor
+  source_hash: sha256|null

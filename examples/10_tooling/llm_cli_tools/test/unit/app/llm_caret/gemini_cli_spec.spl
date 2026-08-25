@@ -1,0 +1,406 @@
+# LLM Caret Gemini CLI Specification
+#
+# Tests pure functions: build_gemini_args, parse_gemini_json_response.
+# No subprocess calls in unit tests.
+
+# ============================================================================
+# Inline helpers
+# ============================================================================
+
+fn _LB() -> text:
+    "{(123 as char)}"
+
+fn _RB() -> text:
+    "{(125 as char)}"
+
+fn _Q() -> text:
+    "\""
+
+fn _unwrap_idx(opt) -> i64:
+    match opt:
+        Some(i): return i
+        nil: return -1
+
+fn _escape_json(s: text) -> text:
+    var result = ""
+    var i = 0
+    while i < s.len():
+        val ch = s[i]
+        if ch == "\\":
+            result = result + "\\\\"
+        elif ch == "\"":
+            result = result + "\\\""
+        elif ch == "\n":
+            result = result + "\\n"
+        elif ch == "\r":
+            result = result + "\\r"
+        elif ch == "\t":
+            result = result + "\\t"
+        else:
+            result = result + ch
+        i = i + 1
+    result
+
+fn _extract_json_string(json: text, key: text) -> text:
+    val quote = "\""
+    val search = quote + key + quote + ":"
+    val idx = _unwrap_idx(json.index_of(search))
+    if idx < 0:
+        return ""
+    val slen = search.len()
+    val start = idx + slen
+    val after = json.substring(start)
+    val trimmed = after.trim()
+    if trimmed.starts_with(quote):
+        val rest = trimmed.substring(1)
+        var end = 0
+        var escaped = false
+        while end < rest.len():
+            val ch = rest[end]
+            if escaped:
+                escaped = false
+            elif ch == "\\":
+                escaped = true
+            elif ch == "\"":
+                return rest.substring(0, end)
+            end = end + 1
+    ""
+
+fn _extract_json_value(json: text, key: text) -> text:
+    val search = _Q() + key + _Q() + ":"
+    val idx = _unwrap_idx(json.index_of(search))
+    if idx < 0:
+        return "null"
+    val slen = search.len()
+    val start = idx + slen
+    val after = json.substring(start)
+    val trimmed = after.trim()
+    var end = 0
+    while end < trimmed.len():
+        val ch = trimmed[end]
+        if ch == "," or ch == _RB() or ch == "]":
+            break
+        end = end + 1
+    trimmed.substring(0, end).trim()
+
+fn _extract_json_int(json: text, key: text) -> i64:
+    val raw = _extract_json_value(json, key)
+    if raw == "null" or raw == "":
+        return 0
+    int(raw)
+
+fn _extract_json_bool(json: text, key: text) -> bool:
+    val raw = _extract_json_value(json, key)
+    raw == "true"
+
+# ============================================================================
+# Inline struct
+# ============================================================================
+
+struct GeminiCliResponse:
+    content: text
+    model: text
+    session_id: text
+    stop_reason: text
+    input_tokens: i64
+    output_tokens: i64
+    error: text
+    is_error: bool
+    raw: text
+
+# ============================================================================
+# Functions under test (inlined)
+# ============================================================================
+
+fn build_gemini_args(prompt: text, model: text, output_format: text, session_id: text, extra_args: [text]) -> [text]:
+    var args: [text] = []
+    args = args + ["-p", prompt]
+    if output_format != "":
+        args = args + ["--output-format", output_format]
+    else:
+        args = args + ["--output-format", "json"]
+    if model != "":
+        args = args + ["--model", model]
+    if session_id != "":
+        args = args + ["--resume", session_id]
+    for arg in extra_args:
+        if arg != "":
+            args = args + [arg]
+    args
+
+fn parse_gemini_json_response(raw: text) -> GeminiCliResponse:
+    if raw.trim() == "":
+        return GeminiCliResponse(
+            content: "",
+            model: "",
+            session_id: "",
+            stop_reason: "",
+            input_tokens: 0,
+            output_tokens: 0,
+            error: "empty response",
+            is_error: true,
+            raw: ""
+        )
+    val response_text = _extract_json_string(raw, "response")
+    val model_text = _extract_json_string(raw, "model")
+    val in_tok = _extract_json_int(raw, "input_tokens")
+    val out_tok = _extract_json_int(raw, "output_tokens")
+    val error_text = _extract_json_string(raw, "error")
+    var is_err = false
+    if error_text != "":
+        is_err = true
+    if response_text == "" and error_text == "":
+        val trimmed = raw.trim()
+        if trimmed != "":
+            is_err = false
+    var final_stop = "end_turn"
+    if is_err:
+        final_stop = "error"
+    GeminiCliResponse(
+        content: response_text,
+        model: model_text,
+        session_id: "",
+        stop_reason: final_stop,
+        input_tokens: in_tok,
+        output_tokens: out_tok,
+        error: error_text,
+        is_error: is_err,
+        raw: raw
+    )
+
+# Helper to check if arg list contains a specific value
+fn args_contain(args: [text], needle: text) -> bool:
+    for arg in args:
+        if arg == needle:
+            return true
+    false
+
+# Helper to get value after a flag
+fn args_get_flag_value(args: [text], flag: text) -> text:
+    var i = 0
+    while i < args.len() - 1:
+        if args[i] == flag:
+            return args[i + 1]
+        i = i + 1
+    ""
+
+# Helper to build mock Gemini JSON response
+fn mock_json(response_val: text, model_val: text) -> text:
+    var r = _LB()
+    r = r + _Q() + "response" + _Q() + ":" + _Q() + _escape_json(response_val) + _Q() + ","
+    r = r + _Q() + "model" + _Q() + ":" + _Q() + model_val + _Q() + ","
+    r = r + _Q() + "stats" + _Q() + ":" + _LB()
+    r = r + _Q() + "input_tokens" + _Q() + ":200,"
+    r = r + _Q() + "output_tokens" + _Q() + ":55"
+    r = r + _RB()
+    r = r + _RB()
+    r
+
+fn mock_error_json(error_val: text) -> text:
+    var r = _LB()
+    r = r + _Q() + "error" + _Q() + ":" + _Q() + _escape_json(error_val) + _Q()
+    r = r + _RB()
+    r
+
+fn mock_json_with_tokens(response_val: text, in_tok: i64, out_tok: i64) -> text:
+    var r = _LB()
+    r = r + _Q() + "response" + _Q() + ":" + _Q() + _escape_json(response_val) + _Q() + ","
+    r = r + _Q() + "input_tokens" + _Q() + ":" + "{in_tok}" + ","
+    r = r + _Q() + "output_tokens" + _Q() + ":" + "{out_tok}"
+    r = r + _RB()
+    r
+
+# ============================================================================
+# Tests: Arg Building
+# ============================================================================
+
+describe "build_gemini_args - minimal":
+    """
+    # Minimal Arg Building
+    Tests that build_gemini_args produces correct args with minimal input.
+    """
+
+    it "includes prompt with -p flag":
+        val args = build_gemini_args("Hello", "", "", "", [])
+        expect(args_contain(args, "-p")).to_equal(true)
+        expect(args_get_flag_value(args, "-p")).to_equal("Hello")
+
+    it "defaults to json output format":
+        val args = build_gemini_args("Hi", "", "", "", [])
+        expect(args_get_flag_value(args, "--output-format")).to_equal("json")
+
+    it "has no model flag when empty":
+        val args = build_gemini_args("Hi", "", "", "", [])
+        expect(args_contain(args, "--model")).to_equal(false)
+
+    it "has no resume flag when empty":
+        val args = build_gemini_args("Hi", "", "", "", [])
+        expect(args_contain(args, "--resume")).to_equal(false)
+
+describe "build_gemini_args - model":
+    """
+    # Model Flag
+    Tests that model flag is correctly included.
+    """
+
+    it "includes model flag":
+        val args = build_gemini_args("Hi", "gemini-2.5-pro", "", "", [])
+        expect(args_get_flag_value(args, "--model")).to_equal("gemini-2.5-pro")
+
+    it "supports flash model":
+        val args = build_gemini_args("Hi", "gemini-2.5-flash", "", "", [])
+        expect(args_get_flag_value(args, "--model")).to_equal("gemini-2.5-flash")
+
+describe "build_gemini_args - output format":
+    """
+    # Output Format
+    Tests custom output format override.
+    """
+
+    it "uses custom output format":
+        val args = build_gemini_args("Hi", "", "text", "", [])
+        expect(args_get_flag_value(args, "--output-format")).to_equal("text")
+
+describe "build_gemini_args - session":
+    """
+    # Session Resume
+    Tests session resume flag.
+    """
+
+    it "includes session resume":
+        val args = build_gemini_args("Hi", "", "", "abc-123", [])
+        expect(args_get_flag_value(args, "--resume")).to_equal("abc-123")
+
+describe "build_gemini_args - extra args":
+    """
+    # Extra Args
+    Tests extra argument appending.
+    """
+
+    it "appends extra args":
+        val args = build_gemini_args("Hi", "", "", "", ["--no-cache"])
+        expect(args_contain(args, "--no-cache")).to_equal(true)
+
+    it "skips empty extra args":
+        val args = build_gemini_args("Hi", "", "", "", ["", "--flag", ""])
+        expect(args_contain(args, "--flag")).to_equal(true)
+        expect(args_contain(args, "")).to_equal(false)
+
+describe "build_gemini_args - combined":
+    """
+    # Combined Flags
+    Tests that all flags work together correctly.
+    """
+
+    it "builds complete args":
+        val args = build_gemini_args("prompt", "gemini-2.5-pro", "json", "sess-1", ["--sandbox"])
+        expect(args_get_flag_value(args, "-p")).to_equal("prompt")
+        expect(args_get_flag_value(args, "--model")).to_equal("gemini-2.5-pro")
+        expect(args_get_flag_value(args, "--output-format")).to_equal("json")
+        expect(args_get_flag_value(args, "--resume")).to_equal("sess-1")
+        expect(args_contain(args, "--sandbox")).to_equal(true)
+
+# ============================================================================
+# Tests: Response Parsing
+# ============================================================================
+
+describe "parse_gemini_json_response - success":
+    """
+    # Successful Response Parsing
+    Tests parsing of valid Gemini JSON responses.
+    """
+
+    it "parses successful response":
+        val json = mock_json("Hello world!", "gemini-2.5-pro")
+        val resp = parse_gemini_json_response(json)
+        expect(resp.content).to_equal("Hello world!")
+        expect(resp.is_error).to_equal(false)
+
+    it "parses model field":
+        val json = mock_json("Hi", "gemini-2.5-flash")
+        val resp = parse_gemini_json_response(json)
+        expect(resp.model).to_equal("gemini-2.5-flash")
+
+    it "parses stop reason as end_turn":
+        val json = mock_json("Hi", "gemini-2.5-pro")
+        val resp = parse_gemini_json_response(json)
+        expect(resp.stop_reason).to_equal("end_turn")
+
+    it "preserves raw json":
+        val json = mock_json("Hi", "gemini-2.5-pro")
+        val resp = parse_gemini_json_response(json)
+        expect(resp.raw).to_equal(json)
+
+    it "session_id is always empty for gemini":
+        val json = mock_json("Hi", "gemini-2.5-pro")
+        val resp = parse_gemini_json_response(json)
+        expect(resp.session_id).to_equal("")
+
+describe "parse_gemini_json_response - tokens":
+    """
+    # Token Extraction
+    Tests parsing of token counts from response.
+    """
+
+    it "parses token counts":
+        val json = mock_json_with_tokens("Hi", 300, 75)
+        val resp = parse_gemini_json_response(json)
+        expect(resp.input_tokens).to_equal(300)
+        expect(resp.output_tokens).to_equal(75)
+
+describe "parse_gemini_json_response - error":
+    """
+    # Error Response Parsing
+    Tests parsing of error and edge-case responses.
+    """
+
+    it "parses error response":
+        val json = mock_error_json("Rate limited")
+        val resp = parse_gemini_json_response(json)
+        expect(resp.is_error).to_equal(true)
+        expect(resp.error).to_equal("Rate limited")
+        expect(resp.stop_reason).to_equal("error")
+
+    it "handles empty response":
+        val resp = parse_gemini_json_response("")
+        expect(resp.is_error).to_equal(true)
+        expect(resp.error).to_equal("empty response")
+
+    it "handles whitespace-only response":
+        val resp = parse_gemini_json_response("   ")
+        expect(resp.is_error).to_equal(true)
+        expect(resp.error).to_equal("empty response")
+
+describe "parse_gemini_json_response - edge cases":
+    """
+    # Edge Cases
+    Tests parsing with missing or unusual fields.
+    """
+
+    it "handles missing model field":
+        var json = _LB()
+        json = json + _Q() + "response" + _Q() + ":" + _Q() + "Hello" + _Q()
+        json = json + _RB()
+        val resp = parse_gemini_json_response(json)
+        expect(resp.content).to_equal("Hello")
+        expect(resp.model).to_equal("")
+
+    it "handles response with no content and no error":
+        var json = _LB()
+        json = json + _Q() + "model" + _Q() + ":" + _Q() + "gemini-2.5-pro" + _Q()
+        json = json + _RB()
+        val resp = parse_gemini_json_response(json)
+        expect(resp.content).to_equal("")
+        expect(resp.is_error).to_equal(false)
+
+    it "handles multiline response content":
+        val json = mock_json("Line 1\\nLine 2", "gemini-2.5-pro")
+        val resp = parse_gemini_json_response(json)
+        expect(resp.content).to_contain("Line 1")
+
+    it "defaults stop reason to end_turn for non-error":
+        var json = _LB()
+        json = json + _Q() + "response" + _Q() + ":" + _Q() + "Done" + _Q()
+        json = json + _RB()
+        val resp = parse_gemini_json_response(json)
+        expect(resp.stop_reason).to_equal("end_turn")

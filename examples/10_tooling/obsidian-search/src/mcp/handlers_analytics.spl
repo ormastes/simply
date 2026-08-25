@@ -1,0 +1,65 @@
+# MCP Handlers — analytics tool dispatch (Phase D)
+#
+# Routes vault_structure, find_orphan_notes, vault_stats tool calls
+# to the analytics core module and formats results as MCP responses.
+
+use src.util.json_helpers.{js, jp, jo, jo1, jo2, jo3, jo4, jo5, jo6, jo7, ja, ji, jf, jb, make_json_result, make_error, tool_text_result, extract_field, extract_nested, extract_arg, safe_substr, LB, RB, SB_L, SB_R}
+use src.core.analytics.{vault_structure, vault_structure_filtered, find_orphan_notes, find_orphan_notes_with_options, compute_vault_stats, FolderInfo, VaultStats}
+
+# --- Format helpers ---
+
+fn format_folder_infos(infos: [FolderInfo]) -> text:
+    var items: [text] = []
+    for info in infos:
+        var pairs: [text] = []
+        pairs.push(jp("path", js(info.path)))
+        pairs.push(jp("file_count", ji(info.file_count)))
+        pairs.push(jp("subfolder_count", ji(info.subfolder_count)))
+        items.push(jo(pairs))
+    ja(items)
+
+fn format_orphan_paths(paths: [text]) -> text:
+    var items: [text] = []
+    for p in paths:
+        items.push(js(p))
+    ja(items)
+
+fn format_vault_stats(stats: VaultStats) -> text:
+    var pairs: [text] = []
+    pairs.push(jp("total_notes", ji(stats.total_notes)))
+    pairs.push(jp("total_links", ji(stats.total_links)))
+    pairs.push(jp("total_tags", ji(stats.total_tags)))
+    pairs.push(jp("total_tasks", ji(stats.total_tasks)))
+    pairs.push(jp("total_words", ji(stats.total_words)))
+    pairs.push(jp("avg_links_per_note", jf(stats.avg_links_per_note)))
+    pairs.push(jp("orphan_count", ji(stats.orphan_count)))
+    jo(pairs)
+
+# --- Main handler dispatch ---
+
+fn handle_analytics_tool(id: text, tool_name: text, body: text, vault_path: text) -> text:
+    if tool_name == "vault_structure":
+        val directory = extract_arg(body, "directory")
+        var infos: [FolderInfo] = []
+        if directory != "":
+            infos = vault_structure_filtered(vault_path, directory)
+        else:
+            infos = vault_structure(vault_path)
+        val json_infos = format_folder_infos(infos)
+        val output = jo2(jp("folders", json_infos), jp("count", ji(infos.len())))
+        return tool_text_result(id, output)
+
+    elif tool_name == "find_orphan_notes":
+        val include_daily_str = extract_arg(body, "include_daily")
+        val include_daily = include_daily_str == "true"
+        val orphans = find_orphan_notes_with_options(vault_path, include_daily)
+        val json_orphans = format_orphan_paths(orphans)
+        val output = jo2(jp("orphans", json_orphans), jp("count", ji(orphans.len())))
+        return tool_text_result(id, output)
+
+    elif tool_name == "vault_stats":
+        val stats = compute_vault_stats(vault_path)
+        val output = format_vault_stats(stats)
+        return tool_text_result(id, output)
+
+    make_error(id, -32602, "Unknown analytics tool: " + tool_name)

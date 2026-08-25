@@ -1,0 +1,107 @@
+# Matrix Helpers
+#
+# Shared CPU-side matrix utilities for CUDA examples.
+# Matrices are stored as flat [f32] arrays in row-major order.
+# Index (row, col) in an (rows x cols) matrix = row * cols + col.
+
+# ============================================================================
+# Matrix Construction
+# ============================================================================
+
+# Create a rows x cols matrix filled with zeros.
+fn matrix_zeros(rows: i64, cols: i64) -> [f32]:
+    val total = rows * cols
+    var result: [f32] = []
+    var i = 0
+    while i < total:
+        result.push(0.0)
+        i = i + 1
+    result
+
+# Create a rows x cols matrix filled with ones.
+fn matrix_ones(rows: i64, cols: i64) -> [f32]:
+    val total = rows * cols
+    var result: [f32] = []
+    var i = 0
+    while i < total:
+        result.push(1.0)
+        i = i + 1
+    result
+
+# Create a rows x cols matrix with pseudo-random values in [0, 1).
+# Uses a simple linear congruential generator (LCG) for reproducibility.
+# NOT cryptographically secure -- for testing only.
+fn matrix_random(rows: i64, cols: i64) -> [f32]:
+    val total = rows * cols
+    var result: [f32] = []
+    # LCG parameters (Numerical Recipes)
+    var seed: i64 = 1234567
+    val a: i64 = 1664525
+    val c: i64 = 1013904223
+    val m: i64 = 2147483647  # 2^31 - 1
+
+    var i = 0
+    while i < total:
+        seed = (a * seed + c) % m
+        var value = seed
+        if value < 0:
+            value = 0 - value
+        val f_val = (value as f32) / (m as f32)
+        result.push(f_val)
+        i = i + 1
+    result
+
+# ============================================================================
+# Matrix Multiplication (CPU reference)
+# ============================================================================
+
+# Multiply matrix A (m x k) by matrix B (k x n) producing C (m x n).
+# Both A and B are flat row-major [f32] arrays.
+# This is the naive O(m*n*k) algorithm used as a CPU reference for GPU results.
+fn matrix_multiply_cpu(a: [f32], b: [f32], m: i64, n: i64, k: i64) -> [f32]:
+    var result = matrix_zeros(m, n)
+
+    var row = 0
+    while row < m:
+        var col = 0
+        while col < n:
+            var sum: f32 = 0.0
+            var idx = 0
+            while idx < k:
+                val a_val = a[row * k + idx]
+                val b_val = b[idx * n + col]
+                sum = sum + a_val * b_val
+                idx = idx + 1
+            result[row * n + col] = sum
+            col = col + 1
+        row = row + 1
+    result
+
+# ============================================================================
+# Matrix Comparison
+# ============================================================================
+
+# Return true if every element of a and b differs by at most epsilon.
+# Arrays must be the same length.
+fn matrix_equal(a: [f32], b: [f32], epsilon: f32) -> bool:
+    if a.len() != b.len():
+        return false
+
+    var i = 0
+    while i < a.len():
+        val diff = a[i] - b[i]
+        var abs_diff = diff
+        if abs_diff < 0.0:
+            abs_diff = 0.0 - abs_diff
+        if abs_diff > epsilon:
+            return false
+        i = i + 1
+    true
+
+# ============================================================================
+# Exports
+# ============================================================================
+
+export matrix_zeros, matrix_ones, matrix_random
+export matrix_multiply_cpu
+export matrix_equal

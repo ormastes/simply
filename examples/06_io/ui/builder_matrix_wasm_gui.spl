@@ -1,0 +1,183 @@
+# Generated-WASM GUI builder matrix entry.
+#
+# Unlike the dependency-light widget matrix, this source constructs a real
+# common.ui WidgetNode tree before exposing the generated WASM payload markers.
+
+use common.ui.builder.{
+    build_tree,
+    button,
+    column,
+    divider,
+    inspector,
+    label,
+    row,
+    scroll,
+    segmented_control,
+    sidebar,
+    text_widget
+}
+use common.ui.builder.{textarea, tree_leaf, tree_node, tree_widget}
+use common.ui.ios.builder.{card, navigation_bar, search_bar, switch_toggle, tab_bar, tab_item}
+use common.ui.widget.{UITree, WidgetNode, WidgetKind}
+
+fn builder_radio(id: text, label_text: text, checked: bool) -> WidgetNode:
+    var node = WidgetNode.new(id, WidgetKind.RadioButton.to_wire())
+    node = node.set_prop("label", label_text)
+    node = node.set_prop("checked", if checked: "true" else: "false")
+    return node
+
+fn builder_heading(id: text, label_text: text) -> WidgetNode:
+    var node = WidgetNode.new(id, WidgetKind.Heading.to_wire())
+    node = node.set_prop("label", label_text)
+    node = node.set_prop("level", "2")
+    return node
+
+fn builder_command_palette(id: text, prompt: text) -> WidgetNode:
+    var node = WidgetNode.new(id, WidgetKind.CommandPalette.to_wire())
+    node = node.set_prop("prompt", prompt)
+    node = node.set_prop("visible", "true")
+    node = node.add_child(text_widget("{id}_entry_0", "Open Command"))
+    node = node.add_child(text_widget("{id}_entry_1", "Run Builder Matrix"))
+    return node
+
+fn builder_surface(id: text, kind: WidgetKind, label_text: text) -> WidgetNode:
+    var node = WidgetNode.new(id, kind.to_wire())
+    node = node.set_prop("label", label_text)
+    return node
+
+fn builder_matrix_tree() -> UITree:
+    val controls = row("builder_matrix_controls", [
+        builder_radio("builder_radio_ready", "Ready", true),
+        switch_toggle("builder_switch_enabled", "Enabled", true),
+        search_bar("builder_search_bar", "Search builder matrix", "wasm"),
+        segmented_control("builder_segmented_mode", ["Design", "Run", "Verify"], 1, "builder_mode"),
+        button("builder_button_run", "Run", "builder_run")
+    ])
+    val content = card("builder_card_summary", "Builder Card", [
+        builder_heading("builder_heading_title", "Builder Matrix"),
+        label("builder_label_status", "Generated from common.ui builders"),
+        divider("builder_divider_main"),
+        builder_command_palette("builder_command_palette", "Type a command")
+    ])
+    val navigation = navigation_bar("builder_navigation_bar", "Builder Matrix", [button("builder_nav_back", "Back", "back")], [button("builder_nav_done", "Done", "done")])
+    val tabs = tab_bar("builder_tab_bar", [
+        tab_item("builder_tab_home", "home", "Home"),
+        tab_item("builder_tab_tools", "command_palette", "Tools")
+    ])
+    val tree = tree_widget("builder_tree", [
+        tree_node("builder_tree_root", "Root", [
+            tree_leaf("builder_tree_leaf", "Leaf")
+        ])
+    ])
+    val layout = row("builder_layout_surfaces", [
+        sidebar("builder_sidebar", [text_widget("builder_sidebar_item", "Sidebar")]),
+        inspector("builder_inspector", "Inspector", [text_widget("builder_inspector_value", "Value")]),
+        scroll("builder_scroll", 96, [
+            textarea("builder_textarea_notes", "Builder textarea", "Notes", 3),
+            tree
+        ])
+    ])
+    val shell = column("builder_shell_surfaces", [
+        builder_surface("builder_glass_title_bar", WidgetKind.GlassTitleBar, "Glass Title Bar"),
+        builder_surface("builder_command_bar", WidgetKind.CommandBar, "Command Bar"),
+        builder_surface("builder_workspace_tabs", WidgetKind.WorkspaceTabs, "Workspace Tabs"),
+        builder_surface("builder_toast", WidgetKind.Toast, "Toast"),
+        builder_surface("builder_sheet_modal", WidgetKind.SheetModal, "Sheet Modal"),
+        builder_surface("builder_context_menu", WidgetKind.ContextMenu, "Context Menu"),
+        builder_surface("builder_utility_rail", WidgetKind.UtilityRail, "Utility Rail"),
+        builder_surface("builder_status_chip", WidgetKind.StatusChip, "Status Chip"),
+        builder_surface("builder_selection_pill", WidgetKind.SelectionPill, "Selection Pill"),
+        builder_surface("builder_empty_state", WidgetKind.EmptyState, "Empty State")
+    ])
+    build_tree(column("builder_matrix_root", [navigation, tabs, controls, content, layout, shell]))
+
+fn builder_matrix_wasm_gui_title() -> text:
+    "Builder Matrix"
+
+fn builder_matrix_wasm_gui_body() -> text:
+    val tree = builder_matrix_tree()
+    val ids = tree.all_widget_ids().join("|")
+    "<main data-simple-wasm='builder_matrix' data-builder-source='common.ui.builder' data-builder-ids='" + ids + "'><section id='builder_navigation_bar' data-simple-surface='navigation_bar tab_bar'></section><section id='builder_matrix_controls' data-simple-surface='radio switch search_bar segmented_control button'></section><section id='builder_card_summary' data-simple-surface='card heading label divider command_palette'></section><section id='builder_layout_surfaces' data-simple-surface='sidebar inspector scroll textarea tree treenode'></section><section id='builder_shell_surfaces' data-simple-surface='glass_title_bar command_bar workspace_tabs toast sheet_modal context_menu utility_rail status_chip selection_pill empty_state'></section><span id='hello_button' hidden>Generated WASM UI</span></main>"
+
+fn builder_matrix_wasm_gui_css() -> text:
+    "main[data-simple-wasm='builder_matrix']{display:flex;flex-direction:column;gap:8px;padding:16px;}#builder_navigation_bar,#builder_matrix_controls,#builder_layout_surfaces,#builder_shell_surfaces{display:flex;gap:8px;align-items:center;flex-wrap:wrap;}#builder_card_summary{border:1px solid #64748b;padding:12px;border-radius:6px;}#builder_command_palette{min-height:40px;}"
+
+fn builder_matrix_wasm_gui_event_response(event_name: text, target_id: text) -> text:
+    if event_name == "change" and target_id == "builder_radio_ready":
+        return "builder_radio:changed"
+    if event_name == "change" and target_id == "builder_switch_enabled":
+        return "builder_switch:toggled"
+    if event_name == "text" and target_id == "builder_search_bar":
+        return "builder_search:accepted"
+    if event_name == "change" and target_id == "builder_segmented_mode":
+        return "builder_segmented:changed"
+    if event_name == "command" and target_id == "builder_command_palette":
+        return "builder_command_palette:accepted"
+    if event_name == "open" and target_id == "builder_sheet_modal":
+        return "builder_sheet_modal:opened"
+    if event_name == "contextmenu" and target_id == "builder_context_menu":
+        return "builder_context_menu:opened"
+    "builder_event:ignored"
+
+fn hello_wasm_gui_event_response(event_name: text, target_id: text) -> text:
+    builder_matrix_wasm_gui_event_response(event_name, target_id)
+
+fn simple_app_init() -> i64:
+    1
+
+fn simple_app_render() -> text:
+    builder_matrix_wasm_gui_body()
+
+fn simple_app_event(event_name: text, target_id: text) -> text:
+    builder_matrix_wasm_gui_event_response(event_name, target_id)
+
+fn simple_app_render_probe() -> i64:
+    val body = simple_app_render()
+    val tree = builder_matrix_tree()
+    var count = 0i64
+    if body.contains("data-simple-wasm='builder_matrix'"):
+        count = count + 1
+    if body.contains("data-builder-source='common.ui.builder'"):
+        count = count + 1
+    if body.contains("builder_navigation_bar"):
+        count = count + 1
+    if body.contains("builder_matrix_controls"):
+        count = count + 1
+    if body.contains("builder_card_summary"):
+        count = count + 1
+    if body.contains("builder_layout_surfaces"):
+        count = count + 1
+    if body.contains("builder_shell_surfaces"):
+        count = count + 1
+    val ids = tree.all_widget_ids()
+    count = count + ids.len()
+    count
+
+fn simple_app_event_probe() -> i64:
+    var count = 0i64
+    if simple_app_event("change", "builder_radio_ready") == "builder_radio:changed":
+        count = count + 1
+    if simple_app_event("change", "builder_switch_enabled") == "builder_switch:toggled":
+        count = count + 1
+    if simple_app_event("text", "builder_search_bar") == "builder_search:accepted":
+        count = count + 1
+    if simple_app_event("change", "builder_segmented_mode") == "builder_segmented:changed":
+        count = count + 1
+    if simple_app_event("command", "builder_command_palette") == "builder_command_palette:accepted":
+        count = count + 1
+    if simple_app_event("open", "builder_sheet_modal") == "builder_sheet_modal:opened":
+        count = count + 1
+    if simple_app_event("contextmenu", "builder_context_menu") == "builder_context_menu:opened":
+        count = count + 1
+    if simple_app_event("click", "wrong_builder") == "builder_event:ignored":
+        count = count + 1
+    count
+
+fn main() -> i64:
+    val tree = builder_matrix_tree()
+    print "wasm_gui:title:{builder_matrix_wasm_gui_title()}"
+    print "wasm_gui:ids:{tree.all_widget_ids().join(\"|\")}"
+    print "wasm_gui:body:{builder_matrix_wasm_gui_body()}"
+    print "wasm_gui:css:{builder_matrix_wasm_gui_css()}"
+    print "wasm_gui:event:{builder_matrix_wasm_gui_event_response(\"command\", \"builder_command_palette\")}"
+    return 0

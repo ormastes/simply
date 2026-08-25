@@ -1,0 +1,83 @@
+# Static Polymorphism Example
+# Demonstrates the difference between dynamic and static dispatch
+
+# Define a Logger trait
+trait Logger:
+    fn log(msg: str)
+    fn level() -> i32
+
+# Console logger implementation
+struct ConsoleLogger:
+    prefix: str
+
+impl Logger for ConsoleLogger:
+    fn log(msg: str):
+        print("{self.prefix}: {msg}")
+
+    fn level() -> i32:
+        return 1
+
+# File logger implementation
+struct FileLogger:
+    path: str
+
+impl Logger for FileLogger:
+    fn log(msg: str):
+        # Would write to file in real implementation
+        pass
+
+    fn level() -> i32:
+        return 2
+
+# ============================================
+# DYNAMIC DISPATCH (Default - no binding)
+# ============================================
+# Without a binding, Logger uses dynamic dispatch.
+# The actual implementation is determined at runtime via vtable.
+
+fn log_dynamic(logger: Logger, msg: str):
+    # This is a vtable call - resolved at runtime
+    logger.log(msg)
+
+fn example_dynamic():
+    # Both work because Logger accepts any implementation
+    val console: Logger = ConsoleLogger(prefix: "CONSOLE")
+    val file: Logger = FileLogger(path: "/var/log/app.log")
+
+    log_dynamic(console, "Hello from console")  # vtable -> ConsoleLogger.log
+    log_dynamic(file, "Hello from file")        # vtable -> FileLogger.log
+
+# ============================================
+# STATIC DISPATCH (With binding)
+# ============================================
+# The binding tells the compiler: Logger = ConsoleLogger
+# This enables monomorphization - no vtable overhead.
+
+bind Logger = ConsoleLogger
+
+fn log_static(logger: Logger, msg: str):
+    # Compiler knows Logger = ConsoleLogger
+    # This becomes a direct call to ConsoleLogger.log
+    # No vtable, can be inlined
+    logger.log(msg)
+
+fn example_static():
+    # With binding, type inference knows Logger -> ConsoleLogger
+    val logger = ConsoleLogger(prefix: "APP")
+
+    # Direct call, monomorphized, potentially inlined
+    log_static(logger, "Hello, static polymorphism!")
+
+    print("Logger level: {logger.level()}")
+
+# ============================================
+# Main entry point
+# ============================================
+
+fn main():
+    print("=== Dynamic Dispatch Example ===")
+    example_dynamic()
+
+    print("")
+    print("=== Static Dispatch Example ===")
+    example_static()

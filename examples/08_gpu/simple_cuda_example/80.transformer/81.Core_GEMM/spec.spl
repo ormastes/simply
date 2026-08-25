@@ -1,0 +1,72 @@
+# 81. Core GEMM - Tests
+#
+# Hardware-independent: strategy selection by size, and every strategy's host
+# path must agree on exactly-representable inputs.
+
+use std.gpu.*
+use self.main.{gemm_simd, gemm_shared, gemm_dispatch, select_strategy, strategy_name, transpose, max_abs_diff, TILE_SIZE}
+
+describe "Core GEMM dispatcher":
+    it "should select SIMD for small matrices":
+        expect(strategy_name(select_strategy(4, 4, 4))).to_equal("simd")
+        expect(strategy_name(select_strategy(64, 64, 512))).to_equal("simd")
+
+    it "should select SharedMemory for medium matrices":
+        expect(strategy_name(select_strategy(128, 128, 128))).to_equal("shared_memory")
+        expect(strategy_name(select_strategy(256, 512, 64))).to_equal("shared_memory")
+
+    it "should select TensorCore only for large tile-aligned matrices":
+        expect(strategy_name(select_strategy(1024, 1024, 1024)).starts_with("tensor_core")).to_equal(true)
+        # not a multiple of TILE_SIZE -> falls back to shared memory
+        expect(strategy_name(select_strategy(1000, 1000, 1000))).to_equal("shared_memory")
+        expect(TILE_SIZE).to_equal(16)
+
+    it "should compute shared memory GEMM correctly":
+        val c = gemm_shared([1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0], 2, 2, 2)?
+        expect(c[0]).to_equal(19.0)
+        expect(c[1]).to_equal(22.0)
+        expect(c[2]).to_equal(43.0)
+        expect(c[3]).to_equal(50.0)
+
+    it "should compute SIMD GEMM correctly (k=8 fills one Vec8f)":
+        # A = 1x8 row 1..8, B = 8x1 column of ones -> 36
+        val a = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+        val b = [for i in 0..8: 1.0]
+        val c = gemm_simd(a, transpose(b, 8, 1), 1, 1, 8)
+        expect(c[0]).to_equal(36.0)
+
+    it "should handle SIMD remainder lanes (k=2)":
+        val c = gemm_simd([1.0, 2.0, 3.0, 4.0], transpose([5.0, 6.0, 7.0, 8.0], 2, 2), 2, 2, 2)
+        expect(c[0]).to_equal(19.0)
+        expect(c[3]).to_equal(50.0)
+
+    it "should dispatch correctly for small matrices":
+        val c = gemm_dispatch([1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0], 2, 2, 2)?
+        expect(c[0]).to_equal(19.0)
+        expect(c[3]).to_equal(50.0)
+
+    it "should handle non-square matrices":
+        # 2x3 * 3x2
+        val a = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+        val b = [7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
+        val c = gemm_dispatch(a, b, 2, 2, 3)?
+        expect(c[0]).to_equal(58.0)
+        expect(c[1]).to_equal(64.0)
+        expect(c[2]).to_equal(139.0)
+        expect(c[3]).to_equal(154.0)
+
+    it "should agree between shared and SIMD":
+        val m = 4
+        val k = 16
+        val n = 8
+        val a = [for i in 0..(m * k): ((i % 7) - 3) * 0.5]
+        val b = [for i in 0..(k * n): ((i % 5) - 2) * 0.25]
+        val simd = gemm_simd(a, transpose(b, k, n), m, n, k)
+        val shared = gemm_shared(a, b, m, n, k)?
+        expect(max_abs_diff(simd, shared)).to_equal(0.0)
+
+    it "should transpose a 2x3 matrix":
+        val t = transpose([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, 3)
+        expect(t[1]).to_equal(4.0)
+        expect(t[2]).to_equal(2.0)
+        expect(t[5]).to_equal(6.0)

@@ -1,0 +1,104 @@
+#!/bin/sh
+# Boot the bare-metal RV64 NVMe-firmware self-test ELF under QEMU and check the PASS marker.
+cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
+
+if [ "${1:-}" = "--self-test" ]; then
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_dir"' EXIT
+  fake_bin="$tmp_dir/bin"
+  mkdir -p "$fake_bin"
+  cat >"$fake_bin/qemu-system-riscv64" <<'EOF'
+#!/bin/sh
+serial=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -serial)
+      shift
+      serial="${1#file:}"
+      ;;
+  esac
+  shift
+done
+[ -n "$serial" ] || exit 3
+case "${NVME_RV64_FAKE_SERIAL:-pass}" in
+  pass)
+    printf '%s\n' "SimpleOS RV64" "[BOOT] boot complete" "ALL RV64 NVME FW CHECKS PASS" >"$serial"
+    ;;
+  missing)
+    printf '%s\n' "SimpleOS RV64" "[BOOT] boot complete" >"$serial"
+    ;;
+  empty)
+    : >"$serial"
+    ;;
+  fail)
+    printf '%s\n' "SimpleOS RV64" "[BOOT] boot complete" "ALL RV64 NVME FW CHECKS PASS" "FAIL injected" >"$serial"
+    ;;
+  *)
+    exit 4
+    ;;
+esac
+EOF
+  chmod +x "$fake_bin/qemu-system-riscv64"
+  fake_elf="$tmp_dir/fake.elf"
+  : >"$fake_elf"
+
+  PATH="$fake_bin:$PATH" NVME_RV64_FAKE_SERIAL=pass NVME_RV64_BOOT_LOG="$tmp_dir/pass.log" sh "$0" "$fake_elf" >"$tmp_dir/pass.out" 2>&1
+  grep -Fq "RESULT: PASS" "$tmp_dir/pass.out" || {
+    echo "STATUS: FAIL nvme-rv64-boot self-test: fake pass did not pass" >&2
+    exit 1
+  }
+
+  if PATH="$fake_bin:$PATH" NVME_RV64_FAKE_SERIAL=missing NVME_RV64_BOOT_LOG="$tmp_dir/missing.log" sh "$0" "$fake_elf" >"$tmp_dir/missing.out" 2>&1; then
+    echo "STATUS: FAIL nvme-rv64-boot self-test: missing marker passed" >&2
+    exit 1
+  fi
+  grep -Fq "RESULT: FAIL (marker not found)" "$tmp_dir/missing.out" || {
+    echo "STATUS: FAIL nvme-rv64-boot self-test: missing marker reason absent" >&2
+    exit 1
+  }
+
+  if PATH="$fake_bin:$PATH" NVME_RV64_FAKE_SERIAL=empty NVME_RV64_BOOT_LOG="$tmp_dir/empty.log" sh "$0" "$fake_elf" >"$tmp_dir/empty.out" 2>&1; then
+    echo "STATUS: FAIL nvme-rv64-boot self-test: empty serial passed" >&2
+    exit 1
+  fi
+  grep -Fq "RESULT: FAIL (serial empty)" "$tmp_dir/empty.out" || {
+    echo "STATUS: FAIL nvme-rv64-boot self-test: empty serial reason absent" >&2
+    exit 1
+  }
+
+  if PATH="$fake_bin:$PATH" NVME_RV64_FAKE_SERIAL=fail NVME_RV64_BOOT_LOG="$tmp_dir/fail.log" sh "$0" "$fake_elf" >"$tmp_dir/fail.out" 2>&1; then
+    echo "STATUS: FAIL nvme-rv64-boot self-test: serial FAIL marker passed" >&2
+    exit 1
+  fi
+  grep -Fq "RESULT: FAIL (serial failure marker found)" "$tmp_dir/fail.out" || {
+    echo "STATUS: FAIL nvme-rv64-boot self-test: serial FAIL reason absent" >&2
+    exit 1
+  }
+
+  echo "STATUS: PASS nvme-rv64-boot self-test"
+  exit 0
+fi
+
+ELF="${1:-build/nvme_fw_rv64.elf}"
+LOG="${NVME_RV64_BOOT_LOG:-build/nvme_fw_rv64_serial.log}"
+PRINT_LOG="${LOG}.print"
+if [ ! -f "$ELF" ]; then
+  echo "missing-media: $ELF (run examples/09_embedded/simpleos_nvme_fw/fw_rv64/build.shs first)"
+  exit 2
+fi
+mkdir -p "$(dirname "$LOG")"; rm -f "$LOG"
+# RV64 firmware links at 0x80200000 as an OpenSBI S-mode payload.
+timeout 15 qemu-system-riscv64 -machine virt -cpu rv64 -m 128M -nographic \
+  -kernel "$ELF" -serial file:"$LOG" </dev/null >/dev/null 2>&1
+awk 'NR <= 80 { print } NR == 81 { print "... serial truncated ..." }' "$LOG" >"$PRINT_LOG" 2>/dev/null || true
+echo "--- serial ---"; cat "$PRINT_LOG" 2>/dev/null; echo "--- end ---"
+if [ ! -s "$LOG" ]; then
+  echo "RESULT: FAIL (serial empty)"; exit 1
+fi
+if ! grep -q "ALL RV64 NVME FW CHECKS PASS" "$LOG" 2>/dev/null; then
+  echo "RESULT: FAIL (marker not found)"; exit 1
+fi
+if grep -q "FAIL" "$LOG" 2>/dev/null; then
+  echo "RESULT: FAIL (serial failure marker found)"; exit 1
+fi
+echo "RESULT: PASS"

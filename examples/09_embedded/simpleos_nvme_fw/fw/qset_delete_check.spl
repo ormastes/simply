@@ -1,0 +1,32 @@
+"""
+qset_delete_check — IO queue delete must not drop pending host work.
+
+Run: bin/simple run examples/09_embedded/simpleos_nvme_fw/fw/qset_delete_check.spl
+"""
+
+use nvme_types.*
+use nvme_qset.*
+use hil_queue.*
+
+fn main():
+    var fail: i64 = 0
+    var qs: QueueSet = queue_set_new()
+
+    fail = fail + expect_eq(qs.create_cq(1, 64), SC_SUCCESS, "create CQ")
+    fail = fail + expect_eq(qs.create_sq(1, 64, 1), SC_SUCCESS, "create SQ")
+    fail = fail + expect_eq(bool_to_i64(qs.sq_submit(1, cmd_make(88, OP_READ, 0, 1, 0))), 1, "submit SQ")
+    fail = fail + expect_eq(qs.delete_sq(1), SC_QUEUE_BUSY, "delete pending SQ rejected")
+    val cmd: NvmeCmd = qs.sq_fetch(1)
+    fail = fail + expect_eq(cmd.cid, 88, "pending SQ entry survives rejected delete")
+    fail = fail + expect_eq(qs.delete_sq(1), SC_SUCCESS, "delete drained SQ")
+
+    fail = fail + expect_eq(bool_to_i64(qs.cq_post(1, cpl_make(89, SC_SUCCESS, 0x44))), 1, "post CQ")
+    fail = fail + expect_eq(qs.delete_cq(1), SC_QUEUE_BUSY, "delete pending CQ rejected")
+    val cpl: NvmeCpl = qs.cq_reap(1)
+    fail = fail + expect_eq(cpl.cid, 89, "pending CQ entry survives rejected delete")
+    fail = fail + expect_eq(qs.delete_cq(1), SC_SUCCESS, "delete drained CQ")
+
+    if fail == 0:
+        print "QSET DELETE OK"
+    else:
+        print "QSET DELETE FAIL ({fail})"

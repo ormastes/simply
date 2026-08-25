@@ -1,0 +1,214 @@
+#!/usr/bin/env simple
+# Spawn Keyword and Actor Syntax Example
+#
+# Demonstrates the new spawn keyword and actor definitions.
+# NOTE: Requires parser support (in progress).
+
+# ================================================================
+# Actor Definitions
+# ================================================================
+
+# Simple actor
+actor Counter:
+    """A counter actor with message handlers."""
+    var value: i64
+
+    fn init():
+        """Constructor - called when actor is spawned."""
+        self.value = 0
+
+    fn increment():
+        """Message handler - increment counter."""
+        self.value += 1
+        print "Counter: {self.value}"
+
+    fn decrement():
+        """Message handler - decrement counter."""
+        self.value -= 1
+        print "Counter: {self.value}"
+
+    fn get() -> i64:
+        """Message handler with return value."""
+        self.value
+
+    fn cleanup():
+        """Destructor - called when actor stops."""
+        print "Counter stopped at {self.value}"
+
+# Worker actor with typed messages
+actor Worker:
+    """Worker that processes tasks."""
+    var id: i64
+    var tasks_processed: i64
+
+    fn init(id: i64):
+        self.id = id
+        self.tasks_processed = 0
+
+    fn process(task: Task):
+        """Process a task."""
+        print "Worker {self.id} processing: {task.name}"
+        self.tasks_processed += 1
+
+    fn get_stats() -> WorkerStats:
+        """Get worker statistics."""
+        WorkerStats(id: self.id, processed: self.tasks_processed)
+
+# Supervisor actor
+actor Supervisor:
+    """Supervises a pool of workers."""
+    var workers: [ActorRef<Worker>]
+    var next_worker: i64
+
+    fn init(worker_count: i64):
+        self.workers = []
+        self.next_worker = 0
+
+        # Spawn workers
+        for i in 0..worker_count:
+            val worker = spawn Worker(id: i)
+            self.workers.push(worker)
+
+    fn dispatch(task: Task):
+        """Dispatch task to next worker (round-robin)."""
+        val worker = self.workers[self.next_worker % self.workers.len()]
+        worker.send(process, task)
+        self.next_worker += 1
+
+    fn stop_all():
+        """Stop all workers."""
+        for worker in self.workers:
+            worker.send(stop)
+
+# ================================================================
+# Using Spawn Keyword
+# ================================================================
+
+fn example_spawn():
+    """Examples of spawning actors."""
+
+    # Spawn single actor
+    val counter = spawn Counter()
+
+    # Send messages (fire-and-forget)
+    counter.send(increment)
+    counter.send(increment)
+    counter.send(decrement)
+
+    # Request-response
+    val value = await counter.ask(get)
+    print "Counter value: {value}"
+
+    # Spawn with arguments
+    val worker = spawn Worker(id: 1)
+    worker.send(process, Task(name: "task1"))
+
+    # Spawn multiple actors
+    val workers = [for i in 0..10: spawn Worker(id: i)]
+
+    # Spawn supervisor
+    val supervisor = spawn Supervisor(worker_count: 5)
+    supervisor.send(dispatch, Task(name: "important"))
+
+# ================================================================
+# Actor Patterns
+# ================================================================
+
+fn example_ping_pong():
+    """Ping-pong pattern with two actors."""
+
+    actor Ping:
+        var pong: ActorRef<Pong>
+        var count: i64
+
+        fn init(pong: ActorRef<Pong>):
+            self.pong = pong
+            self.count = 0
+
+        fn start():
+            self.pong.send(ping, 0)
+
+        fn pong(n: i64):
+            if n < 10:
+                print "Ping: {n}"
+                self.pong.send(ping, n + 1)
+
+    actor Pong:
+        var ping: ActorRef<Ping>
+
+        fn init(ping: ActorRef<Ping>):
+            self.ping = ping
+
+        fn ping(n: i64):
+            print "Pong: {n}"
+            self.ping.send(pong, n)
+
+    # Create actors with circular references
+    val pong_ref = spawn Pong(ping: nil)  # Placeholder
+    val ping_ref = spawn Ping(pong: pong_ref)
+
+    # Update pong's ping reference
+    pong_ref.send(set_ping, ping_ref)
+
+    # Start ping-pong
+    ping_ref.send(start)
+
+# ================================================================
+# Actor Lifecycle
+# ================================================================
+
+fn example_lifecycle():
+    """Actor lifecycle management."""
+
+    actor LifecycleDemo:
+        fn init():
+            print "Actor created"
+
+        fn on_start():
+            """Called when actor starts processing."""
+            print "Actor started"
+
+        fn on_message(msg: text):
+            """Called for each message."""
+            print "Received: {msg}"
+
+        fn on_stop():
+            """Called when actor is stopping."""
+            print "Actor stopping"
+
+        fn cleanup():
+            """Called after actor stops."""
+            print "Actor cleaned up"
+
+    val actor = spawn LifecycleDemo()
+    actor.send(on_message, "hello")
+    actor.send(stop)  # Graceful shutdown
+
+# ================================================================
+# Type Definitions
+# ================================================================
+
+struct Task:
+    name: text
+
+struct WorkerStats:
+    id: i64
+    processed: i64
+
+# ActorRef is provided by runtime
+# type ActorRef<T> = ... (opaque handle)
+
+# ================================================================
+# Notes
+# ================================================================
+
+# The spawn keyword compiles to:
+#
+# val actor = spawn Worker(id: 1)
+#
+# Becomes:
+#
+# val actor = get_actor_runtime().spawn_actor(Worker(id: 1))
+#
+# Actors are lightweight (1KB each) and communicate via messages.
+# The runtime handles scheduling and message delivery.

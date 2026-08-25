@@ -1,0 +1,452 @@
+"""
+fil_nand_emu — Vt-physics NAND backend (opt-in alternate to fil_nand_device).
+
+Where `fil_nand_device` drives a *behavioural* ONFI chip (one i64 per page,
+status flags synthesised directly), this backend stores the page's main byte in
+a real threshold-voltage cell array — the `hardware.nand_emu` NeChip emulator
+(profile S1) — and drives it through the SAME pin-level command / address / data
+handshake:
+
+    READ    :  00h , <col,row> , 30h , (data_out streams the page register)
+    PROGRAM :  80h , <col,row> , (data_in) , 10h
+    ERASE   :  60h , <row>     , D0h
+    STATUS  :  70h            (read status register — I/O0 = FAIL)
+
+Because the byte now lives in physical cells, a page read reflects the analog Vt
+after lazy retention / read-disturb drift: an aged, worn block reads back with
+real bit flips at the default read reference and reads clean once the reference
+is shifted (read-retry) — the FTL-visible failure the Vt model exists to produce.
+This is the payoff over `fil_nand_device`, whose bytes never decay.
+
+Drop-in contract: `NandEmu` exposes the exact same public seam as
+`fil_nand_device.NandDevice` / `fil_nand.Nand`
+(`program / read_page / erase_block / erase_count / inject_prog_fail /
+inject_erase_fail / inject_read_bitflip / corrupt_page_data / set_bad`),
+returning the shared `fil_nand.NandRead`. It is an API-compatible drop-in and is
+verified at the device level (fil_nand_emu_check.spl); it is NOT wired as the
+default backend and end-to-end fil/ftl has NOT been exercised on it, because
+`fil.spl` currently hardcodes `NandDevice` with no backend-selection seam (adding
+that seam is out of scope here — `fil.spl`/`ftl*.spl` must stay untouched). Once a
+seam exists this backend is selected explicitly by a test that wants the physics.
+
+Two honest divergences from `fil_nand_device`, both because this backend is
+*real-NAND faithful* rather than a placeholder:
+  1. An erased / never-programmed page reads FFh (the real NAND erased state),
+     not 0 — `fil_nand_device` returns a placeholder 0. OOB still reads UNMAP.
+  2. The `err` field carries a PHYSICS-derived bit-error count — popcount(sensed
+     XOR last-written byte, via the per-page `shadow`) — with any injected flips
+     added on top, where `fil_nand_device` reports only the injected count. So
+     retention / read-disturb drift surfaces a real corrected-bit count (not just
+     wrong data): a drooped single cell reads back as an ECC-correctable single-bit
+     error, a heavily-drifted page as an honest uncorrectable one. Consequence: a
+     `corrupt_page_data` overwrite is counted the same way (sensed diverges from
+     the written intent), so it is caught via the bit-error path — a 3+bit silent
+     corrupt now correctly FAILs instead of risking a syndrome mis-correction.
+
+Geometry: the firmware addresses a 64-block × 64-page space (nvme_types), while
+the S1 emulator backs 8 blocks × 4 pages. Firmware addresses are folded into the
+S1 window (block mod 8, page mod 4); distinct (block<8, page<4) addresses map
+1:1 and round-trip exactly. Addresses beyond the window alias — the documented
+S1 shrink behaviour (doc §4), acceptable for an opt-in physics backend.
+
+Test seam (for FTL fault-injection tests): `inject` / `advance_time_s` /
+`set_vref_offset` forward to the NeChip, and `set_block_wear` seeds a block's
+program/erase-cycle count so a "worn" block can be modelled without simulating
+thousands of real erases (pe_cycles IS the emulator's entire wear state, so
+seeding it is identical to having cycled the block that many times).
+"""
+
+use nvme_types.*
+use fil_nand.*   # NandRead (shared FIL read result {data, lba, seq, ecc, err})
+use fil_ecc.*
+use std.hardware.nand_emu.chip.{NeChip, ne_chip_new}
+use std.hardware.nand_emu.nand_types.{NeProfile, NeGeometry, NeFault}
+use std.hardware.nand_emu.nand_types.{ne_erased_byte, ne_vt_prog_mean, ne_vt_erase_mean}
+use std.hardware.nand_emu.geometry.ne_cell_index
+use std.hardware.nand_emu.vt_array.{ne_block_meta_get, ne_block_meta_set}
+
+# ── ONFI opcodes + status bit (mirror fil_nand_device / doc §1.3, §1.4) ────────
+val EMU_READ_1ST:  i64 = 0x00
+val EMU_READ_2ND:  i64 = 0x30
+val EMU_PROG_1ST:  i64 = 0x80
+val EMU_PROG_2ND:  i64 = 0x10
+val EMU_ERASE_1ST: i64 = 0x60
+val EMU_ERASE_2ND: i64 = 0xD0
+val EMU_STATUS_FAIL: i64 = 0x01   # 70h I/O0 = 1 on failure
+
+# ── Address shrink: fold a firmware ppn/blk into the S1 window ─────────────────
+fn emu_fold_row(fw_ppn: i64, geo: NeGeometry) -> i64:
+    """Fold a firmware page number (0..NUM_PAGES) into an S1 row (0..total_pages):
+    block mod S1-blocks, page mod S1-pages-per-block. 1:1 for block<8, page<4."""
+    val blk: i64 = ppn_block(fw_ppn)
+    val page: i64 = ppn_page(fw_ppn)
+    val ne_blk: i64 = blk % geo.blocks
+    val ne_page: i64 = page % geo.pages_per_block
+    ne_blk * geo.pages_per_block + ne_page
+
+fn emu_fold_blk(fw_blk: i64, geo: NeGeometry) -> i64:
+    """Fold a firmware block index into the S1 block window (block mod S1-blocks)."""
+    fw_blk % geo.blocks
+
+fn emu_first_row_of_blk(ne_blk: i64, geo: NeGeometry) -> i64:
+    """First S1 row of an S1 block (its lowest page)."""
+    ne_blk * geo.pages_per_block
+
+fn emu_erase_counter_next(v: i64) -> i64:
+    """Saturating erase-count increment (matches nand_device_erase_counter_next)."""
+    if v < 0:
+        return 1
+    if v >= FW_SAFE_I64_LIMIT:
+        return FW_SAFE_I64_LIMIT
+    v + 1
+
+fn emu_popcount8(v: i64) -> i64:
+    """Number of set bits in the low 8 bits of `v` (0..8). Used to derive the
+    physics bit-error count of a read as popcount(sensed XOR last-written byte)."""
+    var x: i64 = v & 0xFF
+    var count: i64 = 0
+    var bit: i64 = 0
+    while bit < 8:
+        count = count + ((x >> bit) & 1)
+        bit = bit + 1
+    count
+
+# ── Pin-level address latching (return-the-object; chip is a value type) ───────
+fn emu_latch_addr5(chip: NeChip, row: i64) -> NeChip:
+    """Drive the 5-cycle READ/PROGRAM address (column 0, the given row) onto the
+    ALE pin, one byte per cycle (doc §1.2 cycle map)."""
+    var c = chip
+    c = c.addr(0)                    # cyc1: column A0-A7  = 0
+    c = c.addr(0)                    # cyc2: column A8-A12 = 0
+    c = c.addr(row & 0xFF)           # cyc3: row A13-A20
+    c = c.addr((row >> 8) & 0xFF)    # cyc4: row A21-A28
+    c = c.addr((row >> 16) & 0x3)    # cyc5: row A29-A30
+    c
+
+fn emu_latch_addr3(chip: NeChip, row: i64) -> NeChip:
+    """Drive the 3-cycle ERASE address (row only) onto the ALE pin (doc §1.2)."""
+    var c = chip
+    c = c.addr(row & 0xFF)
+    c = c.addr((row >> 8) & 0xFF)
+    c = c.addr((row >> 16) & 0x3)
+    c
+
+# ── NandEmu: the physics-backed drop-in device ────────────────────────────────
+struct NandEmu:
+    """A NAND device backed by the Vt-physics NeChip emulator. Composition, not
+    inheritance: the analog media is the NeChip; OOB metadata, the no-overwrite
+    guard, bad-block / fault flags and erase counters are kept alongside it (same
+    role they play in fil_nand_device), all indexed by the folded S1 row/block."""
+    chip: NeChip
+    oob_lba:    [i64]   # S1 total_pages, spare-area logical addr (UNMAP if unwritten)
+    oob_seq:    [i64]   # S1 total_pages, spare-area write sequence number
+    oob_ecc:    [i64]   # S1 total_pages, spare-area ECC stored at program time
+    programmed: [i64]   # S1 total_pages, 1 = page holds data (no overwrite w/o erase)
+    injected:   [i64]   # S1 total_pages, injected read bit-flip count (adds to err)
+    shadow:     [i64]   # S1 total_pages, last-written payload byte (0xFF = erased);
+                        #   read_page derives the PHYSICS bit-error count as
+                        #   popcount(sensed XOR shadow) so retention/disturb drift
+                        #   surfaces a real corrected-bit count, not only injection.
+    bad_block:  [i64]   # S1 blocks, 1 = block retired
+    blk_erase:  [i64]   # S1 blocks, cumulative erase count
+    prog_fail:  [i64]   # S1 blocks, 1 = next program to this block fails (one-shot)
+    erase_fail: [i64]   # S1 blocks, 1 = next erase of this block fails (one-shot)
+
+fn nand_emu_new() -> NandEmu:
+    """Construct a fresh S1-backed emulated device: an idle NeChip plus empty OOB
+    and per-block state. The Vt array itself is allocated lazily by the NeChip on
+    its first operation (erased distribution), so a never-programmed page reads FFh."""
+    val chip = ne_chip_new(NeProfile.S1)
+    val geo = chip.geometry
+    var oob_lba:    [i64] = []
+    var oob_seq:    [i64] = []
+    var oob_ecc:    [i64] = []
+    var programmed: [i64] = []
+    var injected:   [i64] = []
+    var shadow:     [i64] = []
+    var i: i64 = 0
+    while i < geo.total_pages:
+        oob_lba.push(UNMAP)
+        oob_seq.push(0)
+        oob_ecc.push(0)
+        programmed.push(0)
+        injected.push(0)
+        shadow.push(0xFF)          # erased pages sense FFh -> zero physics error
+        i = i + 1
+
+    var bad_block:  [i64] = []
+    var blk_erase:  [i64] = []
+    var prog_fail:  [i64] = []
+    var erase_fail: [i64] = []
+    i = 0
+    while i < geo.blocks:
+        bad_block.push(0)
+        blk_erase.push(0)
+        prog_fail.push(0)
+        erase_fail.push(0)
+        i = i + 1
+
+    NandEmu(chip: chip, oob_lba: oob_lba, oob_seq: oob_seq, oob_ecc: oob_ecc, programmed: programmed, injected: injected, shadow: shadow, bad_block: bad_block, blk_erase: blk_erase, prog_fail: prog_fail, erase_fail: erase_fail)
+
+impl NandEmu:
+    # ── High-level FIL seam (drop-in for fil_nand_device.NandDevice) ───────────
+    me program(ppn: i64, lba: i64, seq: i64, data: i64) -> i64:
+        """Program one page (main byte + OOB) via the ONFI pin handshake. Returns
+        NAND_OK / NAND_BAD_BLOCK / NAND_PROG_FAIL, matching fil_nand_device: bad
+        block and one-shot program faults are rejected up front, an already-written
+        page is refused (NAND cannot overwrite without an erase), and a NeChip-level
+        program failure (an armed ProgramFail fault) surfaces as the 70h FAIL bit."""
+        if not ppn_in_range(ppn):
+            return NAND_BAD_BLOCK
+        val geo = me.chip.geometry
+        val row: i64 = emu_fold_row(ppn, geo)
+        val ne_blk: i64 = row / geo.pages_per_block
+        if ne_blk >= me.bad_block.len():
+            return NAND_BAD_BLOCK
+        if me.bad_block[ne_blk] != 0:
+            return NAND_BAD_BLOCK
+        if me.prog_fail[ne_blk] != 0:
+            me.prog_fail[ne_blk] = 0
+            return NAND_PROG_FAIL
+        if row >= me.programmed.len():
+            return NAND_BAD_BLOCK
+        if me.programmed[row] != 0:
+            return NAND_PROG_FAIL
+        # Pin sequence: 80h , <col=0,row> , data_in , 10h .
+        var c = me.chip
+        c = c.cmd(EMU_PROG_1ST)          # presets page register to FFh, opens load
+        c = emu_latch_addr5(c, row)      # -> ProgLoad, cur_row = row, col_counter = 0
+        c = c.data_in(data & 0xFF)       # main byte into column 0
+        c = c.cmd(EMU_PROG_2ND)          # execute (MODEL busy) -> status.pass set
+        me.chip = c
+        if (me.chip.read_status() & EMU_STATUS_FAIL) == EMU_STATUS_FAIL:
+            return NAND_PROG_FAIL
+        me.oob_lba[row] = lba
+        me.oob_seq[row] = seq
+        me.oob_ecc[row] = ecc_compute(data, lba, seq)
+        me.programmed[row] = 1
+        me.shadow[row] = data & 0xFF     # record intent for the physics err count
+        NAND_OK
+
+    me read_page(ppn: i64) -> NandRead:
+        """Read one page via the ONFI handshake. `data` is the byte sensed from the
+        Vt cells at column 0 (so it reflects retention / disturb drift); OOB and the
+        stored ECC come from the spare area; `err` is the injected bit-flip count.
+        An out-of-range page reports an uncorrectable read (err = 2), as
+        fil_nand_device does; a never-programmed page senses FFh (erased)."""
+        if not ppn_in_range(ppn):
+            return NandRead(data: 0, lba: UNMAP, seq: 0, ecc: 0, err: 2)
+        val geo = me.chip.geometry
+        val row: i64 = emu_fold_row(ppn, geo)
+        # Pin sequence: 00h , <col=0,row> , 30h , data_out .
+        var c = me.chip
+        c = c.cmd(EMU_READ_1ST)
+        c = emu_latch_addr5(c, row)      # -> AddrLatch(00h,5), cur_row = row, col 0
+        c = c.cmd(EMU_READ_2ND)          # sense page into the register (MODEL busy)
+        val databyte: i64 = c.data_out() # stream column 0 (advances the column counter)
+        me.chip = c
+        # Physics-derived bit-error count: how many bits of the sensed byte differ
+        # from the last-written payload (retention / read-disturb drift makes drooped
+        # programmed cells sense 1). This models the corrected-bit telemetry a real
+        # ECC decoder reports for a page — NOT a claim that hardware compares against
+        # written data. Injected flips (fault-injection) ADD to it, so a test can
+        # stack an artificial count on top of real drift.
+        var inj: i64 = me.injected[row]
+        if inj < 0:
+            inj = 0
+        val phys: i64 = emu_popcount8(databyte ^ (me.shadow[row] & 0xFF))
+        val err: i64 = phys + inj
+        NandRead(data: databyte, lba: me.oob_lba[row], seq: me.oob_seq[row], ecc: me.oob_ecc[row], err: err)
+
+    me read_at_vref(ppn: i64, offset: i64) -> NandRead:
+        """Read one page at a shifted read reference (read-retry ladder primitive).
+        Captures the chip's current Vref offset, applies `offset` (chip-global:
+        vref = 128 + offset), senses at that reference, then RESTORES the prior
+        offset before returning — set→read→restore is atomic within the call so no
+        shifted reference leaks to a later read. The sense still materialises lazy
+        retention drift and advances the emulated clock exactly as read_page does
+        (only the comparison threshold moves), so a drooped programmed cell that
+        reads 1 at the default reference reads 0 again here while stored Vt / clock
+        stay consistent. Out-of-range folds to an uncorrectable read (err = 2)."""
+        if not ppn_in_range(ppn):
+            return NandRead(data: 0, lba: UNMAP, seq: 0, ecc: 0, err: 2)
+        val prior: i64 = me.chip.vref_offset
+        me.chip = me.chip.set_vref_offset(offset)
+        val rd: NandRead = me.read_page(ppn)
+        me.chip = me.chip.set_vref_offset(prior)
+        rd
+
+    me erase_block(blk: i64) -> i64:
+        """Erase one block via the ONFI handshake (60h , <row> , D0h). Returns
+        NAND_OK / NAND_BAD_BLOCK / NAND_ERASE_FAIL. On success the four folded pages
+        return to the erased state (OOB -> UNMAP, cells -> FFh) and the erase count
+        bumps; a bad block or an armed one-shot erase fault is rejected."""
+        if not block_in_range(blk):
+            return NAND_BAD_BLOCK
+        val geo = me.chip.geometry
+        val ne_blk: i64 = emu_fold_blk(blk, geo)
+        if ne_blk >= me.bad_block.len():
+            return NAND_BAD_BLOCK
+        if me.bad_block[ne_blk] != 0:
+            return NAND_BAD_BLOCK
+        if me.erase_fail[ne_blk] != 0:
+            me.erase_fail[ne_blk] = 0
+            return NAND_ERASE_FAIL
+        val first: i64 = emu_first_row_of_blk(ne_blk, geo)
+        var c = me.chip
+        c = c.cmd(EMU_ERASE_1ST)
+        c = emu_latch_addr3(c, first)    # -> EraseSetup, cur_row in ne_blk
+        c = c.cmd(EMU_ERASE_2ND)         # execute erase (MODEL busy)
+        me.chip = c
+        if (me.chip.read_status() & EMU_STATUS_FAIL) == EMU_STATUS_FAIL:
+            return NAND_ERASE_FAIL
+        var pg: i64 = 0
+        while pg < geo.pages_per_block:
+            val r: i64 = first + pg
+            me.oob_lba[r] = UNMAP
+            me.oob_seq[r] = 0
+            me.oob_ecc[r] = 0
+            me.programmed[r] = 0
+            me.injected[r] = 0
+            me.shadow[r] = 0xFF          # back to the erased state
+            pg = pg + 1
+        me.blk_erase[ne_blk] = emu_erase_counter_next(me.blk_erase[ne_blk])
+        NAND_OK
+
+    me erase_count(blk: i64) -> i64:
+        """Cumulative erase count of a block (folded), clamped to a safe range."""
+        if not block_in_range(blk):
+            return 0
+        val ne_blk: i64 = emu_fold_blk(blk, me.chip.geometry)
+        if ne_blk >= me.blk_erase.len():
+            return 0
+        if me.blk_erase[ne_blk] < 0:
+            return 0
+        if me.blk_erase[ne_blk] > FW_SAFE_I64_LIMIT:
+            return FW_SAFE_I64_LIMIT
+        me.blk_erase[ne_blk]
+
+    # ── fault / test hooks (same surface as fil_nand_device.NandDevice) ────────
+    me inject_prog_fail(blk: i64):
+        """Arm a one-shot program failure on the next program to this block."""
+        if not block_in_range(blk):
+            return
+        val ne_blk: i64 = emu_fold_blk(blk, me.chip.geometry)
+        if ne_blk < me.prog_fail.len():
+            me.prog_fail[ne_blk] = 1
+
+    me inject_erase_fail(blk: i64):
+        """Arm a one-shot erase failure on the next erase of this block."""
+        if not block_in_range(blk):
+            return
+        val ne_blk: i64 = emu_fold_blk(blk, me.chip.geometry)
+        if ne_blk < me.erase_fail.len():
+            me.erase_fail[ne_blk] = 1
+
+    me inject_read_bitflip(ppn: i64, n: i64):
+        """Set the reported read bit-flip count for a page (negative clamps to 0)."""
+        if not ppn_in_range(ppn):
+            return
+        val row: i64 = emu_fold_row(ppn, me.chip.geometry)
+        if row >= me.injected.len():
+            return
+        if n < 0:
+            me.injected[row] = 0
+            return
+        me.injected[row] = n
+
+    me corrupt_page_data(ppn: i64, data: i64):
+        """Overwrite the column-0 Vt cells so the page senses `data`, leaving the
+        stored OOB ECC and the written-intent `shadow` untouched (mirrors
+        fil_nand_device.corrupt_page_data). Because the sensed byte then diverges
+        from the written intent, the next read reports the divergence as a
+        bit-error count (popcount(sensed XOR intent)) — so the FIL ECC layer
+        catches it via the flips path (definitively FAIL for a multi-bit corrupt),
+        as well as against the stored `ecc`. No effect on an unallocated
+        (never-touched) page."""
+        if not ppn_in_range(ppn):
+            return
+        val geo = me.chip.geometry
+        val row: i64 = emu_fold_row(ppn, geo)
+        var c = me.chip
+        var vt = c.vt
+        val top: i64 = ne_cell_index(row, 0, 7, geo.page_bytes)
+        if top >= vt.len():
+            return
+        var bit: i64 = 0
+        while bit < 8:
+            val idx: i64 = ne_cell_index(row, 0, bit, geo.page_bytes)
+            if ((data >> bit) & 1) == 1:
+                vt[idx] = ne_vt_erase_mean() as u8   # senses 1 (erased)
+            else:
+                vt[idx] = ne_vt_prog_mean() as u8    # senses 0 (programmed)
+            bit = bit + 1
+        c.vt = vt
+        me.chip = c
+
+    me set_bad(blk: i64):
+        """Retire a block (subsequent program/erase to it fail closed)."""
+        if not block_in_range(blk):
+            return
+        val ne_blk: i64 = emu_fold_blk(blk, me.chip.geometry)
+        if ne_blk < me.bad_block.len():
+            me.bad_block[ne_blk] = 1
+
+    # ── NeChip test API exposed for FTL retention / SPO tests ──────────────────
+    me inject(f: NeFault):
+        """Arm a NeChip fault descriptor (SPO / ProgramFail / EraseFail /
+        TimeAdvance). Coordinates in `f` (target_row / target_block) are CHIP
+        (folded S1) coordinates; use target_row = -1 to target the next matching
+        op regardless of address."""
+        me.chip = me.chip.inject(f)
+
+    me advance_time_s(seconds: f64):
+        """Advance the emulator's clock (retention / disturb driver). Drift is
+        applied lazily at the next sense."""
+        me.chip = me.chip.advance_time_s(seconds)
+
+    me set_vref_offset(offset: i64):
+        """Shift the read reference for read-retry: vref = 128 + offset. A drooped
+        (aged) programmed cell that reads 1 at the default reference reads 0 again
+        once the reference is lowered."""
+        me.chip = me.chip.set_vref_offset(offset)
+
+    me vt_histogram(ppn: i64) -> [i64]:
+        """Re-export the NeChip per-page stored-Vt histogram (256 bins) for soft
+        observability (arch doc §3 prereq 3, §5). `ppn` is a firmware page number,
+        folded into the S1 window exactly like read_page so a spec inspects the same
+        cells it programmed. A half-programmed page shows two lobes (an erased lobe
+        below the read reference and a programmed lobe at/above it). Read-only."""
+        if not ppn_in_range(ppn):
+            var empty: [i64] = []
+            return empty
+        val row: i64 = emu_fold_row(ppn, me.chip.geometry)
+        me.chip.vt_histogram(row)
+
+    me read_margin(ppn: i64) -> i64:
+        """Re-export the NeChip read margin (valley width in Vt codes between the
+        erased and programmed lobes) for `ppn` (folded like read_page). Positive on a
+        freshly-programmed page whose two lobes are cleanly separated; narrows as
+        retention drift pulls the programmed lobe down toward the reference; 0 when
+        the page has a single lobe (all erased or all programmed). Read-only."""
+        if not ppn_in_range(ppn):
+            return 0
+        val row: i64 = emu_fold_row(ppn, me.chip.geometry)
+        me.chip.read_margin(row)
+
+    me set_block_wear(blk: i64, pe_cycles: i64):
+        """Seed a block's program/erase-cycle count so it can be modelled as worn
+        without simulating thousands of real erases. pe_cycles is the emulator's
+        entire wear state (it scales retention loss), so seeding it is identical to
+        having cycled the block that many times. Requires the block metadata to be
+        allocated (any prior op on the chip does so)."""
+        if not block_in_range(blk):
+            return
+        val ne_blk: i64 = emu_fold_blk(blk, me.chip.geometry)
+        var c = me.chip
+        if ne_blk >= c.block_metas.len():
+            return
+        var m = ne_block_meta_get(c.block_metas, ne_blk)
+        m.pe_cycles = pe_cycles
+        c.block_metas = ne_block_meta_set(c.block_metas, ne_blk, m)
+        me.chip = c

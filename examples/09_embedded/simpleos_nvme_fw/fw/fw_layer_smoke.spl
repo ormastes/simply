@@ -1,0 +1,47 @@
+"""
+fw_layer_smoke — short system-test entrypoint for the live firmware stack.
+
+This keeps SSpec subprocess output small while still exercising the composed
+Firmware -> HIL -> FTL -> FIL path.
+"""
+
+use nvme_types.*
+use firmware.*
+use openssd_config.*
+
+fn main():
+    var fail: i64 = 0
+    var fw: Firmware = firmware_new_for_target(TARGET_OPENSSD_8CH8WAY)
+
+    fail = fail + expect_eq(fw.hardware_target(), 1, "smoke: OpenSSD target selected")
+    fail = fail + expect_eq(fw.target_channels(), NUM_CHANNELS, "smoke: OpenSSD channel count")
+    fail = fail + expect_eq(fw.target_ways_per_channel(), 8, "smoke: OpenSSD ways per channel")
+    fail = fail + expect_eq(fw.target_nvme_blocks_per_slice(), 4, "smoke: OpenSSD slice geometry")
+    fail = fail + expect_eq(fw.target_cpu_cores(), 2, "smoke: OpenSSD core count")
+
+    fw.submit(cmd_make(10, OP_WRITE, 10, 3, 0x30))
+    fail = fail + expect_eq(fw.service_tick(), 1, "smoke: one foreground tick")
+    fail = fail + expect_eq(fw.service(), 0, "smoke: no extra foreground work")
+    fw.reap_all()
+
+    fw.submit(cmd_make(11, OP_READ, 10, 1, 0))
+    fw.submit(cmd_make(12, OP_READ, 11, 1, 0))
+    fw.submit(cmd_make(13, OP_READ, 12, 1, 0))
+    fw.service()
+    val r0: NvmeCpl = fw.reap()
+    val r1: NvmeCpl = fw.reap()
+    val r2: NvmeCpl = fw.reap()
+    fail = fail + expect_eq(r0.data, 0x30, "smoke: multi-block byte 0")
+    fail = fail + expect_eq(r1.data, 0x31, "smoke: multi-block byte 1")
+    fail = fail + expect_eq(r2.data, 0x32, "smoke: multi-block byte 2")
+
+    fw.map_owner = MAP_OWNER_BG
+    fw.submit(cmd_make(14, OP_WRITE, 20, 1, 0x44))
+    fail = fail + expect_eq(fw.service_tick(), 0, "smoke: owner token blocks overlap")
+    fw.map_owner = MAP_OWNER_NONE
+    fail = fail + expect_eq(fw.service_tick(), 1, "smoke: owner release resumes foreground")
+
+    if fail == 0:
+        print "FW LAYER SMOKE PASS"
+    else:
+        print "FW LAYER SMOKE FAIL ({fail})"

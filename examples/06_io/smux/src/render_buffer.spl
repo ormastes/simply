@@ -1,0 +1,156 @@
+# Partial-Update Render Buffer
+# Manages a ring buffer of lines with dirty tracking for efficient terminal rendering.
+# Only re-renders changed lines using ANSI cursor positioning.
+
+# ============================================================================
+# ANSI Helpers
+# ============================================================================
+
+val ESC: text = "\u{001b}"
+
+fn ansi_move(row: i32, col: i32) -> text:
+    "{ESC}[{row};{col}H"
+
+fn ansi_clear_line() -> text:
+    "{ESC}[2K"
+
+fn ansi_clear_screen() -> text:
+    "{ESC}[2J"
+
+fn ansi_hide_cursor() -> text:
+    "{ESC}[?25l"
+
+fn ansi_show_cursor() -> text:
+    "{ESC}[?25h"
+
+fn ansi_enable_alt_screen() -> text:
+    "{ESC}[?1049h"
+
+fn ansi_disable_alt_screen() -> text:
+    "{ESC}[?1049l"
+
+fn ansi_reset() -> text:
+    "{ESC}[0m"
+
+# ============================================================================
+# Line Buffer
+# ============================================================================
+
+struct BufferLine:
+    content: text
+    dirty: bool
+
+# ============================================================================
+# Render Buffer
+# ============================================================================
+
+class RenderBuffer:
+    lines: [BufferLine]
+    width: i32
+    height: i32
+    scroll_offset: i32
+    total_lines: i32
+
+    static fn create(width: i32, height: i32) -> RenderBuffer:
+        var buf_lines: [BufferLine] = []
+        var i = 0
+        while i < height:
+            buf_lines.push(BufferLine(content: "", dirty: true))
+            i = i + 1
+        RenderBuffer(
+            lines: buf_lines,
+            width: width,
+            height: height,
+            scroll_offset: 0,
+            total_lines: 0
+        )
+
+    me resize(new_width: i32, new_height: i32):
+        self.width = new_width
+        # Add or remove lines as needed
+        while self.lines.len() < new_height:
+            self.lines.push(BufferLine(content: "", dirty: true))
+        self.height = new_height
+        # Mark all dirty on resize
+        self._mark_all_dirty()
+
+    me set_line(row: i32, content: text):
+        if row < 0 or row >= self.height:
+            return
+        val old = self.lines[row]
+        if old.content != content:
+            self.lines[row] = BufferLine(content: content, dirty: true)
+
+    me append_line(content: text):
+        # Shift lines up, add new at bottom
+        if self.total_lines >= self.height:
+            var i = 0
+            while i < self.height - 1:
+                self.lines[i] = self.lines[i + 1]
+                self.lines[i] = BufferLine(content: self.lines[i].content, dirty: true)
+                i = i + 1
+            self.lines[self.height - 1] = BufferLine(content: content, dirty: true)
+        else:
+            self.lines[self.total_lines] = BufferLine(content: content, dirty: true)
+            self.total_lines = self.total_lines + 1
+
+    me clear():
+        var i = 0
+        while i < self.height:
+            self.lines[i] = BufferLine(content: "", dirty: true)
+            i = i + 1
+        self.total_lines = 0
+        self.scroll_offset = 0
+
+    me scroll_up(amount: i32):
+        self.scroll_offset = self.scroll_offset - amount
+        if self.scroll_offset < 0:
+            self.scroll_offset = 0
+        self._mark_all_dirty()
+
+    me scroll_down(amount: i32):
+        self.scroll_offset = self.scroll_offset + amount
+        val max_offset = self.total_lines - self.height
+        if max_offset > 0 and self.scroll_offset > max_offset:
+            self.scroll_offset = max_offset
+        self._mark_all_dirty()
+
+    # Render only dirty lines (partial update)
+    me render_visible() -> text:
+        var output = ansi_hide_cursor()
+        var i = 0
+        while i < self.height:
+            val line = self.lines[i]
+            if line.dirty:
+                output = "{output}{ansi_move(i + 1, 1)}{ansi_clear_line()}{line.content}"
+                self.lines[i] = BufferLine(content: line.content, dirty: false)
+            i = i + 1
+        return output
+
+    # Full redraw (on scroll-up or resize)
+    me render_full() -> text:
+        self._mark_all_dirty()
+        var output = ansi_hide_cursor()
+        output = "{output}{ansi_clear_screen()}"
+        var i = 0
+        while i < self.height:
+            val line = self.lines[i]
+            output = "{output}{ansi_move(i + 1, 1)}{line.content}"
+            self.lines[i] = BufferLine(content: line.content, dirty: false)
+            i = i + 1
+        return output
+
+    fn has_dirty_lines() -> bool:
+        var i = 0
+        while i < self.height:
+            if self.lines[i].dirty:
+                return true
+            i = i + 1
+        return false
+
+    me _mark_all_dirty():
+        var i = 0
+        while i < self.height:
+            val line = self.lines[i]
+            self.lines[i] = BufferLine(content: line.content, dirty: true)
+            i = i + 1

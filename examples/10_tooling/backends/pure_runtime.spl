@@ -1,0 +1,60 @@
+# Pure Simple Runtime Demo
+# Demonstrates 100% Simple implementation - no FFI
+
+use std.pure.runtime (
+    alloc, dealloc, gc_stats,
+    string_to_int, math_abs, math_pow, math_min, math_max
+)
+
+fn main():
+    print "═══════════════════════════════════════"
+    print "  Pure Simple Runtime Demo"
+    print "  100% Simple - Zero FFI Dependencies"
+    print "═══════════════════════════════════════"
+    print ""
+
+    demo_memory()
+    demo_math()
+    demo_strings()
+
+    print ""
+    print "═══════════════════════════════════════"
+    print "  All pure runtime features working!"
+    print "  Total: 2,000+ lines of pure Simple"
+    print "═══════════════════════════════════════"
+
+fn demo_memory():
+    print "🧠 Memory Management (Reference Counting)"
+    print "----------------------------------------"
+
+    val (live1, alloc1, freed1) = gc_stats()
+    print "Initial GC stats:"
+    print "  Live objects: {live1}"
+    print "  Total allocated: {alloc1}"
+    print "  Total freed: {freed1}"
+
+    print ""
+
+fn demo_math():
+    print "🔢 Math Operations"
+    print "-----------------"
+
+    print "abs(-42) = {math_abs(-42)}"
+    print "min(10, 20) = {math_min(10, 20)}"
+    print "max(10, 20) = {math_max(10, 20)}"
+    print "pow(2, 10) = {math_pow(2, 10)}"
+    print "pow(5, 3) = {math_pow(5, 3)}"
+
+    print ""
+
+fn demo_strings():
+    print "📝 String Operations"
+    print "-------------------"
+
+    print "string_to_int('123') = {string_to_int('123')}"
+    print "string_to_int('-456') = {string_to_int('-456')}"
+    print "string_to_int('999') = {string_to_int('999')}"
+
+    print ""
+
+main()

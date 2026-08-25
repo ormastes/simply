@@ -1,0 +1,98 @@
+# x86_64 freestanding module-level val-initializer probe
+#
+# Minimal --entry-closure probe for the systemic bug:
+#   "freestanding module-level val/var initializers never run under
+#    x86_64-unknown-none native-build, so globals read garbage"
+#   (doc/08_tracking/bug/freestanding_entry_module_val_initializers_never_run_2026-07-06.md)
+#
+# Declares three module-level globals with compile-time-constant initializers
+# and prints them at boot. GATE:
+#   B=0   (bool false must read 0, NOT tagged-3-truthy)
+#   N=42  (i64)
+#   A=0x1000 (u64 address)
+#
+# Direct port-I/O serial + isa-debug-exit, no nvme/net/vmm — modeled on
+# abi_probe_entry.spl. Instrumentation labels are explicit serial_put(<ascii>)
+# to avoid the separate text-iteration bug.
+
+extern fn rt_port_inb(port: u64) -> u64
+extern fn rt_port_outb(port: u64, value: u64)
+
+# The three globals under test.
+val B: bool = false
+val N: i64 = 42
+val A: u64 = 0x1000
+
+fn serial_wait_ready():
+    var guard: i64 = 100000
+    while guard > 0:
+        if (rt_port_inb(0x3FD) & 0x20) != 0:
+            return
+        guard = guard - 1
+
+fn serial_put(ch: u64):
+    serial_wait_ready()
+    rt_port_outb(0x3F8, ch)
+
+fn serial_newline():
+    serial_put(13)
+    serial_put(10)
+
+fn serial_hex_nib(nib: u64):
+    if nib < 10:
+        serial_put(48 + nib)
+    else:
+        serial_put(87 + nib)
+
+fn serial_hex_u64(v: u64):
+    serial_put(48)
+    serial_put(120)
+    var shift: i64 = 60
+    var started: bool = false
+    while shift >= 0:
+        val nib = (v >> (shift as u64)) & 0xF
+        if nib != 0 or started or shift == 0:
+            started = true
+            serial_hex_nib(nib)
+        shift = shift - 4
+
+fn serial_dec_i64(v: i64):
+    if v < 0:
+        serial_put(45)
+        serial_dec_i64(0 - v)
+        return
+    if v >= 10:
+        serial_dec_i64(v / 10)
+    val digit = v % 10
+    serial_put((48 + digit) as u64)
+
+fn mark(c: u64):
+    serial_put(c)
+    serial_put(61)  # '='
+
+fn spl_start():
+    serial_put(80)
+    serial_put(49)
+    serial_newline()  # "P1"
+
+    # B: bool false -> expect 0
+    serial_put(77)  # 'M'
+    serial_put(32)
+    mark(66)  # 'B'=
+    if B:
+        serial_dec_i64(1)
+    else:
+        serial_dec_i64(0)
+    serial_put(32)
+    mark(78)  # 'N'=
+    serial_dec_i64(N)
+    serial_put(32)
+    mark(65)  # 'A'=
+    serial_hex_u64(A)
+    serial_newline()  # "M B=? N=? A=0x?"
+
+    serial_put(80)
+    serial_put(68)
+    serial_newline()  # "PD" (done)
+
+    rt_port_outb(0xF4, 0)

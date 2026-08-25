@@ -1,0 +1,191 @@
+# feature/monitor/dashboard — UI widget-based status display
+#
+# Uses std.ui builder API for structured widget tree output.
+
+use std.ui.{column, row, panel, label, text_widget, table_widget,
+             progress, statusbar, divider, build_tree_with_title, UITree,
+             input, button, text_field}
+use common.ui.widget.{UIState, UIEvent}
+
+fn dashboard_ui() -> UITree:
+    # Stats row
+    var agent_count_text = BK_AGENT_COUNT.to_text()
+    var task_count_text = BK_TASK_COUNT.to_text()
+    var completed_text = BK_COMPLETED.to_text()
+
+    val stats = row("stats", [
+        label("stat_agents", "Agents: " + agent_count_text),
+        label("stat_tasks", "Tasks: " + task_count_text),
+        label("stat_done", "Completed: " + completed_text)
+    ])
+
+    # Agent pool table
+    var agent_rows: [[text]] = []
+    var i = 0
+    while i < BK_AGENT_COUNT:
+        var ld = BK_AGENT_LOADS[i]
+        var mx = BK_AGENT_MAX_CONCURRENT[i]
+        agent_rows = agent_rows + [[
+            BK_AGENT_IDS[i],
+            BK_AGENT_STATUSES[i],
+            ld.to_text() + "/" + mx.to_text(),
+            BK_AGENT_CAPS[i]
+        ]]
+        i = i + 1
+
+    val agents_table = table_widget("agents_table",
+        ["ID", "Status", "Load", "Capabilities"],
+        agent_rows
+    )
+
+    # Task queue table
+    var task_rows: [[text]] = []
+    var j = 0
+    while j < BK_TASK_COUNT:
+        val agent = BK_TASK_AGENTS[j]
+        var agent_col = if agent != "": agent else: "-"
+        task_rows = task_rows + [[
+            BK_TASK_IDS[j],
+            BK_TASK_STATUSES[j],
+            agent_col,
+            BK_TASK_CONTENTS[j]
+        ]]
+        j = j + 1
+
+    val tasks_table = table_widget("tasks_table",
+        ["ID", "Status", "Agent", "Content"],
+        task_rows
+    )
+
+    # Compose full dashboard
+    val root = column("dashboard", [
+        stats,
+        divider("div1"),
+        panel("agents_panel", "Agent Pool", [agents_table]),
+        divider("div2"),
+        panel("tasks_panel", "Task Queue", [tasks_table]),
+        statusbar("status_bar", "mate-broker", "strategy: " + BK_STRATEGY)
+    ])
+
+    build_tree_with_title(root, "Mate Broker Dashboard", "dark")
+
+fn dashboard_interactive_ui() -> UITree:
+    var agent_count_text = BK_AGENT_COUNT.to_text()
+    var task_count_text = BK_TASK_COUNT.to_text()
+    var completed_text = BK_COMPLETED.to_text()
+
+    val stats = row("stats", [
+        label("stat_agents", "Agents: " + agent_count_text),
+        label("stat_tasks", "Tasks: " + task_count_text),
+        label("stat_done", "Completed: " + completed_text)
+    ])
+
+    var agent_rows: [[text]] = []
+    var ai = 0
+    while ai < BK_AGENT_COUNT:
+        var ld = BK_AGENT_LOADS[ai]
+        var mx = BK_AGENT_MAX_CONCURRENT[ai]
+        agent_rows = agent_rows + [[
+            BK_AGENT_IDS[ai],
+            BK_AGENT_STATUSES[ai],
+            ld.to_text() + "/" + mx.to_text(),
+            BK_AGENT_CAPS[ai]
+        ]]
+        ai = ai + 1
+
+    val agents_table = table_widget("agents_table",
+        ["ID", "Status", "Load", "Capabilities"],
+        agent_rows
+    )
+
+    var task_rows: [[text]] = []
+    var tj = 0
+    while tj < BK_TASK_COUNT:
+        val agent = BK_TASK_AGENTS[tj]
+        var agent_col = if agent != "": agent else: "-"
+        task_rows = task_rows + [[
+            BK_TASK_IDS[tj],
+            BK_TASK_STATUSES[tj],
+            agent_col,
+            BK_TASK_CONTENTS[tj]
+        ]]
+        tj = tj + 1
+
+    val tasks_table = table_widget("tasks_table",
+        ["ID", "Status", "Agent", "Content"],
+        task_rows
+    )
+
+    val task_form = panel("task_form", "Submit Task", [
+        row("task_inputs", [
+            text_field("task_content_input", INPUT_TASK_CONTENT, "Task description"),
+            text_field("task_caps_input", INPUT_TASK_CAPS, "Capabilities"),
+            button("submit_task_btn", "Submit", "submit_task")
+        ])
+    ])
+
+    val agent_form = panel("agent_form", "Register Agent", [
+        row("agent_inputs", [
+            text_field("agent_id_input", INPUT_AGENT_ID, "Agent ID"),
+            text_field("agent_caps_input", INPUT_AGENT_CAPS, "Capabilities"),
+            button("register_btn", "Register", "register_agent")
+        ])
+    ])
+
+    val actions = row("action_buttons", [
+        button("process_btn", "Process Pending", "process_pending"),
+        button("refresh_btn", "Refresh", "refresh")
+    ])
+
+    val status_text = if STATUS_MSG != "": STATUS_MSG else: "Ready"
+
+    val root = column("dashboard", [
+        stats,
+        divider("div1"),
+        task_form,
+        agent_form,
+        actions,
+        divider("div2"),
+        panel("agents_panel", "Agent Pool", [agents_table]),
+        divider("div3"),
+        panel("tasks_panel", "Task Queue", [tasks_table]),
+        statusbar("status_bar", "mate-broker", status_text)
+    ])
+
+    build_tree_with_title(root, "Mate Broker Dashboard", "dark")
+
+fn dashboard_status() -> text:
+    # Legacy text fallback for CLI output
+    var parts: [text] = []
+    parts.push("=== Mate Broker Dashboard ===")
+    parts.push("")
+    parts.push("Agents: " + BK_AGENT_COUNT.to_text())
+    parts.push("Tasks: " + BK_TASK_COUNT.to_text())
+    parts.push("Completed: " + BK_COMPLETED.to_text())
+    parts.push("")
+
+    parts.push("Agent Pool:")
+    var i = 0
+    while i < BK_AGENT_COUNT:
+        var ld = BK_AGENT_LOADS[i]
+        var mx = BK_AGENT_MAX_CONCURRENT[i]
+        val line = "  " + BK_AGENT_IDS[i] + " [" + BK_AGENT_STATUSES[i] + "] " + ld.to_text() + "/" + mx.to_text()
+        parts.push(line)
+        i = i + 1
+
+    parts.push("")
+    parts.push("Task Queue:")
+    if BK_TASK_COUNT == 0:
+        parts.push("  (empty)")
+    else:
+        var j = 0
+        while j < BK_TASK_COUNT:
+            var task_line = "  " + BK_TASK_IDS[j] + " [" + BK_TASK_STATUSES[j] + "]"
+            val agent = BK_TASK_AGENTS[j]
+            if agent != "":
+                task_line = task_line + " -> " + agent
+            task_line = task_line + " " + BK_TASK_CONTENTS[j]
+            parts.push(task_line)
+            j = j + 1
+
+    parts.join("\n")

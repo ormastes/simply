@@ -1,0 +1,71 @@
+"""
+Purpose: prove the same SVM-G program runs on cuda / vulkan / metal with only
+the per-directory `simple.sdn` `gpu:` section changing (examples/08_gpu/backends/).
+Audience: GPU backend and example maintainers.
+Run: bin/simple test examples/08_gpu/backends/backends_spec.spl   (from repo root)
+"""
+use std.spec.*
+use std.nogc_sync_mut.notebook.gpu_config.{load_gpu_config}
+use std.gc_async_mut.gpu_lane.cuda_lane_session.{CudaLaneSession}
+use std.gc_async_mut.gpu_lane.vulkan_lane_session.{VulkanLaneSession}
+use std.gc_async_mut.gpu_lane.metal_lane_session.{MetalLaneSession}
+use std.gc_async_mut.gpu_lane.cuda_vm_executor.{CudaVmExecutor}
+use std.gc_async_mut.gpu_lane.vulkan_vm_executor.{VulkanVmExecutor}
+use std.gc_async_mut.gpu_lane.metal_vm_executor.{MetalVmExecutor}
+use std.gc_async_mut.gpu_lane.lane_probe_verdict.{gpu_lane_probe_verdict, gpu_lane_report_skip}
+use std.sffi.io.{file_read_bytes, file_read_text}
+
+val HELLO_PROGRAM = "PUSHI 1\nPUSHI 9\nSYS_RESULT\nPUSHI 3\nSYS_EXIT"
+val CONFIG_DIR = "examples/08_gpu/backends"
+val LANE_DIR = "src/lib/gc_async_mut/gpu_lane"
+
+describe "examples/08_gpu/backends — one program, three simple.sdn configs":
+    it "each directory's simple.sdn selects exactly its own backend":
+        step("Parse the three checked-in manifests")
+        for b in ["cuda", "vulkan", "metal"]:
+            val cfg = load_gpu_config("{CONFIG_DIR}/{b}/simple.sdn")
+            assert_equal(cfg.backend, b)
+            assert_equal(cfg.submode, "interpreter")
+
+    it "cuda config: runs the program on a live CUDA device, or SKIPs with the lane's own reason":
+        val probe = CudaLaneSession.create().probe()
+        if probe.starts_with("skip:"):
+            gpu_lane_report_skip("backends example cuda", probe)
+            assert_equal(gpu_lane_probe_verdict("cuda", probe), "skip")
+        else:
+            var ex = CudaVmExecutor.create()
+            assert_equal(ex.init(file_read_bytes("{LANE_DIR}/svmg_cuda_kernel.ptx")), "")
+            val o = ex.run_source(HELLO_PROGRAM, 1000, 0)
+            assert_true(o.ok)
+            assert_equal(o.exit_code, 3)
+            assert_equal(o.records.len(), 1)
+            assert_equal(o.records[0].value, 9)
+
+    it "vulkan config: runs the same program on a live Vulkan device, or SKIPs with the lane's own reason":
+        val probe = VulkanLaneSession.create().probe()
+        if probe.starts_with("skip:"):
+            gpu_lane_report_skip("backends example vulkan", probe)
+            assert_equal(gpu_lane_probe_verdict("vulkan", probe), "skip")
+        else:
+            var ex = VulkanVmExecutor.create()
+            assert_equal(ex.init(file_read_bytes("{LANE_DIR}/svmg_vulkan_kernel.spv")), "")
+            val o = ex.run_source(HELLO_PROGRAM, 1000, 0)
+            assert_true(o.ok)
+            assert_equal(o.exit_code, 3)
+            # KNOWN RED on a host where the cuda case above ran live first:
+            # doc/08_tracking/bug/vulkan_vm_lane_returns_exit0_after_cuda_lane_same_process_2026-08-25.md
+            assert_equal(o.records.len(), 1)
+            assert_equal(o.records[0].value, 9)
+
+    it "metal config: runs on macOS, and on any other host reports the honest skip reason (never a fake pass)":
+        val probe = MetalLaneSession.create().probe()
+        if probe.starts_with("skip:"):
+            gpu_lane_report_skip("backends example metal", probe)
+            assert_equal(gpu_lane_probe_verdict("metal", probe), "skip")
+            assert_true(probe.starts_with("skip:metal-unavailable"))
+        else:
+            var ex = MetalVmExecutor.create()
+            assert_equal(ex.init(file_read_text("{LANE_DIR}/svmg_metal_kernel.metal")), "")
+            val o = ex.run_source(HELLO_PROGRAM, 1000, 0)
+            assert_true(o.ok)
+            assert_equal(o.exit_code, 3)

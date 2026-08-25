@@ -1,0 +1,252 @@
+# LLM Caret Chat Session Specification
+
+# Inline JSON helpers
+fn _LB() -> text:
+    "{(123 as char)}"
+
+fn _RB() -> text:
+    "{(125 as char)}"
+
+fn _Q() -> text:
+    "\""
+
+fn _escape_json(s: text) -> text:
+    var result = ""
+    var i = 0
+    while i < s.len():
+        val ch = s[i]
+        if ch == "\\":
+            result = result + "\\\\"
+        elif ch == "\"":
+            result = result + "\\\""
+        elif ch == "\n":
+            result = result + "\\n"
+        elif ch == "\r":
+            result = result + "\\r"
+        elif ch == "\t":
+            result = result + "\\t"
+        else:
+            result = result + ch
+        i = i + 1
+    result
+
+# Module-level state
+var CHAT_ROLES: [text] = []
+var CHAT_CONTENTS: [text] = []
+var CHAT_SYSTEM_PROMPT = ""
+var CHAT_MAX_HISTORY = 100
+
+fn _roles_len() -> i64:
+    val r = CHAT_ROLES
+    r.len()
+
+fn _contents_len() -> i64:
+    val c = CHAT_CONTENTS
+    c.len()
+
+fn chat_clear():
+    CHAT_ROLES = []
+    CHAT_CONTENTS = []
+
+fn chat_set_system_prompt(prompt: text):
+    CHAT_SYSTEM_PROMPT = prompt
+
+fn chat_get_system_prompt() -> text:
+    CHAT_SYSTEM_PROMPT
+
+fn chat_set_max_history(max_items: i64):
+    CHAT_MAX_HISTORY = max_items
+
+fn chat_add_message(role: text, content: text):
+    CHAT_ROLES = CHAT_ROLES + [role]
+    CHAT_CONTENTS = CHAT_CONTENTS + [content]
+    if _roles_len() > CHAT_MAX_HISTORY:
+        chat_truncate(CHAT_MAX_HISTORY)
+
+fn chat_add_user(content: text):
+    chat_add_message("user", content)
+
+fn chat_add_assistant(content: text):
+    chat_add_message("assistant", content)
+
+fn chat_history_len() -> i64:
+    _roles_len()
+
+fn chat_get_role(idx: i64) -> text:
+    if idx >= 0 and idx < _roles_len():
+        val r = CHAT_ROLES
+        return r[idx]
+    ""
+
+fn chat_get_content(idx: i64) -> text:
+    if idx >= 0 and idx < _contents_len():
+        val c = CHAT_CONTENTS
+        return c[idx]
+    ""
+
+fn chat_truncate(keep_last: i64):
+    if _roles_len() <= keep_last:
+        return
+    val start = _roles_len() - keep_last
+    var new_roles: [text] = []
+    var new_contents: [text] = []
+    var i = start
+    while i < _roles_len():
+        val r = CHAT_ROLES
+        val c = CHAT_CONTENTS
+        new_roles = new_roles + [r[i]]
+        new_contents = new_contents + [c[i]]
+        i = i + 1
+    CHAT_ROLES = new_roles
+    CHAT_CONTENTS = new_contents
+
+fn chat_build_messages_json() -> text:
+    var items: [text] = []
+    var i = 0
+    while i < _roles_len():
+        val roles = CHAT_ROLES
+        val contents = CHAT_CONTENTS
+        var msg = _LB()
+        msg = msg + _Q() + "role" + _Q() + ":" + _Q() + roles[i] + _Q() + ","
+        msg = msg + _Q() + "content" + _Q() + ":" + _Q() + _escape_json(contents[i]) + _Q()
+        msg = msg + _RB()
+        items = items + [msg]
+        i = i + 1
+    var result = "["
+    var j = 0
+    for item in items:
+        if j > 0:
+            result = result + ","
+        result = result + item
+        j = j + 1
+    result = result + "]"
+    result
+
+fn chat_last_content() -> text:
+    if _contents_len() == 0:
+        return ""
+    val c = CHAT_CONTENTS
+    c[_contents_len() - 1]
+
+fn chat_last_role() -> text:
+    if _roles_len() == 0:
+        return ""
+    val r = CHAT_ROLES
+    r[_roles_len() - 1]
+
+# ============================================================================
+# Tests
+# ============================================================================
+
+describe "Chat History":
+    it "starts empty":
+        chat_clear()
+        expect(chat_history_len()).to_equal(0)
+
+    it "adds user message":
+        chat_clear()
+        chat_add_user("Hello")
+        expect(chat_history_len()).to_equal(1)
+        expect(chat_get_role(0)).to_equal("user")
+        expect(chat_get_content(0)).to_equal("Hello")
+
+    it "adds assistant message":
+        chat_clear()
+        chat_add_assistant("Hi there!")
+        expect(chat_history_len()).to_equal(1)
+        expect(chat_get_role(0)).to_equal("assistant")
+
+    it "maintains conversation order":
+        chat_clear()
+        chat_add_user("Hi")
+        chat_add_assistant("Hello!")
+        chat_add_user("How are you?")
+        expect(chat_history_len()).to_equal(3)
+        expect(chat_get_role(0)).to_equal("user")
+        expect(chat_get_role(1)).to_equal("assistant")
+        expect(chat_get_role(2)).to_equal("user")
+
+    it "clears history":
+        chat_clear()
+        chat_add_user("test")
+        chat_clear()
+        expect(chat_history_len()).to_equal(0)
+
+    it "returns empty for out-of-bounds index":
+        chat_clear()
+        expect(chat_get_role(-1)).to_equal("")
+        expect(chat_get_role(99)).to_equal("")
+        expect(chat_get_content(-1)).to_equal("")
+
+describe "Chat Truncation":
+    it "truncates to keep last N":
+        chat_clear()
+        chat_add_user("msg1")
+        chat_add_assistant("resp1")
+        chat_add_user("msg2")
+        chat_add_assistant("resp2")
+        chat_truncate(2)
+        expect(chat_history_len()).to_equal(2)
+        expect(chat_get_content(0)).to_equal("msg2")
+        expect(chat_get_content(1)).to_equal("resp2")
+
+    it "does nothing when under limit":
+        chat_clear()
+        chat_add_user("msg1")
+        chat_truncate(10)
+        expect(chat_history_len()).to_equal(1)
+
+    it "auto-truncates on max history":
+        chat_clear()
+        chat_set_max_history(3)
+        chat_add_user("a")
+        chat_add_assistant("b")
+        chat_add_user("c")
+        chat_add_assistant("d")
+        expect(chat_history_len()).to_equal(3)
+        chat_set_max_history(100)
+
+describe "Chat System Prompt":
+    it "sets system prompt":
+        chat_set_system_prompt("Be helpful")
+        expect(chat_get_system_prompt()).to_equal("Be helpful")
+
+    it "can clear system prompt":
+        chat_set_system_prompt("")
+        expect(chat_get_system_prompt()).to_equal("")
+
+describe "Chat JSON":
+    it "builds empty messages":
+        chat_clear()
+        val json = chat_build_messages_json()
+        expect(json).to_equal("[]")
+
+    it "builds single message":
+        chat_clear()
+        chat_add_user("Hello")
+        val json = chat_build_messages_json()
+        expect(json).to_contain("user")
+        expect(json).to_contain("Hello")
+        expect(json).to_start_with("[")
+        expect(json).to_end_with("]")
+
+    it "builds multi-turn conversation":
+        chat_clear()
+        chat_add_user("Hi")
+        chat_add_assistant("Hello!")
+        val json = chat_build_messages_json()
+        expect(json).to_contain("user")
+        expect(json).to_contain("assistant")
+
+describe "Chat Last Message":
+    it "returns last content":
+        chat_clear()
+        chat_add_user("First")
+        chat_add_assistant("Second")
+        expect(chat_last_content()).to_equal("Second")
+        expect(chat_last_role()).to_equal("assistant")
+
+    it "returns empty when no history":
+        chat_clear()
+        expect(chat_last_content()).to_equal("")
+        expect(chat_last_role()).to_equal("")

@@ -1,0 +1,560 @@
+use std.io.{file_exists, file_read, home, cwd, process_run}
+use std.text.{to_int_or}
+use std.nogc_sync_mut.cli.cli_util.{get_cli_args}
+use std.common.json.parser.{json_parse}
+use std.common.json.types.{json_get_type, json_to_string, json_to_number, json_to_boolean}
+use std.common.json.object_ops.{json_object_get}
+use std.common.json.array_ops.{json_array_get, json_array_length}
+use std.common.json.path_ops.{json_path_get}
+use examples.llm_hud.src.types.{HudOptions, ProviderSnapshot, VcsSnapshot, HudState, default_options, empty_snapshot, empty_vcs}
+
+fn parse_options() -> HudOptions:
+    val args = get_cli_args()
+    var options = default_options(cwd())
+
+    var i = 0
+    while i < args.len():
+        val arg = args[i]
+        if arg == "--provider" and i + 1 < args.len():
+            options.provider = normalize_provider(args[i + 1])
+            i = i + 1
+        elif arg.starts_with("--provider="):
+            val parts = arg.split("=")
+            if parts.len() > 1:
+                options.provider = normalize_provider(parts[1])
+        elif arg == "--mode" and i + 1 < args.len():
+            options.mode = normalize_mode(args[i + 1])
+            i = i + 1
+        elif arg.starts_with("--mode="):
+            val parts = arg.split("=")
+            if parts.len() > 1:
+                options.mode = normalize_mode(parts[1])
+        elif arg == "--watch":
+            options.watch = true
+        elif arg == "--interval-ms" and i + 1 < args.len():
+            options.interval_ms = to_int_or(args[i + 1], 1500)
+            i = i + 1
+        elif arg.starts_with("--interval-ms="):
+            val parts = arg.split("=")
+            if parts.len() > 1:
+                options.interval_ms = to_int_or(parts[1], 1500)
+        elif arg == "--path" and i + 1 < args.len():
+            options.path = args[i + 1]
+            i = i + 1
+        elif arg.starts_with("--path="):
+            val parts = arg.split("=")
+            if parts.len() > 1:
+                options.path = parts[1]
+        elif arg == "--no-color":
+            options.color = false
+        elif arg == "--hide-inputs":
+            options.show_inputs = false
+        elif arg == "--help" or arg == "-h":
+            options.help = true
+        i = i + 1
+
+    if options.interval_ms < 200:
+        options.interval_ms = 200
+    options
+
+fn normalize_provider(provider: text) -> text:
+    val lower = provider.trim().to_lower()
+    if lower == "claude" or lower == "codex" or lower == "gemini" or lower == "all":
+        return lower
+    if lower == "":
+        return "auto"
+    "auto"
+
+fn normalize_mode(mode: text) -> text:
+    val lower = mode.trim().to_lower()
+    if lower == "tui":
+        return "tui"
+    "statusline"
+
+fn collect_state(options: HudOptions) -> HudState:
+    val provider_names = resolve_provider_names(options)
+    var providers: [ProviderSnapshot] = []
+    for provider_name in provider_names:
+        if provider_name == "claude":
+            providers = providers.push(collect_claude_snapshot(options.path))
+        elif provider_name == "codex":
+            providers = providers.push(collect_codex_snapshot())
+        elif provider_name == "gemini":
+            providers = providers.push(collect_gemini_snapshot())
+    HudState(
+        providers: providers,
+        vcs: collect_vcs_snapshot(options.path)
+    )
+
+fn resolve_provider_names(options: HudOptions) -> [text]:
+    if options.provider == "all":
+        return ["claude", "codex", "gemini"]
+    if options.provider != "auto":
+        return [options.provider]
+
+    if latest_codex_session_file() != "":
+        return ["codex"]
+    if latest_claude_transcript(options.path) != "":
+        return ["claude"]
+    if file_exists(gemini_projects_path()):
+        return ["gemini"]
+    ["codex", "claude", "gemini"]
+
+fn collect_codex_snapshot() -> ProviderSnapshot:
+    var snapshot = empty_snapshot("Codex")
+    val session_file = latest_codex_session_file()
+    if session_file == "":
+        snapshot.note = "no local Codex sessions"
+        return snapshot
+
+    snapshot.connected = true
+    snapshot.source_path = session_file
+
+    val content = file_read(session_file)
+    val lines = content.split("\n")
+
+    for line in lines:
+        val trimmed = line.trim()
+        if trimmed == "":
+            continue
+        val record = json_parse(trimmed)
+        if record == nil:
+            continue
+        val record_type = json_text_at(record, "type")
+        val payload = json_object_get(record, "payload")
+        if record_type == "session_meta":
+            snapshot.session_id = json_text_at(payload, "id")
+            val current_cwd = json_text_at(payload, "cwd")
+            if current_cwd != "":
+                snapshot.cwd = current_cwd
+        elif record_type == "turn_context":
+            val model = json_text_at(payload, "model")
+            if model != "":
+                snapshot.model = model
+            if snapshot.cwd == "":
+                snapshot.cwd = json_text_at(payload, "cwd")
+        elif record_type == "event_msg":
+            val payload_type = json_text_at(payload, "type")
+            if payload_type == "agent_message":
+                val message = json_text_at(payload, "message")
+                if message != "":
+                    snapshot.status_text = message
+            elif payload_type == "task_complete":
+                snapshot.status_text = "task complete"
+            elif payload_type == "task_started":
+                val task_window = json_number_at(payload, "model_context_window")
+                if task_window > 0 and snapshot.context_window == 0:
+                    snapshot.context_window = task_window
+            elif payload_type == "token_count":
+                snapshot.input_tokens = json_number_at(payload, "info.total_token_usage.input_tokens")
+                snapshot.cached_input_tokens = json_number_at(payload, "info.total_token_usage.cached_input_tokens")
+                snapshot.output_tokens = json_number_at(payload, "info.total_token_usage.output_tokens")
+                snapshot.total_tokens = json_number_at(payload, "info.total_token_usage.total_tokens")
+                snapshot.context_active_tokens = json_number_at(payload, "info.last_token_usage.total_tokens")
+                val info_window = json_number_at(payload, "info.model_context_window")
+                if info_window > 0:
+                    snapshot.context_window = info_window
+                snapshot.rate_primary_pct = json_number_at(payload, "rate_limits.primary.used_percent")
+                snapshot.rate_secondary_pct = json_number_at(payload, "rate_limits.secondary.used_percent")
+        elif record_type == "response_item":
+            val payload_type = json_text_at(payload, "type")
+            if payload_type == "function_call":
+                val tool_name = json_text_at(payload, "name")
+                if tool_name != "":
+                    snapshot.last_tool = tool_name
+                    val raw_arguments = json_text_at(payload, "arguments")
+                    snapshot.last_tool_input = summarize_codex_tool_input(tool_name, raw_arguments)
+                    if tool_name == "spawn_agent":
+                        snapshot.agent_count = snapshot.agent_count + 1
+                    if tool_name == "update_plan":
+                        val counts = parse_update_plan_counts(raw_arguments)
+                        snapshot.todos_done = counts.0
+                        snapshot.todos_total = counts.1
+            elif payload_type == "message":
+                val role = json_text_at(payload, "role")
+                if role == "assistant":
+                    val short_text = first_message_text(payload)
+                    if short_text != "":
+                        snapshot.status_text = short_text
+
+    if snapshot.model == "":
+        snapshot.model = "gpt-5"
+    if snapshot.context_active_tokens == 0 and snapshot.total_tokens > 0:
+        snapshot.context_active_tokens = snapshot.total_tokens
+    snapshot
+
+fn collect_claude_snapshot(repo_path: text) -> ProviderSnapshot:
+    var snapshot = empty_snapshot("Claude")
+    val transcript_path = latest_claude_transcript(repo_path)
+    if transcript_path == "":
+        snapshot.note = "no local Claude transcripts"
+        return snapshot
+
+    snapshot.connected = true
+    snapshot.source_path = transcript_path
+
+    val content = file_read(transcript_path)
+    val lines = content.split("\n")
+
+    for line in lines:
+        val trimmed = line.trim()
+        if trimmed == "":
+            continue
+        val record = json_parse(trimmed)
+        if record == nil:
+            continue
+        val record_type = json_text_at(record, "type")
+
+        if snapshot.session_id == "":
+            val candidate_id = json_text_at(record, "sessionId")
+            if candidate_id != "":
+                snapshot.session_id = candidate_id
+        if snapshot.cwd == "":
+            val candidate_cwd = json_text_at(record, "cwd")
+            if candidate_cwd != "":
+                snapshot.cwd = candidate_cwd
+
+        if record_type == "assistant":
+            val message = json_object_get(record, "message")
+            val model = json_text_at(message, "model")
+            if model != "":
+                snapshot.model = model
+
+            val in_tokens = json_number_at(message, "usage.input_tokens")
+            val cache_create = json_number_at(message, "usage.cache_creation_input_tokens")
+            val cache_read = json_number_at(message, "usage.cache_read_input_tokens")
+            val out_tokens = json_number_at(message, "usage.output_tokens")
+
+            snapshot.input_tokens = snapshot.input_tokens + in_tokens
+            snapshot.cached_input_tokens = snapshot.cached_input_tokens + cache_create + cache_read
+            snapshot.output_tokens = snapshot.output_tokens + out_tokens
+            snapshot.total_tokens = snapshot.total_tokens + in_tokens + cache_create + cache_read + out_tokens
+
+            val current_total = in_tokens + cache_create + cache_read + out_tokens
+            if current_total > 0:
+                snapshot.context_active_tokens = current_total
+
+            val content_items = json_object_get(message, "content")
+            var j = 0
+            while j < json_array_length(content_items):
+                val item = json_array_get(content_items, j)
+                val content_type = json_text_at(item, "type")
+                if content_type == "text":
+                    val text = json_text_at(item, "text").trim()
+                    if text != "":
+                        snapshot.status_text = text
+                elif content_type == "tool_use":
+                    val tool_name = json_text_at(item, "name")
+                    if tool_name != "":
+                        snapshot.last_tool = tool_name
+                        val tool_input = json_object_get(item, "input")
+                        snapshot.last_tool_input = summarize_claude_tool_input(tool_name, tool_input)
+                        if tool_name == "Agent":
+                            snapshot.agent_count = snapshot.agent_count + 1
+                        if tool_name == "TodoWrite":
+                            val counts = parse_todo_write_counts(tool_input)
+                            snapshot.todos_done = counts.0
+                            snapshot.todos_total = counts.1
+                j = j + 1
+        elif record_type == "user":
+            val user_text = json_text_at(record, "message.content").trim()
+            if snapshot.status_text == "" and user_text != "":
+                snapshot.status_text = user_text
+
+    if snapshot.model == "":
+        snapshot.model = "claude"
+    snapshot
+
+fn collect_gemini_snapshot() -> ProviderSnapshot:
+    var snapshot = empty_snapshot("Gemini")
+    val projects_path = gemini_projects_path()
+    if not file_exists(projects_path):
+        snapshot.note = "missing ~/.gemini/projects.json"
+        return snapshot
+
+    snapshot.source_path = projects_path
+    val projects_doc = json_parse(file_read(projects_path))
+    if projects_doc == nil:
+        snapshot.note = "invalid Gemini project cache"
+        return snapshot
+
+    val projects_obj = json_object_get(projects_doc, "projects")
+    val project_count = json_object_key_count(projects_obj)
+    snapshot.connected = project_count > 0
+    snapshot.model = "gemini"
+    if project_count > 0:
+        snapshot.status_text = "{project_count} cached project(s)"
+    else:
+        snapshot.note = "no local Gemini session artifacts"
+    snapshot
+
+fn collect_vcs_snapshot(repo_path: text) -> VcsSnapshot:
+    val jj_root = process_run("jj", ["--no-pager", "--color", "never", "-R", repo_path, "root"])
+    if jj_root.2 == 0:
+        return collect_jj_snapshot(repo_path)
+
+    val git_root = process_run("git", ["-C", repo_path, "rev-parse", "--show-toplevel"])
+    if git_root.2 == 0:
+        return collect_git_snapshot(repo_path)
+    empty_vcs()
+
+fn collect_jj_snapshot(repo_path: text) -> VcsSnapshot:
+    val status_result = process_run("jj", ["--no-pager", "--color", "never", "-R", repo_path, "status"])
+    if status_result.2 != 0:
+        return empty_vcs()
+
+    val lines = status_result.0.trim().split("\n")
+    var dirty_count = 0
+    var headline = ""
+    var parent = ""
+
+    for line in lines:
+        val trimmed = line.trim()
+        if trimmed.starts_with("A ") or trimmed.starts_with("M ") or trimmed.starts_with("D ") or trimmed.starts_with("R ") or trimmed.starts_with("C "):
+            dirty_count = dirty_count + 1
+        elif trimmed.starts_with("Working copy"):
+            headline = trimmed.replace("Working copy  (@) :", "@").replace("Working copy (@) :", "@")
+        elif trimmed.starts_with("Parent commit"):
+            parent = trimmed.replace("Parent commit (@-):", "").trim()
+    if headline == "":
+        headline = "@ unknown"
+    VcsSnapshot(
+        backend: "jj",
+        headline: headline,
+        parent: parent,
+        dirty_count: dirty_count,
+        clean: dirty_count == 0
+    )
+
+fn collect_git_snapshot(repo_path: text) -> VcsSnapshot:
+    val branch_result = process_run("git", ["-C", repo_path, "rev-parse", "--abbrev-ref", "HEAD"])
+    val status_result = process_run("git", ["-C", repo_path, "status", "--short"])
+    val branch = if branch_result.2 == 0: branch_result.0.trim() else: "HEAD"
+    val dirty_lines = filter_non_empty(status_result.0.split("\n"))
+    val dirty_count = dirty_lines.len()
+    val parent_result = process_run("git", ["-C", repo_path, "log", "-1", "--pretty=%h %s"])
+    val parent = if parent_result.2 == 0: parent_result.0.trim() else: ""
+    VcsSnapshot(
+        backend: "git",
+        headline: branch,
+        parent: parent,
+        dirty_count: dirty_count,
+        clean: dirty_count == 0
+    )
+
+fn latest_codex_session_file() -> text:
+    val home_dir = home()
+    val result = process_run("/bin/sh", ["-lc", "ls -1t \"" + home_dir + "/.codex/sessions\"/*/*/*/*.jsonl 2>/dev/null | head -n 1"])
+    if result.2 != 0:
+        return ""
+    result.0.trim()
+
+fn latest_claude_transcript(repo_path: text) -> text:
+    val home_dir = home()
+    val project_dir = claude_project_dir(repo_path)
+    val direct_result = process_run("/bin/sh", ["-lc", "ls -1t \"" + project_dir + "\"/*.jsonl 2>/dev/null | head -n 1"])
+    if direct_result.2 == 0 and direct_result.0.trim() != "":
+        return direct_result.0.trim()
+    val fallback_result = process_run("/bin/sh", ["-lc", "ls -1t \"" + home_dir + "/.claude/projects\"/*/*.jsonl 2>/dev/null | head -n 1"])
+    if fallback_result.2 != 0:
+        return ""
+    fallback_result.0.trim()
+
+fn claude_project_dir(repo_path: text) -> text:
+    var slug = ""
+    for ch in repo_path:
+        if ch == "/":
+            slug = slug + "-"
+        else:
+            slug = slug + ch
+    home() + "/.claude/projects/" + slug
+
+fn gemini_projects_path() -> text:
+    home() + "/.gemini/projects.json"
+
+fn summarize_codex_tool_input(tool_name: text, raw_arguments: text) -> text:
+    if raw_arguments.trim() == "":
+        return ""
+    if tool_name == "apply_patch":
+        return first_patch_target(raw_arguments)
+    val parsed = json_parse(raw_arguments)
+    if parsed == nil:
+        return short_text(raw_arguments.trim(), 72)
+
+    if tool_name == "exec_command":
+        val cmd = json_text_at(parsed, "cmd")
+        if cmd != "":
+            return short_text(cmd, 72)
+    if tool_name == "update_plan":
+        val counts = parse_update_plan_counts(raw_arguments)
+        if counts.1 > 0:
+            return "{counts.0}/{counts.1} completed"
+    val generic_text = first_non_empty([
+        json_text_at(parsed, "message"),
+        json_text_at(parsed, "question"),
+        json_text_at(parsed, "prompt"),
+        json_text_at(parsed, "path"),
+        json_text_at(parsed, "url"),
+        json_text_at(parsed, "location"),
+        json_text_at(parsed, "cmd")
+    ])
+    if generic_text != "":
+        return short_text(generic_text, 72)
+    short_text(raw_arguments.trim(), 72)
+
+fn summarize_claude_tool_input(tool_name: text, input_value: any) -> text:
+    if input_value == nil:
+        return ""
+    if tool_name == "TodoWrite":
+        val counts = parse_todo_write_counts(input_value)
+        if counts.1 > 0:
+            return "{counts.0}/{counts.1} completed"
+    val generic_text = first_non_empty([
+        json_text_at(input_value, "description"),
+        json_text_at(input_value, "prompt"),
+        json_text_at(input_value, "command"),
+        json_text_at(input_value, "path"),
+        json_text_at(input_value, "url")
+    ])
+    if generic_text != "":
+        return short_text(generic_text, 72)
+    short_text(json_summary(input_value), 72)
+
+fn parse_update_plan_counts(raw_arguments: text) -> (i64, i64):
+    val parsed = json_parse(raw_arguments)
+    if parsed == nil:
+        return (0, 0)
+    val plan = json_object_get(parsed, "plan")
+    var done = 0
+    var total = 0
+    var i = 0
+    while i < json_array_length(plan):
+        total = total + 1
+        val item = json_array_get(plan, i)
+        val status = json_text_at(item, "status").to_lower()
+        if status == "completed":
+            done = done + 1
+        i = i + 1
+    (done, total)
+
+fn parse_todo_write_counts(input_value: any) -> (i64, i64):
+    val todos = json_object_get(input_value, "todos")
+    var done = 0
+    var total = 0
+    var i = 0
+    while i < json_array_length(todos):
+        total = total + 1
+        val item = json_array_get(todos, i)
+        val status = json_text_at(item, "status").to_lower()
+        val is_done = json_bool_at(item, "done")
+        if status == "completed" or status == "done" or is_done:
+            done = done + 1
+        i = i + 1
+    (done, total)
+
+fn json_text_at(value: any, path: text) -> text:
+    val target = if path == "": value else: json_path_get(value, path)
+    if target == nil:
+        return ""
+    val target_type = json_get_type(target)
+    if target_type == "string":
+        val s = json_to_string(target)
+        if s == nil:
+            return ""
+        return s
+    if target_type == "number":
+        val n = json_to_number(target)
+        if n == nil:
+            return ""
+        return "{n as i64}"
+    if target_type == "boolean":
+        val b = json_to_boolean(target)
+        if b == nil:
+            return ""
+        return if b: "true" else: "false"
+    ""
+
+fn json_number_at(value: any, path: text) -> i64:
+    val target = if path == "": value else: json_path_get(value, path)
+    if target == nil:
+        return 0
+    if json_get_type(target) != "number":
+        return 0
+    val n = json_to_number(target)
+    if n == nil:
+        return 0
+    n as i64
+
+fn json_bool_at(value: any, path: text) -> bool:
+    val target = if path == "": value else: json_path_get(value, path)
+    if target == nil:
+        return false
+    if json_get_type(target) != "boolean":
+        return false
+    val b = json_to_boolean(target)
+    if b == nil:
+        return false
+    b
+
+fn json_object_key_count(value: any) -> i64:
+    if value == nil or json_get_type(value) != "object":
+        return 0
+    val obj = value.1
+    obj.keys().len()
+
+fn json_summary(value: any) -> text:
+    if value == nil:
+        return ""
+    val value_type = json_get_type(value)
+    if value_type == "string":
+        return json_text_at(value, "")
+    if value_type == "object":
+        return "object"
+    if value_type == "array":
+        return "array[{json_array_length(value)}]"
+    value_type
+
+fn first_message_text(message_payload: any) -> text:
+    val content = json_object_get(message_payload, "content")
+    var i = 0
+    while i < json_array_length(content):
+        val item = json_array_get(content, i)
+        val item_type = json_text_at(item, "type")
+        if item_type == "output_text" or item_type == "input_text":
+            val text = json_text_at(item, "text").trim()
+            if text != "":
+                return short_text(text, 96)
+        i = i + 1
+    ""
+
+fn first_patch_target(raw_patch: text) -> text:
+    for line in raw_patch.split("\n"):
+        val trimmed = line.trim()
+        if trimmed.starts_with("*** Update File:"):
+            return trimmed.replace("*** Update File:", "").trim()
+        if trimmed.starts_with("*** Add File:"):
+            return trimmed.replace("*** Add File:", "").trim()
+        if trimmed.starts_with("*** Delete File:"):
+            return trimmed.replace("*** Delete File:", "").trim()
+    short_text(raw_patch.trim(), 72)
+
+fn filter_non_empty(lines: [text]) -> [text]:
+    var result: [text] = []
+    for line in lines:
+        if line.trim() != "":
+            result = result.push(line)
+    result
+
+fn first_non_empty(values: [text]) -> text:
+    for value in values:
+        if value.trim() != "":
+            return value.trim()
+    ""
+
+fn short_text(value: text, max_len: i64) -> text:
+    val trimmed = value.trim().replace("\n", " ")
+    if trimmed.len() <= max_len:
+        return trimmed
+    if max_len <= 3:
+        return trimmed.slice(0, max_len)
+    trimmed.slice(0, max_len - 3) + "..."

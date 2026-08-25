@@ -1,0 +1,14 @@
+schema: spipe.project_relation
+version: 1
+record: project_relation
+identity: relation_uid
+fields:
+  relation_uid: opaque_uid(R)
+  from_project_uid: opaque_uid(P)
+  to_project_uid: opaque_uid(P)
+  semantic: enum(independent,dependent,extends)
+  physical: enum(none,path,symlink,junction,gitlink,worktree,package)
+  revision: immutable_revision|null
+  version_relation: enum(commit,tag,range,floating,pinned)|null
+  mount: project_relative_path|null
+  trust: enum(trusted,reviewed,untrusted)

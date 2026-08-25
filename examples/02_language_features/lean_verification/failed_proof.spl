@@ -1,0 +1,12 @@
+# Failed proof example
+# Demonstrates: failed verification state, actionable error output
+#
+# This function claims ret >= 0 but does not handle the negative case.
+# Lean verification will report a Failed state with an actionable error
+# showing which obligation could not be discharged.
+
+@verify
+fn buggy_abs(x: i64) -> i64:
+    out(ret): ret >= 0
+    # Bug: doesn't handle negative case
+    x

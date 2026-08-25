@@ -1,0 +1,40 @@
+# Static File Serving — Full Standalone Web Server Example
+#
+# Directory-based static file handler using the lightweight lib's
+# mount() prefix routing and MIME type detection.
+#
+# Reuses: std.nogc_sync_mut.http_server (lightweight lib)
+# Lib source: src/lib/nogc_sync_mut/http_server/
+# Design: doc/05_design/simple_web_server_example.md
+
+use std.nogc_sync_mut.http_server.types.{
+    HttpRequest, HttpResponse, HttpStatus, mime_type_for_extension
+}
+
+# AC-9: app-facing code uses the stdlib fs wrappers, not raw rt_* externs.
+use std.io_runtime.{read_file, file_exists}
+
+fn make_static_handler(root: text, prefix: text) -> fn(HttpRequest) -> HttpResponse:
+    return \req:
+        val rel_path = strip_prefix(req.path, prefix)
+        if rel_path.contains(".."):
+            return HttpResponse.error(HttpStatus.Forbidden, "403 Forbidden")
+
+        var file_path = "{root}/{rel_path}"
+        if rel_path == "" or rel_path == "/":
+            file_path = "{root}/index.html"
+
+        if not file_exists(file_path):
+            return HttpResponse.error(HttpStatus.NotFound, "File not found: {rel_path}")
+
+        val content = read_file(file_path)
+        val content_type = mime_type_for_extension(file_path)
+        return HttpResponse.ok(content).with_content_type(content_type)
+
+fn strip_prefix(path: text, prefix: text) -> text:
+    if path.starts_with(prefix):
+        val rest = path.slice(prefix.len(), path.len())
+        if rest.starts_with("/"):
+            return rest.slice(1, rest.len())
+        return rest
+    return path

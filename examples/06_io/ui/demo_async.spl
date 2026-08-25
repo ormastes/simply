@@ -1,0 +1,129 @@
+# Async UI Demo
+#
+# Demonstrates the async event loop with channel-based event delivery.
+# Simulates a backend pushing events into the bus and the loop processing
+# them with render batching.
+#
+# Run:  bin/simple run examples/ui/demo_async.spl
+
+use common.ui.widget.{UIState, UITree, UIEvent, WidgetNode}
+use common.ui.builder.{column, text_widget, button, statusbar, build_tree_with_title}
+use common.ui.state.{init_state}
+use common.ui.async_loop.{UIEventBus, new_event_bus, send_event, stop_event_bus}
+use common.ui.async_state.{AsyncUIState, new_async_state, dispatch, get_current}
+use common.ui.async_state.{dispatch_key, dispatch_focus_next, dispatch_quit}
+use common.ui.async_reactive.{new_async_store, async_define, async_get, async_set, async_observe}
+
+# ============================================================================
+# Build demo widget tree
+# ============================================================================
+
+fn build_demo_tree() -> UIState:
+    val title = text_widget("title", "Async UI Demo")
+    val info = text_widget("info", "Events flow through channels")
+    val btn_next = button("btn_next", "Next", "focus_next")
+    val btn_quit = button("btn_quit", "Quit", "quit")
+    val status = statusbar("status", "NORMAL", "Async Demo")
+    val root = column("root", [title, info, btn_next, btn_quit, status])
+    val tree = build_tree_with_title(root, "Async Demo", "dark")
+    return init_state(tree)
+
+# ============================================================================
+# Simulated render callback
+# ============================================================================
+
+var render_count = 0
+
+fn demo_render(state: UIState):
+    render_count = render_count + 1
+    print "[render #{render_count}] mode={state.mode_name()} focused={state.focused_id}"
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn main() -> i64:
+    print "=== Async UI Demo ==="
+    print ""
+
+    # --- Set up async infrastructure ---
+    val bus = new_event_bus()
+    val initial = build_demo_tree()
+    val async_state = new_async_state(initial, bus)
+
+    print "1. Event bus created (channels open)"
+    print "   running={bus.running}"
+    print ""
+
+    # --- Simulate backend pushing events ---
+    print "2. Simulating event dispatch..."
+    dispatch_focus_next(async_state)
+    dispatch_key(async_state, "j")
+    dispatch_key(async_state, ":")
+    print "   3 events dispatched to bus"
+    print ""
+
+    # --- Drain events and process manually (simulates loop iteration) ---
+    print "3. Draining events from bus..."
+    var drained = 0
+    var event = bus.events.try_recv()
+    while event != nil:
+        drained = drained + 1
+        print "   event #{drained}: received"
+        event = bus.events.try_recv()
+    print "   total drained: {drained}"
+    print ""
+
+    # --- Demonstrate render queue batching ---
+    print "4. Render queue batching..."
+    val s1 = initial
+    bus.render_queue.send(s1)
+    bus.render_queue.send(s1)
+    bus.render_queue.send(s1)
+    print "   queued 3 renders"
+
+    var latest: UIState? = nil
+    var batch_count = 0
+    var has_render = true
+    while has_render:
+        val queued = bus.render_queue.try_recv()
+        if queued != nil:
+            latest = queued
+            batch_count = batch_count + 1
+        else:
+            has_render = false
+    print "   drained {batch_count} renders, would render only latest"
+    if latest != nil:
+        demo_render(latest)
+    print ""
+
+    # --- Demonstrate async reactive store ---
+    print "5. Async reactive store..."
+    val store = new_async_store()
+    async_define(store, "counter", "0")
+    async_define(store, "status", "idle")
+    val observer = async_observe(store)
+
+    async_set(store, "counter", "1")
+    async_set(store, "counter", "2")
+    async_set(store, "status", "busy")
+    print "   counter={async_get(store, "counter")}"
+    print "   status={async_get(store, "status")}"
+
+    # Drain observer notifications
+    var notifications = 0
+    var note = observer.try_recv()
+    while note != nil:
+        notifications = notifications + 1
+        note = observer.try_recv()
+    print "   observer received {notifications} change notifications"
+    print ""
+
+    # --- Clean shutdown ---
+    print "6. Shutting down..."
+    stop_event_bus(bus)
+    print "   bus stopped: running={bus.running} closed={bus.events.is_closed()}"
+    print ""
+
+    print "=== Demo Complete ==="
+    return 0

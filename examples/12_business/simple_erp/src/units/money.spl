@@ -1,0 +1,47 @@
+# UBS Units — Money (nominal currency arithmetic)
+#
+# Money is nominal: currencies never silently coerce. Amounts are integer minor
+# units (e.g. cents), so a system of record carries no floating-point drift.
+# Same-currency arithmetic succeeds; mixing two real currencies is rejected
+# (ok=false) rather than producing a wrong-currency total. The empty-currency
+# value zero("") is a neutral element so a running total can start from zero
+# and adopt the first real currency it meets (see kernel/projection.spl).
+
+struct Money:
+    val currency: text
+    val minor: i64
+
+# Result of a fallible money operation. ok=false means the operation was
+# rejected (a real currency mismatch); value is then a zero sentinel, not a sum.
+struct MoneyResult:
+    val ok: bool
+    val value: Money
+
+fn money(currency: text, minor: i64) -> Money:
+    return Money { currency: currency, minor: minor }
+
+fn zero(currency: text) -> Money:
+    return Money { currency: currency, minor: 0 }
+
+fn is_zero(m: Money) -> bool:
+    return m.minor == 0
+
+fn money_eq(a: Money, b: Money) -> bool:
+    return a.currency == b.currency and a.minor == b.minor
+
+fn money_neg(m: Money) -> Money:
+    return Money { currency: m.currency, minor: 0 - m.minor }
+
+# Same-currency add. The empty-currency neutral ("" from zero("")) adopts the
+# other operand's currency; two DIFFERENT real currencies are rejected.
+fn money_add(a: Money, b: Money) -> MoneyResult:
+    if a.currency == "":
+        return MoneyResult { ok: true, value: Money { currency: b.currency, minor: a.minor + b.minor } }
+    if b.currency == "":
+        return MoneyResult { ok: true, value: Money { currency: a.currency, minor: a.minor + b.minor } }
+    if a.currency != b.currency:
+        return MoneyResult { ok: false, value: zero(a.currency) }
+    return MoneyResult { ok: true, value: Money { currency: a.currency, minor: a.minor + b.minor } }
+
+fn money_sub(a: Money, b: Money) -> MoneyResult:
+    return money_add(a, money_neg(b))

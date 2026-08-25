@@ -1,0 +1,276 @@
+# Exercise 27: Multi-GPU - Vector Add Split Across Two Devices
+#
+# CUDA original: cudaSetDevice(0) / cudaSetDevice(1), one stream per device,
+# each device adds half of the vector, cudaMemcpyPeer to move data between
+# devices.
+#
+# Simple translation (Rust seed, std.cuda driver API): one context per
+# device (`gpu_setup(id)` = cuCtxCreate on that device), `cuda_ctx_set_current`
+# to switch between them, and one PTX module loaded per context (modules are
+# context-local). std.cuda has NO cudaMemcpyPeer / cuMemcpyPeer, so
+# `copy_between_devices` stages through the host explicitly. When only one
+# device is present both halves run on device 0 and the program says so.
+
+use std.cuda.{cuda_device_count}
+use ..gpu_test_helpers.{
+    gpu_setup, gpu_teardown,
+    gpu_upload_f32s, gpu_download_f32s, gpu_alloc_zeroed_words, gpu_free_ptr,
+    gpu_load_ptx, gpu_unload, gpu_run_1d, grid_for, gpu_device_display_name
+}
+
+# std.cuda wraps cuCtxSetCurrent (cuda/mod.spl) but does not export it, so
+# bind the runtime hook directly. Returns 0 on success.
+extern fn rt_cuda_ctx_set_current(ctx: i64) -> i64
+
+fn cuda_ctx_set_current(ctx: i64) -> i64:
+    rt_cuda_ctx_set_current(ctx)
+
+val BLOCK_SIZE = 256
+# Same PTX text as 22.Streams_and_Async (scale_kernel is unused here). It is
+# loaded per context through gpu_load_ptx, which copies the text into a
+# NUL-padded buffer -- see the note on that helper for the seed JIT bug it
+# works around.
+val PTX = """
+.version 7.0
+.target sm_75
+.address_size 64
+
+.visible .entry scale_kernel(.param .u64 data, .param .u64 scale_bits, .param .u64 n)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<8>;
+    .reg .f32 %f<4>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [data];
+    ld.param.u64 %rd2, [scale_bits];
+    ld.param.u64 %rd3, [n];
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r4, %r1, %r2, %r3;
+    cvt.u64.u32 %rd4, %r4;
+    setp.ge.u64 %p1, %rd4, %rd3;
+    @%p1 bra DONE;
+    cvt.u32.u64 %r5, %rd2;
+    mov.b32 %f1, %r5;
+    shl.b64 %rd5, %rd4, 2;
+    add.u64 %rd6, %rd1, %rd5;
+    ld.global.f32 %f2, [%rd6];
+    mul.f32 %f3, %f2, %f1;
+    st.global.f32 [%rd6], %f3;
+DONE:
+    ret;
+}
+
+.visible .entry add_kernel(.param .u64 a, .param .u64 b, .param .u64 c, .param .u64 n)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<8>;
+    .reg .f32 %f<4>;
+    .reg .b64 %rd<12>;
+    ld.param.u64 %rd1, [a];
+    ld.param.u64 %rd2, [b];
+    ld.param.u64 %rd3, [c];
+    ld.param.u64 %rd4, [n];
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r4, %r1, %r2, %r3;
+    cvt.u64.u32 %rd5, %r4;
+    setp.ge.u64 %p1, %rd5, %rd4;
+    @%p1 bra DONE;
+    shl.b64 %rd6, %rd5, 2;
+    add.u64 %rd7, %rd1, %rd6;
+    add.u64 %rd8, %rd2, %rd6;
+    add.u64 %rd9, %rd3, %rd6;
+    ld.global.f32 %f1, [%rd7];
+    ld.global.f32 %f2, [%rd8];
+    add.f32 %f3, %f1, %f2;
+    st.global.f32 [%rd9], %f3;
+DONE:
+    ret;
+}
+"""
+
+# ----------------------------------------------------------------------------
+# Host-side helpers (pure)
+# ----------------------------------------------------------------------------
+
+fn make_data(n: i64, fill: f32) -> [f32]:
+    var out: [f32] = []
+    for i in 0..n:
+        out.push(fill)
+    out
+
+fn slice_of(xs: [f32], from: i64, to: i64) -> [f32]:
+    var out: [f32] = []
+    for i in from..to:
+        out.push(xs[i])
+    out
+
+fn concat(a: [f32], b: [f32]) -> [f32]:
+    var out: [f32] = []
+    for x in a:
+        out.push(x)
+    for x in b:
+        out.push(x)
+    out
+
+fn cpu_add(a: [f32], b: [f32]) -> [f32]:
+    var out: [f32] = []
+    for i in 0..a.len():
+        out.push(a[i] + b[i])
+    out
+
+# The split point: device 0 takes [0, half), device 1 takes [half, n).
+fn split_point(n: i64) -> i64:
+    n / 2
+
+fn max_abs_diff(a: [f32], b: [f32]) -> f32:
+    if a.len() != b.len():
+        return 1.0e30
+    var m: f32 = 0.0
+    for i in 0..a.len():
+        var d = a[i] - b[i]
+        if d < 0.0:
+            d = 0.0 - d
+        if d > m:
+            m = d
+    m
+
+# ----------------------------------------------------------------------------
+# One device: a context + the module loaded in it
+# ----------------------------------------------------------------------------
+
+struct GpuLane:
+    device_id: i64
+    ctx: i64
+    module: i64
+
+# Build a lane from a context created by `gpu_setup(device_id)` and a module
+# loaded while that context was current. The caller (main / the spec) does
+# both calls itself: under the seed's `run` engine a PTX load issued from
+# inside a nested function intermittently fails with CUDA_ERROR_INVALID_PTX
+# (-218) even though the same text loads fine from main() -- 21-24 all load
+# in main() for the same reason. `ctx == 0` means the device is unavailable.
+fn lane_of(device_id: i64, ctx: i64, module: i64) -> GpuLane:
+    if ctx == 0:
+        return GpuLane(device_id: device_id, ctx: 0, module: 0)
+    GpuLane(device_id: device_id, ctx: ctx, module: module)
+
+fn lane_close(lane: GpuLane):
+    if lane.ctx == 0:
+        return
+    cuda_ctx_set_current(lane.ctx)
+    gpu_unload(lane.module)
+    gpu_teardown(lane.ctx)
+
+# c = a + b on this lane's device (blocking). Equivalent of cudaSetDevice +
+# cudaMemcpy + launch + cudaDeviceSynchronize + cudaMemcpy.
+fn add_on_lane(lane: GpuLane, a: [f32], b: [f32]) -> Result<[f32], text>:
+    if lane.ctx == 0 or lane.module == 0:
+        return Err("device {lane.device_id} unavailable")
+    if cuda_ctx_set_current(lane.ctx) != 0:
+        return Err("cannot make context of device {lane.device_id} current")
+    val n = a.len()
+    val da = gpu_upload_f32s(a)
+    val db = gpu_upload_f32s(b)
+    val dc = gpu_alloc_zeroed_words(n)
+    if da == 0 or db == 0 or dc == 0:
+        return Err("alloc failed on device {lane.device_id}")
+    val ok = gpu_run_1d(lane.module, "add_kernel", grid_for(n, BLOCK_SIZE), BLOCK_SIZE, [da, db, dc, n])
+    val out = gpu_download_f32s(dc, n)
+    gpu_free_ptr(da)
+    gpu_free_ptr(db)
+    gpu_free_ptr(dc)
+    if not ok or out.len() != n:
+        return Err("add_kernel failed on device {lane.device_id}")
+    Ok(out)
+
+# cudaMemcpyPeer stand-in: std.cuda exposes no peer copy, so the bytes go
+# device -> host -> device. Returns the device pointer on `dst` (caller frees
+# it in dst's context) or 0.
+fn copy_between_devices(src: GpuLane, src_ptr: i64, n: i64, dst: GpuLane) -> i64:
+    if cuda_ctx_set_current(src.ctx) != 0:
+        return 0
+    val staged = gpu_download_f32s(src_ptr, n)
+    if staged.len() != n:
+        return 0
+    if cuda_ctx_set_current(dst.ctx) != 0:
+        return 0
+    gpu_upload_f32s(staged)
+
+# ----------------------------------------------------------------------------
+# Split a + b across two lanes
+# ----------------------------------------------------------------------------
+
+fn split_add_across_lanes(lane0: GpuLane, lane1: GpuLane, a: [f32], b: [f32]) -> Result<[f32], text>:
+    val n = a.len()
+    if b.len() != n:
+        return Err("length mismatch")
+    val half = split_point(n)
+    val first = add_on_lane(lane0, slice_of(a, 0, half), slice_of(b, 0, half))
+    if first.is_err():
+        return first
+    val second = add_on_lane(lane1, slice_of(a, half, n), slice_of(b, half, n))
+    if second.is_err():
+        return second
+    Ok(concat(first.unwrap(), second.unwrap()))
+
+fn device_info() -> i64:
+    val count = cuda_device_count()
+    print "Available GPU devices: {count}"
+    for i in 0..count:
+        print "  Device {i}: {gpu_device_display_name(i)}"
+    count
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+
+fn main():
+    val ctx0 = gpu_setup(0)
+    if ctx0 == 0:
+        print "No CUDA device available; nothing to run."
+        return
+    val lane0 = lane_of(0, ctx0, gpu_load_ptx(PTX))
+    val count = device_info()
+
+    # Second lane: real device 1 when present, otherwise device 0 again.
+    var dev1 = 1
+    var ctx1 = gpu_setup(1)
+    if ctx1 == 0:
+        print "Only one device: running both halves on device 0."
+        dev1 = 0
+        ctx1 = gpu_setup(0)
+    val lane1 = lane_of(dev1, ctx1, gpu_load_ptx(PTX))
+
+    val n = 65536
+    val a = make_data(n, 1.0)
+    val b = make_data(n, 2.0)
+    val expected = cpu_add(a, b)
+
+    print "=== Vector add split across devices {lane0.device_id} and {lane1.device_id} ==="
+    match split_add_across_lanes(lane0, lane1, a, b):
+        case Ok(c):
+            print "  n = {n}, split at {split_point(n)}"
+            print "  first = {c[0]}, last = {c[n - 1]}, max |gpu - cpu| = {max_abs_diff(c, expected)}"
+        case Err(e):
+            print "  error: {e}"
+
+    print "=== Copy between devices (host-staged; std.cuda has no cudaMemcpyPeer) ==="
+    if cuda_ctx_set_current(lane0.ctx) == 0:
+        val src = gpu_upload_f32s([1.0, 2.0, 3.0, 4.0])
+        val dst = copy_between_devices(lane0, src, 4, lane1)
+        if dst != 0:
+            val back = gpu_download_f32s(dst, 4)
+            print "  device {lane0.device_id} -> device {lane1.device_id}: {back}"
+            gpu_free_ptr(dst)
+        else:
+            print "  error: copy failed"
+        cuda_ctx_set_current(lane0.ctx)
+        gpu_free_ptr(src)
+
+    lane_close(lane1)
+    lane_close(lane0)
+    print "All multi-GPU demos complete."

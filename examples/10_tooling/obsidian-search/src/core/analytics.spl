@@ -1,0 +1,273 @@
+# Vault analytics — structure, orphan detection, and statistics
+#
+# Provides vault-level analytics: folder hierarchy, orphan note detection,
+# and comprehensive vault statistics (notes, links, tags, tasks, words).
+
+use src.core.vault_scanner.{scan_vault, relative_path}
+use src.core.note_parser.{parse_frontmatter, extract_wikilinks, extract_tags, extract_tasks}
+use src.util.json_helpers.{safe_substr}
+use std.io_runtime.{read_file}
+
+# --- Data structures ---
+
+struct FolderInfo:
+    path: text
+    file_count: i64
+    subfolder_count: i64
+
+struct VaultStats:
+    total_notes: i64
+    total_links: i64
+    total_tags: i64
+    total_tasks: i64
+    total_words: i64
+    avg_links_per_note: f64
+    orphan_count: i64
+
+# --- Vault structure ---
+
+/**
+Build folder hierarchy with file and subfolder counts.
+Scans all .md files in the vault, extracts directory components,
+and counts files and immediate subfolders per directory.
+
+```sdoctest
+>>> val folders = vault_structure("/path/to/vault")
+>>> # Returns sorted list of FolderInfo for each folder
+```
+*/
+fn vault_structure(vault_path: text) -> [FolderInfo]:
+    vault_structure_filtered(vault_path, "")
+
+fn vault_structure_filtered(vault_path: text, directory: text) -> [FolderInfo]:
+    val files = scan_vault(vault_path)
+    # Collect all folder paths and their file counts
+    var folder_files: [text] = []
+    var folder_counts: [i64] = []
+
+    for file in files:
+        val rel = relative_path(file, vault_path)
+        val dir = extract_dir(rel)
+        # Filter by directory prefix if specified
+        if directory != "":
+            if dir != directory and not dir.starts_with(directory + "/"):
+                continue
+        # Find or add folder
+        var found = false
+        var idx = 0
+        for f in folder_files:
+            if f == dir:
+                folder_counts[idx] = folder_counts[idx] + 1
+                found = true
+                break
+            idx = idx + 1
+        if not found:
+            folder_files.push(dir)
+            folder_counts.push(1)
+
+    # Build FolderInfo list with subfolder counts
+    var result: [FolderInfo] = []
+    var i = 0
+    for folder in folder_files:
+        var subfolder_count: i64 = 0
+        for other in folder_files:
+            if other != folder and other.starts_with(folder):
+                # Check it's an immediate subfolder
+                val rest = if folder == ".": other else: safe_substr(other, folder.len() + 1, other.len())
+                if not rest.contains("/"):
+                    subfolder_count = subfolder_count + 1
+        result.push(FolderInfo(
+            path: folder,
+            file_count: folder_counts[i],
+            subfolder_count: subfolder_count
+        ))
+        i = i + 1
+
+    # Sort by path (simple insertion sort)
+    sort_folder_infos(result)
+
+fn extract_dir(rel_path: text) -> text:
+    val slash_idx = rel_path.last_index_of("/")
+    match slash_idx:
+        Some(i):
+            return safe_substr(rel_path, 0, i)
+        nil:
+            return "."
+
+fn sort_folder_infos(infos: [FolderInfo]) -> [FolderInfo]:
+    var sorted: [FolderInfo] = []
+    for info in infos:
+        sorted.push(info)
+    # Simple insertion sort by path
+    var i = 1
+    while i < sorted.len():
+        val key = sorted[i]
+        var j = i - 1
+        while j >= 0 and sorted[j].path > key.path:
+            sorted[j + 1] = sorted[j]
+            j = j - 1
+        sorted[j + 1] = key
+        i = i + 1
+    sorted
+
+# --- Orphan detection ---
+
+/**
+Find notes with zero incoming wikilinks from other notes.
+A note is orphan if no other note contains a `[[filename]]` link to it.
+Excludes index.md and daily notes (daily/ folder) from orphan detection.
+
+```sdoctest
+>>> val orphans = find_orphan_notes("/path/to/vault")
+>>> # Returns relative paths of notes with no incoming links
+```
+*/
+fn find_orphan_notes(vault_path: text) -> [text]:
+    find_orphan_notes_with_options(vault_path, false)
+
+fn find_orphan_notes_with_options(vault_path: text, include_daily: bool) -> [text]:
+    val files = scan_vault(vault_path)
+
+    # Step 1: Build set of all wikilink targets across all notes
+    var all_targets: [text] = []
+    for file in files:
+        val content = read_file(file) ?? ""
+        if content == "":
+            continue
+        val links = extract_wikilinks(content)
+        for link in links:
+            val target = ("" + link.target).lower()
+            # Deduplicate
+            var found = false
+            for existing in all_targets:
+                if existing == target:
+                    found = true
+                    break
+            if not found:
+                all_targets.push(target)
+
+    # Step 2: Check each note for incoming links
+    var orphans: [text] = []
+    for file in files:
+        val rel = relative_path(file, vault_path)
+
+        # Exclude index.md
+        if rel == "index.md":
+            continue
+
+        # Exclude daily notes unless include_daily is true
+        if not include_daily and rel.starts_with("daily/"):
+            continue
+
+        # Get filename without .md extension
+        val filename = extract_filename_no_ext(rel)
+        val lower_filename = ("" + filename).lower()
+
+        # Check if any note links to this one
+        var has_incoming = false
+        for target in all_targets:
+            if target == lower_filename:
+                has_incoming = true
+                break
+        if not has_incoming:
+            orphans.push(rel)
+
+    orphans
+
+fn extract_filename_no_ext(rel_path: text) -> text:
+    var name = rel_path
+    val slash_idx = rel_path.last_index_of("/")
+    match slash_idx:
+        Some(i):
+            name = safe_substr(rel_path, i + 1, rel_path.len())
+        nil: pass_dn
+    if name.ends_with(".md"):
+        return safe_substr(name, 0, name.len() - 3)
+    name
+
+# --- Vault statistics ---
+
+/**
+Compute comprehensive vault statistics.
+Scans all notes and aggregates: total notes, links, unique tags,
+tasks, word count, average links per note, and orphan count.
+
+```sdoctest
+>>> val stats = compute_vault_stats("/path/to/vault")
+>>> stats.total_notes
+6
+```
+*/
+fn compute_vault_stats(vault_path: text) -> VaultStats:
+    val files = scan_vault(vault_path)
+    var total_notes: i64 = 0
+    var total_links: i64 = 0
+    var total_tasks: i64 = 0
+    var total_words: i64 = 0
+    var unique_tags: [text] = []
+
+    for file in files:
+        total_notes = total_notes + 1
+        val content = read_file(file) ?? ""
+        if content == "":
+            continue
+
+        # Count links
+        val links = extract_wikilinks(content)
+        total_links = total_links + links.len()
+
+        # Count unique tags (frontmatter + inline)
+        val meta = parse_frontmatter(content)
+        val inline_tags = extract_tags(content)
+        for t in meta.tags:
+            if t != "":
+                add_unique(unique_tags, t)
+        for t in inline_tags:
+            if t != "":
+                add_unique(unique_tags, t)
+
+        # Count tasks
+        val tasks = extract_tasks(content)
+        total_tasks = total_tasks + tasks.len()
+
+        # Count words
+        total_words = total_words + count_words(content)
+
+    # Compute orphan count
+    val orphans = find_orphan_notes(vault_path)
+    val orphan_count = orphans.len()
+
+    # Average links per note
+    val avg_links = if total_notes > 0: (total_links as f64) / (total_notes as f64) else: 0.0
+
+    VaultStats(
+        total_notes: total_notes,
+        total_links: total_links,
+        total_tags: unique_tags.len(),
+        total_tasks: total_tasks,
+        total_words: total_words,
+        avg_links_per_note: avg_links,
+        orphan_count: orphan_count
+    )
+
+fn add_unique(items: [text], item: text) -> nil:
+    for existing in items:
+        if existing == item:
+            return nil
+    items.push(item)
+    nil
+
+fn count_words(content: text) -> i64:
+    var count: i64 = 0
+    var in_word = false
+    for ch in content:
+        if ch == " " or ch == "\n" or ch == "\r" or ch == "\t":
+            if in_word:
+                count = count + 1
+                in_word = false
+        else:
+            in_word = true
+    # Count last word if content doesn't end with whitespace
+    if in_word:
+        count = count + 1
+    count

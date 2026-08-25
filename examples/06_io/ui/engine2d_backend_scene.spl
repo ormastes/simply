@@ -1,0 +1,77 @@
+use std.gpu.engine2d.backend.{RenderBackend}
+use std.gpu.engine2d.simd_provider.{reset_simd_hits, simd_hit_counts}
+
+pub val W: i32 = 48
+pub val H: i32 = 40
+val BG: u32 = 0xFF101018u32
+val SQUARE_COL: u32 = 0xFFE53935u32
+val CIRCLE_COL: u32 = 0xFF43A047u32
+val LINE_COL: u32 = 0xFF1E88E5u32
+val TEXT_COL: u32 = 0xFFFFFFFFu32
+val GRAD_TOP: u32 = 0xFFFFB300u32
+val GRAD_BOT: u32 = 0xFF6A1B9Au32
+val ROUND_COL: u32 = 0xFF00ACC1u32
+
+fn _px(pixels: [u32], x: i32, y: i32) -> u32:
+    pixels[y * W + x]
+
+fn _count_non_bg(pixels: [u32], x0: i32, y0: i32, x1: i32, y1: i32) -> i32:
+    var n: i32 = 0
+    var y = y0
+    while y < y1:
+        var x = x0
+        while x < x1:
+            if _px(pixels, x, y) != BG:
+                n = n + 1
+            x = x + 1
+        y = y + 1
+    n
+
+fn _report(label: text, ok: bool) -> i32:
+    val mark = if ok: "PASS" else: "FAIL"
+    print "    [{mark}] {label}"
+    if ok: 1 else: 0
+
+fn _check_scene(pixels: [u32]) -> i32:
+    var passed: i32 = 0
+    passed = passed + _report("square  (filled rect, solid center)", _px(pixels, 8, 7) == SQUARE_COL)
+    passed = passed + _report("circle  (filled, solid center)", _px(pixels, 36, 8) == CIRCLE_COL)
+    passed = passed + _report("line    (thick horizontal midpoint)", _px(pixels, 24, 16) == LINE_COL)
+    val g_top = _px(pixels, 10, 22)
+    val g_bot = _px(pixels, 10, 30)
+    passed = passed + _report("shade   (vertical gradient varies top->bottom)", g_top != BG and g_bot != BG and g_top != g_bot)
+    val edge_ok = _px(pixels, 33, 20) == ROUND_COL
+    val corner_rounded = _px(pixels, 24, 20) == BG
+    passed = passed + _report("rounded (edge drawn, corner rounded away)", edge_ok and corner_rounded)
+    val text_px = _count_non_bg(pixels, 2, 31, 44, 40)
+    passed = passed + _report("text    ({text_px} glyph pixels)", text_px > 0)
+    passed
+
+pub fn run_engine2d_scene_backend(engine: RenderBackend, active_name: text, require_simd: bool) -> bool:
+    print "    status: Initialized (active: {active_name})"
+    reset_simd_hits()
+    engine.clear(BG)
+    engine.draw_rect_filled(3, 2, 10, 10, SQUARE_COL)
+    engine.draw_circle_filled(36, 8, 5, CIRCLE_COL)
+    engine.draw_line(2, 16, 45, 16, LINE_COL, 3)
+    engine.draw_gradient_rect(3, 20, 16, 12, GRAD_TOP, GRAD_BOT)
+    engine.draw_rounded_rect(24, 20, 18, 12, 4, ROUND_COL)
+    engine.draw_text(3, 33, "2D", TEXT_COL, 6)
+    engine.present()
+    val pixels = engine.read_pixels()
+    if pixels.len() < W * H:
+        print "    -> readback unavailable (got {pixels.len()} px, need {W * H})"
+        engine.shutdown()
+        return false
+    val passed = _check_scene(pixels)
+    val simd = simd_hit_counts()
+    if require_simd:
+        val simd_ok = simd.fill_hits > 0
+        print "    simd: fill_hits={simd.fill_hits} copy_hits={simd.copy_hits} alpha_hits={simd.alpha_hits}"
+        if not simd_ok:
+            print "    -> cpu_simd selected but no SIMD span hits were recorded"
+            engine.shutdown()
+            return false
+    engine.shutdown()
+    print "    result: {passed}/6 checks passed"
+    passed == 6

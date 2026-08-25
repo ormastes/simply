@@ -1,0 +1,133 @@
+"""
+rel_health_check — absolute oracles for the reliability-engine observability
+sink rel_health.spl (contract: doc/05_design/hardware/nand_recovery/
+recovery_algorithms_design.md §7, design §9 L2; architecture §5
+"Observability"). Known values at known points from a scripted observation
+sequence, not self-comparison (guide "Absolute oracles").
+
+Oracles:
+  1. Cause-tag constants carry the design §7 codes (0/1/2/3), distinct.
+  2. A scripted 4-call `rel_health_note_read` sequence on one block produces
+     EXACT counters: reads, corrected_sum, corrected_events (only
+     corrected>=1 reads counted), and retry_depth_max (the running MAX rung,
+     unaffected by a later shallower read).
+  3. `rel_health_rber` is the EXACT corrected_sum/reads ratio scaled to ppm
+     (i64-first, no float): one exactly-divisible case and one truncating
+     case (proves integer division, not rounding), plus 0-reads -> 0 (no
+     divide-by-zero).
+  4. `rel_health_mark_cause` tags are distinguishable per block (age/err/dist
+     each land on their own block; an untouched block stays `rel_cause_none`).
+  5. `rel_health_on_erase` clears EXACTLY the erased block's transient state
+     (corrected_events/retry_depth_max/refresh_cause -> 0/0/none) while
+     leaving that same block's RBER lifetime numerator/denominator
+     (reads/corrected_sum) untouched, AND leaves a NEIGHBORING block's full
+     state (including reads/corrected_sum) completely untouched — no bleed
+     across the array index (design §7 "Erase-reset discipline").
+
+Run: bin/simple run examples/09_embedded/simpleos_nvme_fw/fw/rel_health_check.spl
+Gate: prints "REL HEALTH OK" and exits 0.
+"""
+
+use nvme_types.*
+use nd_types.*
+use rel_types.*
+use rel_health.*
+
+# Loop-built dense zero array (rel_types owns no array constructor; mirrors
+# rel_types_check.spl's zeros() idiom).
+fn zeros(n: i64) -> [i64]:
+    var a: [i64] = []
+    var i: i64 = 0
+    while i < n:
+        a.push(0)
+        i = i + 1
+    a
+
+fn new_health() -> RelHealth:
+    RelHealth(reads: zeros(NUM_BLOCKS), corrected_sum: zeros(NUM_BLOCKS), corrected_events: zeros(NUM_BLOCKS), retry_depth_max: zeros(NUM_BLOCKS), refresh_cause: zeros(NUM_BLOCKS))
+
+fn main():
+    var fail: i64 = 0
+
+    # ── Oracle 1: cause-tag constants are the design §7 codes, distinct ───────
+    fail = fail + expect_eq(rel_cause_none(), 0, "rel_cause_none() == 0")
+    fail = fail + expect_eq(rel_cause_age(), 1, "rel_cause_age() == 1 (FCR)")
+    fail = fail + expect_eq(rel_cause_err(), 2, "rel_cause_err() == 2 (DEAR)")
+    fail = fail + expect_eq(rel_cause_dist(), 3, "rel_cause_dist() == 3 (STRAW)")
+
+    # ── Oracle 2: scripted note_read sequence on block 5 -> exact counters ────
+    var h: RelHealth = new_health()
+    h = rel_health_note_read(h, nd_block(5), 0, 0)   # clean read, depth 0
+    h = rel_health_note_read(h, nd_block(5), 1, 1)   # corrected read, ladder rung 1
+    h = rel_health_note_read(h, nd_block(5), 2, 3)   # uncorrectable-bucket read, deepest rung 3
+    h = rel_health_note_read(h, nd_block(5), 0, 1)   # clean again at a SHALLOWER depth
+
+    fail = fail + expect_eq(h.reads[5], 4, "block 5: reads == 4 after 4 note_read calls")
+    fail = fail + expect_eq(h.corrected_sum[5], 3, "block 5: corrected_sum == 0+1+2+0 == 3")
+    fail = fail + expect_eq(h.corrected_events[5], 2, "block 5: corrected_events == 2 (only corrected>=1 reads counted)")
+    fail = fail + expect_eq(h.retry_depth_max[5], 3, "block 5: retry_depth_max == 3 (deepest rung; later shallower read does not lower it)")
+
+    # ── Oracle 3: rber is the EXACT corrected_sum/reads ratio, scaled ppm ─────
+    # block 5: corrected_sum=3, reads=4 -> 3 * 1_000_000 / 4 == 750_000 exactly.
+    fail = fail + expect_eq(rel_health_rber(h, nd_block(5)), 750000, "block 5: rber == 750000 ppm (3,000,000/4 exact)")
+
+    # Truncating case (i64-first, no float): reads=3, corrected_sum=1 -> 333333
+    # (not a rounded 333333.33...), proving integer division.
+    var h2: RelHealth = new_health()
+    h2 = rel_health_note_read(h2, nd_block(20), 1, 0)
+    h2 = rel_health_note_read(h2, nd_block(20), 0, 0)
+    h2 = rel_health_note_read(h2, nd_block(20), 0, 0)
+    fail = fail + expect_eq(h2.reads[20], 3, "block 20: reads == 3")
+    fail = fail + expect_eq(h2.corrected_sum[20], 1, "block 20: corrected_sum == 1")
+    fail = fail + expect_eq(rel_health_rber(h2, nd_block(20)), 333333, "block 20: rber truncates to 333333 ppm (i64 division, no float)")
+
+    # Untouched block: 0 reads -> rber 0, no divide-by-zero.
+    fail = fail + expect_eq(rel_health_rber(h2, nd_block(21)), 0, "block 21 (untouched): rber == 0, no divide-by-zero")
+
+    # ── Oracle 4: cause tagging is distinguishable per block ───────────────────
+    var hc: RelHealth = new_health()
+    hc = rel_health_mark_cause(hc, nd_block(1), rel_cause_age())
+    hc = rel_health_mark_cause(hc, nd_block(2), rel_cause_err())
+    hc = rel_health_mark_cause(hc, nd_block(3), rel_cause_dist())
+    fail = fail + expect_eq(hc.refresh_cause[1], rel_cause_age(), "block 1: refresh_cause tagged age (FCR)")
+    fail = fail + expect_eq(hc.refresh_cause[2], rel_cause_err(), "block 2: refresh_cause tagged err (DEAR)")
+    fail = fail + expect_eq(hc.refresh_cause[3], rel_cause_dist(), "block 3: refresh_cause tagged dist (STRAW)")
+    fail = fail + expect_eq(hc.refresh_cause[4], rel_cause_none(), "block 4 (untouched): refresh_cause stays none/0")
+
+    # ── Oracle 5: on_erase clears EXACTLY that block's transient state, and ────
+    # no neighbor's (design §7 "Erase-reset discipline").
+    var he: RelHealth = new_health()
+    he = rel_health_note_read(he, nd_block(6), 1, 2)   # block A (to be erased)
+    he = rel_health_mark_cause(he, nd_block(6), rel_cause_age())
+    he = rel_health_note_read(he, nd_block(7), 1, 4)   # block B (neighbor, NOT erased)
+    he = rel_health_mark_cause(he, nd_block(7), rel_cause_dist())
+
+    # Pre-erase sanity: both blocks populated, distinctly.
+    fail = fail + expect_eq(he.corrected_events[6], 1, "pre-erase: block 6 corrected_events == 1")
+    fail = fail + expect_eq(he.refresh_cause[6], rel_cause_age(), "pre-erase: block 6 refresh_cause == age")
+    fail = fail + expect_eq(he.corrected_events[7], 1, "pre-erase: block 7 (neighbor) corrected_events == 1")
+    fail = fail + expect_eq(he.refresh_cause[7], rel_cause_dist(), "pre-erase: block 7 (neighbor) refresh_cause == dist")
+
+    he = rel_health_on_erase(he, nd_block(6))
+
+    # Erased block 6: transient fields cleared...
+    fail = fail + expect_eq(he.corrected_events[6], 0, "post-erase: block 6 corrected_events cleared to 0")
+    fail = fail + expect_eq(he.retry_depth_max[6], 0, "post-erase: block 6 retry_depth_max cleared to 0")
+    fail = fail + expect_eq(he.refresh_cause[6], rel_cause_none(), "post-erase: block 6 refresh_cause reset to none")
+    # ...but the RBER lifetime numerator/denominator survive the erase (design
+    # §7 does not list reads/corrected_sum among the reset fields).
+    fail = fail + expect_eq(he.reads[6], 1, "post-erase: block 6 reads (RBER denominator) untouched by erase")
+    fail = fail + expect_eq(he.corrected_sum[6], 1, "post-erase: block 6 corrected_sum (RBER numerator) untouched by erase")
+
+    # Neighbor block 7 is completely untouched by erasing block 6 (no bleed
+    # across the array index).
+    fail = fail + expect_eq(he.reads[7], 1, "post-erase: neighbor block 7 reads untouched")
+    fail = fail + expect_eq(he.corrected_sum[7], 1, "post-erase: neighbor block 7 corrected_sum untouched")
+    fail = fail + expect_eq(he.corrected_events[7], 1, "post-erase: neighbor block 7 corrected_events untouched (no bleed)")
+    fail = fail + expect_eq(he.retry_depth_max[7], 4, "post-erase: neighbor block 7 retry_depth_max untouched")
+    fail = fail + expect_eq(he.refresh_cause[7], rel_cause_dist(), "post-erase: neighbor block 7 refresh_cause untouched (no bleed)")
+
+    if fail == 0:
+        print "REL HEALTH OK"
+    else:
+        print "REL HEALTH FAIL ({fail})"

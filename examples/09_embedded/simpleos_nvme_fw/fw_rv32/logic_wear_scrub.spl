@@ -1,0 +1,4 @@
+use logic_wear_scrub_cases.*
+
+fn rv32_wear_scrub_selftest() -> i32:
+    rv32_wear_scrub_cases_selftest()

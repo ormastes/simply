@@ -1,0 +1,58 @@
+# XPBD Rope — physics + game2d demo
+use std.game2d as g
+use std.common.engine.math2d.{Vec2}
+use std.common.engine.color.{EngineColor}
+use std.nogc_sync_mut.engine.physics.solver.xpbd_solver.{XpbdWorld}
+
+class Game:
+    world: XpbdWorld
+    particle_count: i64
+
+    fn load(self):
+        pass_do_nothing
+
+    fn update(self, dt: f32):
+        val _ = dt
+
+    fn fixed_update(self, step: f32):
+        self.world.step(0.02)
+
+    fn draw(self, ctx: g.Canvas):
+        ctx.clear(EngineColor(r: 0.1, g: 0.1, b: 0.15, a: 1.0))
+        val yellow = EngineColor(r: 1.0, g: 0.9, b: 0.2, a: 1.0)
+        val white = EngineColor(r: 1.0, g: 1.0, b: 1.0, a: 1.0)
+        var i = 0
+        while i < self.particle_count - 1:
+            val p1 = self.world.get_position(i)
+            val p2 = self.world.get_position(i + 1)
+            val x1 = 400.0 + p1.0 * 80.0
+            val y1 = 100.0 - p1.1 * 80.0
+            val x2 = 400.0 + p2.0 * 80.0
+            val y2 = 100.0 - p2.1 * 80.0
+            ctx.line(Vec2(x: x1, y: y1), Vec2(x: x2, y: y2), yellow)
+            i = i + 1
+        var j = 0
+        while j < self.particle_count:
+            val pos = self.world.get_position(j)
+            val sx = 400.0 + pos.0 * 80.0
+            val sy = 100.0 - pos.1 * 80.0
+            ctx.circle(g.DrawMode.Fill, Vec2(x: sx, y: sy), 6.0, white)
+            j = j + 1
+        ctx.text("XPBD Rope", Vec2(x: 10.0, y: 20.0), white)
+
+fn setup_rope() -> XpbdWorld:
+    var world = XpbdWorld.create(4)
+    world.add_fixed_particle(0.0, 0.0, 0.0)
+    var i = 1
+    while i < 12:
+        val x = i.to_f64() * 0.4
+        world.add_particle(x, 0.0, 0.0, 1.0)
+        i = i + 1
+    var j = 0
+    while j < 11:
+        world.add_distance_constraint(j, j + 1, 80.0)
+        j = j + 1
+    world
+
+fn main():
+    g.run(Game(world: setup_rope(), particle_count: 12), "XPBD Rope", 800, 600)

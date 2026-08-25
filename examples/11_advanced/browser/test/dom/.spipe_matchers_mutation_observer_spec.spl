@@ -1,0 +1,310 @@
+#![allow(REQC001)]
+#![allow(REQC004)]
+#![allow(unnamed_duplicate_typed_args)]
+"""
+# Mutation Observer
+
+Tests for mutation observer functionality.
+"""
+#![allow(unnamed_duplicate_typed_args)]
+# MutationObserver Tests
+#
+# Category: Browser Platform DOM
+# Status: Active
+#
+# Validates the MutationObserver API: observer creation, observation registration,
+# notification for child list / attribute / character data changes, record retrieval,
+# disconnect, and attribute filtering.
+#
+# The MutationObserver is modeled as a lightweight data structure; tests exercise
+# its record-keeping directly rather than through DOM mutation hooks.
+#
+# Run with: bin/simple test examples/browser/test/dom/mutation_observer_spec.spl
+
+use std.spec
+
+# ============================================================================
+# MutationObserver types (inline — no feature module yet)
+# ============================================================================
+
+enum MutationKind:
+    ChildList
+    Attributes
+    CharacterData
+
+class MutationRecord:
+    kind: MutationKind
+    target_id: i64
+    attribute_name: text
+    old_value: text
+    added_nodes: [i64]
+    removed_nodes: [i64]
+
+    static fn child_list(target_id: i64, added: [i64], removed: [i64]) -> MutationRecord:
+        MutationRecord(
+            kind: MutationKind.ChildList,
+            target_id: target_id,
+            attribute_name: "",
+            old_value: "",
+            added_nodes: added,
+            removed_nodes: removed
+        )
+
+    static fn attribute(target_id: i64, name: text, old_value: text) -> MutationRecord:
+        MutationRecord(
+            kind: MutationKind.Attributes,
+            target_id: target_id,
+            attribute_name: name,
+            old_value: old_value,
+            added_nodes: [i64](),
+            removed_nodes: [i64]()
+        )
+
+    static fn character_data(target_id: i64, old_value: text) -> MutationRecord:
+        MutationRecord(
+            kind: MutationKind.CharacterData,
+            target_id: target_id,
+            attribute_name: "",
+            old_value: old_value,
+            added_nodes: [i64](),
+            removed_nodes: [i64]()
+        )
+
+class MutationObserverInit:
+    child_list: bool
+    attributes: bool
+    character_data: bool
+    attribute_old_value: bool
+    character_data_old_value: bool
+    attribute_filter: [text]
+
+    static fn default_init() -> MutationObserverInit:
+        MutationObserverInit(
+            child_list: false,
+            attributes: false,
+            character_data: false,
+            attribute_old_value: false,
+            character_data_old_value: false,
+            attribute_filter: [text]()
+        )
+
+class ObservationEntry:
+    target_id: i64
+    options: MutationObserverInit
+
+class MutationObserver:
+    id: i64
+    observations: [ObservationEntry]
+    records: [MutationRecord]
+    active: bool
+
+    static fn create(id: i64) -> MutationObserver:
+        MutationObserver(
+            id: id,
+            observations: [ObservationEntry](),
+            records: [MutationRecord](),
+            active: true
+        )
+
+    me observe(target_id: i64, options: MutationObserverInit):
+        if self.active:
+            self.observations.push(ObservationEntry(target_id: target_id, options: options))
+
+    me notify_child_list(target_id: i64, added: [i64], removed: [i64]):
+        if not self.active:
+            return
+        var i = 0
+        while i < self.observations.len():
+            val obs = self.observations.get(i)
+            if obs.target_id == target_id and obs.options.child_list:
+                self.records.push(MutationRecord.child_list(target_id, added, removed))
+                return
+            i = i + 1
+
+    me notify_attribute(target_id: i64, name: text, old_value: text):
+        if not self.active:
+            return
+        var i = 0
+        while i < self.observations.len():
+            val obs = self.observations.get(i)
+            if obs.target_id == target_id and obs.options.attributes:
+                # Check attribute_filter
+                if obs.options.attribute_filter.len() > 0:
+                    var allowed = false
+                    var fi = 0
+                    while fi < obs.options.attribute_filter.len():
+                        if obs.options.attribute_filter.get(fi) == name:
+                            allowed = true
+                        fi = fi + 1
+                    if not allowed:
+                        return
+                if obs.options.attribute_old_value:
+                    self.records.push(MutationRecord.attribute(target_id, name, old_value))
+                else:
+                    self.records.push(MutationRecord.attribute(target_id, name, ""))
+                return
+            i = i + 1
+
+    me notify_character_data(target_id: i64, old_value: text):
+        if not self.active:
+            return
+        var i = 0
+        while i < self.observations.len():
+            val obs = self.observations.get(i)
+            if obs.target_id == target_id and obs.options.character_data:
+                if obs.options.character_data_old_value:
+                    self.records.push(MutationRecord.character_data(target_id, old_value))
+                else:
+                    self.records.push(MutationRecord.character_data(target_id, ""))
+                return
+            i = i + 1
+
+    me take_records() -> [MutationRecord]:
+        val taken = self.records
+        self.records = [MutationRecord]()
+        taken
+
+    me disconnect():
+        self.active = false
+        self.observations = [ObservationEntry]()
+
+# ============================================================================
+# Tests
+# ============================================================================
+
+describe "MutationObserver":
+    """
+    ## Mutationobserver Tests
+
+    Validates MutationObserver functionality.
+    """
+
+    context "creation":
+        it "create_observer returns valid id":
+            val obs = MutationObserver.create(1)
+            expect obs.id == 1
+            expect obs.active == true
+            expect obs.records.len() == 0
+
+    context "observe":
+        it "observe registers target":
+            var obs = MutationObserver.create(1)
+            var init = MutationObserverInit.default_init()
+            init.child_list = true
+            obs.observe(42, init)
+            expect obs.observations.len() == 1
+
+    context "child list mutations":
+        it "notify_child_list records added nodes":
+            var obs = MutationObserver.create(1)
+            var init = MutationObserverInit.default_init()
+            init.child_list = true
+            obs.observe(10, init)
+            var added = [i64]()
+            added.push(20)
+            added.push(21)
+            obs.notify_child_list(10, added, [i64]())
+            expect obs.records.len() == 1
+            val rec = obs.records.get(0)
+            expect rec.added_nodes.len() == 2
+            expect rec.added_nodes.get(0) == 20
+            expect rec.added_nodes.get(1) == 21
+            expect rec.removed_nodes.len() == 0
+
+        it "notify_child_list records removed nodes":
+            var obs = MutationObserver.create(1)
+            var init = MutationObserverInit.default_init()
+            init.child_list = true
+            obs.observe(10, init)
+            var removed = [i64]()
+            removed.push(30)
+            obs.notify_child_list(10, [i64](), removed)
+            expect obs.records.len() == 1
+            val rec = obs.records.get(0)
+            expect rec.removed_nodes.len() == 1
+            expect rec.removed_nodes.get(0) == 30
+            expect rec.added_nodes.len() == 0
+
+    context "attribute mutations":
+        it "notify_attribute records attribute change":
+            var obs = MutationObserver.create(1)
+            var init = MutationObserverInit.default_init()
+            init.attributes = true
+            obs.observe(10, init)
+            obs.notify_attribute(10, "class", "old-class")
+            expect obs.records.len() == 1
+            val rec = obs.records.get(0)
+            expect rec.attribute_name == "class"
+            # Without attribute_old_value, old_value should be empty
+            expect rec.old_value == ""
+
+        it "notify_attribute includes old value when requested":
+            var obs = MutationObserver.create(1)
+            var init = MutationObserverInit.default_init()
+            init.attributes = true
+            init.attribute_old_value = true
+            obs.observe(10, init)
+            obs.notify_attribute(10, "class", "old-class")
+            expect obs.records.len() == 1
+            val rec = obs.records.get(0)
+            expect rec.attribute_name == "class"
+            expect rec.old_value == "old-class"
+
+    context "character data mutations":
+        it "notify_character_data records text change":
+            var obs = MutationObserver.create(1)
+            var init = MutationObserverInit.default_init()
+            init.character_data = true
+            init.character_data_old_value = true
+            obs.observe(10, init)
+            obs.notify_character_data(10, "old text")
+            expect obs.records.len() == 1
+            val rec = obs.records.get(0)
+            expect rec.old_value == "old text"
+
+    context "take_records":
+        it "take_records returns pending and clears":
+            var obs = MutationObserver.create(1)
+            var init = MutationObserverInit.default_init()
+            init.child_list = true
+            obs.observe(10, init)
+            var added = [i64]()
+            added.push(20)
+            obs.notify_child_list(10, added, [i64]())
+            obs.notify_child_list(10, added, [i64]())
+            expect obs.records.len() == 2
+            val taken = obs.take_records()
+            expect taken.len() == 2
+            expect obs.records.len() == 0
+
+    context "disconnect":
+        it "disconnect stops all observation":
+            var obs = MutationObserver.create(1)
+            var init = MutationObserverInit.default_init()
+            init.child_list = true
+            obs.observe(10, init)
+            obs.disconnect()
+            expect obs.active == false
+            expect obs.observations.len() == 0
+            # Notifications after disconnect are ignored
+            var added = [i64]()
+            added.push(20)
+            obs.notify_child_list(10, added, [i64]())
+            expect obs.records.len() == 0
+
+    context "attribute_filter":
+        it "attribute_filter restricts notifications":
+            var obs = MutationObserver.create(1)
+            var init = MutationObserverInit.default_init()
+            init.attributes = true
+            init.attribute_old_value = true
+            var filter = [text]()
+            filter.push("class")
+            init.attribute_filter = filter
+            obs.observe(10, init)
+            # "class" is in filter — should record
+            obs.notify_attribute(10, "class", "old")
+            expect obs.records.len() == 1
+            # "id" is NOT in filter — should NOT record
+            obs.notify_attribute(10, "id", "old")
+            expect obs.records.len() == 1

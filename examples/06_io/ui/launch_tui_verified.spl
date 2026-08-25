@@ -1,0 +1,93 @@
+# Verified Minimal TUI Launch
+#
+# Uses the repaired shared UI core plus layout computation and ANSI output
+# to launch a real terminal UI frame from an isolated build root.
+
+use common.ui.builder.{column, panel, text_widget, statusbar, build_tree_with_title}
+use common.ui.widget.{WidgetNode, WidgetRect, UIState}
+use common.ui.layout.{compute_layout, find_rect}
+
+val ESC: text = "\u{001b}"
+
+fn ansi_enable_alt_screen() -> text:
+    return "{ESC}[?1049h"
+
+fn ansi_disable_alt_screen() -> text:
+    return "{ESC}[?1049l"
+
+fn ansi_hide_cursor() -> text:
+    return "{ESC}[?25l"
+
+fn ansi_show_cursor() -> text:
+    return "{ESC}[?25h"
+
+fn ansi_cursor_home() -> text:
+    return "{ESC}[H"
+
+fn repeat_text(value: text, count: i32) -> text:
+    var out = ""
+    var idx = 0
+    while idx < count:
+        out = "{out}{value}"
+        idx = idx + 1
+    return out
+
+fn pad_right(value: text, width: i32) -> text:
+    if value.len() >= width:
+        return value.substring(0, width)
+    return "{value}{repeat_text(\" \", width - value.len())}"
+
+fn build_state() -> UIState:
+    val greeting = text_widget("greeting", "Hello from Simple UI")
+    val detail = text_widget("detail", "Verified TUI launch path")
+    val header = panel("header", "Simple GUI Demo", [greeting, detail])
+    val status = statusbar("status", "NORMAL", "launch_tui_verified")
+    val root = column("root", [header, status])
+    val tree = build_tree_with_title(root, "Hello Simple GUI", "dark")
+    return UIState.new(tree)
+
+fn render_text_widget(node: WidgetNode, rect: WidgetRect) -> text:
+    val content = node.get_prop("content")
+    return "| {pad_right(content, rect.w - 4)} |"
+
+fn render_panel(node: WidgetNode, rect: WidgetRect) -> text:
+    val title = node.get_prop("title")
+    var out = "+{repeat_text(\"-\", rect.w - 2)}+\n"
+    out = "{out}| {pad_right(title, rect.w - 4)} |\n"
+    out = "{out}+{repeat_text(\"-\", rect.w - 2)}+\n"
+    for child in node.children():
+        val child_rect = find_rect(compute_layout(node, rect.x, rect.y, rect.w, rect.h), child.id)
+        if child_rect != nil and child.kind_name() == "text":
+            out = "{out}{render_text_widget(child, child_rect)}\n"
+    out = "{out}+{repeat_text(\"-\", rect.w - 2)}+"
+    return out
+
+fn render_status(node: WidgetNode, rect: WidgetRect) -> text:
+    val left = node.get_prop("left")
+    val right = node.get_prop("right")
+    val gap = rect.w - left.len() - right.len() - 2
+    val spaces = if gap > 0: repeat_text(" ", gap) else: " "
+    return "{left}{spaces}{right}"
+
+fn main() -> i64:
+    val state = build_state()
+    val rects = compute_layout(state.tree.root_node(), 0, 0, 48, 8)
+    val root = state.tree.root_node()
+    val header = root.child_at(0)
+    val status = root.child_at(1)
+
+    print ansi_enable_alt_screen()
+    print ansi_hide_cursor()
+    print ansi_cursor_home()
+    print "launch:title:{state.tree.title_text()}"
+    if header != nil:
+        val header_rect = find_rect(rects, header.id)
+        if header_rect != nil:
+            print render_panel(header, header_rect)
+    if status != nil:
+        val status_rect = find_rect(rects, status.id)
+        if status_rect != nil:
+            print render_status(status, status_rect)
+    print ansi_show_cursor()
+    print ansi_disable_alt_screen()
+    return 0

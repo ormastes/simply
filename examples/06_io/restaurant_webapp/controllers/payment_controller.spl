@@ -1,0 +1,259 @@
+use std.web_framework.controller.{ControllerContext, HttpResponseData, ViewData, render_page, render_redirect, render_json, render_error}
+use std.web_framework.session.{session_get}
+use std.web_framework.flash.{flash_add}
+use std.web_framework.csrf_integration.{csrf_token_for_session, verify_csrf_token}
+use std.nogc_sync_mut.io.time_ops.{time_now_unix_micros}
+
+use models.order.{Order, create_order_repository, find_order_by_id}
+use models.payment.{
+    Payment, create_payment_repository, find_payments_for_order,
+    mock_gateway_charge, mock_gateway_refund,
+    payment_method_desk_credit, payment_method_gate_pay, payment_method_store_checkout,
+    is_valid_payment_method, payment_method_display
+}
+use services.email_service.{build_payment_receipt_email, send_notification}
+use models.menu_item.{format_price}
+
+fn require_admin(ctx: ControllerContext) -> Result<text, text>:
+    val username = session_get(ctx, "admin_username")
+    if username.?:
+        Result.ok(username.unwrap())
+    else:
+        Result.err("Not authenticated")
+
+# --- Restaurant Desk Pay (credit card at desk) ---
+
+fn action_desk_pay_form(ctx: ControllerContext) -> HttpResponseData:
+    val admin = require_admin(ctx)?
+    val order_id = ctx.params.get("order_id").unwrap_or("0").parse_i64().unwrap_or(0)
+    val orepo = create_order_repository(ctx.db())
+    val order = find_order_by_id(orepo, order_id)?
+
+    val data = ViewData.new()
+        .set("title", "Desk Pay - Order #{order.id}")
+        .set("order_id", "{order.id}")
+        .set("total", "{order.total}")
+        .set("total_display", format_price(order.total))
+        .set("payment_method", payment_method_desk_credit())
+        .set("csrf_token", csrf_token_for_session(ctx))
+    render_page(ctx, "payment/desk_pay", data.to_dict())
+
+fn action_desk_pay(ctx: ControllerContext) -> HttpResponseData:
+    val admin = require_admin(ctx)?
+    val csrf = ctx.form_value("csrf_token")
+    if not verify_csrf_token(ctx, csrf):
+        flash_add(ctx, "error", "Invalid form submission.")
+        return render_redirect(ctx, "/admin/orders")
+
+    val order_id = ctx.params.get("order_id").unwrap_or("0").parse_i64().unwrap_or(0)
+    val card_number = ctx.form_value("card_number")
+    val card_expiry = ctx.form_value("card_expiry")
+    val card_cvc = ctx.form_value("card_cvc")
+
+    val orepo = create_order_repository(ctx.db())
+    val order = find_order_by_id(orepo, order_id)?
+
+    val charge_result = mock_gateway_charge(order.total, card_number, card_expiry, card_cvc)
+    if charge_result.is_err():
+        flash_add(ctx, "error", "Payment failed: {charge_result.unwrap_err()}")
+        return render_redirect(ctx, "/admin/orders/{order_id}/desk-pay")
+
+    val txn_id = charge_result.unwrap()
+    val last_four = if card_number.len() >= 4:
+        card_number[card_number.len() - 4 : card_number.len()]
+    else:
+        card_number
+
+    val prepo = create_payment_repository(ctx.db())
+    val payment = Payment(
+        id: 0,
+        order_id: order_id,
+        method: payment_method_desk_credit(),
+        status: "completed",
+        amount: order.total,
+        card_last_four: last_four,
+        transaction_id: txn_id,
+        gateway_response: "approved",
+        created_at: "{time_now_unix_micros()}"
+    )
+    prepo.save(payment)?
+
+    val updated_order = Order(
+        id: order.id,
+        table_number: order.table_number,
+        status: order.status,
+        items_json: order.items_json,
+        subtotal: order.subtotal,
+        tax: order.tax,
+        total: order.total,
+        payment_method: payment_method_desk_credit(),
+        payment_status: "paid",
+        notes: order.notes,
+        created_at: order.created_at,
+        updated_at: "{time_now_unix_micros()}"
+    )
+    orepo.update(updated_order)?
+
+    val receipt = build_payment_receipt_email(order, txn_id, payment_method_display(payment_method_desk_credit()))
+    send_notification("customer@example.com", "Payment Receipt - Order #{order_id}", receipt)
+
+    flash_add(ctx, "success", "Payment processed. Transaction: {txn_id}")
+    render_redirect(ctx, "/admin/orders/{order_id}")
+
+# --- Restaurant Gate Pay (pay at exit, end of meal) ---
+
+fn action_gate_pay_form(ctx: ControllerContext) -> HttpResponseData:
+    val admin = require_admin(ctx)?
+    val order_id = ctx.params.get("order_id").unwrap_or("0").parse_i64().unwrap_or(0)
+    val orepo = create_order_repository(ctx.db())
+    val order = find_order_by_id(orepo, order_id)?
+
+    val data = ViewData.new()
+        .set("title", "Gate Pay - Order #{order.id}")
+        .set("order_id", "{order.id}")
+        .set("total", "{order.total}")
+        .set("total_display", format_price(order.total))
+        .set("payment_method", payment_method_gate_pay())
+        .set("csrf_token", csrf_token_for_session(ctx))
+    render_page(ctx, "payment/gate_pay", data.to_dict())
+
+fn action_gate_pay(ctx: ControllerContext) -> HttpResponseData:
+    val admin = require_admin(ctx)?
+    val csrf = ctx.form_value("csrf_token")
+    if not verify_csrf_token(ctx, csrf):
+        flash_add(ctx, "error", "Invalid form submission.")
+        return render_redirect(ctx, "/admin/orders")
+
+    val order_id = ctx.params.get("order_id").unwrap_or("0").parse_i64().unwrap_or(0)
+    val card_number = ctx.form_value("card_number")
+    val card_expiry = ctx.form_value("card_expiry")
+    val card_cvc = ctx.form_value("card_cvc")
+
+    val orepo = create_order_repository(ctx.db())
+    val order = find_order_by_id(orepo, order_id)?
+
+    val charge_result = mock_gateway_charge(order.total, card_number, card_expiry, card_cvc)
+    if charge_result.is_err():
+        flash_add(ctx, "error", "Payment failed: {charge_result.unwrap_err()}")
+        return render_redirect(ctx, "/admin/orders/{order_id}/gate-pay")
+
+    val txn_id = charge_result.unwrap()
+    val last_four = if card_number.len() >= 4:
+        card_number[card_number.len() - 4 : card_number.len()]
+    else:
+        card_number
+
+    val prepo = create_payment_repository(ctx.db())
+    val payment = Payment(
+        id: 0,
+        order_id: order_id,
+        method: payment_method_gate_pay(),
+        status: "completed",
+        amount: order.total,
+        card_last_four: last_four,
+        transaction_id: txn_id,
+        gateway_response: "approved",
+        created_at: "{time_now_unix_micros()}"
+    )
+    prepo.save(payment)?
+
+    val updated_order = Order(
+        id: order.id,
+        table_number: order.table_number,
+        status: "completed",
+        items_json: order.items_json,
+        subtotal: order.subtotal,
+        tax: order.tax,
+        total: order.total,
+        payment_method: payment_method_gate_pay(),
+        payment_status: "paid",
+        notes: order.notes,
+        created_at: order.created_at,
+        updated_at: "{time_now_unix_micros()}"
+    )
+    orepo.update(updated_order)?
+
+    val receipt = build_payment_receipt_email(order, txn_id, payment_method_display(payment_method_gate_pay()))
+    send_notification("customer@example.com", "Payment Receipt - Order #{order_id}", receipt)
+
+    flash_add(ctx, "success", "Gate payment processed. Meal complete.")
+    render_redirect(ctx, "/admin/orders/{order_id}")
+
+# --- Store Checkout (credit card) ---
+
+@public
+fn action_store_checkout_form(ctx: ControllerContext) -> HttpResponseData:
+    val order_id = ctx.params.get("order_id").unwrap_or("0").parse_i64().unwrap_or(0)
+    val orepo = create_order_repository(ctx.db())
+    val order = find_order_by_id(orepo, order_id)?
+
+    val data = ViewData.new()
+        .set("title", "Checkout")
+        .set("order_id", "{order.id}")
+        .set("total", "{order.total}")
+        .set("total_display", format_price(order.total))
+        .set("csrf_token", csrf_token_for_session(ctx))
+    render_page(ctx, "payment/store_checkout", data.to_dict())
+
+@public
+fn action_store_checkout(ctx: ControllerContext) -> HttpResponseData:
+    val csrf = ctx.form_value("csrf_token")
+    if not verify_csrf_token(ctx, csrf):
+        return render_json("{\"error\": \"Invalid form submission\"}")
+
+    val order_id = ctx.params.get("order_id").unwrap_or("0").parse_i64().unwrap_or(0)
+    val card_number = ctx.form_value("card_number")
+    val card_expiry = ctx.form_value("card_expiry")
+    val card_cvc = ctx.form_value("card_cvc")
+    val customer_email = ctx.form_value("email")
+
+    val orepo = create_order_repository(ctx.db())
+    val order = find_order_by_id(orepo, order_id)?
+
+    val charge_result = mock_gateway_charge(order.total, card_number, card_expiry, card_cvc)
+    if charge_result.is_err():
+        flash_add(ctx, "error", "Payment failed: {charge_result.unwrap_err()}")
+        return render_redirect(ctx, "/checkout/{order_id}")
+
+    val txn_id = charge_result.unwrap()
+    val last_four = if card_number.len() >= 4:
+        card_number[card_number.len() - 4 : card_number.len()]
+    else:
+        card_number
+
+    val prepo = create_payment_repository(ctx.db())
+    val payment = Payment(
+        id: 0,
+        order_id: order_id,
+        method: payment_method_store_checkout(),
+        status: "completed",
+        amount: order.total,
+        card_last_four: last_four,
+        transaction_id: txn_id,
+        gateway_response: "approved",
+        created_at: "{time_now_unix_micros()}"
+    )
+    prepo.save(payment)?
+
+    val updated_order = Order(
+        id: order.id,
+        table_number: order.table_number,
+        status: "completed",
+        items_json: order.items_json,
+        subtotal: order.subtotal,
+        tax: order.tax,
+        total: order.total,
+        payment_method: payment_method_store_checkout(),
+        payment_status: "paid",
+        notes: order.notes,
+        created_at: order.created_at,
+        updated_at: "{time_now_unix_micros()}"
+    )
+    orepo.update(updated_order)?
+
+    if customer_email != "":
+        val receipt = build_payment_receipt_email(order, txn_id, payment_method_display(payment_method_store_checkout()))
+        send_notification(customer_email, "Receipt - Order #{order_id}", receipt)
+
+    flash_add(ctx, "success", "Checkout complete!")
+    render_redirect(ctx, "/order/{order_id}/status")

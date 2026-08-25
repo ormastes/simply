@@ -1,0 +1,293 @@
+# widget_interact_metal_gui.spl — INTERACTIVE GUI app on the Engine2D Metal GPU
+# lane proving event handling, text editing, scrollbar movement and animation.
+#
+# Metal twin of the widget showcase, but LIVE: it pumps real winit events
+# (mouse click/move/wheel + keyboard) through pure reducers in
+# common.ui.widget_interact_model and re-renders the resulting state every frame
+# on the Metal GPU. Every presented frame is GPU-complete (gpu_frame_complete);
+# if any draw op falls back to the software mirror the app prints GPU_INCOMPLETE
+# and exits 1.
+#
+# Framebuffer is kept small (256x192) because the interpreter's per-pixel loops
+# make large frames seconds-slow; per-frame render time is reported on stdout.
+# The window is created at the framebuffer size so window pixel coords map 1:1 to
+# framebuffer coords (identity).
+#
+# STDOUT protocol (one line per handled event / per frame) so an orchestrator can
+# verify from launch.log while driving real mouse/keyboard:
+#   EVT click x=.. y=.. counter=..
+#   EVT key code=.. text="..."
+#   EVT wheel dy=.. scroll=..
+#   FRAME n=.. anim_x=.. render_ms=.. gpu=true
+#   GPU_INCOMPLETE            (then exit 1)
+#
+# Launch (window):
+#   SIMPLE_GUI=1 SIMPLE_EXECUTION_MODE=interpret \
+#     SIMPLE_GUI_RUN_SKIP_NUDGE=1 scripts/gui/macos-gui-run.shs \
+#     examples/06_io/ui/widget_interact_metal_gui.spl
+# Headless smoke (renders one GPU frame, prints FRAME gpu=true, exits 0):
+#   SIMPLE_TIMEOUT_SECONDS=300 SIMPLE_EXECUTION_MODE=interpret \
+#     bin/simple run examples/06_io/ui/widget_interact_metal_gui.spl
+
+use std.gpu.engine2d.backend_metal.{MetalBackend}
+use std.io.window_winit.{WinitLoop, WinitWindow, WinitInput, winit_loop_new, winit_loop_free, winit_window_new, winit_window_free, winit_present_rgba, winit_poll_input}
+use common.ui.widget_interact_model.{
+    InteractState, interact_state_new, on_click, on_key, on_wheel, on_tick,
+    BTN_X, BTN_Y, BTN_W, BTN_H, INPUT_X, INPUT_Y, INPUT_W, INPUT_H,
+    LIST_ITEMS, LIST_VISIBLE, scroll_max}
+use std.nogc_sync_mut.concurrent.thread.{thread_sleep}
+use std.nogc_sync_mut.io.time_ops.{current_time_ms}
+
+use std.io_runtime.{env_get, file_append_text}
+
+# Emit one protocol line: stdout always; also appended to the file named by
+# SIMPLE_EVT_LOG when set. The .app-bundle launcher (macos-gui-run.shs) loses
+# stdout entirely (LaunchServices), so orchestrators watch the file instead.
+var evt_log_path: text = ""
+
+fn emit(line: text):
+    print line
+    if evt_log_path != "":
+        file_append_text(evt_log_path, line + "\n")
+
+val W: i32 = 256
+val H: i32 = 192
+
+# Palette
+val BG: u32 = 0xFF14141Cu32
+val CARD: u32 = 0xFF1E1E28u32
+val FG: u32 = 0xFFE6E6F0u32
+val MUTED: u32 = 0xFF8A8A9Au32
+val LINE: u32 = 0xFF34343Eu32
+val ACCENT: u32 = 0xFF3B82F6u32
+val ACCENT_D: u32 = 0xFF1D4ED8u32
+val GREEN: u32 = 0xFF22C55Eu32
+val TRACK: u32 = 0xFF2A2A38u32
+val WHITE: u32 = 0xFFFFFFFFu32
+
+# Scrollbar geometry (framebuffer coords).
+val SB_X: i32 = 236
+val SB_Y: i32 = 100
+val SB_W: i32 = 8
+val SB_H: i32 = 80
+
+# List geometry.
+val LIST_X: i32 = 12
+val LIST_Y: i32 = 100
+val ITEM_H: i32 = 18
+
+# Animation row.
+val ANIM_Y: i32 = 164
+val ANIM_SZ: i32 = 14
+
+# ---------------------------------------------------------------------------
+# Render the full scene for a given interaction state. Uses ONLY GPU-dispatched
+# Engine2D ops (clear / draw_rect* / draw_line / draw_circle* / draw_rounded_rect
+# / draw_triangle_filled / draw_text). Returns the GPU readback pixels, or [] if
+# any op fell back to the software mirror (gpu_frame_complete=false).
+#
+# The backend is created ONCE by the caller and reused across frames — clear()
+# re-arms gpu_frame_complete at the start of every frame, so the per-frame GPU
+# gate stays strict while skipping the per-frame MSL pipeline recompile that
+# made each frame ~10s.
+# ---------------------------------------------------------------------------
+fn render(b: MetalBackend, state: InteractState) -> [u32]:
+    b.clear(BG)
+
+    # Title bar
+    b.draw_rect_filled(0, 0, W, 16, CARD)
+    b.draw_text(6, 4, "Interactive Metal GPU widgets", FG, 6)
+
+    # --- Button + counter ---
+    b.draw_rect_filled(BTN_X, BTN_Y, BTN_W, BTN_H, ACCENT)
+    b.draw_rounded_rect(BTN_X, BTN_Y, BTN_W, BTN_H, 5, ACCENT_D)
+    b.draw_text(BTN_X + 10, BTN_Y + 7, "Click me", WHITE, 6)
+    val counter_label = "Count: {state.counter}"
+    b.draw_text(BTN_X + BTN_W + 12, BTN_Y + 7, counter_label, FG, 7)
+
+    # --- Text input + caret ---
+    b.draw_text(INPUT_X, INPUT_Y - 10, "Type here:", MUTED, 6)
+    b.draw_rect(INPUT_X, INPUT_Y, INPUT_W, INPUT_H, MUTED)
+    val shown = state.text
+    b.draw_text(INPUT_X + 5, INPUT_Y + 5, shown, FG, 7)
+    # caret: a thin vertical line after the text (≈6px per glyph at size 7)
+    val caret_px = INPUT_X + 5 + state.caret * 6
+    b.draw_line(caret_px, INPUT_Y + 3, caret_px, INPUT_Y + INPUT_H - 3, FG, 1)
+
+    # --- Scrollable list ---
+    b.draw_rect(LIST_X - 2, LIST_Y - 2, 200, SB_H + 4, LINE)
+    var row = 0
+    while row < LIST_VISIBLE:
+        val item_idx = state.scroll_offset + row
+        if item_idx < LIST_ITEMS:
+            val iy = LIST_Y + row * ITEM_H
+            val item_label = "Item {item_idx + 1}"
+            b.draw_text(LIST_X, iy + 4, item_label, FG, 7)
+        row = row + 1
+
+    # --- Vertical scrollbar (thumb position reflects scroll_offset) ---
+    b.draw_rect_filled(SB_X, SB_Y, SB_W, SB_H, TRACK)
+    val smax = scroll_max()
+    var thumb_h = SB_H / 3
+    if thumb_h < 10:
+        thumb_h = 10
+    var thumb_y = SB_Y
+    if smax > 0:
+        val travel = SB_H - thumb_h
+        thumb_y = SB_Y + state.scroll_offset * travel / smax
+    b.draw_rounded_rect(SB_X, thumb_y, SB_W, thumb_h, 3, MUTED)
+
+    # --- Animated bouncing square ---
+    b.draw_text(LIST_X, ANIM_Y - 10, "Animation:", MUTED, 6)
+    b.draw_rect_filled(state.anim_x, ANIM_Y, ANIM_SZ, ANIM_SZ, GREEN)
+    b.draw_rect(state.anim_x, ANIM_Y, ANIM_SZ, ANIM_SZ, WHITE)
+
+    b.present()
+    val frame_complete = b.gpu_frame_complete
+    val pixels = b.read_pixels_gpu_only()
+    if not frame_complete:
+        return []
+    if pixels.len() < W * H:
+        return []
+    pixels
+
+fn pack(src: [u32]) -> [i64]:
+    var out: [i64] = [0; src.len()]
+    var i = 0
+    while i < src.len():
+        out[i] = src[i].to_i64() & 0xFFFFFF
+        i = i + 1
+    out
+
+# Render one frame, enforce the GPU-complete invariant, present it (if a window
+# exists), and print the FRAME line. Returns false if the frame was not GPU
+# complete (caller must exit 1).
+fn present_frame(b: MetalBackend, win: WinitWindow, has_win: bool, state: InteractState, n: i64) -> bool:
+    val t0 = current_time_ms()
+    val pixels = render(b, state)
+    val t1 = current_time_ms()
+    if pixels.len() < W * H:
+        emit("GPU_INCOMPLETE")
+        return false
+    if has_win:
+        winit_present_rgba(win, W.to_i64(), H.to_i64(), pack(pixels))
+    emit("FRAME n={n} anim_x={state.anim_x} render_ms={t1 - t0} gpu=true")
+    true
+
+fn main() -> i64:
+    print "Interactive widget GUI — {W}x{H} via Engine2D Metal GPU lane"
+    var state = interact_state_new()
+
+    evt_log_path = env_get("SIMPLE_EVT_LOG") ?? ""
+    val want_gui = (env_get("SIMPLE_GUI") ?? "") == "1"
+
+    var b = MetalBackend.create()
+    if not b.init(W, H):
+        print "Metal backend failed to initialize"
+        return 1
+
+    # Headless smoke path: render the initial frame on the GPU, prove gpu=true,
+    # exit 0 (no window).
+    if not want_gui:
+        val dummy = WinitWindow(handle: 0, is_valid: false)
+        val ok = present_frame(b, dummy, false, state, 0)
+        b.shutdown()
+        if not ok:
+            return 1
+        print "Headless OK (no GUI requested); rendered initial GPU frame."
+        return 0
+
+    val lp = winit_loop_new()
+    if not lp.is_valid:
+        print "No GUI runtime available."
+        b.shutdown()
+        return 1
+    # Window created at the framebuffer size → window pixel coords map 1:1 to
+    # framebuffer coords (identity), so clicks need no scaling.
+    val win = winit_window_new(lp, W.to_i64(), H.to_i64(), "Simple Interactive Widgets (Metal lane)")
+    if not win.is_valid:
+        winit_loop_free(lp)
+        b.shutdown()
+        return 1
+
+    var n = 0
+    if not present_frame(b, win, true, state, n):
+        winit_window_free(win)
+        winit_loop_free(lp)
+        b.shutdown()
+        return 1
+    n = n + 1
+
+    var running = true
+    while running and n < 2000000:
+        # Inner poll loop: pump winit/AppKit every ~30ms so OS activation,
+        # AX raise/move, and input delivery stay responsive even though a GPU
+        # frame takes seconds under the interpreter. Breaks early on any
+        # interaction so the visual response is immediate.
+        var dirty = false
+        var polls = 0
+        while polls < 50 and not dirty and running:
+            val input = winit_poll_input(lp)
+            if input.close:
+                running = false
+
+            # Keyboard events (typing, backspace, arrow-key scroll, esc quits).
+            for k in input.keys:
+                if k == 27:
+                    running = false
+                else:
+                    val before = state.text
+                    val before_scroll = state.scroll_offset
+                    state = on_key(state, k)
+                    if state.text != before:
+                        emit("EVT key code={k} text=\"{state.text}\"")
+                        dirty = true
+                    elif state.scroll_offset != before_scroll:
+                        emit("EVT wheel dy=0 scroll={state.scroll_offset}")
+                        dirty = true
+
+            # Mouse clicks (left-button press only) → reducer with fb coords.
+            var ci = 0
+            while ci < input.click_buttons.len():
+                val btn = input.click_buttons[ci]
+                val pressed = input.click_pressed[ci]
+                if btn == 0 and pressed:
+                    val fx = input.click_x[ci].to_i32()
+                    val fy = input.click_y[ci].to_i32()
+                    state = on_click(state, fx, fy)
+                    emit("EVT click x={fx} y={fy} counter={state.counter}")
+                    dirty = true
+                ci = ci + 1
+
+            # Mouse wheel → list scroll. Wheel up (positive) scrolls to top.
+            if input.scroll_y != 0.0:
+                var dy = 0
+                if input.scroll_y > 0.0:
+                    dy = 1
+                else:
+                    dy = -1
+                val before_scroll = state.scroll_offset
+                state = on_wheel(state, dy)
+                if state.scroll_offset != before_scroll:
+                    emit("EVT wheel dy={dy} scroll={state.scroll_offset}")
+                    dirty = true
+
+            thread_sleep(30)
+            polls = polls + 1
+
+        # Animation always advances — keeps a live GPU frame flowing.
+        state = on_tick(state)
+
+        if not present_frame(b, win, true, state, n):
+            running = false
+            winit_window_free(win)
+            winit_loop_free(lp)
+            b.shutdown()
+            return 1
+        n = n + 1
+
+    winit_window_free(win)
+    winit_loop_free(lp)
+    b.shutdown()
+    print "Interactive session ended after {n} frames."
+    return 0

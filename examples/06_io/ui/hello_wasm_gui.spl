@@ -1,0 +1,76 @@
+# Hello generated-WASM GUI entry.
+#
+# This source is intentionally dependency-light so the WASM compiler/linker
+# path can use it as the first no-JavaScript GUI artifact across mobile and WM
+# targets.
+
+fn hello_wasm_gui_title() -> text:
+    "Hello World"
+
+fn hello_wasm_gui_body() -> text:
+    "<main data-simple-wasm='hello' data-layout='column-gap-8-padding-16'><nav id='hello_taskbar' data-simple-surface='taskbar'><button id='hello_taskbar_home'>Home</button><button id='hello_taskbar_apps'>Apps</button></nav><section id='hello_command_bar' data-simple-surface='command_bar'><button id='hello_command_run'>Run</button><input id='hello_command_input' value='simple run gui'></section><button id='hello_button'>Hello World</button><input id='hello_text' value='Generated WASM UI'><img id='hello_image' width='64' height='64' alt='Simple image' src='data:image/svg+xml,%3Csvg xmlns=\"http://www.w3.org/2000/svg\" width=\"64\" height=\"64\"%3E%3Crect width=\"64\" height=\"64\" fill=\"%232563eb\"/%3E%3Ccircle cx=\"32\" cy=\"32\" r=\"18\" fill=\"white\"/%3E%3C/svg%3E'><section id='hello_primitives' data-simple-primitives='rect,circle,line'><span data-primitive='rect'></span><span data-primitive='circle'></span><span data-primitive='line'></span></section></main>"
+
+fn hello_wasm_gui_css() -> text:
+    "main{display:flex;flex-direction:column;gap:8px;padding:16px;}button,input{min-height:44px;}#hello_taskbar,#hello_command_bar{display:flex;gap:8px;min-height:44px;}#hello_command_input{min-width:160px;}#hello_image{width:64px;height:64px;}#hello_primitives{width:128px;height:48px;position:relative;}[data-primitive]{position:absolute;display:block;}[data-primitive='rect']{left:0;top:0;width:40px;height:28px;background:#2563eb;}[data-primitive='circle']{left:48px;top:0;width:32px;height:32px;border-radius:16px;background:#16a34a;}[data-primitive='line']{left:88px;top:20px;width:40px;height:4px;background:#111827;}"
+
+fn hello_wasm_gui_event_response(event_name: text, target_id: text) -> text:
+    if event_name == "click" and target_id == "hello_button":
+        return "hello_button:clicked"
+    if event_name == "scroll":
+        return "hello_scroll:accepted"
+    if event_name == "text" and target_id == "hello_text":
+        return "hello_text:accepted"
+    if event_name == "command" and target_id == "hello_command_input":
+        return "hello_command:accepted"
+    "hello_event:ignored"
+
+fn simple_app_init() -> i64:
+    1
+
+fn simple_app_render() -> text:
+    hello_wasm_gui_body()
+
+fn simple_app_event(event_name: text, target_id: text) -> text:
+    hello_wasm_gui_event_response(event_name, target_id)
+
+fn simple_app_render_probe() -> i64:
+    val body = simple_app_render()
+    var count = 0i64
+    if body.contains("data-simple-wasm='hello'"):
+        count = count + 1
+    if body.contains("data-layout='column-gap-8-padding-16'"):
+        count = count + 1
+    if body.contains("id='hello_taskbar'"):
+        count = count + 1
+    if body.contains("id='hello_command_bar'"):
+        count = count + 1
+    if body.contains("id='hello_button'"):
+        count = count + 1
+    if body.contains("id='hello_text'"):
+        count = count + 1
+    if body.contains("id='hello_image'"):
+        count = count + 1
+    if body.contains("data-simple-primitives='rect,circle,line'"):
+        count = count + 1
+    count
+
+fn simple_app_event_probe() -> i64:
+    var count = 0i64
+    if simple_app_event("click", "hello_button") == "hello_button:clicked":
+        count = count + 1
+    if simple_app_event("scroll", "viewport") == "hello_scroll:accepted":
+        count = count + 1
+    if simple_app_event("text", "hello_text") == "hello_text:accepted":
+        count = count + 1
+    if simple_app_event("command", "hello_command_input") == "hello_command:accepted":
+        count = count + 1
+    if simple_app_event("click", "wrong_button") == "hello_event:ignored":
+        count = count + 1
+    count
+
+fn main() -> i64:
+    print "wasm_gui:title:{hello_wasm_gui_title()}"
+    print "wasm_gui:body:{hello_wasm_gui_body()}"
+    print "wasm_gui:css:{hello_wasm_gui_css()}"
+    print "wasm_gui:event:{hello_wasm_gui_event_response(\"click\", \"hello_button\")}"
+    return 0

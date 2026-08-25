@@ -1,0 +1,162 @@
+"""
+queue_tail_backpressure_check — corrupted queue pointers or CIDs must not drop admin or IO work.
+
+Run: bin/simple run examples/09_embedded/simpleos_nvme_fw/fw/queue_tail_backpressure_check.spl
+"""
+
+use nvme_types.*
+use nvme_admin_types.*
+use nvme_admin.*
+use nvme_controller.*
+
+fn main():
+    var fail: i64 = 0
+    var c: NvmeController = nvme_controller_new()
+
+    c.aq.cq_tail = MAX_QUEUE_SIZE
+    c.admin_submit(admin_identify_cmd(1, CNS_CONTROLLER))
+    fail = fail + expect_eq(c.admin_process(), 0, "admin dispatch backs off on invalid CQ tail")
+    fail = fail + expect_eq(c.aq.pending(), 1, "admin command remains pending")
+    c.aq.cq_tail = 0
+    c.admin_process()
+    val ac: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(ac.status, SC_SUCCESS, "admin command completes after CQ tail repair")
+
+    c.aq.cq_head = MAX_QUEUE_SIZE
+    c.admin_submit(admin_identify_cmd(5, CNS_CONTROLLER))
+    fail = fail + expect_eq(c.admin_process(), 0, "admin dispatch backs off on invalid CQ head")
+    fail = fail + expect_eq(c.aq.pending(), 1, "admin command remains pending behind invalid head")
+    c.aq.cq_head = 0
+    c.admin_process()
+    val ah: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(ah.status, SC_SUCCESS, "admin command completes after CQ head repair")
+
+    c.admin_submit(admin_identify_cmd(7, CNS_CONTROLLER))
+    val bad_admin_cid_slot: i64 = c.aq.sq_head
+    val saved_admin_cid: i64 = c.aq.sq_cid[bad_admin_cid_slot]
+    c.aq.sq_cid[bad_admin_cid_slot] = 70000
+    fail = fail + expect_eq(c.admin_process(), 0, "admin dispatch backs off on invalid SQ head cid")
+    fail = fail + expect_eq(c.aq.pending(), 1, "admin command remains pending behind invalid SQ head cid")
+    c.aq.sq_cid[bad_admin_cid_slot] = saved_admin_cid
+    c.admin_process()
+    val ach: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(ach.status, SC_SUCCESS, "admin command completes after SQ cid repair")
+
+    c.admin_submit(admin_identify_cmd(9, CNS_CONTROLLER))
+    c.admin_process()
+    c.aq.cq_head = MAX_QUEUE_SIZE
+    val bad_admin_reap: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(bad_admin_reap.status, SC_INVALID_FIELD, "admin reap fails closed on invalid CQ head")
+    fail = fail + expect_eq(c.aq.cq_pending(), 1, "admin completion remains pending behind invalid CQ head")
+    c.aq.cq_head = 0
+    val repaired_admin_reap: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(repaired_admin_reap.status, SC_SUCCESS, "admin completion reaps after CQ head repair")
+
+    c.admin_submit(admin_identify_cmd(11, CNS_CONTROLLER))
+    c.admin_process()
+    val bad_admin_cq_cid_slot: i64 = c.aq.cq_head
+    val saved_admin_cq_cid: i64 = c.aq.cq_cid[bad_admin_cq_cid_slot]
+    c.aq.cq_cid[bad_admin_cq_cid_slot] = 70000
+    val bad_admin_cid_reap: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(bad_admin_cid_reap.status, SC_INVALID_FIELD, "admin reap fails closed on invalid CQ head cid")
+    fail = fail + expect_eq(c.aq.cq_pending(), 1, "admin completion remains pending behind invalid CQ head cid")
+    c.aq.cq_cid[bad_admin_cq_cid_slot] = saved_admin_cq_cid
+    val repaired_admin_cid_reap: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(repaired_admin_cid_reap.status, SC_SUCCESS, "admin completion reaps after CQ cid repair")
+
+    c.admin_submit(admin_identify_cmd(13, CNS_CONTROLLER))
+    c.admin_process()
+    val bad_admin_cq_status_slot: i64 = c.aq.cq_head
+    val saved_admin_cq_status: i64 = c.aq.cq_status[bad_admin_cq_status_slot]
+    c.aq.cq_status[bad_admin_cq_status_slot] = 70000
+    val bad_admin_status_reap: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(bad_admin_status_reap.status, SC_INVALID_FIELD, "admin reap fails closed on invalid CQ head status")
+    fail = fail + expect_eq(c.aq.cq_pending(), 1, "admin completion remains pending behind invalid CQ head status")
+    c.admin_submit(admin_identify_cmd(14, CNS_CONTROLLER))
+    fail = fail + expect_eq(c.admin_process(), 0, "admin dispatch backs off on invalid CQ head status")
+    fail = fail + expect_eq(c.aq.pending(), 1, "admin command remains pending behind invalid CQ head status")
+    c.aq.cq_status[bad_admin_cq_status_slot] = saved_admin_cq_status
+    val repaired_admin_status_reap: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(repaired_admin_status_reap.status, SC_SUCCESS, "admin completion reaps after CQ status repair")
+    c.admin_process()
+    val status_blocked_admin_reap: NvmeCpl = c.admin_reap()
+    fail = fail + expect_eq(status_blocked_admin_reap.status, SC_SUCCESS, "admin command completes after CQ status repair")
+
+    c.admin_submit(admin_create_cq_cmd(2, 1, 64))
+    c.admin_submit(admin_create_sq_cmd(3, 1, 64, 1))
+    c.admin_process()
+    c.admin_reap()
+    c.admin_reap()
+    c.qset.cq_tail[1] = MAX_QUEUE_SIZE
+    c.io_submit(1, cmd_make(4, OP_READ, 0, 1, 0))
+    fail = fail + expect_eq(c.io_process(), 0, "IO dispatch backs off on invalid CQ tail")
+    fail = fail + expect_eq(c.qset.sq_pending(1), 1, "IO command remains pending")
+    c.qset.cq_tail[1] = 0
+    c.io_process()
+    val ic: NvmeCpl = c.io_reap(1)
+    fail = fail + expect_eq(ic.status, SC_SUCCESS, "IO command completes after CQ tail repair")
+
+    c.qset.cq_head[1] = MAX_QUEUE_SIZE
+    c.io_submit(1, cmd_make(6, OP_READ, 0, 1, 0))
+    fail = fail + expect_eq(c.io_process(), 0, "IO dispatch backs off on invalid CQ head")
+    fail = fail + expect_eq(c.qset.sq_pending(1), 1, "IO command remains pending behind invalid head")
+    c.qset.cq_head[1] = 0
+    c.io_process()
+    val ih: NvmeCpl = c.io_reap(1)
+    fail = fail + expect_eq(ih.status, SC_SUCCESS, "IO command completes after CQ head repair")
+
+    c.io_submit(1, cmd_make(8, OP_READ, 0, 1, 0))
+    val bad_io_cid_slot: i64 = 1 * MAX_QUEUE_SIZE + c.qset.sq_head[1]
+    val saved_io_cid: i64 = c.qset.sq_cid[bad_io_cid_slot]
+    c.qset.sq_cid[bad_io_cid_slot] = 70000
+    fail = fail + expect_eq(c.io_process(), 0, "IO dispatch backs off on invalid SQ head cid")
+    fail = fail + expect_eq(c.qset.sq_pending(1), 1, "IO command remains pending behind invalid SQ head cid")
+    c.qset.sq_cid[bad_io_cid_slot] = saved_io_cid
+    c.io_process()
+    val ich: NvmeCpl = c.io_reap(1)
+    fail = fail + expect_eq(ich.status, SC_SUCCESS, "IO command completes after SQ cid repair")
+
+    c.io_submit(1, cmd_make(10, OP_READ, 0, 1, 0))
+    c.io_process()
+    c.qset.cq_head[1] = MAX_QUEUE_SIZE
+    val bad_io_reap: NvmeCpl = c.io_reap(1)
+    fail = fail + expect_eq(bad_io_reap.status, SC_INVALID_FIELD, "IO reap fails closed on invalid CQ head")
+    fail = fail + expect_eq(c.qset.cq_pending(1), 1, "IO completion remains pending behind invalid CQ head")
+    c.qset.cq_head[1] = 0
+    val repaired_io_reap: NvmeCpl = c.io_reap(1)
+    fail = fail + expect_eq(repaired_io_reap.status, SC_SUCCESS, "IO completion reaps after CQ head repair")
+
+    c.io_submit(1, cmd_make(12, OP_READ, 0, 1, 0))
+    c.io_process()
+    val bad_io_cq_cid_slot: i64 = 1 * MAX_QUEUE_SIZE + c.qset.cq_head[1]
+    val saved_io_cq_cid: i64 = c.qset.cq_cid[bad_io_cq_cid_slot]
+    c.qset.cq_cid[bad_io_cq_cid_slot] = 70000
+    val bad_io_cid_reap: NvmeCpl = c.io_reap(1)
+    fail = fail + expect_eq(bad_io_cid_reap.status, SC_INVALID_FIELD, "IO reap fails closed on invalid CQ head cid")
+    fail = fail + expect_eq(c.qset.cq_pending(1), 1, "IO completion remains pending behind invalid CQ head cid")
+    c.qset.cq_cid[bad_io_cq_cid_slot] = saved_io_cq_cid
+    val repaired_io_cid_reap: NvmeCpl = c.io_reap(1)
+    fail = fail + expect_eq(repaired_io_cid_reap.status, SC_SUCCESS, "IO completion reaps after CQ cid repair")
+
+    c.io_submit(1, cmd_make(14, OP_READ, 0, 1, 0))
+    c.io_process()
+    val bad_io_cq_status_slot: i64 = 1 * MAX_QUEUE_SIZE + c.qset.cq_head[1]
+    val saved_io_cq_status: i64 = c.qset.cq_status[bad_io_cq_status_slot]
+    c.qset.cq_status[bad_io_cq_status_slot] = 70000
+    val bad_io_status_reap: NvmeCpl = c.io_reap(1)
+    fail = fail + expect_eq(bad_io_status_reap.status, SC_INVALID_FIELD, "IO reap fails closed on invalid CQ head status")
+    fail = fail + expect_eq(c.qset.cq_pending(1), 1, "IO completion remains pending behind invalid CQ head status")
+    c.io_submit(1, cmd_make(15, OP_READ, 0, 1, 0))
+    fail = fail + expect_eq(c.io_process(), 0, "IO dispatch backs off on invalid CQ head status")
+    fail = fail + expect_eq(c.qset.sq_pending(1), 1, "IO command remains pending behind invalid CQ head status")
+    c.qset.cq_status[bad_io_cq_status_slot] = saved_io_cq_status
+    val repaired_io_status_reap: NvmeCpl = c.io_reap(1)
+    fail = fail + expect_eq(repaired_io_status_reap.status, SC_SUCCESS, "IO completion reaps after CQ status repair")
+    c.io_process()
+    val status_blocked_io_reap: NvmeCpl = c.io_reap(1)
+    fail = fail + expect_eq(status_blocked_io_reap.status, SC_SUCCESS, "IO command completes after CQ status repair")
+
+    if fail == 0:
+        print "QUEUE BACKPRESSURE OK"
+    else:
+        print "QUEUE BACKPRESSURE FAIL ({fail})"

@@ -1,0 +1,33 @@
+# UBS Kernel — Materialized Balance Snapshots
+#
+# account_balance is O(entries): at volume, re-summing the whole ledger for every
+# balance read is wasteful. A snapshot materialises the balance for one account
+# up to a cut point; a later read only sums the tail past the cut and adds the
+# snapshot. Because balances are a deterministic projection of the entries, the
+# snapshot is a cache, never a second source of truth — snapshot + tail always
+# equals a full re-sum.
+
+use kernel.projection.{JournalEntry, account_balance}
+use units.money.{Money}
+
+struct BalanceSnapshot:
+    val upto_entry: i64
+    val account: i64
+    val currency: text
+    val balance_minor: i64
+
+# Materialise the balance over entries[0..upto_entry) for one account+currency.
+# Arrays are value types, so build a fresh head slice rather than aliasing.
+fn take_snapshot(entries: [JournalEntry], upto_entry: i64, account: i64, currency: text) -> BalanceSnapshot:
+    var head: [JournalEntry] = []
+    var i = 0
+    while (i < upto_entry and i < entries.length()):
+        head.push(entries[i])
+        i = i + 1
+    val bal = account_balance(head, account, currency)
+    return BalanceSnapshot { upto_entry: upto_entry, account: account, currency: currency, balance_minor: bal.minor }
+
+# Snapshot balance plus the tail's balance == full account_balance.
+fn balance_with_snapshot(snap: BalanceSnapshot, tail: [JournalEntry]) -> i64:
+    val tb = account_balance(tail, snap.account, snap.currency)
+    return snap.balance_minor + tb.minor

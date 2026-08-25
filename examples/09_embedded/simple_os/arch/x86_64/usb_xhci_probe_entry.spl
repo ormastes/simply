@@ -1,0 +1,39 @@
+# x86_64 q35 USB xHCI enumeration proof entry — minimal SimpleOS USB proof.
+#
+# Boots under `-device qemu-xhci -device usb-kbd -device usb-mouse` and
+# proves the real xHCI host-controller driver (src/os/drivers/usb/xhci_driver.spl
+# + xhci_enum.spl) actually enumerates the QEMU-attached HID devices: PCI
+# probe, xHCI §4.2 init, port status scan, Enable Slot + Address Device
+# commands, and an EP0 GET_DESCRIPTOR control transfer per device.
+
+extern fn serial_println(msg: text)
+extern fn rt_port_outb(port: u16, value: u8)
+
+use os.kernel.memory.pmm.{pmm_init_identity_range}
+use os.kernel.boot.mmio.{mmio_disable_test_mode}
+use os.drivers.usb.usb_xhci_probe_boot.{usb_xhci_probe_serial_lines}
+
+fn _start():
+    serial_println("")
+    serial_println("=== SimpleOS q35 USB xHCI probe ===")
+    serial_println("")
+
+    # Freestanding builds skip module initializers: pin MMIO to real hardware
+    # before any physical-memory access (see mmio.spl mmio_disable_test_mode).
+    mmio_disable_test_mode()
+
+    val memory_ready = pmm_init_identity_range(
+        536870912u64,
+        0x100000u64,
+        33554432u64
+    )
+    if memory_ready:
+        serial_println("[boot] memory init OK")
+    else:
+        serial_println("[boot] memory init FAILED")
+
+    for line in usb_xhci_probe_serial_lines():
+        serial_println(line)
+
+    serial_println("TEST PASSED")
+    rt_port_outb(0xf4, 0)

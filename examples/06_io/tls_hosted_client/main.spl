@@ -1,0 +1,81 @@
+#!/usr/bin/env simple
+@allow(primitive_api)
+
+use std.io_runtime.{env_get}
+
+extern fn rt_file_read_bytes(path: text) -> [u8]?
+extern fn rt_thread_sleep(ms: i64)
+
+use std.nogc_sync_mut.io.tcp.{TcpStream}
+use os.tls13.mod.{
+    load_tls_test_server_config, tls13_connect_host_stream_with_config, tls13_default_client_config,
+    tls13_close, Tls13ConnectResult
+}
+
+fn _read_bytes(path: text) -> [u8]:
+    rt_file_read_bytes(path) ?? []
+
+fn _read_bytes_retry(path: text) -> [u8]:
+    var attempt: i64 = 0
+    while attempt < 40:
+        val bytes = _read_bytes(path)
+        if bytes.len() > 0:
+            return bytes
+        rt_thread_sleep(50)
+        attempt = attempt + 1
+    []
+
+fn main() -> i64:
+    var config_path = env_get("TLS_TEST_SERVER_CONFIG")
+    if config_path == nil or config_path == "":
+        config_path = "tools/tls_test_server/server.sdn"
+
+    val config_result = load_tls_test_server_config(config_path)
+    if val Err(err) = config_result:
+        print "[simple-client] config error: {err}"
+        return 1
+
+    val config = match config_result:
+        case Ok(cfg): cfg
+        case _:
+            print "[simple-client] config error"
+            return 1
+
+    if config.listen == "":
+        print "[simple-client] invalid listen addr: {config.listen}"
+        return 1
+    val stream_result = TcpStream.connect(config.listen)
+    if stream_result.err.?:
+        print "[simple-client] connect failed: {stream_result.err.unwrap()}"
+        return 1
+    val stream = stream_result.unwrap()
+    val _ = stream.set_nodelay(true)
+    val _ = stream.set_read_timeout(10000)
+    val _ = stream.set_write_timeout(10000)
+
+    var tls_config = tls13_default_client_config()
+    # The spec validates the exported CA and live server separately with openssl.
+    # Keep the Simple probe focused on the live TLS state machine to reduce runtime.
+    tls_config.root_store = []
+    if config.require_client_auth:
+        tls_config.client_cert_chain = [_read_bytes_retry(config.fixture_dir + "/client.der")]
+        tls_config.client_pkcs8 = _read_bytes_retry(config.fixture_dir + "/client.key.der")
+        tls_config.client_sig_scheme = 0x0807
+
+    val tls_result = tls13_connect_host_stream_with_config(stream, "localhost", tls_config)
+    if val Tls13ConnectResult.Failed(reason) = tls_result:
+        print "[simple-client] handshake failed: {reason}"
+        return 1
+
+    val ctx = match tls_result:
+        case Tls13ConnectResult.Connected(connected_ctx): connected_ctx
+        case _:
+            print "[simple-client] connect result mismatch"
+            return 1
+
+    val close_result = tls13_close(ctx)
+    if not close_result.ok:
+        print "[simple-client] close failed: {close_result.reason}"
+        return 1
+    print "[simple-client] handshake ok"
+    0

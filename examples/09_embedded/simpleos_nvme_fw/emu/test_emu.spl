@@ -1,0 +1,27 @@
+"""
+Aggregated self-test suite for the SimpleOS NVMe host/device emulator — every
+emulator module (NAND array, shared memcpy/DMA seam, emulated FTL, NVMe device).
+The end-to-end scenario lives in nvme_emu_main.spl.
+Run: bin/simple run examples/09_embedded/simpleos_nvme_fw/emu/test_emu.spl
+Gate: prints "ALL EMU SELFTESTS PASS" and exits 0.
+"""
+
+use nvme_ct.*
+use nvme_shared.*
+use nvme_memcpy.*
+use nand_onfi.*
+use ftl_emu.*
+use nvme_host.*
+use nvme_device.*
+
+fn main():
+    var f: i64 = 0
+    f = f + nand_array_selftest()
+    f = f + shared_memcpy_selftest()
+    f = f + ftl_selftest()
+    f = f + nvme_device_selftest()
+    print ""
+    if f == 0:
+        print "ALL EMU SELFTESTS PASS"
+    else:
+        print "EMU SELFTESTS FAIL ({f})"

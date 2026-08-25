@@ -1,0 +1,269 @@
+# LLM Caret Server Specification
+
+# Inline helpers
+fn _LB() -> text:
+    "{(123 as char)}"
+
+fn _RB() -> text:
+    "{(125 as char)}"
+
+fn _Q() -> text:
+    "\""
+
+fn _unwrap_idx(opt) -> i64:
+    match opt:
+        Some(i): return i
+        nil: return -1
+
+fn _escape_json(s: text) -> text:
+    var result = ""
+    var i = 0
+    while i < s.len():
+        val ch = s[i]
+        if ch == "\\":
+            result = result + "\\\\"
+        elif ch == "\"":
+            result = result + "\\\""
+        elif ch == "\n":
+            result = result + "\\n"
+        elif ch == "\r":
+            result = result + "\\r"
+        elif ch == "\t":
+            result = result + "\\t"
+        else:
+            result = result + ch
+        i = i + 1
+    result
+
+fn _extract_json_string(json: text, key: text) -> text:
+    val quote = "\""
+    val search = quote + key + quote + ":"
+    val idx = _unwrap_idx(json.index_of(search))
+    if idx < 0:
+        return ""
+    val slen = search.len()
+    val start = idx + slen
+    val after = json.substring(start)
+    val trimmed = after.trim()
+    if trimmed.starts_with(quote):
+        val rest = trimmed.substring(1)
+        var end = 0
+        var escaped = false
+        while end < rest.len():
+            val ch = rest[end]
+            if escaped:
+                escaped = false
+            elif ch == "\\":
+                escaped = true
+            elif ch == "\"":
+                return rest.substring(0, end)
+            end = end + 1
+    ""
+
+# Response builders (from server.spl)
+fn build_health_response() -> text:
+    var r = _LB()
+    r = r + _Q() + "status" + _Q() + ":" + _Q() + "ok" + _Q() + ","
+    r = r + _Q() + "service" + _Q() + ":" + _Q() + "llm_caret" + _Q() + ","
+    r = r + _Q() + "version" + _Q() + ":" + _Q() + "0.1.0" + _Q()
+    r = r + _RB()
+    r
+
+fn build_models_response() -> text:
+    var models: [text] = []
+    var m1 = _LB()
+    m1 = m1 + _Q() + "id" + _Q() + ":" + _Q() + "claude-sonnet-4-20250514" + _Q() + ","
+    m1 = m1 + _Q() + "provider" + _Q() + ":" + _Q() + "claude_cli" + _Q()
+    m1 = m1 + _RB()
+    models = models + [m1]
+    var m2 = _LB()
+    m2 = m2 + _Q() + "id" + _Q() + ":" + _Q() + "claude-opus-4-20250514" + _Q() + ","
+    m2 = m2 + _Q() + "provider" + _Q() + ":" + _Q() + "claude_cli" + _Q()
+    m2 = m2 + _RB()
+    models = models + [m2]
+    var m3 = _LB()
+    m3 = m3 + _Q() + "id" + _Q() + ":" + _Q() + "gpt-4o" + _Q() + ","
+    m3 = m3 + _Q() + "provider" + _Q() + ":" + _Q() + "openai" + _Q()
+    m3 = m3 + _RB()
+    models = models + [m3]
+    var data = "["
+    var i = 0
+    for md in models:
+        if i > 0:
+            data = data + ","
+        data = data + md
+        i = i + 1
+    data = data + "]"
+    var r = _LB()
+    r = r + _Q() + "object" + _Q() + ":" + _Q() + "list" + _Q() + ","
+    r = r + _Q() + "data" + _Q() + ":" + data
+    r = r + _RB()
+    r
+
+fn build_chat_completion_response(content: text, model: text, finish_reason: text) -> text:
+    var r = _LB()
+    r = r + _Q() + "id" + _Q() + ":" + _Q() + "chatcmpl-llm_caret" + _Q() + ","
+    r = r + _Q() + "object" + _Q() + ":" + _Q() + "chat.completion" + _Q() + ","
+    r = r + _Q() + "model" + _Q() + ":" + _Q() + _escape_json(model) + _Q() + ","
+    var choice = _LB()
+    choice = choice + _Q() + "index" + _Q() + ":0,"
+    var msg = _LB()
+    msg = msg + _Q() + "role" + _Q() + ":" + _Q() + "assistant" + _Q() + ","
+    msg = msg + _Q() + "content" + _Q() + ":" + _Q() + _escape_json(content) + _Q()
+    msg = msg + _RB()
+    choice = choice + _Q() + "message" + _Q() + ":" + msg + ","
+    choice = choice + _Q() + "finish_reason" + _Q() + ":" + _Q() + finish_reason + _Q()
+    choice = choice + _RB()
+    r = r + _Q() + "choices" + _Q() + ":[" + choice + "]"
+    r = r + _RB()
+    r
+
+fn build_anthropic_response(content: text, model: text, stop_reason: text) -> text:
+    var r = _LB()
+    r = r + _Q() + "id" + _Q() + ":" + _Q() + "msg_llm_caret" + _Q() + ","
+    r = r + _Q() + "type" + _Q() + ":" + _Q() + "message" + _Q() + ","
+    r = r + _Q() + "model" + _Q() + ":" + _Q() + _escape_json(model) + _Q() + ","
+    r = r + _Q() + "stop_reason" + _Q() + ":" + _Q() + stop_reason + _Q() + ","
+    var block = _LB()
+    block = block + _Q() + "type" + _Q() + ":" + _Q() + "text" + _Q() + ","
+    block = block + _Q() + "text" + _Q() + ":" + _Q() + _escape_json(content) + _Q()
+    block = block + _RB()
+    r = r + _Q() + "content" + _Q() + ":[" + block + "]"
+    r = r + _RB()
+    r
+
+fn build_error_response(error_msg: text, status_code: i64) -> text:
+    var r = _LB()
+    r = r + _Q() + "error" + _Q() + ":"
+    var inner = _LB()
+    inner = inner + _Q() + "message" + _Q() + ":" + _Q() + _escape_json(error_msg) + _Q() + ","
+    inner = inner + _Q() + "type" + _Q() + ":" + _Q() + "error" + _Q() + ","
+    inner = inner + _Q() + "code" + _Q() + ":" + "{status_code}"
+    inner = inner + _RB()
+    r = r + inner
+    r = r + _RB()
+    r
+
+fn parse_chat_request_model(body: text) -> text:
+    _extract_json_string(body, "model")
+
+fn parse_chat_request_content(body: text) -> text:
+    _extract_json_string(body, "content")
+
+fn handle_route(method: text, path: text, body: text) -> text:
+    if method == "GET" and path == "/v1/health":
+        return build_health_response()
+    if method == "GET" and path == "/v1/models":
+        return build_models_response()
+    if method == "POST" and path == "/v1/chat/completions":
+        val content = parse_chat_request_content(body)
+        if content == "":
+            return build_error_response("messages required", 400)
+        return build_error_response("backend not connected - use provider.dispatch_send()", 501)
+    if method == "POST" and path == "/v1/messages":
+        val content = parse_chat_request_content(body)
+        if content == "":
+            return build_error_response("messages required", 400)
+        return build_error_response("backend not connected - use provider.dispatch_send()", 501)
+    build_error_response("not found: " + path, 404)
+
+# ============================================================================
+# Tests
+# ============================================================================
+
+describe "Health Endpoint":
+    it "returns ok status":
+        val resp = build_health_response()
+        expect(resp).to_contain("\"ok\"")
+
+    it "returns service name":
+        val resp = build_health_response()
+        expect(resp).to_contain("llm_caret")
+
+    it "returns version":
+        val resp = build_health_response()
+        expect(resp).to_contain("0.1.0")
+
+describe "Models Endpoint":
+    it "returns list object":
+        val resp = build_models_response()
+        expect(resp).to_contain("\"list\"")
+
+    it "includes claude sonnet":
+        val resp = build_models_response()
+        expect(resp).to_contain("claude-sonnet-4-20250514")
+
+    it "includes claude opus":
+        val resp = build_models_response()
+        expect(resp).to_contain("claude-opus-4-20250514")
+
+    it "includes gpt-4o":
+        val resp = build_models_response()
+        expect(resp).to_contain("gpt-4o")
+
+describe "Chat Completion Response":
+    it "includes content":
+        val resp = build_chat_completion_response("Hello!", "gpt-4o", "stop")
+        expect(resp).to_contain("Hello!")
+
+    it "includes model":
+        val resp = build_chat_completion_response("Hi", "gpt-4o", "stop")
+        expect(resp).to_contain("gpt-4o")
+
+    it "includes finish reason":
+        val resp = build_chat_completion_response("Hi", "gpt-4o", "stop")
+        expect(resp).to_contain("stop")
+
+    it "has chat.completion object type":
+        val resp = build_chat_completion_response("Hi", "gpt-4o", "stop")
+        expect(resp).to_contain("chat.completion")
+
+    it "has assistant role":
+        val resp = build_chat_completion_response("Hi", "gpt-4o", "stop")
+        expect(resp).to_contain("assistant")
+
+describe "Anthropic Response":
+    it "includes text content":
+        val resp = build_anthropic_response("Hello!", "claude-sonnet-4-20250514", "end_turn")
+        expect(resp).to_contain("Hello!")
+
+    it "has message type":
+        val resp = build_anthropic_response("Hi", "claude-sonnet-4-20250514", "end_turn")
+        expect(resp).to_contain("\"message\"")
+
+    it "includes stop reason":
+        val resp = build_anthropic_response("Hi", "claude-sonnet-4-20250514", "end_turn")
+        expect(resp).to_contain("end_turn")
+
+describe "Error Response":
+    it "includes error message":
+        val resp = build_error_response("not found", 404)
+        expect(resp).to_contain("not found")
+
+    it "includes status code":
+        val resp = build_error_response("bad request", 400)
+        expect(resp).to_contain("400")
+
+describe "Route Handling":
+    it "handles health check":
+        val resp = handle_route("GET", "/v1/health", "")
+        expect(resp).to_contain("ok")
+
+    it "handles models list":
+        val resp = handle_route("GET", "/v1/models", "")
+        expect(resp).to_contain("list")
+
+    it "returns 404 for unknown path":
+        val resp = handle_route("GET", "/unknown", "")
+        expect(resp).to_contain("not found")
+
+    it "returns error for empty chat completion":
+        val resp = handle_route("POST", "/v1/chat/completions", "")
+        expect(resp).to_contain("messages required")
+
+    it "returns 501 for valid chat request":
+        var body = _LB()
+        body = body + _Q() + "content" + _Q() + ":" + _Q() + "Hello" + _Q()
+        body = body + _RB()
+        val resp = handle_route("POST", "/v1/chat/completions", body)
+        expect(resp).to_contain("501")

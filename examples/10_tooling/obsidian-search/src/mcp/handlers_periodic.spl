@@ -1,0 +1,170 @@
+# MCP Handlers — periodic & template tool dispatch (Phase E)
+#
+# Routes periodic tool/call requests to core periodic functions
+# and formats results as MCP tool responses.
+
+use src.util.json_helpers.{js, jp, jo, jo1, jo2, jo3, ja, ji, jb, make_error, tool_text_result, extract_arg, LB, RB}
+use src.core.periodic.{get_today_date, get_daily_note_path, read_daily_note, create_daily_note, get_periodic_note_path, read_periodic_note, create_periodic_note, list_recent_periodic_notes, apply_template, list_templates}
+
+# --- Helper: parse limit string to i64 ---
+
+fn parse_limit(s: text) -> i64:
+    if s == "": return 10
+    if s == "1": return 1
+    if s == "2": return 2
+    if s == "3": return 3
+    if s == "4": return 4
+    if s == "5": return 5
+    if s == "6": return 6
+    if s == "7": return 7
+    if s == "8": return 8
+    if s == "9": return 9
+    if s == "10": return 10
+    if s == "15": return 15
+    if s == "20": return 20
+    if s == "25": return 25
+    if s == "30": return 30
+    if s == "50": return 50
+    if s == "100": return 100
+    10
+
+# --- Main periodic handler dispatch ---
+
+fn handle_periodic_tool(id: text, tool_name: text, body: text, vault_path: text) -> text:
+
+    if tool_name == "daily_note":
+        var date = extract_arg(body, "date")
+        var action = extract_arg(body, "action")
+        if date == "":
+            date = get_today_date()
+        if action == "":
+            action = "read"
+
+        if action == "read":
+            val content = read_daily_note(vault_path, date)
+            if content == "":
+                val path = get_daily_note_path(vault_path, date)
+                val output = jo3(
+                    jp("exists", "false"),
+                    jp("date", js(date)),
+                    jp("path", js(path))
+                )
+                return tool_text_result(id, output)
+            val output = jo3(
+                jp("exists", "true"),
+                jp("date", js(date)),
+                jp("content", js(content))
+            )
+            return tool_text_result(id, output)
+
+        elif action == "create":
+            val content = extract_arg(body, "content")
+            val ok = create_daily_note(vault_path, date, content)
+            if ok:
+                val output = jo3(
+                    jp("success", "true"),
+                    jp("date", js(date)),
+                    jp("path", js(get_daily_note_path(vault_path, date)))
+                )
+                return tool_text_result(id, output)
+            else:
+                val output = jo2(
+                    jp("success", "false"),
+                    jp("error", js("Failed to create daily note for " + date))
+                )
+                return tool_text_result(id, output)
+
+        else:
+            return make_error(id, -32602, "Invalid action for daily_note: " + action + ". Must be 'read' or 'create'.")
+
+    elif tool_name == "periodic_note":
+        val period = extract_arg(body, "period")
+        var date = extract_arg(body, "date")
+        var action = extract_arg(body, "action")
+        if period == "":
+            return make_error(id, -32602, "Missing required parameter: period")
+        if period != "weekly" and period != "monthly" and period != "quarterly" and period != "yearly":
+            return make_error(id, -32602, "Invalid period: " + period + ". Must be weekly, monthly, quarterly, or yearly.")
+        if date == "":
+            date = get_today_date()
+        if action == "":
+            action = "read"
+
+        if action == "read":
+            val content = read_periodic_note(vault_path, period, date)
+            if content == "":
+                val path = get_periodic_note_path(vault_path, period, date)
+                val output = jo3(
+                    jp("exists", "false"),
+                    jp("period", js(period)),
+                    jp("path", js(path))
+                )
+                return tool_text_result(id, output)
+            val output = jo3(
+                jp("exists", "true"),
+                jp("period", js(period)),
+                jp("content", js(content))
+            )
+            return tool_text_result(id, output)
+
+        elif action == "create":
+            val content = extract_arg(body, "content")
+            val ok = create_periodic_note(vault_path, period, date, content)
+            if ok:
+                val path = get_periodic_note_path(vault_path, period, date)
+                val output = jo3(
+                    jp("success", "true"),
+                    jp("period", js(period)),
+                    jp("path", js(path))
+                )
+                return tool_text_result(id, output)
+            else:
+                val output = jo2(
+                    jp("success", "false"),
+                    jp("error", js("Failed to create " + period + " note for " + date))
+                )
+                return tool_text_result(id, output)
+
+        elif action == "list":
+            val limit_str = extract_arg(body, "limit")
+            val limit = parse_limit(limit_str)
+            val notes = list_recent_periodic_notes(vault_path, period, limit)
+            # Build JSON array of note paths
+            var items: [text] = []
+            for note in notes:
+                items.push(js(note))
+            val notes_json = ja(items)
+            val output = jo3(
+                jp("period", js(period)),
+                jp("count", ji(notes.len())),
+                jp("notes", notes_json)
+            )
+            return tool_text_result(id, output)
+
+        else:
+            return make_error(id, -32602, "Invalid action for periodic_note: " + action + ". Must be 'read', 'create', or 'list'.")
+
+    elif tool_name == "apply_template":
+        val template = extract_arg(body, "template")
+        val target = extract_arg(body, "target")
+        val variables = extract_arg(body, "variables")
+        if template == "":
+            return make_error(id, -32602, "Missing required parameter: template")
+        if target == "":
+            return make_error(id, -32602, "Missing required parameter: target")
+        val ok = apply_template(vault_path, template, target, variables)
+        if ok:
+            val output = jo3(
+                jp("success", "true"),
+                jp("template", js(template)),
+                jp("target", js(target))
+            )
+            return tool_text_result(id, output)
+        else:
+            val output = jo2(
+                jp("success", "false"),
+                jp("error", js("Failed to apply template. Template may not exist: " + template))
+            )
+            return tool_text_result(id, output)
+
+    make_error(id, -32602, "Unknown periodic tool: " + tool_name)

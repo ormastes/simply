@@ -1,0 +1,85 @@
+# Minimal line drawing window for quick GUI smoke testing.
+#
+# Launch:
+#   SIMPLE_GUI_RUN_SKIP_NUDGE=1 scripts/macos-gui-run.shs examples/ui/line_drawing_gui.spl
+
+use std.io.window_winit.{WinitLoop, WinitWindow, winit_loop_new, winit_loop_free, winit_window_new, winit_window_free, winit_present_rgba, winit_poll_close_requested}
+
+use std.io_runtime.{env_get}
+
+val W: i32 = 320
+val H: i32 = 240
+val BG: u32 = 0xFF101820u32
+
+fn abs_i32(v: i32) -> i32:
+    if v < 0:
+        return 0 - v
+    v
+
+fn draw_line(buf: [u32], w: i32, h: i32, x0_in: i32, y0_in: i32, x1: i32, y1: i32, col: u32):
+    var x0 = x0_in
+    var y0 = y0_in
+    val dx = abs_i32(x1 - x0)
+    val dy = 0 - abs_i32(y1 - y0)
+    var sx = -1
+    if x0 < x1:
+        sx = 1
+    var sy = -1
+    if y0 < y1:
+        sy = 1
+    var err = dx + dy
+    var done = false
+    while not done:
+        if x0 >= 0 and x0 < w and y0 >= 0 and y0 < h:
+            buf[y0 * w + x0] = col
+        if x0 == x1 and y0 == y1:
+            done = true
+        else:
+            val e2 = err * 2
+            if e2 >= dy:
+                err = err + dy
+                x0 = x0 + sx
+            if e2 <= dx:
+                err = err + dx
+                y0 = y0 + sy
+
+fn pack_pixels(src: [u32]) -> [i64]:
+    var out: [i64] = [0; src.len()]
+    var i = 0
+    while i < src.len():
+        out[i] = src[i].to_i64() & 0xFFFFFF
+        i = i + 1
+    out
+
+fn main() -> i64:
+    var pixels: [u32] = [BG; W * H]
+    draw_line(pixels, W, H, 20, 30, 300, 210, 0xFF33A1FDu32)
+    draw_line(pixels, W, H, 20, 210, 300, 30, 0xFFFFC857u32)
+    draw_line(pixels, W, H, 30, 120, 290, 120, 0xFF4ADE80u32)
+    draw_line(pixels, W, H, 160, 20, 160, 220, 0xFFF472B6u32)
+    print "Rendered {pixels.len()} px"
+
+    if (env_get("SIMPLE_GUI") ?? "") != "1":
+        print "No GUI requested (use scripts/macos-gui-run.shs to open a window); headless only."
+        return 0
+
+    val lp = winit_loop_new()
+    if not lp.is_valid:
+        print "No GUI runtime available."
+        return 0
+    val win = winit_window_new(lp, 640, 480, "Simple 2D Line Drawing")
+    if not win.is_valid:
+        print "Window creation failed."
+        winit_loop_free(lp)
+        return 0
+    val packed = pack_pixels(pixels)
+    var running = true
+    var iters = 0
+    while running and iters < 2000000:
+        winit_present_rgba(win, W.to_i64(), H.to_i64(), packed)
+        if winit_poll_close_requested(lp):
+            running = false
+        iters = iters + 1
+    winit_window_free(win)
+    winit_loop_free(lp)
+    return 0

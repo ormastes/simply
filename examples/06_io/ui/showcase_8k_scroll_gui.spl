@@ -1,0 +1,227 @@
+# showcase_8k_scroll_gui.spl — 8K scrollable list showcase on the pure-Simple
+# Engine2D CPU lane, with an opt-in dirty-region / partial-redraw path, plus a
+# built-in benchmark that compares optimization ON vs OFF.
+#
+# Framebuffer: targets 8K UHD (7680x4320, 33,177,600 px), configurable via
+# SHOWCASE_8K_W / SHOWCASE_8K_H. The surface scrolls a list of N rows that is
+# TALLER than the surface, with a real working scrollbar whose thumb tracks the
+# scroll offset. The DEFAULT viewport is a reviewer-friendly 1280x800 so the bare
+# `bin/simple run` command finishes under the 10s examples timeout; set the 8K
+# size explicitly for the full-resolution numbers.
+#
+# Render core lives in std.common.ui.scroll_surface (shared with the spec) so the
+# persistent packed [i64] buffer is mutated in place via me-methods and never
+# copied wholesale (arrays are value types in Simple).
+#
+# Two render modes, SAME image:
+#   OFF: clear + repaint the FULL viewport every frame, then full-pack.
+#   ON : scroll-blit retained rows + raster only the exposed band + thumb.
+#
+# Present finding: no sub-rect present extern exists (rt_winit/rt_sdl2 present take
+# a full pixels+w+h upload only) — on a real window full-frame upload is the
+# ceiling. The ON win is in the raster stage that this benchmark times.
+#
+# Headless bench: bin/simple run examples/06_io/ui/showcase_8k_scroll_gui.spl
+# Full 8K (raise timeout): SIMPLE_TIMEOUT_SECONDS=120 bin/simple run <file>
+# Smoke:  SHOWCASE_8K_W=256 SHOWCASE_8K_H=256 bin/simple run <file>
+
+use common.ui.dirty_region.{DirtyTracker}
+use common.ui.scroll_surface.{FrameBuffer, ScrollModel, paint_full, step_off, step_on, content_height, max_scroll}
+use std.nogc_sync_mut.io.time_ops.{time_now_unix_micros}
+
+extern fn rt_env_get(key: text) -> text
+
+val ROW_H_LOCAL: i32 = 48     # mirrors scroll_surface ROW_H for row-count sizing
+
+# ponytail: local alias around raw env is intentional until
+# doc/08_tracking/bug/interp_io_runtime_env_get_option_text_corruption_2026-06-19.md
+# is fixed; std/app env_get wrappers corrupt or drop this benchmark's overrides.
+fn showcase_env_get(name: text) -> text:
+    rt_env_get(name) ?? ""
+
+# ============================================================================
+# Benchmark harness
+# ============================================================================
+struct Stat:
+    p50: i64
+    p99: i64
+    mean_us: i64
+    total_us: i64
+    dirty_px: i64
+
+fn sort_i64(xs: [i64]) -> [i64]:
+    var a = xs
+    var i = 1
+    while i < a.len():
+        val key = a[i]
+        var j = i - 1
+        while j >= 0 and a[j] > key:
+            a[j + 1] = a[j]
+            j = j - 1
+        a[j + 1] = key
+        i = i + 1
+    return a
+
+fn percentile(sorted: [i64], pct: i32) -> i64:
+    if sorted.len() == 0:
+        return 0
+    var idx = (pct * sorted.len()) / 100
+    if idx >= sorted.len():
+        idx = sorted.len() - 1
+    return sorted[idx]
+
+fn summarize(samples: [i64], dirty_px: i64) -> Stat:
+    val sorted = sort_i64(samples)
+    var total: i64 = 0
+    for s in samples:
+        total = total + s
+    var mean: i64 = 0
+    if samples.len() > 0:
+        mean = total / samples.len().to_i64()
+    return Stat(p50: percentile(sorted, 50), p99: percentile(sorted, 99), mean_us: mean, total_us: total, dirty_px: dirty_px)
+
+# Format a ratio (num/den) as a "X.Y" string using fixed-point x10 math.
+fn ratio_str(num: i64, den: i64) -> text:
+    if den <= 0:
+        return "inf"
+    val x10 = (num * 10) / den
+    val whole = x10 / 10
+    val frac = x10 % 10
+    return "{whole}.{frac}"
+
+# Run one (mode, scenario) config for `frames` frames; returns its Stat.
+fn run_config(m: ScrollModel, frames: i32, mode_on: bool, scroll_active: bool, scroll_step: i32) -> Stat:
+    var fb = FrameBuffer.create(m.view_w, m.view_h)
+    var tracker = DirtyTracker.create(m.view_w, m.view_h)
+    var scroll = 0
+    val prime = paint_full(fb, m, scroll)       # prime buffer (not timed)
+    var samples: [i64] = []
+    var last_dirty: i64 = 0
+    val ms = max_scroll(m)
+    var f = 0
+    while f < frames:
+        var new_scroll = scroll
+        if scroll_active:
+            new_scroll = scroll + scroll_step
+            if new_scroll > ms:
+                new_scroll = 0          # wrap to keep scrolling
+        val t0 = time_now_unix_micros()
+        if mode_on:
+            val w_on = step_on(fb, m, scroll, new_scroll, tracker)
+            last_dirty = tracker.dirty_pixels()
+        else:
+            val w_off = step_off(fb, m, new_scroll, tracker)
+            last_dirty = tracker.dirty_pixels()
+        val t1 = time_now_unix_micros()
+        samples = samples + [t1 - t0]
+        scroll = new_scroll
+        f = f + 1
+    return summarize(samples, last_dirty)
+
+fn print_row(label: text, s: Stat):
+    # fps as fixed-point X.Y so sub-1-fps frames (8K full repaint) still read.
+    val fps = ratio_str(1000000, s.mean_us)
+    print "  {label}  p50={s.p50}us  p99={s.p99}us  mean={s.mean_us}us  fps={fps}  dirty_px={s.dirty_px}"
+
+fn env_i32(name: text, fallback: i32) -> i32:
+    val raw = showcase_env_get(name)
+    if raw == "":
+        return fallback
+    val v = raw.to_int().to_i32()
+    if v <= 0:
+        return fallback
+    return v
+
+# Standalone correctness check that ACTUALLY executes under `bin/simple run`
+# (unlike spec `it` blocks, which the interpreter test runner only loads). Proves
+# the ON scroll path produces a byte-identical buffer to the OFF full repaint.
+fn buffers_equal(a: [i64], b: [i64]) -> bool:
+    if a.len() != b.len():
+        return false
+    var i = 0
+    while i < a.len():
+        if a[i] != b[i]:
+            return false
+        i = i + 1
+    return true
+
+fn verify_on_equals_off(vw: i32, vh: i32, step: i32) -> bool:
+    val m = ScrollModel(total_rows: (vh / ROW_H_LOCAL) + 50, view_w: vw, view_h: vh)
+    # scroll-down
+    var off_d = FrameBuffer.create(vw, vh)
+    var trk1 = DirtyTracker.create(vw, vh)
+    val a0 = paint_full(off_d, m, step)
+    var on_d = FrameBuffer.create(vw, vh)
+    var trk2 = DirtyTracker.create(vw, vh)
+    val a1 = paint_full(on_d, m, 0)
+    val a2 = step_on(on_d, m, 0, step, trk2)
+    if not buffers_equal(on_d.buf, off_d.buf):
+        return false
+    # scroll-up
+    var off_u = FrameBuffer.create(vw, vh)
+    var trk3 = DirtyTracker.create(vw, vh)
+    val b0 = paint_full(off_u, m, step)
+    var on_u = FrameBuffer.create(vw, vh)
+    var trk4 = DirtyTracker.create(vw, vh)
+    val b1 = paint_full(on_u, m, 2 * step)
+    val b2 = step_on(on_u, m, 2 * step, step, trk4)
+    return buffers_equal(on_u.buf, off_u.buf)
+
+fn main() -> i64:
+    # Self-verify the ON==OFF invariant on a small surface (executes for real).
+    val ok = verify_on_equals_off(96, 96, 16)
+    if ok:
+        print "[verify] ON scroll path == OFF full repaint (byte-identical buffers): PASS"
+    else:
+        print "[verify] ON != OFF — partial-redraw is incorrect: FAIL"
+        return 1
+    print ""
+
+    # Default to a reviewer-friendly viewport that completes well under the 10s
+    # examples timeout; full 8K via SHOWCASE_8K_W=7680 SHOWCASE_8K_H=4320 (raise
+    # SIMPLE_TIMEOUT_SECONDS, since one 8K full repaint alone is ~3s).
+    val w = env_i32("SHOWCASE_8K_W", 1280)
+    val h = env_i32("SHOWCASE_8K_H", 800)
+    # OFF is multi-second/frame at 8K; keep OFF frame count tiny, ON can be larger.
+    val off_frames = env_i32("SHOWCASE_8K_OFF_FRAMES", 3)
+    val on_frames = env_i32("SHOWCASE_8K_ON_FRAMES", 8)
+    val total_rows = (h / ROW_H_LOCAL) + 200      # content taller than the surface
+    val scroll_step = ROW_H_LOCAL                 # one row per frame of steady scroll
+    val m = ScrollModel(total_rows: total_rows, view_w: w, view_h: h)
+    val full_px = m.view_w.to_i64() * m.view_h.to_i64()
+
+    print "8K Scroll Showcase — surface {w}x{h} ({full_px} px), {total_rows} rows, content_h={content_height(m)}px"
+    print "off_frames={off_frames}  on_frames={on_frames}  scroll_step={scroll_step}px"
+    print "present note: no sub-rect present extern exists; full-frame upload is the on-window ceiling."
+    print ""
+
+    print "IDLE scenario (no scroll):"
+    val idle_off = run_config(m, off_frames, false, false, scroll_step)
+    print_row("OFF", idle_off)
+    val idle_on = run_config(m, on_frames, true, false, scroll_step)
+    print_row("ON ", idle_on)
+    print ""
+
+    print "STEADY-SCROLL scenario ({scroll_step}px/frame):"
+    val scr_off = run_config(m, off_frames, false, true, scroll_step)
+    print_row("OFF", scr_off)
+    val scr_on = run_config(m, on_frames, true, true, scroll_step)
+    print_row("ON ", scr_on)
+    print ""
+
+    print "Summary (raster stage; full-frame present-upload ceiling excluded):"
+    if idle_on.mean_us > 0:
+        print "  idle:   OFF mean={idle_off.mean_us}us  ON mean={idle_on.mean_us}us  speedup~={ratio_str(idle_off.mean_us, idle_on.mean_us)}x"
+    else:
+        print "  idle:   OFF mean={idle_off.mean_us}us  ON mean<1us (0 dirty px)  speedup>={idle_off.mean_us}x"
+    if scr_on.mean_us > 0:
+        print "  scroll: OFF mean={scr_off.mean_us}us  ON mean={scr_on.mean_us}us  speedup~={ratio_str(scr_off.mean_us, scr_on.mean_us)}x"
+    else:
+        print "  scroll: OFF mean={scr_off.mean_us}us  ON mean<1us  speedup>={scr_off.mean_us}x"
+    print "  dirty/frame: idle ON={idle_on.dirty_px}px  scroll ON={scr_on.dirty_px}px  (full={full_px}px)"
+    var scroll_ratio: i64 = 0
+    if scr_on.dirty_px > 0:
+        scroll_ratio = full_px / scr_on.dirty_px
+    print "  scroll fresh-raster fraction: ON re-rasters 1/{scroll_ratio} of the surface (band+thumb); the rest is a blit copy"
+    print "  note: rows are solid fills, so blit copy ~= raster cost; dirty-region's bigger win is skipping expensive text/shape re-raster, not exercised here."
+    return 0

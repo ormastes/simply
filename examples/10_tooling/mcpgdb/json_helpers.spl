@@ -1,0 +1,264 @@
+#![allow(unnamed_duplicate_typed_args)]
+@allow(unnamed_duplicate_typed_args)
+# mcpgdb MCP — JSON, protocol, and shell helpers
+
+extern fn stdin_read_char() -> text
+
+use std.io_runtime.{file_exists, env_get, process_run}
+
+fn Q() -> text:
+    "\""
+
+fn LB() -> text:
+    (123 as char).to_string()
+
+fn RB() -> text:
+    (125 as char).to_string()
+
+fn SB_L() -> text:
+    "["
+
+fn SB_R() -> text:
+    "]"
+
+fn escape_json(s: text) -> text:
+    var out = s
+    out = out.replace("\\", "\\\\")
+    out = out.replace("\"", "\\\"")
+    out = out.replace("\n", "\\n")
+    out = out.replace("\r", "\\r")
+    out = out.replace("\t", "\\t")
+    out
+
+fn js(value: text) -> text:
+    Q() + escape_json(value) + Q()
+
+fn jp(key: text, value: text) -> text:
+    Q() + key + Q() + ":" + value
+
+fn jo0() -> text:
+    LB() + RB()
+
+fn jo1(p1: text) -> text:
+    LB() + p1 + RB()
+
+fn jo2(p1: text, p2: text) -> text:
+    LB() + p1 + "," + p2 + RB()
+
+fn jo3(p1: text, p2: text, p3: text) -> text:
+    LB() + p1 + "," + p2 + "," + p3 + RB()
+
+fn jo4(p1: text, p2: text, p3: text, p4: text) -> text:
+    LB() + p1 + "," + p2 + "," + p3 + "," + p4 + RB()
+
+fn ja(items: [text]) -> text:
+    SB_L() + items.join(",") + SB_R()
+
+fn has_method(msg: text, name: text) -> bool:
+    msg.contains("\"method\":\"" + name + "\"") or msg.contains("\"method\": \"" + name + "\"")
+
+fn extract_field(json: text, key: text) -> text:
+    val raw = extract_field_raw(json, key)
+    if raw == "":
+        return ""
+    if raw.starts_with(Q()) and raw.ends_with(Q()) and raw.len() >= 2:
+        return raw.substring(1, raw.len() - 1)
+    raw
+
+fn extract_field_raw(json: text, key: text) -> text:
+    val search = Q() + key + Q() + ":"
+    val idx_opt = json.index_of(search)
+    var idx = -1
+    match idx_opt:
+        Some(i): idx = i
+        nil: return ""
+    var pos = idx + search.len()
+    while pos < json.len():
+        val ch = json.substring(pos, pos + 1)
+        if ch != " " and ch != "\n" and ch != "\r" and ch != "\t":
+            break
+        pos = pos + 1
+    if pos >= json.len():
+        return ""
+    val first = json.substring(pos, pos + 1)
+    if first == Q():
+        var end = pos + 1
+        var escaped = false
+        while end < json.len():
+            val ch = json.substring(end, end + 1)
+            if escaped:
+                escaped = false
+            elif ch == "\\":
+                escaped = true
+            elif ch == Q():
+                return json.substring(pos, end + 1)
+            end = end + 1
+        return ""
+    if first == LB() or first == SB_L():
+        var depth = 0
+        var cur = pos
+        var in_string = false
+        var escaped2 = false
+        while cur < json.len():
+            val ch = json.substring(cur, cur + 1)
+            if in_string:
+                if escaped2:
+                    escaped2 = false
+                elif ch == "\\":
+                    escaped2 = true
+                elif ch == Q():
+                    in_string = false
+            else:
+                if ch == Q():
+                    in_string = true
+                elif ch == LB() or ch == SB_L():
+                    depth = depth + 1
+                elif ch == RB() or ch == SB_R():
+                    depth = depth - 1
+                    if depth == 0:
+                        return json.substring(pos, cur + 1)
+            cur = cur + 1
+        return ""
+    var parts: [text] = []
+    var cur2 = pos
+    while cur2 < json.len():
+        val ch = json.substring(cur2, cur2 + 1)
+        if ch == "," or ch == RB() or ch == SB_R() or ch == "\n" or ch == "\r":
+            break
+        parts.push(ch)
+        cur2 = cur2 + 1
+    parts.join("").trim()
+
+fn extract_nested(json: text, key: text) -> text:
+    val params = extract_field_raw(json, "params")
+    if params == "":
+        return extract_field(json, key)
+    val from_params = extract_field(params, key)
+    if from_params != "":
+        return from_params
+    val arguments = extract_field_raw(params, "arguments")
+    if arguments == "":
+        return ""
+    extract_field(arguments, key)
+
+fn extract_nested_raw(json: text, key: text) -> text:
+    val params = extract_field_raw(json, "params")
+    if params == "":
+        return extract_field_raw(json, key)
+    val from_params = extract_field_raw(params, key)
+    if from_params != "":
+        return from_params
+    val arguments = extract_field_raw(params, "arguments")
+    if arguments == "":
+        return ""
+    extract_field_raw(arguments, key)
+
+fn extract_id(json: text) -> text:
+    val raw = extract_field_raw(json, "id")
+    if raw == "":
+        return "null"
+    raw
+
+fn jsonrpc_result(id: text, result: text) -> text:
+    jo3(jp("jsonrpc", js("2.0")), jp("id", id), jp("result", result))
+
+fn jsonrpc_error(id: text, code: i64, message: text) -> text:
+    val err = jo2(jp("code", str(code)), jp("message", js(message)))
+    jo3(jp("jsonrpc", js("2.0")), jp("id", id), jp("error", err))
+
+fn make_tool_result(id: text, content: text) -> text:
+    val text_obj = jo2(jp("type", js("text")), jp("text", js(content)))
+    val result = jo1(jp("content", ja([text_obj])))
+    jsonrpc_result(id, result)
+
+fn make_tool_error(id: text, message: text) -> text:
+    val text_obj = jo2(jp("type", js("text")), jp("text", js(message)))
+    val result = jo2(jp("content", ja([text_obj])), jp("isError", "true"))
+    jsonrpc_result(id, result)
+
+var USE_JSON_LINES = false
+
+fn _read_line() -> text:
+    var result = ""
+    while true:
+        val ch = stdin_read_char()
+        if ch == "":
+            if result == "":
+                return ""
+            return result
+        result = result + ch
+        if ch == "\n":
+            return result
+
+fn _read_chars(count: i64) -> text:
+    var result = ""
+    var i = 0
+    while i < count:
+        val ch = stdin_read_char()
+        if ch == "":
+            break
+        result = result + ch
+        i = i + 1
+    result
+
+fn _strip_line_end(line: text) -> text:
+    if line.ends_with("\r\n"):
+        return line.substring(0, line.len() - 2)
+    if line.ends_with("\n"):
+        return line.substring(0, line.len() - 1)
+    if line.ends_with("\r"):
+        return line.substring(0, line.len() - 1)
+    line
+
+fn read_stdin_message() -> text:
+    var content_length = 0
+    while true:
+        var line = _read_line()
+        if line == "":
+            if content_length > 0:
+                break
+            return ""
+        if line == "\r\n" or line == "\n" or line == "\r":
+            if content_length > 0:
+                break
+            continue
+        line = _strip_line_end(line)
+        if line.starts_with(LB()):
+            USE_JSON_LINES = true
+            return line
+        if line.starts_with("Content-Length:"):
+            var len_str = line.replace("Content-Length:", "").trim()
+            content_length = int(len_str) ?? 0
+    if content_length <= 0:
+        return ""
+    _read_chars(content_length)
+
+fn write_stdout_message(body: text):
+    val nl = "\n"
+    if USE_JSON_LINES:
+        print_raw(body + nl)
+        return
+    val header = "Content-Length: " + str(body.len()) + "\r" + nl + "\r" + nl
+    print_raw(header)
+    print_raw(body)
+
+fn shell_quote(value: text) -> text:
+    "'" + value.replace("'", "'\\''") + "'"
+
+fn shell_sleep(seconds: text):
+    process_run(shell_bin(), ["-c", "sleep " + seconds])
+
+fn shell_bin() -> text:
+    if file_exists("/usr/bin/sh"):
+        return "/usr/bin/sh"
+    "/bin/sh"
+
+fn find_binary(env_name: text, names: [text]) -> text:
+    val env_value = env_get(env_name) ?? ""
+    if env_value != "":
+        return env_value
+    for name in names:
+        val (stdout, _stderr, code) = process_run(shell_bin(), ["-c", "which " + shell_quote(name) + " 2>/dev/null"])
+        if code == 0 and stdout.trim() != "":
+            return stdout.trim()
+    ""

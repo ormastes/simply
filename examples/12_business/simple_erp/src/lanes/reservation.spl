@@ -1,0 +1,57 @@
+# Reservation Lane — bookings on the shared guarded-write framework
+#
+# Owns the Reservation shape, capacity/booking transitions, and its validation
+# verdict. Writes go through framework.gate_write with action "reservation.write"
+# so the session -> rbac -> validation -> idempotency order is enforced once.
+
+use framework.guarded.{Tenant, Actor, Session, WriteResult, gate_write}
+use std.nogc_sync_mut.enterprise_store.store.{EnterpriseStore}
+
+struct Reservation:
+    val id: i64
+    val resource: text
+    val kind: text
+    val capacity: i64
+    val booked: i64
+    val status: text
+    val deposit: i64
+
+# Domain validity: identity present, resource named, booked within capacity,
+# non-negative deposit.
+fn validate_reservation(r: Reservation) -> bool:
+    return (r.id > 0 and r.resource.len() > 0 and r.booked >= 0 and r.booked <= r.capacity and r.deposit >= 0)
+
+# Can we take `seats` more? Only while open, positive, and within capacity.
+fn can_book(r: Reservation, seats: i64) -> bool:
+    return (r.status == "open" and seats > 0 and r.booked + seats <= r.capacity)
+
+# Book seats (stays open). Callers gate on can_book first.
+fn book(r: Reservation, seats: i64) -> Reservation:
+    return Reservation { id: r.id, resource: r.resource, kind: r.kind, capacity: r.capacity, booked: r.booked + seats, status: r.status, deposit: r.deposit }
+
+# Hold seats against a deposit, moving the reservation to "held".
+# Fail closed: an over-capacity or non-open hold returns the reservation unchanged.
+fn hold(r: Reservation, seats: i64, deposit: i64) -> Reservation:
+    if !can_book(r, seats):
+        return r
+    return Reservation { id: r.id, resource: r.resource, kind: r.kind, capacity: r.capacity, booked: r.booked + seats, status: "held", deposit: deposit }
+
+# Release the whole reservation.
+fn cancel(r: Reservation) -> Reservation:
+    return Reservation { id: r.id, resource: r.resource, kind: r.kind, capacity: r.capacity, booked: 0, status: "cancelled", deposit: 0 }
+
+# Mark a no-show, keeping the booking and deposit for policy handling.
+fn no_show(r: Reservation) -> Reservation:
+    return Reservation { id: r.id, resource: r.resource, kind: r.kind, capacity: r.capacity, booked: r.booked, status: "no-show", deposit: r.deposit }
+
+# Free seats across all still-open reservations.
+fn open_slots(list: [Reservation]) -> i64:
+    var total = 0
+    for r in list:
+        if r.status == "open":
+            total = total + r.capacity - r.booked
+    return total
+
+# The lane's single write entry point.
+fn submit_reservation_write(session: Session, tenant: Tenant, user: Actor, r: Reservation, key: text, store: EnterpriseStore) -> WriteResult:
+    return gate_write(store, session, tenant, user, "reservation.write", validate_reservation(r), key)

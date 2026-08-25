@@ -1,0 +1,53 @@
+#![allow(unnamed_duplicate_typed_args)]
+# Korean Stock MCP - Formatting utilities
+#
+# Korean Won formatting, percentage, volume helpers.
+
+fn format_krw(amount_str: text) -> text:
+    if amount_str == "" or amount_str == "0":
+        return "0"
+    # Remove commas if present
+    var clean = amount_str.replace(",", "")
+    val amount = int(clean) ?? 0
+    if amount == 0:
+        return amount_str
+    # Add comma separators
+    val abs_amount = if amount < 0 then -amount else amount
+    var s = str(abs_amount)
+    var result: [text] = []
+    var count = 0
+    var i = s.len() - 1
+    while i >= 0:
+        if count > 0 and count % 3 == 0:
+            result.push(",")
+        result.push(mcp_char_at(s, i))
+        count = count + 1
+        i = i - 1
+    result.reverse()
+    var formatted = result.join("")
+    if amount < 0:
+        formatted = "-" + formatted
+    formatted
+
+fn format_pct(value_str: text) -> text:
+    if value_str == "":
+        return "0.00%"
+    val v = float(value_str) ?? 0.0
+    if v > 0.0:
+        return "+" + value_str + "%"
+    value_str + "%"
+
+fn format_volume(vol_str: text) -> text:
+    if vol_str == "":
+        return "0"
+    var clean = vol_str.replace(",", "")
+    val vol = int(clean) ?? 0
+    if vol == 0:
+        return vol_str
+    if vol >= 1000000:
+        val m = vol / 1000000
+        return str(m) + "M"
+    elif vol >= 1000:
+        val k = vol / 1000
+        return str(k) + "K"
+    str(vol)

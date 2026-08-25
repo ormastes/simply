@@ -1,0 +1,64 @@
+use os.kernel.ipc.host_gpu_ivshmem_map.{map_qemu_audio_ivshmem_bar2, qemu_audio_ivshmem_window_base}
+use os.lib.audio_offload.ivshmem_protocol.*
+use os.kernel.boot.mmio_hardware.{mmio_read32}
+use os.kernel.boot.monotonic_hardware.{boot_monotonic_prepare, boot_monotonic_now_us}
+
+extern fn serial_println(msg: text)
+
+val AUDIO_CUDA_PROBE_CAPACITY: i64 = 8
+val AUDIO_CUDA_PROBE_GENERATION: u64 = 7u64
+val AUDIO_CUDA_PROBE_CORRELATION: u64 = 7001u64
+val AUDIO_CUDA_PROBE_TIMEOUT_US: i64 = 10000000
+
+fn _audio_cuda_fail(reason: text) -> bool:
+    serial_println("AUDIO_CUDA_PROBE_FAIL reason={reason}")
+    serial_println("TEST FAILED")
+    false
+
+fn _audio_cuda_output_word(base: u64, index: i64) -> u32:
+    val payload = base + (SIMPLE_AUDIO_IVSHMEM_PAYLOAD_BASE as u64) + (SIMPLE_AUDIO_IVSHMEM_OUTPUT_OFFSET as u64)
+    mmio_read32(payload + ((index * 4) as u64))
+
+pub fn audio_cuda_ivshmem_probe_main() -> bool:
+    boot_monotonic_prepare()
+    val mapped_slot = map_qemu_audio_ivshmem_bar2()
+    if mapped_slot <= 0:
+        return _audio_cuda_fail("map-bar2-{mapped_slot}")
+    val base = qemu_audio_ivshmem_window_base(mapped_slot)
+    if base == 0u64:
+        return _audio_cuda_fail("map-base")
+    serial_println("AUDIO_CUDA_MAP_OK device={mapped_slot - 1} base={base}")
+    if simple_audio_ivshmem_initialize(base, AUDIO_CUDA_PROBE_CAPACITY) != "ready":
+        return _audio_cuda_fail("initialize")
+    val started_us = boot_monotonic_now_us()
+    val deadline_us = started_us + AUDIO_CUDA_PROBE_TIMEOUT_US
+    val input = [32768u32, 16384u32, 4294959104u32]
+    val kernel = [16384u32, 8192u32]
+    val published = simple_audio_ivshmem_publish_q15(base, 0, AUDIO_CUDA_PROBE_CAPACITY, AUDIO_CUDA_PROBE_GENERATION, 1u64, AUDIO_CUDA_PROBE_CORRELATION, 0u64, (deadline_us as u64) * 1000u64, 3, 1, 1, input, kernel, 1)
+    if published != "published":
+        return _audio_cuda_fail("submit-{published}")
+    serial_println("AUDIO_CUDA_SUBMIT_OK generation={AUDIO_CUDA_PROBE_GENERATION} correlation={AUDIO_CUDA_PROBE_CORRELATION}")
+    var now_us = boot_monotonic_now_us()
+    var wire_state = simple_audio_ivshmem_state(base, 0, AUDIO_CUDA_PROBE_CAPACITY)
+    while wire_state != SIMPLE_AUDIO_WIRE_STATE_COMPLETED and now_us <= deadline_us:
+        wire_state = simple_audio_ivshmem_state(base, 0, AUDIO_CUDA_PROBE_CAPACITY)
+        now_us = boot_monotonic_now_us()
+    val completion = simple_audio_ivshmem_poll(base, 0, AUDIO_CUDA_PROBE_CAPACITY)
+    val status = simple_audio_ivshmem_completion_status(completion, AUDIO_CUDA_PROBE_GENERATION, AUDIO_CUDA_PROBE_CORRELATION, (now_us as u64) * 1000u64, (deadline_us as u64) * 1000u64)
+    if status != "accepted-device-result":
+        return _audio_cuda_fail("completion-{status}")
+    if _audio_cuda_output_word(base, 0) != 16384u32 or _audio_cuda_output_word(base, 1) != 16384u32 or _audio_cuda_output_word(base, 2) != 0u32 or _audio_cuda_output_word(base, 3) != 4294965248u32:
+        return _audio_cuda_fail("payload-mismatch")
+    if simple_audio_ivshmem_release(base, 0, AUDIO_CUDA_PROBE_CAPACITY, AUDIO_CUDA_PROBE_GENERATION) != "released":
+        return _audio_cuda_fail("release")
+    serial_println("AUDIO_CUDA_READBACK_OK samples=4 checksum={completion.readback_checksum} device={completion.device_identity} error_millionths={completion.normalized_error_millionths}")
+    serial_println("TEST PASSED")
+    true
+
+export audio_cuda_ivshmem_probe_main
+
+extern fn rt_debug_exit_success()
+
+fn spl_start():
+    audio_cuda_ivshmem_probe_main()
+    rt_debug_exit_success()

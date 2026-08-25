@@ -1,0 +1,31 @@
+# AES-128 minimal encrypt/decrypt round-trip example
+use std.common.aes.cipher.{aes_encrypt_block, aes_decrypt_block}
+
+fn main():
+    # 16-byte plaintext block (ASCII "Hello, AES-128!!")
+    val plaintext = [72, 101, 108, 108, 111, 44, 32, 65, 69, 83, 45, 49, 50, 56, 33, 33]
+
+    # 16-byte AES-128 key
+    val key = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+
+    # Encrypt
+    val ciphertext = aes_encrypt_block(plaintext, key)
+
+    # Decrypt
+    val recovered = aes_decrypt_block(ciphertext, key)
+
+    # Verify round-trip
+    var match = true
+    var i = 0
+    while i < 16:
+        if plaintext[i] != recovered[i]:
+            match = false
+        i = i + 1
+
+    print("AES-128 encrypt/decrypt round-trip example")
+    print("Plaintext length:   16 bytes")
+    print("Ciphertext length:  16 bytes")
+    if match:
+        print("Round-trip: OK - decrypted matches original plaintext")
+    else:
+        print("Round-trip: FAIL")

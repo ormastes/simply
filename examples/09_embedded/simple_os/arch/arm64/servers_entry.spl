@@ -1,0 +1,97 @@
+# ARM64 filesystem-launched HTTP + durable database server kernel entry.
+
+extern fn serial_println(msg: text)
+extern fn rt_exit(code: i32)
+extern fn rt_arm64_harden_canary_value() -> i64
+
+use os.kernel.boot.mmio.{mmio_disable_test_mode}
+use os.services.vfs.arm_fs_exec_vfs.{arm_fs_exec_vfs_boot_init, arm_fs_exec_read_file_bytes}
+use os.services.vfs.vfs_boot_state.{g_mount_table}
+use os.kernel.loader.arm64_authenticated_media_fixture.{arm64_authenticated_media_execute_server_v1}
+use os.kernel.scheduler.scheduler_types.{Scheduler}
+use os.services.netstack.netstack_init.{net_boot_init_arm64_mmio}
+use os.kernel.arch.arm64.cpu.{wfe}
+use os.kernel.fs.fat32_atomic_replace.{
+    Fat32ReplaceCrashSeam,
+    fat32_replace_fault_injection_set,
+    fat32_replace_fault_injection_clear,
+    fat32_replace_fault_injection_triggered,
+    fat32_replace_fault_injection_occurrence,
+    fat32_replace_replay_generation,
+    fat32_replace_replay_state_code,
+    fat32_replace_replay_recovered
+}
+use generated.simpleos_server_crash_profile.{
+    simpleos_server_crash_seam_code,
+    simpleos_server_crash_occurrence
+}
+
+fn crash_seam(code: i64) -> Fat32ReplaceCrashSeam:
+    match code:
+        0: Fat32ReplaceCrashSeam.PayloadWrite
+        1: Fat32ReplaceCrashSeam.PayloadFlush
+        2: Fat32ReplaceCrashSeam.HeaderWrite
+        3: Fat32ReplaceCrashSeam.HeaderFlush
+        4: Fat32ReplaceCrashSeam.ImageWrite
+        5: Fat32ReplaceCrashSeam.ImageFlush
+        6: Fat32ReplaceCrashSeam.ReclaimHeaderWrite
+        7: Fat32ReplaceCrashSeam.ReclaimHeaderFlush
+        8: Fat32ReplaceCrashSeam.FatCopyWrite
+        9: Fat32ReplaceCrashSeam.FatCopiesFlush
+        10: Fat32ReplaceCrashSeam.FatCopiesReread
+        11: Fat32ReplaceCrashSeam.DoneHeaderWrite
+        _: Fat32ReplaceCrashSeam.DoneHeaderFlush
+
+fn crash_seam_name(code: i64) -> text:
+    val names = ["payload-write", "payload-flush", "header-write", "header-flush",
+        "image-write", "image-flush", "reclaim-header-write", "reclaim-header-flush",
+        "fat-copy-write", "fat-copies-flush", "fat-copies-reread",
+        "done-header-write", "done-header-flush"]
+    if code < 0 or code >= names.len(): return "none"
+    names[code]
+
+fn stop_after_injected_power_cut(code: i64):
+    serial_println("[far-crash] seam={crash_seam_name(code)} occurrence={fat32_replace_fault_injection_occurrence()}")
+    while true:
+        wfe()
+
+fn spl_start():
+    mmio_disable_test_mode()
+    val crash_code = simpleos_server_crash_seam_code()
+    fat32_replace_fault_injection_clear()
+    if crash_code >= 0:
+        fat32_replace_fault_injection_set(crash_seam(crash_code), simpleos_server_crash_occurrence())
+    serial_println("")
+    serial_println("=== SimpleOS ARM64 filesystem server boot ===")
+    serial_println("[harden] canary arch=aarch64 value=" + rt_arm64_harden_canary_value().to_text())
+
+    if not arm_fs_exec_vfs_boot_init():
+        if fat32_replace_fault_injection_triggered():
+            stop_after_injected_power_cut(crash_code)
+        serial_println("[arm64-servers] filesystem mount=fail")
+        rt_exit(1)
+        return
+
+    serial_println("[far-replay] generation={fat32_replace_replay_generation()} state={fat32_replace_replay_state_code()} recovered={fat32_replace_replay_recovered()}")
+
+    if not net_boot_init_arm64_mmio():
+        serial_println("[arm64-servers] network init=fail")
+        rt_exit(1)
+        return
+    serial_println("[arm64-servers] network init=ok service=kernel-local-direct-polling")
+
+    val image = arm_fs_exec_read_file_bytes("/SERVERS.ELF")
+    if image.len() <= 4:
+        serial_println("[arm64-servers] executable read=fail path=/SERVERS.ELF")
+        rt_exit(1)
+        return
+    serial_println("[arm64-servers] executable read=ok path=/SERVERS.ELF bytes={image.len()}")
+    serial_println("[arm64-servers] owner=kernel transport=bounded-syscall-payload")
+
+    val rc = arm64_authenticated_media_execute_server_v1(
+        Scheduler.new(), g_mount_table)
+    if fat32_replace_fault_injection_triggered():
+        stop_after_injected_power_cut(crash_code)
+    fat32_replace_fault_injection_clear()
+    serial_println("[arm64-servers] executable returned rc={rc}")
+    rt_exit(1)

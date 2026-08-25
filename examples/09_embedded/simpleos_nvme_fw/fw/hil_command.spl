@@ -1,0 +1,189 @@
+"""
+hil_command — host command classification, validation, and simulated PRP/SGL
+             addressing for the SimpleOS NVMe firmware (host-runnable simulation).
+
+All functions are pure free functions; no structs or me-methods.
+"""
+
+use nvme_types.*
+
+# ── Classification helpers ────────────────────────────────────────────────────
+
+fn cmd_is_write(c: NvmeCmd) -> bool:
+    c.opcode == OP_WRITE
+
+fn cmd_is_write_zero(c: NvmeCmd) -> bool:
+    c.opcode == OP_WRITE_ZERO
+
+fn cmd_is_read(c: NvmeCmd) -> bool:
+    c.opcode == OP_READ
+
+fn cmd_is_trim(c: NvmeCmd) -> bool:
+    c.opcode == OP_DSM_TRIM
+
+fn cmd_is_flush(c: NvmeCmd) -> bool:
+    c.opcode == OP_FLUSH
+
+# ── Validation ────────────────────────────────────────────────────────────────
+
+fn cmd_validate(c: NvmeCmd) -> i64:
+    if not cid_valid(c.cid):
+        return SC_INVALID_FIELD
+    if c.nsid != 1:
+        return SC_INVALID_FIELD
+    # Reject any opcode the IO command set does not implement -> SC_INVALID_OPCODE.
+    val known: bool = c.opcode == OP_FLUSH or c.opcode == OP_WRITE or c.opcode == OP_WRITE_ZERO or c.opcode == OP_READ or c.opcode == OP_DSM_TRIM
+    if not known:
+        return SC_INVALID_OPCODE
+    # Flush addresses no LBA range; reject host-supplied payload fields.
+    if c.opcode == OP_FLUSH:
+        if c.lba != 0 or c.nblocks != 0 or c.data != 0:
+            return SC_INVALID_FIELD
+        return SC_SUCCESS
+    if c.lba < 0:
+        return SC_LBA_RANGE
+    if c.nblocks <= 0:
+        return SC_LBA_RANGE
+    # Range check, written to be overflow-safe: a malicious lba/nblocks near i64-max
+    # must never wrap `lba + nblocks` negative and slip past the bound (which would
+    # then index l2p[] out of range and crash). Reject the start and count first, then
+    # compare against the headroom so no addition can overflow.
+    if c.lba >= LBA_COUNT:
+        return SC_LBA_RANGE
+    if c.nblocks > LBA_COUNT:
+        return SC_LBA_RANGE
+    if c.lba > LBA_COUNT - c.nblocks:
+        return SC_LBA_RANGE
+    if c.opcode == OP_DSM_TRIM and c.data != 0:
+        return SC_INVALID_FIELD
+    if c.opcode == OP_WRITE_ZERO and c.data != 0:
+        return SC_INVALID_FIELD
+    if c.opcode == OP_READ and c.data != 0:
+        return SC_INVALID_FIELD
+    SC_SUCCESS
+
+# ── Simulated host-buffer addressing ─────────────────────────────────────────
+
+val PRP_SEG_BLOCKS: i64 = 2
+
+fn prp_pack(first_base: i64, second_base: i64) -> i64:
+    (first_base & 0xFF) | ((second_base & 0xFF) << 8)
+
+fn prp_first_base(c: NvmeCmd) -> i64:
+    c.data & 0xFF
+
+fn prp_second_base(c: NvmeCmd) -> i64:
+    (c.data >> 8) & 0xFF
+
+fn prp_byte(c: NvmeCmd, i: i64) -> i64:
+    val first: i64 = prp_first_base(c)
+    val second: i64 = prp_second_base(c)
+    if second == 0:
+        return (first + i) & 0xFF
+    if i < PRP_SEG_BLOCKS:
+        return (first + i) & 0xFF
+    (second + (i - PRP_SEG_BLOCKS)) & 0xFF
+
+fn host_write_byte(c: NvmeCmd, i: i64) -> i64:
+    if cmd_is_write_zero(c):
+        return 0
+    prp_byte(c, i)
+
+# ── Self-test ─────────────────────────────────────────────────────────────────
+
+fn hil_command_selftest() -> i64:
+    var failures: i64 = 0
+
+    # --- classification ---
+    val w: NvmeCmd = cmd_make(1, OP_WRITE, 0, 1, 42)
+    var bv: i64 = 0
+    if cmd_is_write(w):
+        bv = 1
+    failures = failures + expect_eq(bv, 1, "cmd_is_write(OP_WRITE)")
+
+    val wz: NvmeCmd = cmd_make(5, OP_WRITE_ZERO, 0, 1, 0)
+    bv = 0
+    if cmd_is_write_zero(wz):
+        bv = 1
+    failures = failures + expect_eq(bv, 1, "cmd_is_write_zero(OP_WRITE_ZERO)")
+
+    bv = 0
+    if cmd_is_read(w):
+        bv = 1
+    failures = failures + expect_eq(bv, 0, "cmd_is_read(OP_WRITE)==false")
+
+    val r: NvmeCmd = cmd_make(2, OP_READ, 0, 1, 0)
+    bv = 0
+    if cmd_is_read(r):
+        bv = 1
+    failures = failures + expect_eq(bv, 1, "cmd_is_read(OP_READ)")
+
+    val t: NvmeCmd = cmd_make(3, OP_DSM_TRIM, 0, 1, 0)
+    bv = 0
+    if cmd_is_trim(t):
+        bv = 1
+    failures = failures + expect_eq(bv, 1, "cmd_is_trim(OP_DSM_TRIM)")
+
+    val f: NvmeCmd = cmd_make(4, OP_FLUSH, 0, 0, 0)
+    bv = 0
+    if cmd_is_flush(f):
+        bv = 1
+    failures = failures + expect_eq(bv, 1, "cmd_is_flush(OP_FLUSH)")
+
+    # --- validate normal write -> SC_SUCCESS ---
+    val good: NvmeCmd = cmd_make(10, OP_WRITE, 100, 16, 7)
+    failures = failures + expect_eq(cmd_validate(good), SC_SUCCESS, "validate normal write")
+    val badcid: NvmeCmd = cmd_make(65536, OP_WRITE, 100, 1, 7)
+    failures = failures + expect_eq(cmd_validate(badcid), SC_INVALID_FIELD, "validate invalid command id")
+    val badns: NvmeCmd = cmd_make_nsid(26, 0, OP_WRITE, 100, 1, 7)
+    failures = failures + expect_eq(cmd_validate(badns), SC_INVALID_FIELD, "validate invalid namespace id")
+
+    # --- lba + nblocks past LBA_COUNT -> SC_LBA_RANGE ---
+    val past: NvmeCmd = cmd_make(11, OP_WRITE, 3000, 100, 0)
+    failures = failures + expect_eq(cmd_validate(past), SC_LBA_RANGE, "validate lba+n>LBA_COUNT")
+
+    # --- negative lba -> SC_LBA_RANGE ---
+    val neg: NvmeCmd = cmd_make(12, OP_WRITE, -1, 1, 0)
+    failures = failures + expect_eq(cmd_validate(neg), SC_LBA_RANGE, "validate negative lba")
+
+    # --- flush nblocks=0 -> SC_SUCCESS ---
+    val fl: NvmeCmd = cmd_make(13, OP_FLUSH, 0, 0, 0)
+    failures = failures + expect_eq(cmd_validate(fl), SC_SUCCESS, "validate flush nblocks=0")
+    val badfl: NvmeCmd = cmd_make(18, OP_FLUSH, 7, 1, 9)
+    failures = failures + expect_eq(cmd_validate(badfl), SC_INVALID_FIELD, "validate malformed flush fields")
+
+    # --- unknown opcode -> SC_INVALID_OPCODE (not silently accepted / SC_INTERNAL) ---
+    val unk: NvmeCmd = cmd_make(14, 0x7F, 0, 1, 0)
+    failures = failures + expect_eq(cmd_validate(unk), SC_INVALID_OPCODE, "validate unknown opcode")
+
+    # --- overflow-safe range: lba/nblocks near i64-max must NOT wrap past the bound ---
+    val ovf: NvmeCmd = cmd_make(15, OP_WRITE, FW_OVERFLOW_TEST_SIZE, FW_OVERFLOW_TEST_SIZE, 0)
+    failures = failures + expect_eq(cmd_validate(ovf), SC_LBA_RANGE, "validate lba+nblocks overflow rejected")
+
+    # --- boundary: lba == LBA_COUNT is out of range; last valid block is in range ---
+    val atlim: NvmeCmd = cmd_make(16, OP_WRITE, LBA_COUNT, 1, 0)
+    failures = failures + expect_eq(cmd_validate(atlim), SC_LBA_RANGE, "validate lba==LBA_COUNT rejected")
+    val lastok: NvmeCmd = cmd_make(17, OP_WRITE, LBA_COUNT - 1, 1, 0)
+    failures = failures + expect_eq(cmd_validate(lastok), SC_SUCCESS, "validate last block in range")
+    val badtrim: NvmeCmd = cmd_make(19, OP_DSM_TRIM, 10, 1, 7)
+    failures = failures + expect_eq(cmd_validate(badtrim), SC_INVALID_FIELD, "validate malformed trim payload")
+    val badzero: NvmeCmd = cmd_make(23, OP_WRITE_ZERO, 10, 1, 7)
+    failures = failures + expect_eq(cmd_validate(badzero), SC_INVALID_FIELD, "validate malformed write-zero payload")
+    val badread: NvmeCmd = cmd_make(25, OP_READ, 10, 1, 7)
+    failures = failures + expect_eq(cmd_validate(badread), SC_INVALID_FIELD, "validate malformed read payload")
+
+    # --- prp_byte returns the per-block payload byte ---
+    val p: NvmeCmd = cmd_make(20, OP_READ, 0, 4, 99)
+    failures = failures + expect_eq(prp_byte(p, 0), 99, "prp_byte lba=0")
+    failures = failures + expect_eq(prp_byte(p, 3), 102, "prp_byte lba=3")
+    val pw: NvmeCmd = cmd_make(21, OP_READ, 0, 4, 0xFE)
+    failures = failures + expect_eq(prp_byte(pw, 3), 1, "prp_byte wraps at one byte")
+    val ps: NvmeCmd = cmd_make(22, OP_READ, 0, 4, prp_pack(0x10, 0x80))
+    failures = failures + expect_eq(prp_byte(ps, 0), 0x10, "prp segmented byte 0")
+    failures = failures + expect_eq(prp_byte(ps, 1), 0x11, "prp segmented byte 1")
+    failures = failures + expect_eq(prp_byte(ps, 2), 0x80, "prp segmented byte 2")
+    failures = failures + expect_eq(prp_byte(ps, 3), 0x81, "prp segmented byte 3")
+    val z: NvmeCmd = cmd_make(24, OP_WRITE_ZERO, 0, 4, 0)
+    failures = failures + expect_eq(host_write_byte(z, 3), 0, "write-zero host byte is zero")
+
+    failures

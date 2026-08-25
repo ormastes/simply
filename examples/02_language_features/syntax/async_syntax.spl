@@ -1,0 +1,117 @@
+#!/usr/bin/env simple
+# Async/Await Syntax Example
+#
+# Demonstrates the new async fn and await syntax.
+# NOTE: Requires parser support (in progress).
+
+# ================================================================
+# Async Function Definitions
+# ================================================================
+
+# Simple async function
+async fn fetch_data(url: text) -> text:
+    """Fetch data from URL asynchronously."""
+    val response = await http_get(url)
+    await response.text()
+
+# Async function with error handling using Result pattern
+async fn fetch_with_retry(url: text, retries: i64) -> Result<text, text>:
+    """Fetch with automatic retry on failure.
+
+    NOTE: Simple does not support try/catch/throw.
+    Use Result<T, E> pattern for error handling instead.
+    """
+    var attempt = 0
+    var last_error = ""
+    while attempt < retries:
+        val result = await fetch_data_safe(url)
+        match result:
+            case Ok(data):
+                return Ok(data)
+            case Err(err):
+                last_error = err
+                attempt = attempt + 1
+                if attempt < retries:
+                    await sleep_ms(1000)  # Wait before retry
+    Err(last_error)
+
+# Async main function
+async fn main():
+    """Async entry point."""
+    print "Fetching data..."
+
+    # Sequential awaits
+    val user = await fetch_user(123)
+    val posts = await fetch_posts(user.id)
+
+    print "User: {user.name}"
+    print "Posts: {posts.len()}"
+
+    # Parallel awaits with gather
+    val results = await gather([
+        fetch_data("url1"),
+        fetch_data("url2"),
+        fetch_data("url3")
+    ])
+
+    print "Results: {results}"
+
+# ================================================================
+# Helper Functions (Simulated)
+# ================================================================
+
+async fn http_get(url: text) -> Response:
+    """Simulate HTTP GET."""
+    Response(status: 200, body: "data")
+
+async fn fetch_user(id: i64) -> User:
+    """Simulate fetching user."""
+    User(id: id, name: "Alice")
+
+async fn fetch_posts(user_id: i64) -> [Post]:
+    """Simulate fetching posts."""
+    [Post(id: 1, title: "Post 1")]
+
+async fn sleep_ms(ms: i64):
+    """Sleep for milliseconds."""
+    # Would be implemented with actual async sleep
+    pass
+
+# ================================================================
+# Type Definitions
+# ================================================================
+
+struct Response:
+    status: i64
+    body: text
+
+    async fn text() -> text:
+        self.body
+
+struct User:
+    id: i64
+    name: text
+
+struct Post:
+    id: i64
+    title: text
+
+# ================================================================
+# Notes
+# ================================================================
+
+# The async/await syntax compiles to:
+#
+# async fn fetch(url: text) -> text:
+#     await http_get(url)
+#
+# Becomes:
+#
+# fn fetch(url: text) -> Future<text>:
+#     Future.from_async(\:
+#         val response = http_get(url).await_value()
+#         response
+#     )
+#
+# This allows async functions to return Future<T> and await
+# to suspend execution until the future is ready.

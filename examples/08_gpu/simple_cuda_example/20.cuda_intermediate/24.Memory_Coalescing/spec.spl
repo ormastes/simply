@@ -1,0 +1,114 @@
+# Exercise 24: Memory Coalescing - Tests
+#
+# The coalesced column sum, the strided row sum, the tiled transpose and the
+# contiguous scale kernel must all agree with their CPU references. The CPU
+# references are checked on their own first so a device failure is never
+# confused with a reference bug.
+
+use self.main.{
+    PTX, BLOCK_SIZE, TILE,
+    make_matrix, make_sequential_matrix, to_column_major,
+    cpu_column_sum, cpu_row_sum, cpu_scale_scalar, cpu_transpose,
+    run_column_sum_coalesced, run_row_sum_strided, run_transpose, run_gpu_scale,
+    max_abs_diff
+}
+use gpu_test_helpers.{gpu_setup, gpu_teardown, gpu_load_ptx, gpu_unload, close_enough}
+
+describe "Memory Coalescing":
+
+    describe "CPU references":
+
+        it "column sum of a 3x4 sequential matrix":
+            # rows: [0 1 2 3] [4 5 6 7] [8 9 10 11] -> column sums 12 15 18 21
+            val s = cpu_column_sum(make_sequential_matrix(3, 4), 3, 4)
+            expect(s.len()).to_equal(4)
+            expect(close_enough(s[0], 12.0, 0.001)).to_equal(true)
+            expect(close_enough(s[3], 21.0, 0.001)).to_equal(true)
+
+        it "row sum of a 3x4 sequential matrix":
+            val s = cpu_row_sum(make_sequential_matrix(3, 4), 3, 4)
+            expect(s.len()).to_equal(3)
+            expect(close_enough(s[0], 6.0, 0.001)).to_equal(true)
+            expect(close_enough(s[2], 38.0, 0.001)).to_equal(true)
+
+        it "transpose is column-major reordering and is an involution":
+            val data = make_sequential_matrix(4, 4)
+            val t = cpu_transpose(data, 4, 4)
+            expect(close_enough(t[1], 4.0, 0.001)).to_equal(true)
+            expect(close_enough(t[4], 1.0, 0.001)).to_equal(true)
+            expect(close_enough(max_abs_diff(to_column_major(t, 4, 4), data), 0.0, 0.001)).to_equal(true)
+
+        it "block and tile sizes are powers of two":
+            expect(BLOCK_SIZE).to_equal(256)
+            expect(TILE).to_equal(16)
+
+    describe "device kernels":
+
+        it "coalesced column sum of a uniform 32x32 matrix is 32 per column":
+            val ctx = gpu_setup(0)
+            if ctx == 0:
+                skip("device kernels", "no CUDA device")
+            val module = gpu_load_ptx(PTX)
+            val sums = run_column_sum_coalesced(module, make_matrix(32, 32, 1.0), 32, 32).unwrap()
+            expect(sums.len()).to_equal(32)
+            expect(close_enough(max_abs_diff(sums, make_matrix(1, 32, 32.0)), 0.0, 0.01)).to_equal(true)
+            gpu_unload(module)
+            gpu_teardown(ctx)
+
+        it "coalesced column sum matches the CPU on a 64x48 sequential matrix":
+            val ctx = gpu_setup(0)
+            if ctx == 0:
+                skip("device kernels", "no CUDA device")
+            val module = gpu_load_ptx(PTX)
+            val data = make_sequential_matrix(64, 48)
+            val gpu = run_column_sum_coalesced(module, data, 64, 48).unwrap()
+            expect(close_enough(max_abs_diff(gpu, cpu_column_sum(data, 64, 48)), 0.0, 1.0)).to_equal(true)
+            gpu_unload(module)
+            gpu_teardown(ctx)
+
+        it "strided row sum matches the CPU on a 32x64 sequential matrix":
+            val ctx = gpu_setup(0)
+            if ctx == 0:
+                skip("device kernels", "no CUDA device")
+            val module = gpu_load_ptx(PTX)
+            val data = make_sequential_matrix(32, 64)
+            val gpu = run_row_sum_strided(module, data, 32, 64).unwrap()
+            expect(gpu.len()).to_equal(32)
+            expect(close_enough(max_abs_diff(gpu, cpu_row_sum(data, 32, 64)), 0.0, 1.0)).to_equal(true)
+            gpu_unload(module)
+            gpu_teardown(ctx)
+
+        it "transpose of a 4x4 sequential matrix swaps rows and columns":
+            val ctx = gpu_setup(0)
+            if ctx == 0:
+                skip("device kernels", "no CUDA device")
+            val module = gpu_load_ptx(PTX)
+            val t = run_transpose(module, make_sequential_matrix(4, 4), 4, 4).unwrap()
+            expect(close_enough(t[1], 4.0, 0.001)).to_equal(true)
+            expect(close_enough(t[4], 1.0, 0.001)).to_equal(true)
+            expect(close_enough(t[11], 14.0, 0.001)).to_equal(true)
+            gpu_unload(module)
+            gpu_teardown(ctx)
+
+        it "transpose twice on a non-square 16x24 matrix is the identity":
+            val ctx = gpu_setup(0)
+            if ctx == 0:
+                skip("device kernels", "no CUDA device")
+            val module = gpu_load_ptx(PTX)
+            val data = make_sequential_matrix(16, 24)
+            val t1 = run_transpose(module, data, 16, 24).unwrap()
+            val t2 = run_transpose(module, t1, 24, 16).unwrap()
+            expect(close_enough(max_abs_diff(t2, data), 0.0, 0.001)).to_equal(true)
+            gpu_unload(module)
+            gpu_teardown(ctx)
+
+        it "contiguous scale matches the CPU":
+            val ctx = gpu_setup(0)
+            if ctx == 0:
+                skip("device kernels", "no CUDA device")
+            val module = gpu_load_ptx(PTX)
+            val data = make_sequential_matrix(1, 512)
+            val gpu = run_gpu_scale(module, data, 3.0).unwrap()
+            expect(close_enough(max_abs_diff(gpu, cpu_scale_scalar(data, 3.0)), 0.0, 0.01)).to_equal(true)
+            gpu_unload(module)
+            gpu_teardown(ctx)

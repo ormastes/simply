@@ -1,0 +1,12 @@
+use logic_backpressure_abort_core.*
+
+fn rv32_bpa_access_cases_selftest() -> i32:
+    if _rv32_abort_get_sqid(99) != -1:
+        return 1
+    if _rv32_abort_get_cid(70000) != -1:
+        return 1
+    if _rv32_abort_get_sqid(1) != 1:
+        return 1
+    if _rv32_abort_get_cid(100) != 100:
+        return 1
+    0

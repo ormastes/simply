@@ -1,0 +1,306 @@
+# x86_32 FAT32 initrd filesystem-backed app execution probe.
+#
+# The live QEMU lane supplies a FAT32 app image as a Multiboot module. The
+# freestanding boot stub captures the module and exposes narrow payload probes.
+
+extern fn rt_x86_32_initrd_present() -> u32
+extern fn rt_x86_32_initrd_contains_hello_smf() -> u32
+extern fn rt_x86_32_initrd_contains_browser_smf() -> u32
+extern fn rt_x86_32_initrd_contains_x86_32_marker() -> u32
+extern fn rt_sosix_collector_nonce_echo() -> u32
+extern fn rt_x86_32_install_int80_probe()
+extern fn rt_x86_32_tss_init() -> i32
+extern fn rt_x86_32_tss_bind_task(task_id: u32, generation: u32) -> i32
+extern fn rt_x86_32_context_roundtrip_probe() -> u32
+extern fn rt_x86_32_fs_exec_load() -> u32
+extern fn rt_x86_32_elf_policy_self_test() -> u32
+extern fn rt_x86_32_fat_hostile_self_test() -> u32
+extern fn rt_x86_32_fs_exec_status_report()
+extern fn rt_x86_32_fs_list_apps() -> u32
+extern fn rt_x86_32_user_stack_top() -> u32
+extern fn rt_x86_32_security_contract() -> u32
+extern fn rt_x86_32_fault_probe_entry(kind: u32) -> u32
+extern fn rt_x86_32_current_cr3() -> u32
+extern fn rt_x86_32_exec_token_install(task_id: u32, generation: u32, expected_cr3: u32) -> i32
+extern fn rt_x86_32_exec_token_take_result(task_id: u32, generation: u32, expected_cr3: u32) -> i32
+extern fn rt_x86_32_enter_user_first(eip: u32, esp: u32, cs: u32, ss: u32, eflags: u32, cr3_phys: u32)
+extern fn rt_x86_32_trigger_int80(id: u32, arg0: u32, arg1: u32, arg2: u32, arg3: u32, arg4: u32, arg5: u32) -> i32
+extern fn rt_port_outb(port: u16, value: u8)
+
+val DEBUG_EXIT: u16 = 0xF4
+
+fn serial_put(ch: u8):
+    rt_port_outb(0x3F8 as u16, ch)
+
+fn serial_newline():
+    serial_put(13u8)
+    serial_put(10u8)
+
+fn write_prefix():
+    serial_put(91u8)
+    serial_put(120u8)
+    serial_put(56u8)
+    serial_put(54u8)
+    serial_put(95u8)
+    serial_put(51u8)
+    serial_put(50u8)
+    serial_put(32u8)
+    serial_put(102u8)
+    serial_put(115u8)
+    serial_put(93u8)
+    serial_put(32u8)
+
+fn write_ok():
+    serial_put(111u8)
+    serial_put(107u8)
+    serial_newline()
+
+fn write_fail_marker():
+    write_prefix()
+    serial_put(102u8)
+    serial_put(97u8)
+    serial_put(105u8)
+    serial_put(108u8)
+    serial_newline()
+
+fn write_initrd_marker():
+    write_prefix()
+    serial_put(105u8)
+    serial_put(110u8)
+    serial_put(105u8)
+    serial_put(116u8)
+    serial_put(114u8)
+    serial_put(100u8)
+    serial_put(32u8)
+    serial_put(102u8)
+    serial_put(97u8)
+    serial_put(116u8)
+    serial_put(51u8)
+    serial_put(50u8)
+    serial_put(32u8)
+    write_ok()
+
+fn write_hello_marker():
+    write_prefix()
+    serial_put(104u8)
+    serial_put(101u8)
+    serial_put(108u8)
+    serial_put(108u8)
+    serial_put(111u8)
+    serial_put(95u8)
+    serial_put(119u8)
+    serial_put(111u8)
+    serial_put(114u8)
+    serial_put(108u8)
+    serial_put(100u8)
+    serial_put(32u8)
+    serial_put(115u8)
+    serial_put(109u8)
+    serial_put(102u8)
+    serial_put(32u8)
+    write_ok()
+
+fn write_browser_marker():
+    write_prefix()
+    serial_put(98u8)
+    serial_put(114u8)
+    serial_put(111u8)
+    serial_put(119u8)
+    serial_put(115u8)
+    serial_put(101u8)
+    serial_put(114u8)
+    serial_put(32u8)
+    serial_put(115u8)
+    serial_put(109u8)
+    serial_put(102u8)
+    serial_put(32u8)
+    write_ok()
+
+fn write_arch_marker():
+    write_prefix()
+    serial_put(120u8)
+    serial_put(56u8)
+    serial_put(54u8)
+    serial_put(95u8)
+    serial_put(51u8)
+    serial_put(50u8)
+    serial_put(32u8)
+    serial_put(112u8)
+    serial_put(97u8)
+    serial_put(121u8)
+    serial_put(108u8)
+    serial_put(111u8)
+    serial_put(97u8)
+    serial_put(100u8)
+    serial_put(32u8)
+    write_ok()
+
+fn write_exec_marker():
+    write_prefix()
+    serial_put(97u8)
+    serial_put(112u8)
+    serial_put(112u8)
+    serial_put(32u8)
+    serial_put(101u8)
+    serial_put(120u8)
+    serial_put(101u8)
+    serial_put(99u8)
+    serial_put(117u8)
+    serial_put(116u8)
+    serial_put(105u8)
+    serial_put(111u8)
+    serial_put(110u8)
+    serial_put(32u8)
+    write_ok()
+
+fn write_test_passed_marker():
+    serial_put(84u8)
+    serial_put(69u8)
+    serial_put(83u8)
+    serial_put(84u8)
+    serial_put(32u8)
+    serial_put(80u8)
+    serial_put(65u8)
+    serial_put(83u8)
+    serial_put(83u8)
+    serial_put(69u8)
+    serial_put(68u8)
+    serial_newline()
+
+fn x86_32_dispatch_installed_syscall_abi(id: u32, arg0: u32, arg1: u32, arg2: u32, arg3: u32, arg4: u32, arg5: u32) -> i32:
+    _ = arg1
+    _ = arg2
+    _ = arg3
+    _ = arg4
+    _ = arg5
+    if id == 13u32 and arg0 == 3u32:
+        if rt_x86_32_initrd_contains_hello_smf() != 0u32 and rt_x86_32_initrd_contains_x86_32_marker() != 0u32:
+            return 2001
+        return -2
+    if id == 13u32 and arg0 == 1u32:
+        if rt_x86_32_initrd_contains_browser_smf() != 0u32 and rt_x86_32_initrd_contains_x86_32_marker() != 0u32:
+            return 2002
+        return -2
+    -38
+
+fn spl_start():
+    if rt_x86_32_initrd_present() == 0u32:
+        write_fail_marker()
+        rt_port_outb(DEBUG_EXIT, 1u8)
+        return
+    write_initrd_marker()
+
+    if rt_sosix_collector_nonce_echo() != 1u32:
+        print "[x86_32-collector-nonce] target media read failed"
+        write_fail_marker()
+        rt_port_outb(DEBUG_EXIT, 1u8)
+        return
+    print "guest-entry"
+
+    if rt_x86_32_initrd_contains_hello_smf() == 0u32:
+        write_fail_marker()
+        rt_port_outb(DEBUG_EXIT, 1u8)
+        return
+    write_hello_marker()
+
+    if rt_x86_32_initrd_contains_browser_smf() == 0u32:
+        write_fail_marker()
+        rt_port_outb(DEBUG_EXIT, 1u8)
+        return
+    write_browser_marker()
+
+    if rt_x86_32_initrd_contains_x86_32_marker() == 0u32:
+        write_fail_marker()
+        rt_port_outb(DEBUG_EXIT, 1u8)
+        return
+    write_arch_marker()
+
+    if rt_x86_32_tss_init() != 1:
+        write_fail_marker()
+        rt_port_outb(DEBUG_EXIT, 1u8)
+        return
+    if rt_x86_32_context_roundtrip_probe() != 1u32:
+        write_fail_marker()
+        rt_port_outb(DEBUG_EXIT, 1u8)
+        return
+    print "X86_32_CONTEXT_SWITCH_ROUNDTRIP ecx=preserved edx=preserved status=pass"
+    if rt_x86_32_elf_policy_self_test() != 1u32:
+        write_fail_marker()
+        rt_port_outb(DEBUG_EXIT, 1u8)
+        return
+    print "X86_32_HOSTILE_ELF_POLICY status=pass"
+    print "X86_32_HOSTILE_ELF_BAD_EI_VERSION rejected=true"
+    if rt_x86_32_fat_hostile_self_test() != 1u32:
+        write_fail_marker()
+        rt_port_outb(DEBUG_EXIT, 1u8)
+        return
+    print "X86_32_HOSTILE_FAT_BOUNDS large_skip=reject chain_bounds=reject bpb_overflow=reject canary=preserved status=pass"
+    rt_x86_32_install_int80_probe()
+    if rt_x86_32_fs_list_apps() != 1u32:
+        write_fail_marker()
+        rt_port_outb(DEBUG_EXIT, 1u8)
+        return
+    print "FS_PROGRAM_BEGIN path=/FSEXEC.ELF arch=x86_32"
+    val entry = rt_x86_32_fs_exec_load()
+    val user_stack = rt_x86_32_user_stack_top()
+    val cr3 = rt_x86_32_current_cr3()
+    if entry == 0u32 or user_stack == 0u32 or cr3 == 0u32 or rt_x86_32_security_contract() != 1u32:
+        rt_x86_32_fs_exec_status_report()
+        write_fail_marker()
+        rt_port_outb(DEBUG_EXIT, 1u8)
+        return
+    if rt_x86_32_exec_token_install(1u32, 1u32, cr3) != 1 or
+            rt_x86_32_tss_bind_task(1u32, 1u32) != 1:
+        write_fail_marker()
+        rt_port_outb(DEBUG_EXIT, 1u8)
+        return
+    # This minimal lifecycle IDT owns only int 0x80. Keep IF clear during the
+    # run-to-completion child so an unowned PIC/timer vector cannot triple-fault
+    # between iret and the first syscall.
+    rt_x86_32_enter_user_first(entry, user_stack, 0x1Bu32, 0x23u32, 0x2u32, cr3)
+    val rc = rt_x86_32_exec_token_take_result(1u32, 1u32, cr3)
+    if rc != 37:
+        write_fail_marker()
+        rt_port_outb(DEBUG_EXIT, 1u8)
+        return
+    print "FS_PROGRAM_END rc=37 reaped=true"
+    print "X86_32_CONTEXT_ROUNDTRIP status=pass"
+
+    val gp_entry = rt_x86_32_fault_probe_entry(13u32)
+    if gp_entry == 0u32 or
+            rt_x86_32_exec_token_install(1u32, 2u32, cr3) != 1 or
+            rt_x86_32_tss_bind_task(1u32, 2u32) != 1:
+        write_fail_marker()
+        rt_port_outb(DEBUG_EXIT, 1u8)
+        return
+    rt_x86_32_enter_user_first(gp_entry, user_stack, 0x1Bu32, 0x23u32, 0x2u32, cr3)
+    if rt_x86_32_exec_token_install(1u32, 3u32, cr3) != 0:
+        write_fail_marker()
+        rt_port_outb(DEBUG_EXIT, 1u8)
+        return
+    if rt_x86_32_exec_token_take_result(1u32, 3u32, cr3) != -4096:
+        write_fail_marker()
+        rt_port_outb(DEBUG_EXIT, 1u8)
+        return
+    if rt_x86_32_exec_token_take_result(1u32, 2u32, cr3) != -13:
+        write_fail_marker()
+        rt_port_outb(DEBUG_EXIT, 1u8)
+        return
+    print "X86_32_EXACT_REAP generation=2 stale_rejected=true pending_overwrite_rejected=true status=-13"
+
+    val pf_entry = rt_x86_32_fault_probe_entry(14u32)
+    if pf_entry == 0u32 or
+            rt_x86_32_exec_token_install(1u32, 3u32, cr3) != 1 or
+            rt_x86_32_tss_bind_task(1u32, 3u32) != 1:
+        write_fail_marker()
+        rt_port_outb(DEBUG_EXIT, 1u8)
+        return
+    rt_x86_32_enter_user_first(pf_entry, user_stack, 0x1Bu32, 0x23u32, 0x2u32, cr3)
+    if rt_x86_32_exec_token_take_result(1u32, 3u32, cr3) != -14:
+        write_fail_marker()
+        rt_port_outb(DEBUG_EXIT, 1u8)
+        return
+    print "X86_32_WX_FAULT status=pass"
+    write_exec_marker()
+    write_test_passed_marker()
+    rt_port_outb(DEBUG_EXIT, 0u8)

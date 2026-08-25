@@ -1,0 +1,36 @@
+pub fn _rv32_media_block_valid(block: i64) -> i32:
+    if block < 0:
+        return 1
+    if block >= 64:
+        return 1
+    0
+
+pub fn _rv32_media_spare_valid(block: i64) -> i32:
+    if _rv32_media_block_valid(block) != 0:
+        return 1
+    if block < 56:
+        return 1
+    0
+
+pub fn _rv32_media_result_retires(code: i64) -> i32:
+    if code == 3:
+        return 1
+    if code == 4:
+        return 1
+    if code == 5:
+        return 1
+    0
+
+pub fn _rv32_media_bad_count_clamped(count: i64) -> i64:
+    if count < 0:
+        return 0
+    if count > 64:
+        return 64
+    count
+
+pub fn _rv32_media_program_allowed(block: i64, bad: i64) -> i32:
+    if _rv32_media_block_valid(block) != 0:
+        return 1
+    if bad != 0:
+        return 1
+    0

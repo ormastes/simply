@@ -1,0 +1,48 @@
+"""
+# Debug Rules
+
+Tests for debug rules functionality.
+"""
+# Unit tests for mcpgdb raw debugger command rules.
+
+use examples.mcpgdb.debug_rules.{classify_command, evaluate_command_rule}
+
+describe "mcpgdb debug rules":
+    """
+    ## Mcpgdb Debug Rules Tests
+
+    Validates mcpgdb debug rules functionality.
+    """
+
+    context "command classification":
+        it "classifies safe read-only commands":
+            expect(classify_command("gdb", "info threads")).to_equal("read_only")
+            expect(classify_command("lldb", "thread list")).to_equal("read_only")
+
+        it "classifies execution control commands":
+            expect(classify_command("gdb", "continue")).to_equal("execution_control")
+            expect(classify_command("lldb", "process interrupt")).to_equal("execution_control")
+
+        it "classifies topology commands":
+            expect(classify_command("gdb", "target extended-remote :3333")).to_equal("session_topology")
+            expect(classify_command("lldb", "process attach --pid 10")).to_equal("session_topology")
+
+        it "classifies mutation commands":
+            expect(classify_command("gdb", "set $pc=0x1000")).to_equal("target_mutation")
+            expect(classify_command("lldb", "register write pc 0x1000")).to_equal("target_mutation")
+
+        it "blocks shell escape commands":
+            expect(classify_command("gdb", "shell rm -rf /tmp/x")).to_equal("shell_escape")
+            expect(classify_command("lldb", "script print('x')")).to_equal("shell_escape")
+
+    context "rule decisions":
+        it "denies topology changes for raw commands":
+            val decision = evaluate_command_rule("gdb", "target extended-remote localhost:3333", false, false)
+            expect(decision.allowed).to_equal(false)
+            expect(decision.rule_class).to_equal("session_topology")
+
+        it "requires dangerous opt-in for mutations":
+            val denied = evaluate_command_rule("gdb", "set $pc=0x2000", false, false)
+            expect(denied.allowed).to_equal(false)
+            val allowed = evaluate_command_rule("gdb", "set $pc=0x2000", true, false)
+            expect(allowed.allowed).to_equal(true)

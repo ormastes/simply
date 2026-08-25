@@ -1,0 +1,129 @@
+use std.web_framework.controller.{ControllerContext, HttpResponseData, ViewData}
+use std.web_framework.template.{render_page}
+use std.web_framework.response.{render_redirect}
+use std.web_framework.session.{session_set, session_get, session_destroy}
+use std.web_framework.flash.{flash_add}
+use std.web_framework.csrf.{csrf_token_for_session, csrf_hidden_field, verify_csrf_token}
+use std.web_framework.validation.{Validator, Required, MinLength, Email, ValidationResult}
+use std.database.{DbValue}
+use std.time.{now_iso8601}
+
+use models.user.{
+    User, find_user_by_username, is_username_taken, is_email_taken,
+    create_user_repository, hash_password, verify_password,
+    user_registration_validator, user_login_validator
+}
+
+# @public
+fn action_login_form(ctx: ControllerContext) -> HttpResponseData:
+    val csrf = csrf_token_for_session(ctx)
+    val data = ViewData.new()
+        .set("title", "Log In")
+        .set("csrf_token", csrf)
+    render_page(ctx, "auth/login", data.to_dict())
+
+# @public
+fn action_login(ctx: ControllerContext) -> HttpResponseData:
+    val csrf = ctx.form_value("csrf_token")
+    if not verify_csrf_token(ctx, csrf):
+        flash_add(ctx, "error", "Invalid form submission. Please try again.")
+        return render_redirect(ctx, "/login")
+
+    val username = ctx.form_value("username")
+    val password = ctx.form_value("password")
+
+    # Validate input
+    val validator = user_login_validator()
+    val fields = Dict<text, text>.new()
+    fields.set("username", username)
+    fields.set("password", password)
+    val result = validator.validate(fields)
+    if not result.is_valid:
+        flash_add(ctx, "error", result.first_error())
+        return render_redirect(ctx, "/login")
+
+    # Look up user
+    val repo = create_user_repository(ctx.db())
+    val maybe_user = find_user_by_username(repo, username)
+    if maybe_user.?:
+        val user = maybe_user.unwrap()
+        if verify_password(password, user.password_hash):
+            # Login successful -- create session
+            session_set(ctx, "user_id", "{user.id}")
+            session_set(ctx, "username", user.username)
+            flash_add(ctx, "success", "Welcome back, {user.username}!")
+            return render_redirect(ctx, "/todos")
+
+    # Login failed -- generic message to prevent username enumeration
+    flash_add(ctx, "error", "Invalid username or password.")
+    render_redirect(ctx, "/login")
+
+# @public
+fn action_register_form(ctx: ControllerContext) -> HttpResponseData:
+    val csrf = csrf_token_for_session(ctx)
+    val data = ViewData.new()
+        .set("title", "Create Account")
+        .set("csrf_token", csrf)
+    render_page(ctx, "auth/register", data.to_dict())
+
+# @public
+fn action_register(ctx: ControllerContext) -> HttpResponseData:
+    val csrf = ctx.form_value("csrf_token")
+    if not verify_csrf_token(ctx, csrf):
+        flash_add(ctx, "error", "Invalid form submission. Please try again.")
+        return render_redirect(ctx, "/register")
+
+    val username = ctx.form_value("username")
+    val email = ctx.form_value("email")
+    val password = ctx.form_value("password")
+    val password_confirm = ctx.form_value("password_confirm")
+
+    # Validate fields
+    val validator = user_registration_validator()
+    val fields = Dict<text, text>.new()
+    fields.set("username", username)
+    fields.set("email", email)
+    fields.set("password", password)
+    val result = validator.validate(fields)
+    if not result.is_valid:
+        flash_add(ctx, "error", result.first_error())
+        return render_redirect(ctx, "/register")
+
+    # Check password confirmation
+    if password != password_confirm:
+        flash_add(ctx, "error", "Passwords do not match.")
+        return render_redirect(ctx, "/register")
+
+    val repo = create_user_repository(ctx.db())
+
+    # Check uniqueness
+    if is_username_taken(repo, username):
+        flash_add(ctx, "error", "Username is already taken.")
+        return render_redirect(ctx, "/register")
+
+    if is_email_taken(repo, email):
+        flash_add(ctx, "error", "Email is already registered.")
+        return render_redirect(ctx, "/register")
+
+    # Hash password and create user
+    val hashed = hash_password(password)?
+    val now = now_iso8601()
+    val user = User(
+        id: 0,
+        username: username,
+        email: email,
+        password_hash: hashed,
+        created_at: now
+    )
+    val saved_user = repo.insert(user)?
+
+    # Auto-login after registration
+    session_set(ctx, "user_id", "{saved_user.id}")
+    session_set(ctx, "username", saved_user.username)
+    flash_add(ctx, "success", "Account created! Welcome, {saved_user.username}!")
+    render_redirect(ctx, "/todos")
+
+fn action_logout(ctx: ControllerContext) -> HttpResponseData:
+    session_destroy(ctx)
+    flash_add(ctx, "success", "You have been logged out.")
+    render_redirect(ctx, "/")

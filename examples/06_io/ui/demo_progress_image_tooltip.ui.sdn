@@ -1,0 +1,35 @@
+app:
+    title: "Progress Image Tooltip Demo"
+    theme: glass_dark
+
+layout:
+    type: vbox
+    children:
+        display:
+            type: panel
+            title: "Display Widgets"
+            children:
+                prog1:
+                    type: progress
+                    value: 25
+                prog2:
+                    type: progress
+                    value: 50
+                prog3:
+                    type: progress
+                    value: 75
+                prog4:
+                    type: progress
+                    value: 100
+                logo:
+                    type: image
+                    src: "logo.png"
+                    alt: "Company Logo"
+                help_tip:
+                    type: tooltip
+                    content: "Click for help"
+                    target: "help_btn"
+        status:
+            type: statusbar
+            left: "{app.mode}"
+            right: "{app.title}"

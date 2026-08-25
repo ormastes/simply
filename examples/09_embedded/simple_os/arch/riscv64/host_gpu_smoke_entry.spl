@@ -1,0 +1,6 @@
+use arch.common.host_gpu_ivshmem_probe_entry.{host_gpu_ivshmem_probe_main}
+use os.kernel.arch.riscv64.sbi.{sbi_shutdown}
+
+fn spl_start():
+    host_gpu_ivshmem_probe_main()
+    sbi_shutdown()

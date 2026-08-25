@@ -1,0 +1,71 @@
+routes:
+  - method: GET
+    path: "/"
+    controller: HomeController
+    action: index
+    auth: public
+
+  - method: GET
+    path: "/login"
+    controller: AuthController
+    action: login_form
+    auth: public
+
+  - method: POST
+    path: "/login"
+    controller: AuthController
+    action: login
+    auth: public
+
+  - method: GET
+    path: "/register"
+    controller: AuthController
+    action: register_form
+    auth: public
+
+  - method: POST
+    path: "/register"
+    controller: AuthController
+    action: register
+    auth: public
+
+  - method: POST
+    path: "/logout"
+    controller: AuthController
+    action: logout
+
+  # Todo CRUD (all require auth by default)
+  - method: GET
+    path: "/todos"
+    controller: TodosController
+    action: index
+
+  - method: GET
+    path: "/todos/new"
+    controller: TodosController
+    action: new_form
+
+  - method: POST
+    path: "/todos"
+    controller: TodosController
+    action: create
+
+  - method: GET
+    path: "/todos/:id/edit"
+    controller: TodosController
+    action: edit
+
+  - method: POST
+    path: "/todos/:id/update"
+    controller: TodosController
+    action: update
+
+  - method: POST
+    path: "/todos/:id/toggle"
+    controller: TodosController
+    action: toggle
+
+  - method: POST
+    path: "/todos/:id/delete"
+    controller: TodosController
+    action: destroy

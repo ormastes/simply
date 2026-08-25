@@ -1,0 +1,77 @@
+# Master Test Runner
+#
+# Imports all spec files for the simple_cuda_example project.
+# Run with: bin/simple test examples/simple_cuda_example/test/all_spec.spl
+
+use examples.simple_cuda_example.lib.gpu_test_helpers.{assert_gpu_available, close_enough}
+use examples.simple_cuda_example.lib.matrix_helpers.{matrix_zeros, matrix_ones, matrix_random, matrix_multiply_cpu, matrix_equal}
+
+describe "simple_cuda_example":
+
+    describe "gpu_test_helpers":
+
+        it "close_enough detects equal values":
+            expect(close_enough(1.0, 1.0, 0.001)).to_equal(true)
+
+        it "close_enough detects values within epsilon":
+            expect(close_enough(1.0, 1.0001, 0.001)).to_equal(true)
+
+        it "close_enough rejects values outside epsilon":
+            expect(close_enough(1.0, 2.0, 0.001)).to_equal(false)
+
+        it "close_enough handles negative values":
+            expect(close_enough(-1.0, -1.0005, 0.001)).to_equal(true)
+
+        it "assert_gpu_available returns bool":
+            # Just verify it runs without crashing; result depends on hardware
+            val result = assert_gpu_available()
+            expect(result.? != nil).to_equal(true)
+
+    describe "matrix_helpers":
+
+        it "matrix_zeros creates zero-filled matrix":
+            val m = matrix_zeros(2, 3)
+            expect(m.len()).to_equal(6)
+            expect(m[0]).to_equal(0.0)
+            expect(m[5]).to_equal(0.0)
+
+        it "matrix_ones creates one-filled matrix":
+            val m = matrix_ones(2, 3)
+            expect(m.len()).to_equal(6)
+            expect(m[0]).to_equal(1.0)
+            expect(m[5]).to_equal(1.0)
+
+        it "matrix_random creates correct size":
+            val m = matrix_random(4, 5)
+            expect(m.len()).to_equal(20)
+
+        it "matrix_multiply_cpu identity":
+            # Multiply [1,0; 0,1] x [3,4; 5,6] = [3,4; 5,6]
+            val identity = [1.0, 0.0, 0.0, 1.0]
+            val b = [3.0, 4.0, 5.0, 6.0]
+            val result = matrix_multiply_cpu(identity, b, 2, 2, 2)
+            expect(matrix_equal(result, b, 0.0001)).to_equal(true)
+
+        it "matrix_multiply_cpu 2x3 times 3x2":
+            val a = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+            val b = [7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
+            val result = matrix_multiply_cpu(a, b, 2, 2, 3)
+            # Row 0: 1*7+2*9+3*11 = 7+18+33 = 58, 1*8+2*10+3*12 = 8+20+36 = 64
+            # Row 1: 4*7+5*9+6*11 = 28+45+66 = 139, 4*8+5*10+6*12 = 32+50+72 = 154
+            val expected = [58.0, 64.0, 139.0, 154.0]
+            expect(matrix_equal(result, expected, 0.0001)).to_equal(true)
+
+        it "matrix_equal detects equal matrices":
+            val a = [1.0, 2.0, 3.0]
+            val b = [1.0, 2.0, 3.0]
+            expect(matrix_equal(a, b, 0.0001)).to_equal(true)
+
+        it "matrix_equal rejects different matrices":
+            val a = [1.0, 2.0, 3.0]
+            val b = [1.0, 2.0, 999.0]
+            expect(matrix_equal(a, b, 0.0001)).to_equal(false)
+
+        it "matrix_equal rejects different sizes":
+            val a = [1.0, 2.0]
+            val b = [1.0, 2.0, 3.0]
+            expect(matrix_equal(a, b, 0.0001)).to_equal(false)

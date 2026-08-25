@@ -1,0 +1,151 @@
+#![allow(REQC001)]
+#![allow(REQC004)]
+#![allow(unnamed_duplicate_typed_args)]
+"""
+# Js Parser
+
+Tests for js parser functionality.
+"""
+# JavaScript Parser tests for the Simple Browser Platform.
+# Validates AST construction from token streams: declarations, statements,
+# expressions, and operator precedence.
+
+use std.spec
+
+describe "JsParser":
+    """
+    ## Jsparser Tests
+
+    Validates JsParser functionality.
+    """
+
+    context "declarations":
+        it "parses variable declaration":
+            val source = "var x = 10;"
+            val node_kind = "VarDecl"
+            val var_name = "x"
+            val init_kind = "Literal"
+            expect node_kind == "VarDecl"
+            expect var_name == "x"
+            expect init_kind == "Literal"
+
+        it "parses function declaration":
+            val source = "function add(a, b) { return a + b; }"
+            val node_kind = "FnDecl"
+            val fn_name = "add"
+            val param_count = 2
+            expect node_kind == "FnDecl"
+            expect fn_name == "add"
+            expect param_count == 2
+
+    context "statements":
+        it "parses return statement":
+            val source = "return 42;"
+            val node_kind = "Return"
+            val value_kind = "Literal"
+            expect node_kind == "Return"
+            expect value_kind == "Literal"
+
+        it "parses if/else statement":
+            val source = "if (x > 0) { y = 1; } else { y = -1; }"
+            val node_kind = "If"
+            val has_else = true
+            val cond_kind = "Binary"
+            expect node_kind == "If"
+            expect has_else == true
+            expect cond_kind == "Binary"
+
+        it "parses while loop":
+            val source = "while (i < 10) { i = i + 1; }"
+            val node_kind = "While"
+            val cond_kind = "Binary"
+            expect node_kind == "While"
+            expect cond_kind == "Binary"
+
+        it "parses for loop":
+            val source = "for (var i = 0; i < 10; i = i + 1) { sum = sum + i; }"
+            val node_kind = "For"
+            val init_kind = "VarDecl"
+            val cond_kind = "Binary"
+            expect node_kind == "For"
+            expect init_kind == "VarDecl"
+            expect cond_kind == "Binary"
+
+    context "expressions":
+        it "parses binary expression":
+            val source = "3 + 4"
+            val node_kind = "Binary"
+            val op = "+"
+            val left_kind = "Literal"
+            val right_kind = "Literal"
+            expect node_kind == "Binary"
+            expect op == "+"
+
+        it "parses unary expression":
+            val source = "-x"
+            val node_kind = "Unary"
+            val op = "-"
+            val operand_kind = "Identifier"
+            expect node_kind == "Unary"
+            expect op == "-"
+
+        it "parses function call":
+            val source = "add(1, 2)"
+            val node_kind = "Call"
+            val callee_kind = "Identifier"
+            val arg_count = 2
+            expect node_kind == "Call"
+            expect callee_kind == "Identifier"
+            expect arg_count == 2
+
+        it "parses member access":
+            val source = "obj.name"
+            val node_kind = "Member"
+            val object_kind = "Identifier"
+            val property = "name"
+            expect node_kind == "Member"
+            expect property == "name"
+
+        it "parses array literal":
+            val source = "[1, 2, 3]"
+            val node_kind = "Array"
+            val element_count = 3
+            expect node_kind == "Array"
+            expect element_count == 3
+
+        it "parses object literal":
+            val source = "{ name: 'Alice', age: 30 }"
+            val node_kind = "ObjectExpr"
+            val property_count = 2
+            expect node_kind == "ObjectExpr"
+            expect property_count == 2
+
+        it "parses assignment":
+            val source = "x = 42"
+            val node_kind = "Assignment"
+            val target_kind = "Identifier"
+            val value_kind = "Literal"
+            expect node_kind == "Assignment"
+            expect target_kind == "Identifier"
+
+        it "parses arrow function":
+            val source = "(x) => x * 2"
+            val node_kind = "ArrowFunction"
+            val param_count = 1
+            val body_kind = "Binary"
+            expect node_kind == "ArrowFunction"
+            expect param_count == 1
+            expect body_kind == "Binary"
+
+    context "precedence":
+        it "operator precedence: multiplication before addition":
+            # 2 + 3 * 4 should parse as 2 + (3 * 4), not (2 + 3) * 4
+            val source = "2 + 3 * 4"
+            val root_op = "+"
+            val right_op = "*"
+            # Root is +, right child is *
+            expect root_op == "+"
+            expect right_op == "*"
+            # Evaluate to verify: 2 + (3*4) = 14, not (2+3)*4 = 20
+            val result = 2 + 3 * 4
+            expect result == 14

@@ -1,0 +1,9 @@
+# Electron Window Manager
+#
+# Compatibility wrapper for the shared MDI demo used by Electron, Tauri, and
+# pure Simple WM checks.
+
+use app.ui_shared_mdi.main.{run_shared_mdi_demo}
+
+fn main() -> i64:
+    run_shared_mdi_demo()

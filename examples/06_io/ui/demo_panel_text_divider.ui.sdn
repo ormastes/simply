@@ -1,0 +1,35 @@
+app:
+    title: "Panel Text Divider Demo"
+    theme: glass_dark
+
+layout:
+    type: vbox
+    children:
+        main_panel:
+            type: panel
+            id: main_panel
+            title: "Demo Panel"
+            children:
+                line1:
+                    type: text
+                    id: line1
+                    content: "Hello from Panel!"
+                sep1:
+                    type: divider
+                    id: sep1
+                line2:
+                    type: text
+                    id: line2
+                    content: "Text widgets render content."
+                sep2:
+                    type: divider
+                    id: sep2
+                line3:
+                    type: text
+                    id: line3
+                    content: "Dividers separate sections."
+        status:
+            type: statusbar
+            id: status
+            left: "{app.mode}"
+            right: "{app.title}"

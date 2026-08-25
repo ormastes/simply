@@ -1,0 +1,28 @@
+# entity/bid — Bid data structure for task assignment
+
+struct Bid:
+    agent_id: text
+    task_id: text
+    score: i64           # 0-100 composite score
+    cap_overlap: i64     # capability match score (0-100)
+    load_score: i64      # inverse load score (0-100)
+    priority_score: i64  # agent priority score (0-100)
+    accepted: bool
+
+fn bid(agent_id: text, task_id: text, cap_overlap: i64,
+       load_score: i64, priority_score: i64) -> Bid:
+    # Weighted composite: cap_overlap*0.4 + load*0.3 + priority*0.3
+    val score = (cap_overlap * 40 + load_score * 30 + priority_score * 30) / 100
+    Bid(
+        agent_id: agent_id,
+        task_id: task_id,
+        score: score,
+        cap_overlap: cap_overlap,
+        load_score: load_score,
+        priority_score: priority_score,
+        accepted: false
+    )
+
+impl Bid:
+    fn to_text() -> text:
+        "Bid(" + self.agent_id + " -> " + self.task_id + ", score=" + self.score.to_text() + ")"

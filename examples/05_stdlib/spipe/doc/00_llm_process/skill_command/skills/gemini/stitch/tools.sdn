@@ -1,0 +1,8 @@
+# llm-process-gen: managed source=gemini_stitch_tools source_sha256=597e07db61bbeaac71c0da6fbf123a1cc0baddd381bf528258cf3c2c573a9b75 content_sha256=f475264272db545b201b23ab813e1868b1fce9a4ee4edee0fa78a9ccdbc97a37
+skill_tools |skill, source|
+    stitch, gemini
+
+tools |id, type, name, purpose|
+    gemini_cli, cli, "Gemini command prompt", "Run or adapt the copied Gemini workflow prompt"
+    playwright, cli, "Playwright CLI", "Support browser research, visual testing, or UI review when requested"
+    simple_cli, cli, "bin/simple", "Run project checks referenced by the workflow"

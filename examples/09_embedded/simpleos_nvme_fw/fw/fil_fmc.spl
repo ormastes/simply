@@ -1,0 +1,326 @@
+"""
+fil_fmc — Flash Memory Controller (FMC) register-MMIO driver (gap-closure P1).
+
+Mirrors a real firmware's flash-controller driver (cf. Cosmos+ `fmc_driver.c`): the FTL no
+longer calls the NAND device directly — it programs a register file (command / address / data)
+and drives a status state machine (IDLE → BUSY → DONE/ERR), then reads the result latches. The
+NAND chips hang off the controller, so `Fmc` owns the `NandDevice`. Sideband device queries
+(erase counts, bad-block marking, fault injection) are forwarded but are not on the command path.
+
+The command is a single struct register (`FmcCmd`) — one struct param dodges the ×8 multi-param
+interpreter gotcha and satisfies the "3+ params → struct" rule (see CONVENTIONS.md).
+"""
+
+use nvme_types.*
+use fil_nand.*          # NandRead
+use fil_nand_device.*   # NandDevice
+use fil_nand_emu.*      # NandEmu — opt-in Vt-physics backend (fmc_new_emu)
+use fil_ecc.*
+
+# ── FMC command opcodes (the CMD register) ────────────────────────────────────
+val FMC_OP_NONE:    i64 = 0
+val FMC_OP_PROGRAM: i64 = 1
+val FMC_OP_READ:    i64 = 2
+val FMC_OP_ERASE:   i64 = 3
+
+# ── FMC status register (the controller state machine) ────────────────────────
+val FMC_IDLE: i64 = 0   # no command loaded
+val FMC_BUSY: i64 = 1   # command loaded, not yet issued
+val FMC_DONE: i64 = 2   # command completed successfully
+val FMC_ERR:  i64 = 3   # command completed with a NAND fault (sticky until ack)
+
+# ── The command register (host writes this) ───────────────────────────────────
+struct FmcCmd:
+    op:   i64
+    ppn:  i64      # page number (PROGRAM/READ); block number for ERASE
+    lba:  i64
+    seq:  i64
+    data: i64
+
+fn fmc_cmd(op: i64, ppn: i64, lba: i64, seq: i64, data: i64) -> FmcCmd:
+    FmcCmd(op: op, ppn: ppn, lba: lba, seq: seq, data: data)
+
+# ── The result latches (host reads these after DONE) ──────────────────────────
+struct FmcResult:
+    code: i64      # NAND op result (NAND_OK / NAND_PROG_FAIL / NAND_ERASE_FAIL / NAND_BAD_BLOCK)
+    data: i64
+    lba:  i64
+    seq:  i64
+    ecc:  i64
+    err:  i64      # injected bit-error count on a READ
+
+fn fmc_result_empty() -> FmcResult:
+    FmcResult(code: NAND_OK, data: 0, lba: 0, seq: 0, ecc: 0, err: 0)
+
+# ── The controller ────────────────────────────────────────────────────────────
+# `emu` is the backend-selection seam: None (default) drives the behavioural
+# `NandDevice`; Some(NandEmu) routes every device op to the Vt-physics NeChip
+# emulator instead. Composition, not a config flag — the choice is made once at
+# construction (fmc_new vs fmc_new_emu) and never toggled.
+struct Fmc:
+    nand:   NandDevice
+    emu:    Option<NandEmu>
+    cmd:    FmcCmd
+    status: i64
+    result: FmcResult
+
+fn fmc_new() -> Fmc:
+    Fmc(nand: nand_device_new(), emu: None, cmd: fmc_cmd(FMC_OP_NONE, 0, 0, 0, 0),
+        status: FMC_IDLE, result: fmc_result_empty())
+
+# Opt-in: back the controller with the Vt-physics NeChip emulator (fil_nand_emu)
+# rather than the behavioural NandDevice. The NandDevice is still built (it is the
+# field default) but is never consulted while `emu` is Some — every device op
+# routes to the emulator, so reads reflect real threshold-voltage drift.
+fn fmc_new_emu() -> Fmc:
+    Fmc(nand: nand_device_new(), emu: Some(nand_emu_new()), cmd: fmc_cmd(FMC_OP_NONE, 0, 0, 0, 0),
+        status: FMC_IDLE, result: fmc_result_empty())
+
+impl Fmc:
+    me safe_status() -> i64:
+        if me.status < FMC_IDLE or me.status > FMC_ERR:
+            me.status = FMC_ERR
+        me.status
+
+    # ── Backend dispatch ──────────────────────────────────────────────────────
+    # Route a device op to the NeChip emulator when `emu` is Some, else to the
+    # behavioural NandDevice. The unwrapped emu copy is written back because emu
+    # ops mutate chip/OOB state (a sense also materialises lazy retention drift).
+    me dev_program(ppn: i64, lba: i64, seq: i64, data: i64) -> i64:
+        if val Some(ev) = me.emu:
+            var e = ev
+            val rc: i64 = e.program(ppn, lba, seq, data)
+            me.emu = Some(e)
+            return rc
+        me.nand.program(ppn, lba, seq, data)
+
+    me dev_read_page(ppn: i64) -> NandRead:
+        if val Some(ev) = me.emu:
+            var e = ev
+            val rd: NandRead = e.read_page(ppn)
+            me.emu = Some(e)
+            return rd
+        me.nand.read_page(ppn)
+
+    me dev_erase_block(blk: i64) -> i64:
+        if val Some(ev) = me.emu:
+            var e = ev
+            val rc: i64 = e.erase_block(blk)
+            me.emu = Some(e)
+            return rc
+        me.nand.erase_block(blk)
+
+    # Write the command register: accept a command, move IDLE/DONE/ERR → BUSY.
+    me load(c: FmcCmd):
+        val was_invalid: bool = me.status < FMC_IDLE or me.status > FMC_ERR
+        val st: i64 = me.safe_status()
+        if st == FMC_BUSY:
+            return
+        if was_invalid:
+            return
+        me.cmd = c
+        me.result = fmc_result_empty()
+        me.status = FMC_BUSY
+
+    # Issue the loaded command against the NAND device, latch result + status. A no-op unless a
+    # command is loaded (status BUSY) — you cannot complete a command that was never issued.
+    me issue() -> i64:
+        if me.safe_status() != FMC_BUSY:
+            return me.status
+        if me.cmd.op == FMC_OP_PROGRAM:
+            val code: i64 = me.dev_program(me.cmd.ppn, me.cmd.lba, me.cmd.seq, me.cmd.data)
+            me.result = FmcResult(code: code, data: 0, lba: 0, seq: 0, ecc: 0, err: 0)
+            me.status = fmc_status_for(code)
+        elif me.cmd.op == FMC_OP_READ:
+            val rd: NandRead = me.dev_read_page(me.cmd.ppn)
+            me.result = FmcResult(code: NAND_OK, data: rd.data, lba: rd.lba, seq: rd.seq, ecc: rd.ecc, err: rd.err)
+            me.status = FMC_DONE
+        elif me.cmd.op == FMC_OP_ERASE:
+            val code: i64 = me.dev_erase_block(me.cmd.ppn)
+            me.result = FmcResult(code: code, data: 0, lba: 0, seq: 0, ecc: 0, err: 0)
+            me.status = fmc_status_for(code)
+        else:
+            me.status = FMC_ERR
+        me.status
+
+    me poll() -> i64:
+        me.safe_status()
+
+    me out() -> FmcResult:
+        me.result
+
+    # Acknowledge a completed command: DONE/ERR → IDLE. Clears the sticky ERR.
+    me ack():
+        val st: i64 = me.safe_status()
+        if st == FMC_DONE or st == FMC_ERR:
+            me.status = FMC_IDLE
+
+    # Read a page at a shifted read reference (read-retry). Sideband — like the
+    # emu_* test API it forwards to the backend without touching the command FSM.
+    # On the Vt-physics emulator the NandEmu applies the Vref offset for this one
+    # sense and restores the prior reference before returning (atomic set→read→
+    # restore, writeback mandatory: the sense materialises lazy drift + advances the
+    # emulated clock). The behavioural NandDevice has no Vref actuator, so there it
+    # is exactly a plain read — NOT a faked shifted sense.
+    me read_at_vref(ppn: i64, offset: i64) -> FmcResult:
+        if val Some(ev) = me.emu:
+            var e = ev
+            val rd: NandRead = e.read_at_vref(ppn, offset)
+            me.emu = Some(e)
+            return FmcResult(code: NAND_OK, data: rd.data, lba: rd.lba, seq: rd.seq, ecc: rd.ecc, err: rd.err)
+        val dr: NandRead = me.nand.read_page(ppn)
+        FmcResult(code: NAND_OK, data: dr.data, lba: dr.lba, seq: dr.seq, ecc: dr.ecc, err: dr.err)
+
+    # ── Sideband device queries (not on the command path) ──
+    # Each mirrors the command-path dispatch: forward to the emulator when `emu`
+    # is Some (writing the mutated copy back), else to the NandDevice.
+    me erase_count(blk: i64) -> i64:
+        if val Some(ev) = me.emu:
+            var e = ev
+            val rc: i64 = e.erase_count(blk)
+            me.emu = Some(e)
+            return rc
+        me.nand.erase_count(blk)
+
+    me set_bad(blk: i64):
+        if val Some(ev) = me.emu:
+            var e = ev
+            e.set_bad(blk)
+            me.emu = Some(e)
+            return
+        me.nand.set_bad(blk)
+
+    me inject_prog_fail(blk: i64):
+        if val Some(ev) = me.emu:
+            var e = ev
+            e.inject_prog_fail(blk)
+            me.emu = Some(e)
+            return
+        me.nand.inject_prog_fail(blk)
+
+    me inject_erase_fail(blk: i64):
+        if val Some(ev) = me.emu:
+            var e = ev
+            e.inject_erase_fail(blk)
+            me.emu = Some(e)
+            return
+        me.nand.inject_erase_fail(blk)
+
+    me inject_read_bitflip(ppn: i64, n: i64):
+        if val Some(ev) = me.emu:
+            var e = ev
+            e.inject_read_bitflip(ppn, n)
+            me.emu = Some(e)
+            return
+        me.nand.inject_read_bitflip(ppn, n)
+
+    me corrupt_page_data(ppn: i64, data: i64):
+        if val Some(ev) = me.emu:
+            var e = ev
+            e.corrupt_page_data(ppn, data)
+            me.emu = Some(e)
+            return
+        me.nand.corrupt_page_data(ppn, data)
+
+    # ── Emu-only test API (Vt retention / wear injection) ──────────────────────
+    # No-op on the default NandDevice backend, which has no threshold-voltage
+    # physics. Exposed so an FTL built via ftl_new_emu can age/wear its media and
+    # observe the drift surface through the ECC layer (fil_nand_emu_e2e_check).
+    me emu_advance_time_s(seconds: f64):
+        if val Some(ev) = me.emu:
+            var e = ev
+            e.advance_time_s(seconds)
+            me.emu = Some(e)
+
+    me emu_set_block_wear(blk: i64, pe_cycles: i64):
+        if val Some(ev) = me.emu:
+            var e = ev
+            e.set_block_wear(blk, pe_cycles)
+            me.emu = Some(e)
+
+    me emu_set_vref_offset(offset: i64):
+        if val Some(ev) = me.emu:
+            var e = ev
+            e.set_vref_offset(offset)
+            me.emu = Some(e)
+
+    # Soft-observability re-export (arch doc §3 prereq 3, §5): forward the NeChip
+    # per-page Vt histogram / read margin from the emulator backend. Empty / 0 on
+    # the behavioural NandDevice, which has no threshold-voltage model. Read-only on
+    # the chip, but the unwrapped emu copy is still written back to match the
+    # sideband convention (harmless — the observability calls do not mutate cells).
+    me emu_vt_histogram(ppn: i64) -> [i64]:
+        if val Some(ev) = me.emu:
+            var e = ev
+            val h: [i64] = e.vt_histogram(ppn)
+            me.emu = Some(e)
+            return h
+        var empty: [i64] = []
+        empty
+
+    me emu_read_margin(ppn: i64) -> i64:
+        if val Some(ev) = me.emu:
+            var e = ev
+            val m: i64 = e.read_margin(ppn)
+            me.emu = Some(e)
+            return m
+        0
+
+# A NAND op that failed latches ERR (sticky); otherwise DONE.
+fn fmc_status_for(code: i64) -> i64:
+    if code == NAND_PROG_FAIL or code == NAND_ERASE_FAIL or code == NAND_BAD_BLOCK:
+        return FMC_ERR
+    FMC_DONE
+
+# ── Self-test ─────────────────────────────────────────────────────────────────
+fn fil_fmc_selftest() -> i64:
+    var fail: i64 = 0
+    var fmc: Fmc = fmc_new()
+
+    # Fresh controller is IDLE.
+    fail = fail + expect_eq(fmc.poll(), FMC_IDLE, "fmc: fresh controller IDLE")
+
+    # Load → BUSY; issue a PROGRAM → DONE; result code NAND_OK.
+    val ppn: i64 = block_first_ppn(2) + 3
+    fmc.load(fmc_cmd(FMC_OP_PROGRAM, ppn, 42, 7, 0xAB))
+    fmc.load(fmc_cmd(FMC_OP_READ, ppn, 0, 0, 0))
+    fail = fail + expect_eq(fmc.poll(), FMC_BUSY, "fmc: load -> BUSY")
+    fmc.ack()
+    fail = fail + expect_eq(fmc.poll(), FMC_BUSY, "fmc: ack while BUSY is inert")
+    fail = fail + expect_eq(fmc.issue(), FMC_DONE, "fmc: program issue -> DONE")
+    var pr: FmcResult = fmc.out()
+    fail = fail + expect_eq(pr.code, NAND_OK, "fmc: program code NAND_OK")
+    fmc.ack()
+    fail = fail + expect_eq(fmc.poll(), FMC_IDLE, "fmc: ack -> IDLE")
+
+    # READ latches data/oob and reaches DONE.
+    fmc.load(fmc_cmd(FMC_OP_READ, ppn, 0, 0, 0))
+    fail = fail + expect_eq(fmc.issue(), FMC_DONE, "fmc: read issue -> DONE")
+    var rr: FmcResult = fmc.out()
+    fail = fail + expect_eq(rr.data, 0xAB, "fmc: read data latched")
+    fail = fail + expect_eq(rr.lba, 42, "fmc: read lba latched")
+    fail = fail + expect_eq(rr.ecc, ecc_compute(0xAB, 42, 7), "fmc: read ecc latched")
+    fmc.ack()
+
+    # Issuing with no command loaded is a no-op (cannot complete an un-issued command).
+    fail = fail + expect_eq(fmc.issue(), FMC_IDLE, "fmc: issue without load is a no-op")
+
+    # A NAND fault latches the sticky ERR status; it survives a re-poll and clears only on ack.
+    fmc.inject_erase_fail(6)
+    fmc.load(fmc_cmd(FMC_OP_ERASE, 6, 0, 0, 0))
+    fail = fail + expect_eq(fmc.issue(), FMC_ERR, "fmc: faulted erase -> ERR")
+    fail = fail + expect_eq(fmc.poll(), FMC_ERR, "fmc: ERR is sticky across poll")
+    fmc.ack()
+    fail = fail + expect_eq(fmc.poll(), FMC_IDLE, "fmc: ack clears ERR")
+
+    fmc.status = 99
+    fmc.load(fmc_cmd(FMC_OP_PROGRAM, ppn, 42, 7, 0xCD))
+    fail = fail + expect_eq(fmc.poll(), FMC_ERR, "fmc: corrupted oversized status fails closed")
+    fail = fail + expect_eq(fmc.issue(), FMC_ERR, "fmc: corrupted status blocks issue")
+    fmc.ack()
+    fail = fail + expect_eq(fmc.poll(), FMC_IDLE, "fmc: ack clears corrupted status")
+    fmc.status = -4
+    fail = fail + expect_eq(fmc.issue(), FMC_ERR, "fmc: corrupted negative status fails closed")
+    fmc.ack()
+
+    fail

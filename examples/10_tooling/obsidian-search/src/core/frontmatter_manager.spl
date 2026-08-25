@@ -1,0 +1,330 @@
+# Frontmatter manager — YAML frontmatter round-trip operations
+#
+# Provides get/set/delete for individual frontmatter fields,
+# and get_all to return the entire frontmatter as JSON.
+# Preserves existing fields when modifying.
+
+use src.util.json_helpers.{js, jp, jo, ja, safe_substr, Q, LB, RB, SB_L, SB_R, escape_json}
+
+# --- Field extraction ---
+
+/**
+Extract a single field value from YAML frontmatter.
+Returns "" if field not found or no frontmatter exists.
+
+```sdoctest
+>>> val content = "---\ntitle: My Note\ntags: [a, b]\n---\nBody"
+>>> get_frontmatter_field(content, "title")
+My Note
+>>> get_frontmatter_field(content, "tags")
+[a, b]
+```
+*/
+fn get_frontmatter_field(content: text, field: text) -> text:
+    val lines = content.split("\n")
+    var in_fm = false
+    var fm_started = false
+    var line_num = 0
+    var collecting_multiline = false
+    var multiline_items: [text] = []
+    var target_field = field
+
+    for line in lines:
+        val trimmed = line.trim()
+        if line_num == 0 and trimmed == "---":
+            in_fm = true
+            fm_started = true
+            line_num = line_num + 1
+            continue
+        if in_fm and trimmed == "---":
+            # End of frontmatter — flush any multiline collection
+            if collecting_multiline:
+                return "[" + multiline_items.join(", ") + "]"
+            return ""
+        if in_fm:
+            # Check if this is a multiline list item
+            if collecting_multiline:
+                if trimmed.starts_with("- "):
+                    val item_val = safe_substr(trimmed, 2, trimmed.len()).trim()
+                    multiline_items.push(item_val)
+                    line_num = line_num + 1
+                    continue
+                else:
+                    # End of multiline list — we hit a new field
+                    collecting_multiline = false
+                    return "[" + multiline_items.join(", ") + "]"
+
+            val prefix = field + ":"
+            if trimmed.starts_with(prefix):
+                val after = safe_substr(trimmed, prefix.len(), trimmed.len()).trim()
+                if after == "":
+                    # Multiline list format (value on next lines)
+                    collecting_multiline = true
+                    multiline_items = []
+                    line_num = line_num + 1
+                    continue
+                # Remove surrounding quotes
+                var result = after
+                if result.starts_with("\"") and result.ends_with("\""):
+                    result = safe_substr(result, 1, result.len() - 1)
+                return result
+        line_num = line_num + 1
+
+    # If we were collecting multiline at EOF
+    if collecting_multiline:
+        return "[" + multiline_items.join(", ") + "]"
+    ""
+
+# --- Field setting ---
+
+/**
+Set or update a frontmatter field. Preserves other fields.
+If no frontmatter exists, creates a new frontmatter block.
+
+```sdoctest
+>>> val content = "---\ntitle: Old\n---\nBody"
+>>> set_frontmatter_field(content, "title", "New")
+---
+title: New
+---
+Body
+```
+*/
+fn set_frontmatter_field(content: text, field: text, value: text) -> text:
+    val lines = content.split("\n")
+    var result_lines: [text] = []
+    var in_fm = false
+    var fm_started = false
+    var field_found = false
+    var line_num = 0
+    var skip_multiline = false
+
+    for line in lines:
+        val trimmed = line.trim()
+
+        if line_num == 0 and trimmed == "---":
+            in_fm = true
+            fm_started = true
+            result_lines.push(line)
+            line_num = line_num + 1
+            continue
+
+        if in_fm and trimmed == "---":
+            # End of frontmatter — insert field if not found
+            if not field_found:
+                result_lines.push(field + ": " + value)
+                field_found = true
+            in_fm = false
+            result_lines.push(line)
+            line_num = line_num + 1
+            continue
+
+        if in_fm:
+            # Skip multiline list items if we're replacing a multiline field
+            if skip_multiline:
+                if trimmed.starts_with("- "):
+                    line_num = line_num + 1
+                    continue
+                else:
+                    skip_multiline = false
+
+            val prefix = field + ":"
+            if trimmed.starts_with(prefix):
+                val after = safe_substr(trimmed, prefix.len(), trimmed.len()).trim()
+                result_lines.push(field + ": " + value)
+                field_found = true
+                if after == "":
+                    # This was a multiline list — skip subsequent "- item" lines
+                    skip_multiline = true
+                line_num = line_num + 1
+                continue
+
+        result_lines.push(line)
+        line_num = line_num + 1
+
+    # If no frontmatter existed, create one
+    if not fm_started:
+        var new_lines: [text] = []
+        new_lines.push("---")
+        new_lines.push(field + ": " + value)
+        new_lines.push("---")
+        for orig_line in lines:
+            new_lines.push(orig_line)
+        return new_lines.join("\n")
+
+    result_lines.join("\n")
+
+# --- Field deletion ---
+
+/**
+Remove a field from frontmatter. Returns content unchanged if field not found.
+
+```sdoctest
+>>> val content = "---\ntitle: Note\ndate: 2024-01-15\n---\nBody"
+>>> delete_frontmatter_field(content, "date")
+---
+title: Note
+---
+Body
+```
+*/
+fn delete_frontmatter_field(content: text, field: text) -> text:
+    val lines = content.split("\n")
+    var result_lines: [text] = []
+    var in_fm = false
+    var fm_started = false
+    var line_num = 0
+    var skip_multiline = false
+
+    for line in lines:
+        val trimmed = line.trim()
+
+        if line_num == 0 and trimmed == "---":
+            in_fm = true
+            fm_started = true
+            result_lines.push(line)
+            line_num = line_num + 1
+            continue
+
+        if in_fm and trimmed == "---":
+            in_fm = false
+            skip_multiline = false
+            result_lines.push(line)
+            line_num = line_num + 1
+            continue
+
+        if in_fm:
+            if skip_multiline:
+                if trimmed.starts_with("- "):
+                    line_num = line_num + 1
+                    continue
+                else:
+                    skip_multiline = false
+
+            val prefix = field + ":"
+            if trimmed.starts_with(prefix):
+                val after = safe_substr(trimmed, prefix.len(), trimmed.len()).trim()
+                if after == "":
+                    skip_multiline = true
+                line_num = line_num + 1
+                continue
+
+        result_lines.push(line)
+        line_num = line_num + 1
+
+    result_lines.join("\n")
+
+# --- Get all frontmatter as JSON ---
+
+/**
+Return all frontmatter fields as a JSON object string.
+Array fields are returned as JSON arrays; scalar fields as strings.
+
+```sdoctest
+>>> val content = "---\ntitle: Note\ntags: [a, b]\n---\nBody"
+>>> get_all_frontmatter(content)
+{"title":"Note","tags":["a","b"]}
+```
+*/
+fn get_all_frontmatter(content: text) -> text:
+    val lines = content.split("\n")
+    var pairs: [text] = []
+    var in_fm = false
+    var fm_started = false
+    var line_num = 0
+    var collecting_field = ""
+    var multiline_items: [text] = []
+
+    for line in lines:
+        val trimmed = line.trim()
+
+        if line_num == 0 and trimmed == "---":
+            in_fm = true
+            fm_started = true
+            line_num = line_num + 1
+            continue
+
+        if in_fm and trimmed == "---":
+            # Flush any multiline collection
+            if collecting_field != "":
+                val arr_items = format_list_as_json_array(multiline_items)
+                pairs.push(jp(collecting_field, arr_items))
+                collecting_field = ""
+            in_fm = false
+            line_num = line_num + 1
+            continue
+
+        if in_fm:
+            # Check multiline list continuation
+            if collecting_field != "":
+                if trimmed.starts_with("- "):
+                    val item_val = safe_substr(trimmed, 2, trimmed.len()).trim()
+                    multiline_items.push(item_val)
+                    line_num = line_num + 1
+                    continue
+                else:
+                    # Flush multiline
+                    val arr_items = format_list_as_json_array(multiline_items)
+                    pairs.push(jp(collecting_field, arr_items))
+                    collecting_field = ""
+
+            # Parse key: value
+            val colon_idx = find_colon_index(trimmed)
+            if colon_idx > 0:
+                val key = safe_substr(trimmed, 0, colon_idx).trim()
+                val value_part = safe_substr(trimmed, colon_idx + 1, trimmed.len()).trim()
+
+                if value_part == "":
+                    # Multiline list
+                    collecting_field = key
+                    multiline_items = []
+                elif value_part.starts_with("[") and value_part.ends_with("]"):
+                    # Inline array
+                    val inner = safe_substr(value_part, 1, value_part.len() - 1)
+                    val items = parse_inline_list(inner)
+                    val arr = format_list_as_json_array(items)
+                    pairs.push(jp(key, arr))
+                else:
+                    # Scalar value
+                    var clean_val = value_part
+                    if clean_val.starts_with("\"") and clean_val.ends_with("\""):
+                        clean_val = safe_substr(clean_val, 1, clean_val.len() - 1)
+                    pairs.push(jp(key, js(clean_val)))
+
+        line_num = line_num + 1
+
+    # Flush trailing multiline
+    if collecting_field != "":
+        val arr_items = format_list_as_json_array(multiline_items)
+        pairs.push(jp(collecting_field, arr_items))
+
+    if pairs.len() == 0:
+        return LB() + RB()
+    jo(pairs)
+
+# --- Internal helpers ---
+
+fn find_colon_index(line: text) -> i64:
+    var i = 0
+    for ch in line:
+        if ch == ":":
+            return i
+        i = i + 1
+    -1
+
+fn parse_inline_list(inner: text) -> [text]:
+    var items: [text] = []
+    val parts = inner.split(",")
+    for part in parts:
+        var trimmed = part.trim()
+        if trimmed.starts_with("\"") and trimmed.ends_with("\""):
+            trimmed = safe_substr(trimmed, 1, trimmed.len() - 1)
+        if trimmed != "":
+            items.push(trimmed)
+    items
+
+fn format_list_as_json_array(items: [text]) -> text:
+    var json_items: [text] = []
+    for item in items:
+        json_items.push(js(item))
+    SB_L() + json_items.join(",") + SB_R()

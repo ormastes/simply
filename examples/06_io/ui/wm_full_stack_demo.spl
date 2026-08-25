@@ -1,0 +1,504 @@
+# Linux host vertical slice: GLFW -> normalized events -> WM -> GUI/Web/2D.
+
+use common.io.window_event.{
+    WINDOW_ACTION_PRESS,
+    WINDOW_EVENT_CLOSE,
+    WINDOW_EVENT_KEY,
+    WINDOW_STATUS_OK,
+    WINDOW_EVENT_POINTER_BUTTON,
+    WINDOW_EVENT_POINTER_MOVE,
+    WINDOW_EVENT_RESIZE,
+    WINDOW_EVENT_TEXT,
+    WINDOW_EVENT_WHEEL,
+    WINDOW_MOD_CTRL,
+}
+use common.io.window_shortcut.{
+    WINDOW_WM_SHORTCUT_FOCUS_NEXT,
+    WINDOW_WM_SHORTCUT_CLOSE,
+    WINDOW_WM_SHORTCUT_MINIMIZE,
+    WINDOW_WM_SHORTCUT_TOGGLE_MAXIMIZE,
+    window_wm_shortcut_action,
+}
+use common.ui.layout.{compute_layout, find_rect}
+use common.ui.pixel_surface_content_frame.{pixel_surface_content_frame}
+use common.ui.widget.{UIEvent, WidgetNode}
+use common.ui.window_scene_draw_ir.{
+    shared_wm_pixel_buffer_addr,
+    shared_wm_pixel_buffer_count,
+}
+use common.ui.native_scalar_text.{ui_native_i64_text}
+use common.ui.wm_full_stack_demo.{
+    WM_FULL_STACK_DEMO_APP_ID,
+    WM_FULL_STACK_DEMO_IMAGE_URI,
+    WmDemo2dState,
+    wm_full_stack_demo_tree,
+}
+use common.window_protocol.geometry.{Size}
+use common.window_protocol.compositor_methods.{COMP_MINIMIZE}
+use nogc_sync_mut.ui.session.{UISession}
+use nogc_sync_mut.ui.theme_package.{default_theme_id}
+use nogc_sync_mut.engine.audio.sound_engine.{SoundEngine, SoundEngineConfig}
+use nogc_sync_mut.engine.audio.ui_click_pcm_raw.{
+    UI_CLICK_PCM_FRAME_COUNT,
+    ui_click_pcm_create,
+    ui_click_pcm_checksum,
+    ui_click_pcm_play,
+    ui_click_pcm_release,
+}
+use os.compositor.host_compositor_entry.{
+    HostCompositor,
+    host_compositor_cycle_focus,
+}
+use os.compositor.host_gui_event_router.{HostGuiEventRouter}
+use os.compositor.simple_web_window_renderer.{
+    simple_web_child_content_frame_cached,
+}
+use os.userlib.ipc_protocol.{COMP_CREATE_WINDOW}
+use std.gc_async_mut.gpu.engine2d.draw_ir_adv.{
+    engine2d_resolved_draw_ir_image,
+}
+use std.gc_async_mut.ui.gui_content_renderer.{gui_session_content_frame}
+use std.gc_async_mut.ui.web_render_pixel_backend.{
+    web_render_pixel_artifact_cache,
+}
+use std.nogc_sync_mut.io.simple_glfw.{SimpleGlfw}
+use app.ui.web.taskbar_runtime.{
+    host_taskbar_runtime_pinned_app_count,
+    host_taskbar_runtime_pinned_app_id,
+    host_taskbar_runtime_pinned_app_display_name,
+    host_taskbar_runtime_pinned_app_icon,
+    host_taskbar_runtime_try_pin_app,
+    host_taskbar_runtime_try_unpin_app,
+}
+
+extern fn rt_sleep_ms(ms: i64)
+
+fn main() -> i64:
+    var glfw = SimpleGlfw.create(256, 64)
+    if not glfw.available:
+        print "wm-demo:error:glfw-unavailable"
+        return 2
+    val baseline_windows = glfw.live_window_count()
+    val baseline_events = glfw.queued_event_count()
+    val baseline_text = glfw.events.text_live_count()
+    val host_window = glfw.create_window(
+        "Simple Full Stack WM Demo", 640, 600
+    )
+    if host_window == 0:
+        glfw.terminate()
+        print "wm-demo:error:create-window"
+        return 3
+
+    var screen_width = glfw.framebuffer_width(host_window).to_i32()
+    var screen_height = glfw.framebuffer_height(host_window).to_i32()
+    var logical_width = glfw.window_width(host_window).to_i32()
+    var logical_height = glfw.window_height(host_window).to_i32()
+    var content_scale_milli = glfw.content_scale_milli(host_window)
+    if screen_width <= 0:
+        screen_width = 640
+    if screen_height <= 0:
+        screen_height = 600
+    if logical_width <= 0:
+        logical_width = 640
+    if logical_height <= 0:
+        logical_height = 600
+    if content_scale_milli <= 0:
+        content_scale_milli = screen_width.to_i64() * 1000 /
+            logical_width.to_i64()
+    val tree = wm_full_stack_demo_tree("Ready", "Play sound", "")
+    var session = UISession.new(tree)
+    var compositor = HostCompositor.new_headless(
+        Size.wh(screen_width, screen_height)
+    )
+    compositor.apply_bridge_request(
+        1, 10, COMP_CREATE_WINDOW.to_i64(), 0,
+        "Full Stack WM Demo", 20, 20, 488, 516, "",
+        99, WM_FULL_STACK_DEMO_APP_ID
+    )
+    if compositor.windows.len() != 1:
+        glfw.destroy_window(host_window)
+        glfw.terminate()
+        return 4
+    var demo_window_id = compositor.windows[0].id
+    if not compositor.require_external_content_frame(demo_window_id):
+        glfw.destroy_window(host_window)
+        glfw.terminate()
+        return 4
+
+    var router = HostGuiEventRouter.new(demo_window_id)
+    var surface_2d = WmDemo2dState.new()
+    var running = true
+    var needs_render = true
+    var content_revision = 0
+    var last_width = 0
+    var last_height = 0
+    var pinned = false
+    var pinned_index = 0
+    while pinned_index < host_taskbar_runtime_pinned_app_count():
+        val app_id = host_taskbar_runtime_pinned_app_id(pinned_index)
+        compositor.pin_taskbar_app(
+            app_id,
+            host_taskbar_runtime_pinned_app_display_name(pinned_index),
+            host_taskbar_runtime_pinned_app_icon(pinned_index)
+        )
+        if app_id == WM_FULL_STACK_DEMO_APP_ID:
+            pinned = true
+        pinned_index = pinned_index + 1
+    # A fresh taskbar layout has no entry for this standalone demo. Persist
+    # its stable launcher before exposing it in the compositor, so close of
+    # the last window still leaves a taskbar path that can reopen the app.
+    if not pinned:
+        if not host_taskbar_runtime_try_pin_app(
+            WM_FULL_STACK_DEMO_APP_ID, "WM Demo", "demo"
+        ):
+            glfw.destroy_window(host_window)
+            glfw.terminate()
+            print "wm-demo:error:pin-default"
+            return 4
+        if not compositor.pin_taskbar_app(
+            WM_FULL_STACK_DEMO_APP_ID, "WM Demo", "demo"
+        ):
+            glfw.destroy_window(host_window)
+            glfw.terminate()
+            print "wm-demo:error:pin-compositor"
+            return 4
+        pinned = true
+
+    var sound = SoundEngine.create(
+        SoundEngineConfig.platform("linux", "linux")
+    )
+    val baseline_audio_handles = sound.active_audio_handle_count()
+    val audio_device_ready = sound.start_device()
+    val click_pcm_addr = ui_click_pcm_create()
+    val image = engine2d_resolved_draw_ir_image(
+        WM_FULL_STACK_DEMO_IMAGE_URI, 2, 2,
+        [0xffffcc00u32, 0xff00ccffu32, 0xff00ccffu32, 0xffffcc00u32]
+    )
+
+    while running:
+        if running and needs_render:
+            if compositor.windows.len() > 0:
+                val win = compositor.windows[0]
+                val content_width = win.w - 8
+                val content_height = win.h - 36
+                if content_width != last_width or content_height != last_height:
+                    session.dispatch(UIEvent.Resize(content_width, content_height))
+                    last_width = content_width
+                    last_height = content_height
+                content_revision = content_revision + 1
+                val demo_window_text_id = ui_native_i64_text(
+                    demo_window_id
+                )
+                val gui_frame = gui_session_content_frame(
+                    session, demo_window_text_id, "", 0, 0,
+                    content_width, content_height,
+                    compositor.render_revision + 1,
+                    content_revision,
+                    [image]
+                )
+                if not compositor.set_external_content_frame(
+                    demo_window_id, gui_frame
+                ):
+                    print "wm-demo:error:gui-frame-rejected"
+                    running = false
+
+            if running and compositor.windows.len() > 0:
+                val rects = compute_layout(
+                    tree.root_node(), 0, 0, last_width, last_height
+                )
+                if val rect_2d = find_rect(rects, "demo-surface-2d"):
+                    val frame_2d = pixel_surface_content_frame(
+                        "demo-2d", demo_window_text_id, rect_2d.x,
+                        rect_2d.y,
+                        rect_2d.w, rect_2d.h,
+                        surface_2d.pixels(rect_2d.w, rect_2d.h),
+                        compositor.render_revision, content_revision
+                    )
+                    compositor.set_external_child_frame(frame_2d)
+                if val rect_web = find_rect(rects, "demo-surface-web"):
+                    var web_cache = web_render_pixel_artifact_cache(
+                        rect_web.w, rect_web.h, "software"
+                    )
+                    val web_frame = simple_web_child_content_frame_cached(
+                        web_cache, "demo-web", demo_window_text_id,
+                        rect_web.x, rect_web.y,
+                        compositor.render_revision, content_revision,
+                        default_theme_id(), "Embedded Web",
+                        "<p>Simple Web panel</p>",
+                        rect_web.w, rect_web.h, 0
+                    )
+                    compositor.set_external_child_frame(web_frame)
+            if running:
+                compositor.render_frame()
+                if glfw.present_argb_words_raw(
+                    host_window,
+                    shared_wm_pixel_buffer_addr(),
+                    shared_wm_pixel_buffer_count(),
+                    screen_width, screen_height
+                ) != 0:
+                    print "wm-demo:error:present"
+                    running = false
+            needs_render = false
+
+        if running:
+            glfw.poll_events()
+            var poll_status = glfw.poll_event_scalar()
+            var saw_event = false
+            while poll_status == WINDOW_STATUS_OK:
+                saw_event = true
+                val kind = glfw.events.polled_kind
+                val key = glfw.events.polled_key
+                val action = glfw.events.polled_action
+                val modifiers = glfw.events.polled_modifiers
+                val text_handle = glfw.events.polled_text_handle
+                if kind == WINDOW_EVENT_CLOSE:
+                    running = false
+                else:
+                    var consumed_shortcut = false
+                    var committed = ""
+                    if kind == WINDOW_EVENT_TEXT:
+                        committed = glfw.events.text_value(text_handle)
+                    if kind == WINDOW_EVENT_RESIZE:
+                        val resized_width = glfw.events.polled_width.to_i32()
+                        val resized_height = glfw.events.polled_height.to_i32()
+                        if resized_width > 0 and resized_height > 0:
+                            compositor.resize(
+                                resized_width, resized_height
+                            )
+                            if (compositor.width == resized_width and
+                                compositor.height == resized_height):
+                                screen_width = resized_width
+                                screen_height = resized_height
+                                val next_logical_width = glfw.window_width(
+                                    host_window
+                                ).to_i32()
+                                val next_logical_height = glfw.window_height(
+                                    host_window
+                                ).to_i32()
+                                if next_logical_width > 0:
+                                    logical_width = next_logical_width
+                                if next_logical_height > 0:
+                                    logical_height = next_logical_height
+                                val next_scale = glfw.content_scale_milli(
+                                    host_window
+                                )
+                                if next_scale > 0:
+                                    content_scale_milli = next_scale
+                                else:
+                                    content_scale_milli = (
+                                        resized_width.to_i64() * 1000 /
+                                        logical_width.to_i64()
+                                    )
+                                needs_render = true
+                            else:
+                                print "wm-demo:error:resize-unsupported"
+                                running = false
+
+                    if kind == WINDOW_EVENT_KEY and (
+                        action == WINDOW_ACTION_PRESS
+                    ):
+                        val ctrl = (modifiers & WINDOW_MOD_CTRL) != 0
+                        if ctrl and key == 86:
+                            val host_text = glfw.clipboard_get(host_window)
+                            if host_text != "":
+                                session.clipboard.copy(
+                                    "text/plain", host_text
+                                )
+                        val wm_shortcut = window_wm_shortcut_action(
+                            key, action, modifiers
+                        )
+                        if wm_shortcut == WINDOW_WM_SHORTCUT_FOCUS_NEXT:
+                            compositor = host_compositor_cycle_focus(compositor)
+                            consumed_shortcut = true
+                        elif wm_shortcut == WINDOW_WM_SHORTCUT_CLOSE:
+                            compositor.destroy_window(demo_window_id)
+                            consumed_shortcut = true
+                        elif wm_shortcut == WINDOW_WM_SHORTCUT_MINIMIZE:
+                            compositor.apply_bridge_request(
+                                0, 0, COMP_MINIMIZE.to_i64(), demo_window_id,
+                                "", 0, 0, 0, 0, "", 0, ""
+                            )
+                            consumed_shortcut = true
+                        elif wm_shortcut == WINDOW_WM_SHORTCUT_TOGGLE_MAXIMIZE:
+                            if compositor.windows.len() > 0 and compositor.windows[0].maximized:
+                                compositor.restore_window(demo_window_id)
+                            else:
+                                compositor.maximize_window(demo_window_id)
+                            consumed_shortcut = true
+                        elif ctrl and key == 80:
+                            if pinned:
+                                if host_taskbar_runtime_try_unpin_app(
+                                    WM_FULL_STACK_DEMO_APP_ID
+                                ):
+                                    compositor.unpin_taskbar_app(
+                                        WM_FULL_STACK_DEMO_APP_ID
+                                    )
+                                    pinned = false
+                                    WidgetNode(id: "demo-status").set_prop(
+                                        "label", "Unpinned"
+                                    )
+                            else:
+                                if host_taskbar_runtime_try_pin_app(
+                                    WM_FULL_STACK_DEMO_APP_ID,
+                                    "WM Demo",
+                                    "demo"
+                                ):
+                                    compositor.pin_taskbar_app(
+                                        WM_FULL_STACK_DEMO_APP_ID,
+                                        "WM Demo",
+                                        "demo"
+                                    )
+                                    pinned = true
+                                    WidgetNode(id: "demo-status").set_prop(
+                                        "label", "Pinned"
+                                    )
+                            consumed_shortcut = true
+
+                    if running and not consumed_shortcut:
+                        var routed_x_milli = glfw.events.polled_x_milli
+                        var routed_y_milli = glfw.events.polled_y_milli
+                        if (kind == WINDOW_EVENT_POINTER_MOVE or
+                            kind == WINDOW_EVENT_POINTER_BUTTON):
+                            if logical_width > 0:
+                                routed_x_milli = (
+                                    routed_x_milli * screen_width /
+                                    logical_width
+                                )
+                            if logical_height > 0:
+                                routed_y_milli = (
+                                    routed_y_milli * screen_height /
+                                    logical_height
+                                )
+                        val routed_client = router.route_scalar(
+                            kind,
+                            key,
+                            action,
+                            modifiers,
+                            routed_x_milli,
+                            routed_y_milli,
+                            glfw.events.polled_delta_x_milli,
+                            glfw.events.polled_delta_y_milli,
+                            compositor,
+                            session,
+                            committed
+                        )
+                        if (kind == WINDOW_EVENT_KEY and
+                            action == WINDOW_ACTION_PRESS and
+                            (modifiers & WINDOW_MOD_CTRL) != 0 and
+                            (key == 67 or key == 88)):
+                            val copied = session.clipboard.paste()
+                            if copied != nil:
+                                glfw.clipboard_set(
+                                    host_window, copied.data
+                                )
+                        if (compositor.windows.len() > 0 and (
+                            kind == WINDOW_EVENT_POINTER_MOVE or
+                            kind == WINDOW_EVENT_POINTER_BUTTON
+                        )):
+                            surface_2d.route_widget_pointer(
+                                tree.root_node(),
+                                last_width, last_height,
+                                kind, key, action, routed_client,
+                                router.last_local_x,
+                                router.last_local_y
+                            )
+                    if consumed_shortcut:
+                        router.client_pointer_captured = false
+                        surface_2d.pointer("up", 0, 0)
+                        needs_render = true
+                    if text_handle != 0:
+                        glfw.events.release_text(text_handle)
+                    if (not consumed_shortcut and (
+                        kind == WINDOW_EVENT_POINTER_MOVE or
+                        kind == WINDOW_EVENT_POINTER_BUTTON or
+                        kind == WINDOW_EVENT_WHEEL or
+                        kind == WINDOW_EVENT_KEY or
+                        kind == WINDOW_EVENT_TEXT)):
+                        val latest = if kind == WINDOW_EVENT_POINTER_MOVE:
+                            "Pointer moved"
+                        elif kind == WINDOW_EVENT_POINTER_BUTTON:
+                            "Pointer button"
+                        elif kind == WINDOW_EVENT_WHEEL:
+                            "Scrolled"
+                        elif kind == WINDOW_EVENT_KEY:
+                            "Key event"
+                        else:
+                            "Text committed"
+                        WidgetNode(id: "demo-status").set_prop(
+                            "label", latest
+                        )
+                        needs_render = true
+                poll_status = glfw.poll_event_scalar()
+
+            if glfw.should_close(host_window):
+                running = false
+
+            val launch_app_id = compositor.take_pending_taskbar_launch_app_id()
+            if (launch_app_id == WM_FULL_STACK_DEMO_APP_ID and
+                compositor.windows.len() == 0):
+                compositor.apply_bridge_request(
+                    1, 10, COMP_CREATE_WINDOW.to_i64(), 0,
+                    "Full Stack WM Demo", 20, 20, 488, 516, "",
+                    99, WM_FULL_STACK_DEMO_APP_ID
+                )
+                if compositor.windows.len() == 1:
+                    demo_window_id = compositor.windows[0].id
+                if (compositor.windows.len() == 1 and
+                    compositor.require_external_content_frame(demo_window_id)):
+                    router = HostGuiEventRouter.new(demo_window_id)
+                    last_width = 0
+                    last_height = 0
+                    needs_render = true
+                else:
+                    print "wm-demo:error:reopen-window"
+                    running = false
+
+            val action = session.take_pending_action()
+            if action == "wm-demo.click":
+                val checksum = ui_click_pcm_checksum(click_pcm_addr)
+                sound.mixed_pcm_frames = (
+                    sound.mixed_pcm_frames + UI_CLICK_PCM_FRAME_COUNT
+                )
+                sound.mixed_pcm_checksum = checksum
+                var device_played = false
+                if audio_device_ready:
+                    val playback_handle = ui_click_pcm_play(click_pcm_addr)
+                    device_played = playback_handle > 0
+                    if device_played:
+                        sound.playback_handles.push(playback_handle)
+                if audio_device_ready and not device_played:
+                    sound.underrun_count = sound.underrun_count + 1
+                WidgetNode(id: "demo-button").set_prop("label", "Played")
+                WidgetNode(id: "demo-status").set_prop(
+                    "label",
+                    if device_played:
+                        "Button clicked — PCM device"
+                    else:
+                        "Button clicked — PCM capture"
+                )
+                needs_render = true
+            if not saw_event:
+                rt_sleep_ms(8)
+
+    if compositor.windows.len() > 0:
+        compositor.destroy_window(demo_window_id)
+    router.client_pointer_captured = false
+    surface_2d.pointer("up", 0, 0)
+    ui_click_pcm_release(click_pcm_addr)
+    sound.teardown()
+    glfw.destroy_window(host_window)
+    val clean = (
+        compositor.windows.len() == 0 and
+        compositor.external_web_window_ids.len() == 0 and
+        compositor.external_web_frames.len() == 0 and
+        compositor.external_child_frames.len() == 0 and
+        compositor.native_cache_window_ids.len() == 0 and
+        compositor.native_content_caches.len() == 0 and
+        glfw.live_window_count() == baseline_windows and
+        glfw.queued_event_count() == baseline_events and
+        glfw.events.text_live_count() == baseline_text and
+        sound.active_audio_handle_count() == baseline_audio_handles
+    )
+    glfw.terminate()
+    print "wm-demo:closed clean={clean} framebuffer={screen_width}x{screen_height} logical={logical_width}x{logical_height} scale_milli={content_scale_milli} pcm_frames={sound.mixed_pcm_frames} pcm_checksum={sound.mixed_pcm_checksum} audio_device={audio_device_ready} audio_handles={sound.active_audio_handle_count()} audio_baseline={baseline_audio_handles}"
+    if clean: 0 else: 5

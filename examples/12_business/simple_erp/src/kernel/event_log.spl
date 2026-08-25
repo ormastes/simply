@@ -1,0 +1,43 @@
+# UBS Kernel — Event Log
+#
+# The event log is the ONLY place the system writes. Every operational fact
+# (ship goods, log an hour, post a journal entry) is appended as an immutable
+# Event. Financial / tax / project / analytics views are deterministic
+# *projections* of this log (see projection.spl) — never second copies, so
+# there is nothing to reconcile and "sync errors" are impossible by construction.
+
+# A single immutable fact. `payload` is an opaque text/SDN blob owned by the
+# emitting dimension; the kernel never interprets it.
+struct Event:
+    val seq: i64
+    val kind: text
+    val entity: i64
+    val payload: text
+
+# Append-only log. Treated as a value: append returns a new log so callers
+# cannot mutate history in place.
+struct EventLog:
+    val events: [Event]
+
+fn new_event_log() -> EventLog:
+    var evs: [Event] = []
+    return EventLog { events: evs }
+
+# Append one event; the sequence number is assigned monotonically.
+fn append(log: EventLog, kind: text, entity: i64, payload: text) -> EventLog:
+    val seq = log.events.length()
+    val ev = Event { seq: seq, kind: kind, entity: entity, payload: payload }
+    var evs = log.events
+    evs.push(ev)
+    return EventLog { events: evs }
+
+fn event_count(log: EventLog) -> i64:
+    return log.events.length()
+
+# Events touching a given entity, in order. The basis of every per-entity view.
+fn events_for(log: EventLog, entity: i64) -> [Event]:
+    var out: [Event] = []
+    for ev in log.events:
+        if ev.entity == entity:
+            out.push(ev)
+    return out

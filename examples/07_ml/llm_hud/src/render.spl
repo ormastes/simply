@@ -1,0 +1,140 @@
+#![allow(unnamed_duplicate_typed_args)]
+use std.common.report.ansi.{ansi_reset, ansi_bold, ansi_dim, ansi_green, ansi_yellow, ansi_blue, ansi_cyan, ansi_magenta}
+use examples.llm_hud.src.types.{HudOptions, ProviderSnapshot, VcsSnapshot, HudState}
+
+fn render_output(state: HudState, options: HudOptions) -> text:
+    if options.mode == "tui":
+        return render_tui(state, options)
+    render_statusline(state, options)
+
+fn render_statusline(state: HudState, options: HudOptions) -> text:
+    var blocks: [text] = []
+    for provider in state.providers:
+        blocks = blocks.push(render_provider_block(provider, state.vcs, options, false))
+    blocks.join("\n\n")
+
+fn render_tui(state: HudState, options: HudOptions) -> text:
+    var lines: [text] = []
+    lines = lines.push("+----------------------------------------------------------------------------+")
+    lines = lines.push("| simple llm hud                                                             |")
+    lines = lines.push("+----------------------------------------------------------------------------+")
+    for provider in state.providers:
+        lines = lines.push(render_provider_block(provider, state.vcs, options, true))
+        lines = lines.push("+----------------------------------------------------------------------------+")
+    lines.join("\n")
+
+fn render_provider_block(provider: ProviderSnapshot, vcs: VcsSnapshot, options: HudOptions, boxed: bool) -> text:
+    val prefix = if boxed: "| " else: ""
+    val provider_name = colorize(provider.provider, provider_color(provider.provider), options.color)
+    val model_name = if provider.model != "": provider.model else: "disconnected"
+    val vcs_label = render_vcs(vcs, options)
+    val line1 = "{prefix}[{provider_name}] {model_name}  {vcs_label}"
+
+    val ctx_bar = render_context_bar(provider)
+    val ctx_label = render_context_label(provider)
+    val line2 = "{prefix}ctx {ctx_bar} {ctx_label}  tok {format_tokens(provider.total_tokens)}  cache {format_tokens(provider.cached_input_tokens)}  out {format_tokens(provider.output_tokens)}"
+
+    val tool_label = if provider.last_tool != "": provider.last_tool else: "idle"
+    val tool_input = if options.show_inputs and provider.last_tool_input != "": " " + provider.last_tool_input else: ""
+    val todos_label = if provider.todos_total > 0: "{provider.todos_done}/{provider.todos_total}" else: "n/a"
+    val rates_label = if provider.rate_primary_pct > 0 or provider.rate_secondary_pct > 0:
+        "{provider.rate_primary_pct}%/{provider.rate_secondary_pct}%"
+    else:
+        "n/a"
+    val note = first_non_empty([provider.status_text, provider.note, provider.cwd])
+    val line3 = "{prefix}tool {tool_label}{tool_input}  agents:{provider.agent_count}  todos:{todos_label}  rate:{rates_label}  {short_line(note, 84)}"
+
+    "{line1}\n{line2}\n{line3}"
+
+fn render_vcs(vcs: VcsSnapshot, options: HudOptions) -> text:
+    val dirty_label = if vcs.clean: "clean" else: "dirty:{vcs.dirty_count}"
+    val color = if vcs.clean: ansi_green() else: ansi_yellow()
+    val backend = colorize(vcs.backend, color, options.color)
+    if vcs.parent != "":
+        return "[{backend}] {vcs.headline}  {dirty_label}  parent {short_line(vcs.parent, 48)}"
+    "[{backend}] {vcs.headline}  {dirty_label}"
+
+fn render_context_bar(provider: ProviderSnapshot) -> text:
+    val width = 18
+    if provider.context_window <= 0 or provider.context_active_tokens <= 0:
+        return "[" + repeat("#", 6) + repeat("-", width - 6) + "]"
+    val used = if provider.context_active_tokens > provider.context_window:
+        provider.context_window
+    else:
+        provider.context_active_tokens
+    val filled = (used * width) / provider.context_window
+    "[" + repeat("#", filled) + repeat("-", width - filled) + "]"
+
+fn render_context_label(provider: ProviderSnapshot) -> text:
+    if provider.context_window > 0:
+        val pct = (provider.context_active_tokens * 100) / provider.context_window
+        return "{pct}% {format_tokens(provider.context_active_tokens)}/{format_tokens(provider.context_window)}"
+    if provider.context_active_tokens > 0:
+        return "last {format_tokens(provider.context_active_tokens)}"
+    "n/a"
+
+fn provider_color(provider: text) -> text:
+    val lower = provider.to_lower()
+    if lower == "claude":
+        return ansi_magenta()
+    if lower == "gemini":
+        return ansi_blue()
+    ansi_cyan()
+
+fn colorize(text_value: text, color: text, enabled: bool) -> text:
+    if not enabled:
+        return text_value
+    "{color}{text_value}{ansi_reset()}"
+
+fn format_tokens(count: i64) -> text:
+    if count >= 1000000:
+        val m = count / 100000
+        return "{m / 10}.{m % 10}M"
+    if count >= 1000:
+        val k = count / 100
+        return "{k / 10}.{k % 10}K"
+    "{count}"
+
+fn repeat(chunk: text, count: i64) -> text:
+    var result = ""
+    var i = 0
+    while i < count:
+        result = result + chunk
+        i = i + 1
+    result
+
+fn short_line(value: text, max_len: i64) -> text:
+    val trimmed = value.trim()
+    if trimmed == "":
+        return ""
+    if trimmed.len() <= max_len:
+        return trimmed
+    trimmed.slice(0, max_len - 3) + "..."
+
+fn first_non_empty(values: [text]) -> text:
+    for value in values:
+        if value.trim() != "":
+            return value.trim()
+    ""
+
+fn help_text() -> text:
+    var lines: [text] = []
+    lines = lines.push("Simple LLM HUD")
+    lines = lines.push("")
+    lines = lines.push("USAGE:")
+    lines = lines.push("  bin/simple examples/llm_hud/main.spl [options]")
+    lines = lines.push("")
+    lines = lines.push("OPTIONS:")
+    lines = lines.push("  --provider <auto|claude|codex|gemini|all>")
+    lines = lines.push("  --mode <statusline|tui>")
+    lines = lines.push("  --watch")
+    lines = lines.push("  --interval-ms <N>")
+    lines = lines.push("  --path <repo-path>")
+    lines = lines.push("  --no-color")
+    lines = lines.push("  --hide-inputs")
+    lines = lines.push("  --help, -h")
+    lines = lines.push("")
+    lines = lines.push("NOTES:")
+    lines = lines.push("  Prefers jj metadata and falls back to git.")
+    lines = lines.push("  Reads local Claude, Codex, and Gemini artifacts without a plugin host.")
+    lines.join("\n")

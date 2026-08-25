@@ -1,0 +1,8 @@
+use logic_band_geometry_core.*
+
+fn rv32_band_address_cases_selftest() -> i32:
+    if _rv32_band_block_of_impl(1355) != 21:
+        return 1
+    if _rv32_band_first_ppn_impl(21) != 1344:
+        return 1
+    0

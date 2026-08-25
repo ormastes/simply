@@ -1,0 +1,82 @@
+#![allow(export_outside_init)]
+# DEMO ONLY — Uses stale API. Not runnable.
+#!/usr/bin/env simple
+# Device Selection and Management
+# Demonstrates explicit cuda:1 (2nd GPU) selection
+
+use std.torch.{torch_available, torch_cuda_available, TorchTensorWrapper}
+use std.src.dl.config.{Device, load_config}
+
+fn main():
+    print "=== Device Selection (2nd GPU: cuda:1) ==="
+    print ""
+    
+    # Check backends
+    print "Backend Availability:"
+    val torch_ok = torch_available()
+    print "  PyTorch FFI: {torch_ok}"
+    
+    if torch_ok:
+        val cuda_ok = torch_cuda_available()
+        print "  CUDA Support: {cuda_ok}"
+        
+        if not cuda_ok:
+            print ""
+            print "⚠ CUDA not available - running on CPU"
+            print "  Install CUDA and rebuild PyTorch FFI for GPU support"
+            return
+    else:
+        print ""
+        print "⚠ PyTorch not available"
+        return
+    
+    print ""
+    
+    # Load configuration
+    print "Loading DL Configuration..."
+    val config = load_config()
+    print "  Config device: {config.device.to_string()}"
+    print "  Config dtype: {config.dtype.to_string()}"
+    print "  Config backend: {config.backend.to_string()}"
+    print ""
+    
+    # Verify 2nd GPU selection
+    match config.device:
+        case Device.CUDA(id):
+            if id == 1:
+                print "✓ Configured for 2nd GPU (cuda:1)"
+            else:
+                print "⚠ Configured for GPU {id}, expected cuda:1"
+                print "  Edit dl.config.sdn to set device: 'cuda:1'"
+        case Device.GPU:
+            print "⚠ Generic GPU device, not specifically cuda:1"
+            print "  Edit dl.config.sdn to set device: 'cuda:1'"
+        case Device.CPU:
+            print "⚠ Configured for CPU, not GPU"
+            print "  Edit dl.config.sdn to set device: 'cuda:1'"
+    
+    print ""
+    
+    # Create tensors on configured device
+    print "Creating tensors on configured device..."
+    val t1 = TorchTensorWrapper.tensor_zeros([100, 100])
+    val t2 = TorchTensorWrapper.tensor_ones([100, 100])
+    print "  Created: 100x100 zero tensor"
+    print "  Created: 100x100 ones tensor"
+    print ""
+    
+    # Perform GPU operation
+    print "Performing matrix multiplication on GPU..."
+    val result = t1.matmul(t2.handle)
+    print "  Result shape: {result.shape()}"
+    print "  Computed on: cuda:1 (2nd GPU)"
+    print ""
+    
+    print "=== Device Info ==="
+    print "Selected Device: 2nd GPU (cuda:1)"
+    print "Purpose: Dedicated deep learning training/inference"
+    print "Advantage: GPU 0 available for other tasks"
+    print ""
+    print "✓ Device selection verified!"
+
+export main

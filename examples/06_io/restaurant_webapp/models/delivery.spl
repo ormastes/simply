@@ -1,0 +1,83 @@
+use std.database.{DbCodec, DbValue, DbRow, TableSchema, Column, ColumnType, Database}
+use std.web_framework.model.{Repository}
+
+class DeliveryRequest:
+    id: i64
+    order_id: i64
+    customer_name: text
+    customer_phone: text
+    customer_email: text
+    address: text
+    delivery_notes: text
+    status: text
+    estimated_time: text
+    created_at: text
+    updated_at: text
+
+class DeliveryRequestCodec:
+    fn table_name() -> text:
+        "delivery_requests"
+
+    fn columns() -> List<text>:
+        ["order_id", "customer_name", "customer_phone", "customer_email",
+         "address", "delivery_notes", "status", "estimated_time",
+         "created_at", "updated_at"]
+
+    fn encode(d: DeliveryRequest) -> List<DbValue>:
+        [
+            DbValue.integer(d.order_id),
+            DbValue.text(d.customer_name),
+            DbValue.text(d.customer_phone),
+            DbValue.text(d.customer_email),
+            DbValue.text(d.address),
+            DbValue.text(d.delivery_notes),
+            DbValue.text(d.status),
+            DbValue.text(d.estimated_time),
+            DbValue.text(d.created_at),
+            DbValue.text(d.updated_at)
+        ]
+
+    fn decode(row: DbRow) -> DeliveryRequest:
+        DeliveryRequest(
+            id: row.get_i64("id"),
+            order_id: row.get_i64("order_id"),
+            customer_name: row.get_text("customer_name"),
+            customer_phone: row.get_text("customer_phone"),
+            customer_email: row.get_text("customer_email"),
+            address: row.get_text("address"),
+            delivery_notes: row.get_text("delivery_notes"),
+            status: row.get_text("status"),
+            estimated_time: row.get_text("estimated_time"),
+            created_at: row.get_text("created_at"),
+            updated_at: row.get_text("updated_at")
+        )
+
+    fn schema() -> TableSchema:
+        TableSchema(
+            name: "delivery_requests",
+            columns: [
+                Column(name: "id", col_type: ColumnType.integer, primary_key: true, auto_increment: true),
+                Column(name: "order_id", col_type: ColumnType.integer, nullable: false),
+                Column(name: "customer_name", col_type: ColumnType.text, nullable: false),
+                Column(name: "customer_phone", col_type: ColumnType.text, nullable: false),
+                Column(name: "customer_email", col_type: ColumnType.text, nullable: false),
+                Column(name: "address", col_type: ColumnType.text, nullable: false),
+                Column(name: "delivery_notes", col_type: ColumnType.text, nullable: false),
+                Column(name: "status", col_type: ColumnType.text, nullable: false),
+                Column(name: "estimated_time", col_type: ColumnType.text, nullable: false),
+                Column(name: "created_at", col_type: ColumnType.text, nullable: false),
+                Column(name: "updated_at", col_type: ColumnType.text, nullable: false)
+            ]
+        )
+
+fn create_delivery_repository(db: Database) -> Repository<DeliveryRequest>:
+    Repository<DeliveryRequest>(db: db, codec: DeliveryRequestCodec())
+
+fn find_delivery_for_order(repo: Repository<DeliveryRequest>, order_id: i64) -> List<DeliveryRequest>:
+    repo.find_where("order_id = ?", [DbValue.integer(order_id)])
+
+fn find_pending_deliveries(repo: Repository<DeliveryRequest>) -> List<DeliveryRequest>:
+    repo.find_where("status IN ('requested', 'dispatched') ORDER BY created_at", [])
+
+fn find_delivery_by_id(repo: Repository<DeliveryRequest>, id: i64) -> Result<DeliveryRequest, text>:
+    repo.find_by_id(id)

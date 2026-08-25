@@ -1,0 +1,163 @@
+# responsive_showcase_metal_gui.spl — Adaptive responsive scaffold showcase on
+# the Engine2D Metal GPU lane (strict mode).
+#
+# Metal twin of responsive_showcase_gui.spl: the same 3 viewports rendered
+# through MetalBackend with strict GPU-only enforcement.
+#
+# Rules (from project memory — metal strict-GPU recipe):
+#   - Reuse ONE MetalBackend per viewport (init binds W×H; one backend per size).
+#   - After present() capture `val frame_complete = b.gpu_frame_complete` BEFORE
+#     shutdown — shutdown resets it.
+#   - Use read_pixels_gpu_only() — NOT read_pixels() — to refuse the software mirror.
+#   - Refuse to continue if frame_complete is false.
+#   - Do NOT use draw_image (poisons the Metal lane).
+#   - Only draw_rect_filled / draw_rect / draw_text.
+#
+# Headless: SIMPLE_EXECUTION_MODE=interpret SIMPLE_LIB=src bin/simple run <file>
+
+use std.gpu.engine2d.backend_metal.{MetalBackend}
+use std.io.window_winit.{WinitLoop, WinitWindow, WinitInput, winit_loop_new, winit_loop_free, winit_window_new, winit_window_free, winit_present_rgba, winit_poll_input}
+use common.image.ppm_decode.{encode_ppm_p6}
+use common.ui.viewport.{new_viewport}
+use common.ui.form_factor.{compute_form_factor}
+use common.ui.adaptive_scaffold.{NavItem, adaptive_nav_scaffold}
+use common.ui.widget.{WidgetNode}
+use common.ui.builder.{column, label}
+use common.ui.widget_draw_cmds.{DrawCmd, widget_tree_to_draw_cmds}
+use std.nogc_sync_mut.sffi.io.{file_write_bytes}
+
+use std.io_runtime.{env_get}
+
+# =========================================================================
+# Shared nav items + content node
+# =========================================================================
+
+fn make_items() -> [NavItem]:
+    return [
+        NavItem(id: "ms_home",     label: "Home",     icon: "home",     action: "go_home"),
+        NavItem(id: "ms_explore",  label: "Explore",  icon: "explore",  action: "go_explore"),
+        NavItem(id: "ms_library",  label: "Library",  icon: "library",  action: "go_library"),
+        NavItem(id: "ms_profile",  label: "Profile",  icon: "profile",  action: "go_profile")
+    ]
+
+fn make_content(suffix: text) -> WidgetNode:
+    val items: [WidgetNode] = [
+        label("mrc_title_{suffix}",  "Responsive Showcase"),
+        label("mrc_body_{suffix}",   "Content area"),
+        label("mrc_hint_{suffix}",   "Adaptive layout")
+    ]
+    return column("mrc_content_{suffix}", items)
+
+# =========================================================================
+# Strict Metal render for one viewport — takes MetalBackend by concrete type
+# =========================================================================
+
+fn render_viewport_metal(b: MetalBackend, name: text, vp_w: i32, vp_h: i32, platform: text, touch: bool) -> [u32]:
+    """Render one viewport on a pre-initialised MetalBackend.
+
+    Caller must have called b.init(vp_w, vp_h) already.
+    Returns pixels if gpu_frame_complete; returns [] on GPU failure.
+    """
+    val vp = new_viewport(vp_w, vp_h, "gui")
+    val ff = compute_form_factor(vp, platform, touch)
+    val root = adaptive_nav_scaffold("mrs_{name}", make_items(), make_content(name), ff)
+    val cmds = widget_tree_to_draw_cmds(root, vp_w, vp_h)
+
+    # Find probe label for evidence line
+    var probe_label = "none"
+    for cmd in cmds:
+        if cmd.widget_id == "nav_pattern_probe":
+            probe_label = cmd.label
+
+    b.clear(0xFF14141Cu32)
+
+    for cmd in cmds:
+        if cmd.widget_id == "nav_pattern_probe":
+            pass_dn
+        elif cmd.kind == "rect":
+            b.draw_rect_filled(cmd.x, cmd.y, cmd.w, cmd.h, cmd.color)
+        elif cmd.kind == "rect_outline":
+            b.draw_rect(cmd.x, cmd.y, cmd.w, cmd.h, cmd.color)
+        elif cmd.kind == "text":
+            if cmd.label != "":
+                b.draw_text(cmd.x, cmd.y, cmd.label, cmd.color, cmd.size)
+
+    b.present()
+
+    # Strict GPU lane: capture completeness BEFORE shutdown
+    val frame_complete = b.gpu_frame_complete
+    val pixels = b.read_pixels_gpu_only()
+
+    if not frame_complete:
+        print "viewport={name} FAIL gpu_frame_complete=false (software mirror fallback)"
+        return []
+    if pixels.len() < vp_w * vp_h:
+        print "viewport={name} FAIL GPU readback short ({pixels.len()} of {vp_w * vp_h})"
+        return []
+
+    print "viewport={name} nav_pattern={probe_label} gpu_frame_complete=true pixels={pixels.len()}"
+    return pixels
+
+# =========================================================================
+# PPM helper
+# =========================================================================
+
+fn maybe_write_ppm(pixels: [u32], vp_w: i32, vp_h: i32, name: text, ppm_dir: text):
+    if ppm_dir == "":
+        return
+    if pixels.len() < vp_w * vp_h:
+        return
+    val path = "{ppm_dir}/responsive_{name}.ppm"
+    val bytes = encode_ppm_p6(vp_w.to_u32(), vp_h.to_u32(), pixels)
+    if file_write_bytes(path, bytes):
+        print "wrote {path} ({bytes.len()} bytes)"
+    else:
+        print "failed to write {path}"
+
+# =========================================================================
+# main
+# =========================================================================
+
+fn main() -> i64:
+    print "Responsive Showcase GUI — Engine2D Metal GPU lane, 3 viewports (strict)"
+
+    val ppm_dir = env_get("RESP_PPM_DIR") ?? ""
+
+    # --- phone 390x844 ios touch ---
+    var b_phone = MetalBackend.create()
+    if not b_phone.init(390, 844):
+        print "phone FAIL: Metal backend init failed"
+        return 1
+    val px_phone = render_viewport_metal(b_phone, "phone", 390, 844, "ios", true)
+    maybe_write_ppm(px_phone, 390, 844, "phone", ppm_dir)
+    b_phone.shutdown()
+    if px_phone.len() < 390 * 844:
+        print "phone render failed (GPU lane)"
+        return 1
+
+    # --- tablet 700x1000 android touch ---
+    var b_tablet = MetalBackend.create()
+    if not b_tablet.init(700, 1000):
+        print "tablet FAIL: Metal backend init failed"
+        return 1
+    val px_tablet = render_viewport_metal(b_tablet, "tablet", 700, 1000, "android", true)
+    maybe_write_ppm(px_tablet, 700, 1000, "tablet", ppm_dir)
+    b_tablet.shutdown()
+    if px_tablet.len() < 700 * 1000:
+        print "tablet render failed (GPU lane)"
+        return 1
+
+    # --- desktop 1440x900 macos no-touch ---
+    var b_desktop = MetalBackend.create()
+    if not b_desktop.init(1440, 900):
+        print "desktop FAIL: Metal backend init failed"
+        return 1
+    val px_desktop = render_viewport_metal(b_desktop, "desktop", 1440, 900, "macos", false)
+    maybe_write_ppm(px_desktop, 1440, 900, "desktop", ppm_dir)
+    b_desktop.shutdown()
+    if px_desktop.len() < 1440 * 900:
+        print "desktop render failed (GPU lane)"
+        return 1
+
+    print "all 3 viewports gpu_frame_complete=true"
+    return 0

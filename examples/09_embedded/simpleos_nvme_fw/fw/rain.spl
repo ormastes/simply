@@ -1,0 +1,147 @@
+"""
+rain — internal RAID/RAIN parity across NAND channels (gap-closure P8).
+
+Real enterprise SSDs survive a die/channel failure with internal redundancy (RAID/RAIN). We
+model the simplest sound form: one XOR parity word per stripe across the P2 channels. A stripe
+holds one data word per channel plus a parity word = XOR of all data words; if any single
+channel is lost (a data word OR the parity), it is reconstructed from the survivors.
+
+The reconstruction is exact for any survivor combination because XOR is its own inverse:
+parity = lost ⊕ (⊕ survivors), so parity ⊕ (⊕ survivors) = lost (the survivors cancel). This
+is the property proven in proofs/Rain.lean — a genuine algebraic guarantee, not a restatement.
+"""
+
+use nvme_types.*
+use fil_scheduler.*     # NUM_CHANNELS, sched_fill
+
+# XOR-fold a list of words.
+fn xor_all(words: [i64]) -> i64:
+    var acc: i64 = 0
+    var i: i64 = 0
+    while i < words.len():
+        acc = acc ^ words[i]
+        i = i + 1
+    acc
+
+# A parity stripe: one data word per channel + the parity word.
+struct Rain:
+    data:   [i64]      # length NUM_CHANNELS
+    parity: i64
+
+fn rain_new() -> Rain:
+    Rain(data: sched_fill(NUM_CHANNELS, 0), parity: 0)
+
+impl Rain:
+    # Write a stripe (one word per channel) and compute its parity.
+    me write_stripe(words: [i64]):
+        me.data = words
+        me.parity = xor_all(words)
+
+    me data_at(ch: i64) -> i64:
+        me.data[ch]
+
+    me parity_word(self) -> i64:
+        me.parity
+
+    # Reconstruct the data word on a failed channel: XOR the parity with every surviving data
+    # word. Since parity = XOR of all data words, the survivors cancel and the lost word remains.
+    me reconstruct(failed_ch: i64) -> i64:
+        var acc: i64 = me.parity
+        var ch: i64 = 0
+        while ch < NUM_CHANNELS:
+            if ch != failed_ch:
+                acc = acc ^ me.data[ch]
+            ch = ch + 1
+        acc
+
+    # If the parity channel itself is lost, it is just recomputed from the surviving data.
+    me recompute_parity() -> i64:
+        xor_all(me.data)
+
+# ── FTL-integrated parity geometry (gap-closure P8 wiring) ───────────────────────
+# The physical address space is NUM_BLOCKS = NUM_GROUPS × NUM_CHANNELS blocks laid out as
+# block = group·NUM_CHANNELS + channel (so channel = block % NUM_CHANNELS, and each
+# (group, channel) is exactly one block — a clean RAID-4-across-channels grid). A RAIN
+# stripe is the one page per channel at a fixed (group, page); its parity is the XOR of the
+# NUM_CHANNELS page payloads. Losing a whole channel loses one page per stripe, each
+# recoverable from the survivors + parity (the property proven in proofs/Rain.lean).
+
+fn rain_num_groups() -> i64:
+    NUM_BLOCKS / NUM_CHANNELS
+
+fn rain_num_stripes() -> i64:
+    (NUM_BLOCKS / NUM_CHANNELS) * PAGES_PER_BLOCK
+
+fn rain_channel_valid(channel: i64) -> bool:
+    channel >= 0 and channel < NUM_CHANNELS
+
+# Block index for a (group, channel) cell in the RAID-across-channels grid:
+# block = group·NUM_CHANNELS + channel (the layout documented above). Factored
+# into a single named helper so rain_ppn and ftl.spl's rain_recover_channel
+# share ONE derivation of the channel-grid math instead of each re-computing it
+# raw (typed-addressing migration, research doc §4.3 site 9).
+fn rain_blk(group: i64, channel: i64) -> i64:
+    group * NUM_CHANNELS + channel
+
+# Physical page number for a (group, channel, page) cell. Composes through the
+# canonical nvme_types block_first_ppn helper (research doc §4.3 site 10) rather
+# than re-deriving blk * PAGES_PER_BLOCK raw.
+fn rain_ppn(group: i64, channel: i64, page: i64) -> i64:
+    if group < 0 or group >= rain_num_groups() or not rain_channel_valid(channel) or page < 0 or page >= PAGES_PER_BLOCK:
+        return UNMAP
+    block_first_ppn(rain_blk(group, channel)) + page
+
+# The stripe index a physical page belongs to.
+fn rain_stripe_idx(ppn: i64) -> i64:
+    if not ppn_in_range(ppn):
+        return UNMAP
+    val blk: i64 = ppn_block(ppn)
+    val group: i64 = blk / NUM_CHANNELS
+    group * PAGES_PER_BLOCK + ppn_page(ppn)
+
+# ── Self-test ─────────────────────────────────────────────────────────────────
+fn rain_selftest() -> i64:
+    var fail: i64 = 0
+    var r: Rain = rain_new()
+
+    # A stripe of distinct data words across the channels.
+    var words: [i64] = []
+    var i: i64 = 0
+    while i < NUM_CHANNELS:
+        val w: i64 = 0x100 + i * 7
+        words.push(w)
+        i = i + 1
+    r.write_stripe(words)
+
+    # Lose each channel in turn; reconstruction recovers the exact original word.
+    var ch: i64 = 0
+    while ch < NUM_CHANNELS:
+        val orig: i64 = 0x100 + ch * 7
+        val got: i64 = r.reconstruct(ch)
+        fail = fail + expect_eq(got, orig, "rain: reconstruct lost channel")
+        ch = ch + 1
+
+    # Losing the parity channel: parity recomputes exactly from the surviving data.
+    val p2: i64 = r.recompute_parity()
+    val p0: i64 = r.parity_word()
+    fail = fail + expect_eq(p2, p0, "rain: parity recomputed from surviving data")
+
+    # FTL parity-grid geometry: (group, channel, page) → ppn → stripe round-trips, and every
+    # channel of a stripe maps back to the same stripe index (the layout is a clean grid).
+    val ppn_a: i64 = rain_ppn(2, 5, 11)
+    fail = fail + expect_eq(rain_stripe_idx(ppn_a), 2 * PAGES_PER_BLOCK + 11, "rain: ppn → stripe index")
+    fail = fail + expect_eq(rain_ppn(-1, 0, 0), UNMAP, "rain: negative group fails closed")
+    fail = fail + expect_eq(rain_ppn(rain_num_groups(), 0, 0), UNMAP, "rain: oversized group fails closed")
+    fail = fail + expect_eq(rain_ppn(0, -1, PAGES_PER_BLOCK), UNMAP, "rain: invalid channel/page cannot alias ppn 0")
+    fail = fail + expect_eq(rain_ppn(0, 0, PAGES_PER_BLOCK), UNMAP, "rain: oversized page fails closed")
+    fail = fail + expect_eq(rain_stripe_idx(NUM_PAGES), UNMAP, "rain: invalid ppn stripe fails closed")
+    var c2: i64 = 0
+    var same: i64 = 1
+    while c2 < NUM_CHANNELS:
+        val q: i64 = rain_ppn(2, c2, 11)
+        if rain_stripe_idx(q) != 2 * PAGES_PER_BLOCK + 11:
+            same = 0
+        c2 = c2 + 1
+    fail = fail + expect_eq(same, 1, "rain: every channel of a stripe shares one stripe index")
+
+    fail

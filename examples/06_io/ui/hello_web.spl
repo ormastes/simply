@@ -1,0 +1,9 @@
+# Hello Web — Web Backend Hello World
+#
+# Starts an HTTP server on port 8080 serving the hello_web.ui.sdn layout.
+# Open http://localhost:8080 in a browser to see the UI.
+
+use app.ui.web.server.{run_web}
+
+fn main() -> i64:
+    return run_web("examples/ui/hello_web.ui.sdn", 8080)

@@ -1,0 +1,4 @@
+use logic_rain_cases.*
+
+fn rv32_rain_selftest() -> i32:
+    rv32_rain_cases_selftest()

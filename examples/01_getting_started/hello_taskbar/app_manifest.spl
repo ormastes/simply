@@ -1,0 +1,6 @@
+# hello_taskbar manifest compatibility module.
+
+use app.ui.web.taskbar_demo_app.{
+    APP_ID, DISPLAY_NAME, ICON, REQUESTED_BACKEND,
+    resolve_for_host, resolve_for_simpleos, resolve_for_local_host
+}

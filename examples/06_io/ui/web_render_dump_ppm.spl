@@ -1,0 +1,66 @@
+# Dump a Simple Web CPU SIMD render to a PPM image for visual inspection.
+
+use std.gc_async_mut.gpu.browser_engine.simple_web_renderer.{simple_web_render_html_to_pixels_with_engine2d_backend}
+use common.ui.builder.{button, column, build_tree_with_title, with_icon}
+use common.ui.state.{init_state}
+use app.ui.render.html_widgets.{render_html_tree}
+use std.sffi.cli.{cli_get_args}
+
+use std.io_runtime.{read_file, write_file, file_exists}
+
+val W: i32 = 80
+val H: i32 = 60
+val SAMPLE_MARKER: text = "data-simple-actual-gui-button"
+
+fn html_path() -> text:
+    val args = cli_get_args()
+    var i = 0
+    while i < args.len():
+        if args[i].ends_with(".html"):
+            return args[i]
+        i = i + 1
+    "examples/ui/sample_web_renderer_sanity.html"
+
+fn out_path() -> text:
+    val args = cli_get_args()
+    var i = 0
+    while i < args.len():
+        if args[i].ends_with(".ppm"):
+            return args[i]
+        i = i + 1
+    "/tmp/simple-web-capture/simple_web_cpu_simd.ppm"
+
+fn actual_gui_button_html() -> text:
+    val btn = with_icon(button("actual_gui_button", "RUN", "run_actual_gui_button"), "image")
+    val root = column("actual_gui_root", [btn])
+    val tree = build_tree_with_title(root, "Actual GUI Button", "light")
+    val state = init_state(tree)
+    render_html_tree(state.tree.root_node(), state)
+
+fn html_for_render(html: text) -> text:
+    if html.contains(SAMPLE_MARKER):
+        return actual_gui_button_html()
+    html
+
+fn main() -> i64:
+    val hp = html_path()
+    if not file_exists(hp):
+        print "HTML file not found: {hp}"
+        return 1
+    val html = html_for_render(read_file(hp))
+    val pixels = simple_web_render_html_to_pixels_with_engine2d_backend(html, W, H, "cpu_simd")
+    var ppm = "P3\n{W} {H}\n255\n"
+    var i = 0
+    while i < pixels.len():
+        val c = pixels[i]
+        val r = ((c >> 16) & 0xFFu32).to_i32()
+        val g = ((c >> 8) & 0xFFu32).to_i32()
+        val b = (c & 0xFFu32).to_i32()
+        ppm = ppm + "{r} {g} {b}\n"
+        i = i + 1
+    val op = out_path()
+    if not write_file(op, ppm):
+        print "failed to write {op}"
+        return 1
+    print "wrote {op} ({pixels.len()} px)"
+    0

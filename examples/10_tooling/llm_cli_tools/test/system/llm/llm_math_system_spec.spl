@@ -1,0 +1,111 @@
+"""
+# LLM Math Question System Test
+
+**Category:** Tooling
+**Status:** Implemented
+
+## Overview
+
+Live system test that sends a math question to Claude via CLI
+and verifies the response contains the correct answer.
+Requires `claude` CLI binary available on PATH.
+
+## Requirements
+- N/A
+- N/A
+- N/A
+- N/A
+"""
+
+import std.spec
+use std.io_runtime.{process_run}
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+fn _Q() -> text:
+    "\""
+
+fn _unwrap_idx(opt) -> i64:
+    match opt:
+        Some(i): return i
+        nil: return -1
+
+fn _extract_json_string(json: text, key: text) -> text:
+    val quote = "\""
+    val search = quote + key + quote + ":"
+    val idx = _unwrap_idx(json.index_of(search))
+    if idx < 0:
+        return ""
+    val slen = search.len()
+    var start = idx + slen
+    # Skip whitespace
+    while start < json.len() and (json[start] == " " or json[start] == "\t"):
+        start = start + 1
+    if start >= json.len():
+        return ""
+    if json[start] != "\"":
+        return ""
+    start = start + 1
+    var end_pos = start
+    while end_pos < json.len() and json[end_pos] != "\"":
+        if json[end_pos] == "\\":
+            end_pos = end_pos + 2
+        else:
+            end_pos = end_pos + 1
+    json.substring(start, end_pos)
+
+fn _extract_json_bool(json: text, key: text) -> bool:
+    val quote = "\""
+    val search = quote + key + quote + ":"
+    val idx = _unwrap_idx(json.index_of(search))
+    if idx < 0:
+        return false
+    val slen = search.len()
+    var start = idx + slen
+    while start < json.len() and (json[start] == " " or json[start] == "\t"):
+        start = start + 1
+    if start + 4 <= json.len() and json.substring(start, start + 4) == "true":
+        return true
+    false
+
+fn claude_ask(prompt: text) -> text:
+    var args: [text] = []
+    args = args + ["--dangerously-skip-permissions"]
+    args = args + ["-p", prompt]
+    args = args + ["--output-format", "json"]
+    args = args + ["--model", "haiku"]
+    args = args + ["--max-turns", "1"]
+    val result = process_run("claude", args)
+    val stdout = result.0 ?? ""
+    val exit_code = result.2
+    if exit_code != 0:
+        return "ERROR: claude exited with code " + exit_code.to_text()
+    val is_err = _extract_json_bool(stdout, "is_error")
+    if is_err:
+        return "ERROR: " + _extract_json_string(stdout, "result")
+    _extract_json_string(stdout, "result")
+
+# ============================================================================
+# System Tests
+# ============================================================================
+
+describe "LLM Claude CLI Math":
+    """
+    ## Live Math Question Test
+
+    Sends a simple math question to Claude via CLI and checks the answer.
+    Uses haiku model for speed and cost efficiency.
+    """
+
+    it "answers a simple addition question":
+        val response = claude_ask("What is 2 + 2? Reply with ONLY the number, nothing else.")
+        print "Response: " + response
+        # Response should contain "4"
+        expect(response.contains("4")).to_equal(true)
+
+    it "answers a multiplication question":
+        val response = claude_ask("What is 7 * 8? Reply with ONLY the number, nothing else.")
+        print "Response: " + response
+        expect(response.contains("56")).to_equal(true)

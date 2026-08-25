@@ -1,0 +1,533 @@
+# MCP Handlers — per-tool handler dispatch
+#
+# Routes tool/call requests to the appropriate core module functions
+# and formats results as MCP tool responses.
+# 33 tools: 11 original + 4 write + 6 metadata + 5 search_ext + 3 analytics + 3 periodic
+
+use src.util.json_helpers.{js, jp, jo, jo1, jo2, jo3, ja, ji, jf, jb, make_json_result, make_error, tool_text_result, extract_field, extract_nested, extract_arg, safe_substr, LB, RB, SB_L, SB_R}
+use src.core.indexer.{IndexDb, NoteRecord, get_note_by_path, ensure_indexed}
+use src.core.search_engine.{SearchResult, search_vault_query, search_by_tag, search_tasks, search_decisions, read_note_content}
+use src.core.graph.{find_backlinks, find_forward_links, find_related, find_authoritative_docs, graph_walk, compute_authority, GraphNode}
+use src.core.ranker.{rank_results, explain_scores, ScoredResult, ScoreBreakdown}
+use src.core.vault_scanner.{scan_vault, relative_path}
+use src.core.note_parser.{parse_frontmatter, extract_tags, extract_tasks}
+use src.mcp.handlers_write.{handle_write_tool}
+use src.mcp.handlers_metadata.{handle_metadata_tool}
+use src.mcp.handlers_search_ext.{handle_search_ext_tool}
+use src.mcp.handlers_analytics.{handle_analytics_tool}
+use src.mcp.handlers_periodic.{handle_periodic_tool}
+use src.util.query_parser.{parse_query, ParsedQuery}
+use std.io_runtime.{read_file}
+
+# --- Format search results as JSON ---
+
+fn format_search_results(results: [SearchResult]) -> text:
+    var items: [text] = []
+    for r in results:
+        var pairs: [text] = []
+        pairs.push(jp("path", js(r.path)))
+        pairs.push(jp("title", js(r.title)))
+        if r.snippet != "":
+            pairs.push(jp("snippet", js(r.snippet)))
+        pairs.push(jp("score", jf(r.bm25_score)))
+        if r.tags != "":
+            pairs.push(jp("tags", js(r.tags)))
+        items.push(jo(pairs))
+    ja(items)
+
+fn format_scored_results(results: [ScoredResult]) -> text:
+    var items: [text] = []
+    for r in results:
+        var pairs: [text] = []
+        pairs.push(jp("path", js(r.result.path)))
+        pairs.push(jp("title", js(r.result.title)))
+        if r.result.snippet != "":
+            pairs.push(jp("snippet", js(r.result.snippet)))
+        pairs.push(jp("score", jf(r.final_score)))
+        if r.result.tags != "":
+            pairs.push(jp("tags", js(r.result.tags)))
+        items.push(jo(pairs))
+    ja(items)
+
+fn format_graph_nodes(nodes: [GraphNode]) -> text:
+    var items: [text] = []
+    for n in nodes:
+        var pairs: [text] = []
+        pairs.push(jp("path", js(n.path)))
+        pairs.push(jp("title", js(n.title)))
+        pairs.push(jp("depth", ji(n.depth)))
+        items.push(jo(pairs))
+    ja(items)
+
+fn format_breakdowns(breakdowns: [ScoreBreakdown]) -> text:
+    var items: [text] = []
+    for b in breakdowns:
+        var pairs: [text] = []
+        pairs.push(jp("path", js(b.path)))
+        pairs.push(jp("title", js(b.title)))
+        pairs.push(jp("bm25_score", jf(b.bm25_score)))
+        pairs.push(jp("graph_boost", jf(b.graph_boost)))
+        pairs.push(jp("authority_score", jf(b.authority_score)))
+        pairs.push(jp("recency_boost", jf(b.recency_boost)))
+        pairs.push(jp("final_score", jf(b.final_score)))
+        items.push(jo(pairs))
+    ja(items)
+
+fn obs_full_path(vault_path: text, rel_path: text) -> text:
+    var full_path = vault_path
+    if full_path != "" and not full_path.ends_with("/"):
+        full_path = full_path + "/"
+    full_path + rel_path
+
+fn obs_note_title(rel_path: text, content: text) -> text:
+    val meta = parse_frontmatter(content)
+    if meta.title != "":
+        return meta.title
+    rel_path
+
+fn obs_path_title(rel_path: text) -> text:
+    var name = rel_path
+    val slash_idx = rel_path.last_index_of("/")
+    match slash_idx:
+        Some(i):
+            name = rel_path.substring(i + 1, rel_path.len())
+        nil:
+            name = rel_path
+    if name.ends_with(".md"):
+        return safe_substr(name, 0, name.len() - 3)
+    name
+
+fn obs_note_tags(content: text) -> text:
+    val meta = parse_frontmatter(content)
+    val inline_tags = extract_tags(content)
+    var all_tags: [text] = []
+    for t in meta.tags:
+        if t != "":
+            all_tags.push(t)
+    for t in inline_tags:
+        if t != "":
+            var found = false
+            for existing in all_tags:
+                if existing == t:
+                    found = true
+                    break
+            if not found:
+                all_tags.push(t)
+    all_tags.join(",")
+
+fn obs_snippet(content: text, query_str: text) -> text:
+    if content == "":
+        return ""
+    if query_str == "":
+        if content.len() > 200:
+            return safe_substr(content, 0, 200) + "..."
+        return content
+    val lower_content = ("" + content).lower()
+    val lower_query = ("" + query_str).lower()
+    val idx_opt = lower_content.index_of(lower_query)
+    match idx_opt:
+        Some(i):
+            var start = i - 80
+            if start < 0:
+                start = 0
+            var end_pos = i + query_str.len() + 120
+            if end_pos > content.len():
+                end_pos = content.len()
+            var snip = safe_substr(content, start, end_pos)
+            if start > 0:
+                snip = "..." + snip
+            if end_pos < content.len():
+                snip = snip + "..."
+            return snip
+        nil:
+            if content.len() > 200:
+                return safe_substr(content, 0, 200) + "..."
+            return content
+    ""
+
+fn obs_fast_search(vault_path: text, query_str: text, limit: i64, mode: text) -> [SearchResult]:
+    var results: [SearchResult] = []
+    if vault_path == "" or query_str.trim() == "":
+        return results
+    val lower_query = ("" + query_str).lower()
+    val files = obs_candidate_paths(vault_path, query_str, limit * 20)
+    for file in files:
+        val rel_path = relative_path(file, vault_path)
+        var content = ""
+        var title = obs_path_title(rel_path)
+        var tags = ""
+        if mode != "title":
+            content = read_file(file) ?? ""
+            if content == "":
+                continue
+            title = obs_note_title(rel_path, content)
+            tags = obs_note_tags(content)
+        val lower_title = ("" + title).lower()
+        val lower_path = ("" + rel_path).lower()
+        val lower_content = ("" + content).lower()
+
+        var score = 0.0
+        if lower_title.contains(lower_query):
+            score = score + 4.0
+        if lower_path.contains(lower_query):
+            score = score + 2.0
+        if mode != "title" and lower_content.contains(lower_query):
+            score = score + 1.0
+
+        if score > 0.0:
+            val snippet = if mode == "title": "" else: obs_snippet(content, query_str)
+            results.push(SearchResult(
+                note_id: 0,
+                path: rel_path,
+                title: title,
+                snippet: snippet,
+                bm25_score: score,
+                tags: tags,
+                mtime: 0
+            ))
+            if results.len() >= limit:
+                break
+    results
+
+fn obs_fast_search_by_tag(vault_path: text, tag: text) -> [SearchResult]:
+    var results: [SearchResult] = []
+    if vault_path == "" or tag == "":
+        return results
+    val files = scan_vault(vault_path)
+    for file in files:
+        val rel_path = relative_path(file, vault_path)
+        val content = read_file(file) ?? ""
+        if content == "":
+            continue
+        val tags = obs_note_tags(content)
+        if tags.contains(tag):
+            results.push(SearchResult(
+                note_id: 0,
+                path: rel_path,
+                title: obs_note_title(rel_path, content),
+                snippet: "",
+                bm25_score: 1.0,
+                tags: tags,
+                mtime: 0
+            ))
+    results
+
+fn obs_fast_search_tasks(vault_path: text, query_str: text, status_filter: text) -> [SearchResult]:
+    var results: [SearchResult] = []
+    if vault_path == "":
+        return results
+    val lower_query = ("" + query_str).lower()
+    val files = scan_vault(vault_path)
+    for file in files:
+        val rel_path = relative_path(file, vault_path)
+        val content = read_file(file) ?? ""
+        if content == "":
+            continue
+        val tasks = extract_tasks(content)
+        for task in tasks:
+            val lower_task = ("" + task.text_content).lower()
+            if (lower_query == "" or lower_task.contains(lower_query)) and (status_filter == "" or task.status == status_filter):
+                results.push(SearchResult(
+                    note_id: 0,
+                    path: rel_path,
+                    title: obs_note_title(rel_path, content),
+                    snippet: "[" + task.status + "] " + task.text_content,
+                    bm25_score: 1.0,
+                    tags: obs_note_tags(content),
+                    mtime: 0
+                ))
+                break
+    results
+
+fn obs_fast_search_decisions(vault_path: text, query_str: text) -> [SearchResult]:
+    var results: [SearchResult] = []
+    if vault_path == "":
+        return results
+    val lower_query = ("" + query_str).lower()
+    val files = scan_vault(vault_path)
+    for file in files:
+        val rel_path = relative_path(file, vault_path)
+        val title = obs_path_title(rel_path)
+        val lower_title = ("" + title).lower()
+        val lower_path = ("" + rel_path).lower()
+        val looks_like_decision = lower_title.contains("adr") or lower_title.contains("decision") or lower_path.contains("/adr") or lower_path.contains("/decision")
+        if looks_like_decision and (lower_query == "" or lower_title.contains(lower_query) or lower_path.contains(lower_query)):
+            results.push(SearchResult(
+                note_id: 0,
+                path: rel_path,
+                title: title,
+                snippet: "",
+                bm25_score: 1.0,
+                tags: "",
+                mtime: 0
+            ))
+    results
+
+fn obs_authority_bonus(path: text) -> f64:
+    if path.starts_with("spec/"):
+        return 6.0
+    if path.starts_with("architecture/"):
+        return 5.0
+    if path.starts_with("guide/"):
+        return 4.0
+    if path.starts_with("api/") or path.starts_with("adr/"):
+        return 3.5
+    if path.starts_with("design/") or path.starts_with("requirement/"):
+        return 2.5
+    if path.starts_with("report/") or path.starts_with("release/"):
+        return 1.5
+    0.0
+
+fn obs_candidate_paths(vault_path: text, query_str: text, limit: i64) -> [text]:
+    var paths: [text] = []
+    val lower_query = ("" + query_str).lower()
+    val files = scan_vault(vault_path)
+    for file in files:
+        val rel_path = relative_path(file, vault_path)
+        val lower_path = ("" + rel_path).lower()
+        var matched = lower_query == "" or lower_path.contains(lower_query)
+        if not matched:
+            val content = read_file(file) ?? ""
+            matched = ("" + content).lower().contains(lower_query)
+        if matched:
+            paths.push(file)
+            if paths.len() >= limit:
+                break
+    paths
+
+fn obs_fast_authoritative_docs(vault_path: text, query_str: text, limit: i64) -> [SearchResult]:
+    var results: [SearchResult] = []
+    if vault_path == "" or query_str.trim() == "":
+        return results
+    val lower_query = ("" + query_str).lower()
+    val files = scan_vault(vault_path)
+    for file in files:
+        val rel_path = relative_path(file, vault_path)
+        val title = obs_path_title(rel_path)
+        val lower_title = ("" + title).lower()
+        val lower_path = ("" + rel_path).lower()
+        var score = obs_authority_bonus(rel_path)
+        if lower_title.contains(lower_query):
+            score = score + 4.0
+        if lower_path.contains(lower_query):
+            score = score + 1.0
+        if score > 0.0:
+            results.push(SearchResult(
+                note_id: 0,
+                path: rel_path,
+                title: title,
+                snippet: "authority: " + str(score),
+                bm25_score: score,
+                tags: "",
+                mtime: 0
+            ))
+            if results.len() >= limit:
+                break
+    results
+
+fn obs_direct_metadata_json(path: text, content: text) -> text:
+    val meta = parse_frontmatter(content)
+    var meta_pairs: [text] = []
+    meta_pairs.push(jp("path", js(path)))
+    meta_pairs.push(jp("title", js(if meta.title != "": meta.title else: path)))
+    meta_pairs.push(jp("tags", js(obs_note_tags(content))))
+    meta_pairs.push(jp("aliases", js(meta.aliases.join(","))))
+    jo(meta_pairs)
+
+# --- Main handler dispatch ---
+
+fn handle_tool_call(id: text, body: text, db: IndexDb, vault_path: text) -> text:
+    val tool_name = extract_nested(body, "name")
+
+    # Phase 1: Foundation
+
+    if tool_name == "search_vault":
+        val query_str = extract_arg(body, "query")
+        val limit_str = extract_arg(body, "limit")
+        val mode = extract_arg(body, "mode")
+        var limit = if limit_str != "": int(limit_str) ?? 20 else: 20
+        if limit <= 0:
+            limit = 20
+        if limit > 100:
+            limit = 100
+        var results: [ScoredResult] = []
+        if vault_path != "":
+            val direct = obs_fast_search(vault_path, query_str, limit, mode)
+            var direct_scored: [ScoredResult] = []
+            for item in direct:
+                direct_scored.push(ScoredResult(result: item, final_score: item.bm25_score))
+            results = direct_scored
+        else:
+            ensure_indexed(db, vault_path)
+            val parsed = parse_query(query_str)
+            results = rank_results(db, parsed, limit)
+        val json_results = format_scored_results(results)
+        val output = jo2(jp("results", json_results), jp("count", ji(results.len())))
+        return tool_text_result(id, output)
+
+    elif tool_name == "read_note":
+        val path = extract_arg(body, "path")
+        if path == "":
+            return make_error(id, -32602, "Missing required parameter: path")
+        var content = ""
+        var meta_json = jo1(jp("path", js(path)))
+        if vault_path != "":
+            val full_path = obs_full_path(vault_path, path)
+            content = read_file(full_path) ?? ""
+            if content != "":
+                meta_json = obs_direct_metadata_json(path, content)
+        if content == "":
+            ensure_indexed(db, vault_path)
+            content = read_note_content(db, path)
+            if meta_json == jo1(jp("path", js(path))):
+                val note_rec = get_note_by_path(db, path)
+                if note_rec.id > 0:
+                    var meta_pairs: [text] = []
+                    meta_pairs.push(jp("path", js(note_rec.path)))
+                    meta_pairs.push(jp("title", js(note_rec.title)))
+                    meta_pairs.push(jp("tags", js(note_rec.tags)))
+                    meta_pairs.push(jp("aliases", js(note_rec.aliases)))
+                    meta_json = jo(meta_pairs)
+        val output = jo2(jp("metadata", meta_json), jp("content", js(content)))
+        return tool_text_result(id, output)
+
+    elif tool_name == "search_by_tag":
+        val tag = extract_arg(body, "tag")
+        if tag == "":
+            return make_error(id, -32602, "Missing required parameter: tag")
+        var results: [SearchResult] = []
+        if vault_path != "":
+            results = obs_fast_search_by_tag(vault_path, tag)
+        else:
+            ensure_indexed(db, vault_path)
+            results = search_by_tag(db, tag)
+        val json_results = format_search_results(results)
+        val output = jo2(jp("results", json_results), jp("count", ji(results.len())))
+        return tool_text_result(id, output)
+
+    elif tool_name == "find_backlinks":
+        val note_path = extract_arg(body, "note_path")
+        if note_path == "":
+            return make_error(id, -32602, "Missing required parameter: note_path")
+        ensure_indexed(db, vault_path)
+        val results = find_backlinks(db, note_path)
+        val json_results = format_search_results(results)
+        val output = jo2(jp("results", json_results), jp("count", ji(results.len())))
+        return tool_text_result(id, output)
+
+    # Phase 2: Graph + Ranking
+
+    elif tool_name == "find_forward_links":
+        val note_path = extract_arg(body, "note_path")
+        if note_path == "":
+            return make_error(id, -32602, "Missing required parameter: note_path")
+        ensure_indexed(db, vault_path)
+        val results = find_forward_links(db, note_path)
+        val json_results = format_search_results(results)
+        val output = jo2(jp("results", json_results), jp("count", ji(results.len())))
+        return tool_text_result(id, output)
+
+    elif tool_name == "find_related":
+        val note_path = extract_arg(body, "note_path")
+        if note_path == "":
+            return make_error(id, -32602, "Missing required parameter: note_path")
+        ensure_indexed(db, vault_path)
+        val results = find_related(db, note_path)
+        val json_results = format_search_results(results)
+        val output = jo2(jp("results", json_results), jp("count", ji(results.len())))
+        return tool_text_result(id, output)
+
+    elif tool_name == "find_authoritative_docs":
+        val query_str = extract_arg(body, "query")
+        val limit_str = extract_arg(body, "limit")
+        var limit = if limit_str != "": int(limit_str) ?? 10 else: 10
+        if limit <= 0:
+            limit = 10
+        var results: [SearchResult] = []
+        if vault_path != "":
+            results = obs_fast_authoritative_docs(vault_path, query_str, limit)
+        else:
+            ensure_indexed(db, vault_path)
+            results = find_authoritative_docs(db, query_str, limit)
+        val json_results = format_search_results(results)
+        val output = jo2(jp("results", json_results), jp("count", ji(results.len())))
+        return tool_text_result(id, output)
+
+    elif tool_name == "graph_walk":
+        val seed = extract_arg(body, "seed")
+        val hops_str = extract_arg(body, "hops")
+        var hops = if hops_str != "": int(hops_str) ?? 2 else: 2
+        if hops <= 0:
+            hops = 2
+        if hops > 5:
+            hops = 5
+        if seed == "":
+            return make_error(id, -32602, "Missing required parameter: seed")
+        ensure_indexed(db, vault_path)
+        val nodes = graph_walk(db, seed, hops)
+        val json_nodes = format_graph_nodes(nodes)
+        val output = jo2(jp("nodes", json_nodes), jp("count", ji(nodes.len())))
+        return tool_text_result(id, output)
+
+    # Phase 3: Specialized
+
+    elif tool_name == "search_tasks":
+        val query_str = extract_arg(body, "query")
+        val status = extract_arg(body, "status")
+        var results: [SearchResult] = []
+        if vault_path != "":
+            results = obs_fast_search_tasks(vault_path, query_str, status)
+        else:
+            ensure_indexed(db, vault_path)
+            results = search_tasks(db, query_str, status)
+        val json_results = format_search_results(results)
+        val output = jo2(jp("results", json_results), jp("count", ji(results.len())))
+        return tool_text_result(id, output)
+
+    elif tool_name == "search_decisions":
+        val query_str = extract_arg(body, "query")
+        var results: [SearchResult] = []
+        if vault_path != "":
+            results = obs_fast_search_decisions(vault_path, query_str)
+        else:
+            ensure_indexed(db, vault_path)
+            results = search_decisions(db, query_str)
+        val json_results = format_search_results(results)
+        val output = jo2(jp("results", json_results), jp("count", ji(results.len())))
+        return tool_text_result(id, output)
+
+    elif tool_name == "explain_search":
+        val query_str = extract_arg(body, "query")
+        val limit_str = extract_arg(body, "limit")
+        var limit = if limit_str != "": int(limit_str) ?? 5 else: 5
+        if limit <= 0:
+            limit = 5
+        ensure_indexed(db, vault_path)
+        val parsed = parse_query(query_str)
+        val scored = rank_results(db, parsed, limit)
+        val breakdowns = explain_scores(scored)
+        val json_breakdowns = format_breakdowns(breakdowns)
+        val output = jo2(jp("breakdowns", json_breakdowns), jp("count", ji(breakdowns.len())))
+        return tool_text_result(id, output)
+
+    # Phase A: Write tools
+    if tool_name == "create_note" or tool_name == "edit_note" or tool_name == "delete_note" or tool_name == "move_note":
+        return handle_write_tool(id, tool_name, body, vault_path)
+
+    # Phase B: Metadata tools
+    if tool_name == "manage_frontmatter" or tool_name == "add_tags" or tool_name == "remove_tags" or tool_name == "rename_tag" or tool_name == "batch_read_notes" or tool_name == "list_files":
+        return handle_metadata_tool(id, tool_name, body, vault_path)
+
+    # Phase C: Enhanced search tools
+    if tool_name == "fuzzy_search" or tool_name == "search_replace" or tool_name == "search_by_date" or tool_name == "search_with_aliases" or tool_name == "reindex_vault":
+        return handle_search_ext_tool(id, tool_name, body, vault_path)
+
+    # Phase D: Analytics tools
+    if tool_name == "vault_structure" or tool_name == "find_orphan_notes" or tool_name == "vault_stats":
+        return handle_analytics_tool(id, tool_name, body, vault_path)
+
+    # Phase E: Periodic notes tools
+    if tool_name == "daily_note" or tool_name == "periodic_note" or tool_name == "apply_template":
+        return handle_periodic_tool(id, tool_name, body, vault_path)
+
+    make_error(id, -32602, "Unknown tool: " + tool_name)

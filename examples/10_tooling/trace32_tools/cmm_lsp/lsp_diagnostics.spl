@@ -1,0 +1,114 @@
+# CMM Language Server — LSP Diagnostic Publisher
+# Converts internal CmmDiagnostic values to LSP-compatible JSON-RPC
+# notifications (textDocument/publishDiagnostics).
+#
+# LSP severity mapping:
+#   CmmDiagnosticKind.Error   -> 1 (Error)
+#   CmmDiagnosticKind.Warning -> 2 (Warning)
+#   CmmDiagnosticKind.Info    -> 3 (Information)
+#   CmmDiagnosticKind.Hint    -> 4 (Hint)
+
+export build_publish_diagnostics, diagnostic_to_json, severity_to_lsp
+
+use cmm_diagnostics.{CmmDiagnostic, CmmDiagnosticKind}
+use cmm_text_helpers.{escape_json}
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+# Build a complete textDocument/publishDiagnostics JSON-RPC notification.
+# Returns the full JSON-RPC message body (without Content-Length header).
+fn build_publish_diagnostics(uri: text, diagnostics: [CmmDiagnostic]) -> text:
+    val q = "\""
+
+    # Build the diagnostics array
+    var diag_items: [text] = []
+    var i = 0
+    while i < diagnostics.len():
+        diag_items.push(diagnostic_to_json(diagnostics[i]))
+        i = i + 1
+    val diag_array = "[" + diag_items.join(", ") + "]"
+
+    # Build the full JSON-RPC notification
+    # Using string concatenation to avoid }} escape issues
+    var msg = "{"
+    msg = msg + q + "jsonrpc" + q + ": " + q + "2.0" + q + ", "
+    msg = msg + q + "method" + q + ": " + q + "textDocument/publishDiagnostics" + q + ", "
+    msg = msg + q + "params" + q + ": {"
+    msg = msg + q + "uri" + q + ": " + q + escape_json(uri) + q + ", "
+    msg = msg + q + "diagnostics" + q + ": " + diag_array
+    msg = msg + "}"
+    msg = msg + "}"
+    msg
+
+# ---------------------------------------------------------------------------
+# Single diagnostic serialization
+# ---------------------------------------------------------------------------
+
+# Convert a single CmmDiagnostic to an LSP Diagnostic JSON object.
+fn diagnostic_to_json(d: CmmDiagnostic) -> text:
+    val q = "\""
+    val severity = severity_to_lsp(d.kind)
+
+    # LSP ranges are 0-based; our diagnostics use 1-based lines/columns
+    val start_line = d.line - 1
+    val start_col = d.column - 1
+    val end_line = d.end_line - 1
+    val end_col = d.end_column - 1
+
+    # Ensure non-negative values
+    var sl = start_line
+    var sc = start_col
+    var el = end_line
+    var ec = end_col
+    if sl < 0:
+        sl = 0
+    if sc < 0:
+        sc = 0
+    if el < 0:
+        el = 0
+    if ec < 0:
+        ec = 0
+
+    # If end equals start, extend end column by 1 for visibility
+    if sl == el and sc == ec:
+        ec = ec + 1
+
+    var s = "{"
+    # Range
+    s = s + q + "range" + q + ": {"
+    s = s + q + "start" + q + ": {"
+    s = s + q + "line" + q + ": " + "{sl}" + ", "
+    s = s + q + "character" + q + ": " + "{sc}"
+    s = s + "}, "
+    s = s + q + "end" + q + ": {"
+    s = s + q + "line" + q + ": " + "{el}" + ", "
+    s = s + q + "character" + q + ": " + "{ec}"
+    s = s + "}"
+    s = s + "}, "
+    # Severity
+    s = s + q + "severity" + q + ": " + "{severity}" + ", "
+    # Source
+    s = s + q + "source" + q + ": " + q + "cmm-lsp" + q + ", "
+    # Message
+    s = s + q + "message" + q + ": " + q + escape_json(d.message) + q
+    s = s + "}"
+    s
+
+# ---------------------------------------------------------------------------
+# Severity conversion
+# ---------------------------------------------------------------------------
+
+# Map CmmDiagnosticKind to LSP DiagnosticSeverity integer.
+fn severity_to_lsp(kind: CmmDiagnosticKind) -> i64:
+    match kind:
+        case CmmDiagnosticKind.Error: 1
+        case CmmDiagnosticKind.Warning: 2
+        case CmmDiagnosticKind.Info: 3
+        case CmmDiagnosticKind.Hint: 4
+
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
+

@@ -1,0 +1,95 @@
+# LLM Done-Event Hook System
+# Orchestrates user-configurable hooks that fire when an LLM agent finishes.
+# Hooks can check if the user is satisfied and auto-continue or notify.
+
+use std.io_runtime.{process_run, file_exists}
+extern fn rt_process_run_timeout(cmd: text, args: [text], timeout_ms: i64) -> (text, text, i32)
+
+# ============================================================================
+# Hook Result
+# ============================================================================
+
+enum HookAction:
+    Continue
+    Notify
+    Stop
+    Timeout
+    Error(message: text)
+
+    fn should_continue() -> bool:
+        match self:
+            HookAction.Continue => true
+            _ => false
+
+    fn should_notify() -> bool:
+        match self:
+            HookAction.Notify => true
+            HookAction.Stop => true
+            _ => false
+
+# ============================================================================
+# Hook Configuration
+# ============================================================================
+
+struct LlmDoneHookConfig:
+    script_path: text
+    timeout_ms: i64
+    auto_continue: bool
+    notification_mode: text  # "auto", "always", "never"
+
+    static fn defaults() -> LlmDoneHookConfig:
+        LlmDoneHookConfig(
+            script_path: "hooks/check_done.spl",
+            timeout_ms: 30000,
+            auto_continue: true,
+            notification_mode: "auto"
+        )
+
+# ============================================================================
+# Hook Runner
+# ============================================================================
+
+fn run_llm_done_hook(config: LlmDoneHookConfig, base_dir: text) -> HookAction:
+    val script = "{base_dir}/{config.script_path}"
+    if not file_exists(script):
+        return HookAction.Error(message: "Hook script not found: {script}")
+
+    # Run the hook script with timeout
+    val (stdout, stderr, code) = rt_process_run_timeout(
+        "bin/simple",
+        ["run", script],
+        config.timeout_ms
+    )
+
+    if code == -1:
+        # Timeout
+        return HookAction.Timeout
+
+    if code != 0:
+        return HookAction.Error(message: "Hook failed (exit {code}): {stderr}")
+
+    # Parse response
+    val response = stdout.trim().to_lower()
+    return parse_hook_response(response, config.auto_continue)
+
+fn parse_hook_response(response: text, auto_continue: bool) -> HookAction:
+    match response:
+        "done" | "yes" => HookAction.Notify
+        "not done" | "not_done" | "no" =>
+            if auto_continue:
+                HookAction.Continue
+            else:
+                HookAction.Stop
+        "continue" => HookAction.Continue
+        "stop" => HookAction.Stop
+        _ => HookAction.Error(message: "Unknown hook response: {response}")
+
+# ============================================================================
+# Auto-Continue Message Generator
+# ============================================================================
+
+fn make_continue_message() -> text:
+    "Please continue with the remaining work."
+
+fn make_continue_message_with_context(context: text) -> text:
+    "Please continue with the remaining work. Context: {context}"

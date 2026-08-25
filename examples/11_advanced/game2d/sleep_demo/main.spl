@@ -1,0 +1,53 @@
+# Sleep Demo — physics sleep island visualiser
+# 5 boxes drop onto a floor; sleeping boxes turn gray.
+use std.nogc_sync_mut.game2d.app.run.{run}
+use std.nogc_sync_mut.game2d.render.canvas.{Canvas}
+use std.nogc_sync_mut.game2d.math.{DrawMode}
+use std.common.engine.ids.{NodeId}
+use std.common.engine.math2d.{Vec2}
+use std.common.engine.rect.{Rect2}
+use std.common.engine.color.{EngineColor}
+use std.nogc_sync_mut.engine.physics.config.{default_physics_config_2d}
+use std.nogc_sync_mut.engine.physics.world2d.{PhysicsWorld2D}
+
+fn node(i: i64) -> NodeId:
+    NodeId(raw: i)
+
+class Game:
+    world: PhysicsWorld2D
+
+    fn load(self):
+        self.world.add_static_body(node(10), 400.0, 580.0)
+        self.world.add_box_collider_static(node(10), 800.0, 40.0)
+        var i = 0
+        while i < 5:
+            val x = 150.0 + i.to_f64() * 120.0
+            self.world.add_dynamic_body(node(i), x, 80.0, 1.0)
+            self.world.add_box_collider(node(i), 40.0, 40.0)
+            i = i + 1
+
+    fn update(self, dt: f32):
+        val _ = dt
+
+    fn fixed_update(self, step: f32):
+        val _ = step
+        self.world.step(0.016)
+
+    fn draw(self, ctx: Canvas):
+        ctx.clear(EngineColor(r: 0.08, g: 0.08, b: 0.12, a: 1.0))
+        val floor_color = EngineColor(r: 0.4, g: 0.35, b: 0.3, a: 1.0)
+        ctx.rect(DrawMode.Fill, Rect2(x: 0.0, y: 560.0, width: 800.0, height: 40.0), floor_color)
+        var i = 0
+        while i < 5:
+            val pos = self.world.get_position(node(i))
+            val sx = pos.x - 20.0
+            val sy = pos.y - 20.0
+            val sleeping = self.world.islands.is_island_sleeping(i)
+            var color = EngineColor(r: 0.2, g: 0.6, b: 1.0, a: 1.0)
+            if sleeping:
+                color = EngineColor(r: 0.5, g: 0.5, b: 0.5, a: 1.0)
+            ctx.rect(DrawMode.Fill, Rect2(x: sx, y: sy, width: 40.0, height: 40.0), color)
+            i = i + 1
+
+fn main():
+    run(Game(world: PhysicsWorld2D.create(default_physics_config_2d())), "Sleep Demo", 800, 600)

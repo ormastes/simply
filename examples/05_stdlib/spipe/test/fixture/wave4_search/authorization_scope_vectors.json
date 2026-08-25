@@ -1,0 +1,8 @@
+{
+  "schema": "spipe-authorization-scope-vectors-v1",
+  "cases": [
+    {"case":"public","principal":"principal-public","policy_version":1,"allowed_fields":["identifier","title","heading","classification","body"],"forbidden_document_ids":["A-private"]},
+    {"case":"title-only","principal":"principal-redacted","policy_version":2,"allowed_fields":["identifier","title"],"forbidden_fields":["heading","classification","body"]}
+  ],
+  "required_invariant":"Unauthorized documents and fields cannot influence roots, statistics, scores, counts, explanations, caches, cursors, or error shape."
+}

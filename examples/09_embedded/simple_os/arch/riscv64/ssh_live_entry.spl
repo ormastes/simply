@@ -1,0 +1,288 @@
+use os.kernel.boot.riscv_noalloc_handoff.{riscv_noalloc_handoff, riscv_noalloc_boot_idle}
+use os.kernel.boot.riscv_noalloc_heap.{riscv_noalloc_heap_init}
+use os.kernel.boot.riscv_noalloc_log.{riscv_noalloc_log_init, riscv_noalloc_log_boot_ok}
+use os.kernel.boot.riscv_noalloc_services.{riscv_noalloc_services_init}
+use os.kernel.arch.riscv64.paging.{rv64_sv39_activate_and_readback}
+use os.kernel.boot.rv64_pid1_boot.{rv64_pid1_create_and_confirm_live}
+use os.rv64_probe.{rv64_network_init_facts}
+use os.apps.sshd.sshd.{SshDaemon}
+use os.rv64_boot_gate_runtime.{Rv64BootGateRuntime}
+use os.crypto.dual_backend.{dual_backend_alpha_default_mode, dual_backend_set_default_config}
+use os.kernel.arch.riscv64.display.{
+    riscv64_display_initialize,
+    riscv64_display_framebuffer_address,
+    riscv64_display_width,
+    riscv64_display_height,
+    riscv64_display_pitch,
+    riscv64_display_bpp,
+    riscv64_display_generation,
+    riscv64_display_present
+}
+use os.kernel.arch.riscv64.virtio_input.{riscv64_virtio_input_poll}
+use os.drivers.framebuffer.fb_driver.{FramebufferDriver}
+use os.compositor.compositor.{Compositor}
+use os.compositor.arm64_virtio_input_backend.{Arm64VirtioInputBackend}
+use os.compositor.compositor_engine2d.{Engine2dCompositorBackend}
+use os.compositor.engine2d_display.{create_fb_engine_sized}
+use os.compositor.engine2d_wm_frame_executor.{Engine2dWmFrameExecutor}
+use os.compositor.simpleos_wm_theme_bootstrap.{install_generated_simpleos_wm_theme, apply_simpleos_css_theme_override}
+use os.desktop.shell.{DesktopShell}
+use os.desktop.font_bootstrap.{simpleos_desktop_register_selected_fonts_from_vfs}
+use os.services.vfs.vfs_init.{vfs_boot_init_riscv64_virtio_fat32, g_vfs_read_file_text}
+use os.services.launcher.launcher_path_helpers.{launcher_path_exists}
+use os.services.wm.rv64_production_wm_producer.{Rv64ProductionWmProducer}
+use os.services.wm.rv64_production_wm_adapter.{rv64_wm_process_liveness}
+use os.rv64_wm_boot_resources.{
+    RV64_WM_BOOT_BINARY_PATH,
+    RV64_WM_BOOT_MAX_PUMP_ATTEMPTS,
+    rv64_wm_scanout_metadata_valid,
+    rv64_wm_snapshot_facts_ready
+}
+
+extern fn serial_println(msg: text)
+extern fn rt_riscv_qemu_ram_base() -> u64
+extern fn rt_riscv_qemu_ram_size() -> u64
+extern fn rt_riscv_qemu_reserved_end() -> u64
+extern fn rt_riscv_qemu_heap_start() -> u64
+extern fn rt_riscv_qemu_heap_size() -> u64
+extern fn rt_riscv_noalloc_pmm_init(ram_base: u64, ram_size: u64, reserved_end: u64, heap_start: u64) -> bool
+extern fn __simple_call_module_inits()
+
+@section(".text.entry")
+@naked
+fn _start():
+    asm volatile:
+        "mv      s0, a0"
+        "mv      s1, a1"
+        "bnez    s0, .Lrv64_ssh_halt"
+        "la      sp, _stack_top"
+        "la      t0, _sbss"
+        "la      t1, _ebss"
+        ".Lrv64_ssh_bss_loop:"
+        "bgeu    t0, t1, .Lrv64_ssh_bss_done"
+        "sd      zero, 0(t0)"
+        "addi    t0, t0, 8"
+        "j       .Lrv64_ssh_bss_loop"
+        ".Lrv64_ssh_bss_done:"
+        "mv      a0, s0"
+        "mv      a1, s1"
+        "call    m_09_embedded__simple_os__arch__riscv64__ssh_live_entry__rv64_ssh_boot_main"
+        ".Lrv64_ssh_halt:"
+        "wfi"
+        "j       .Lrv64_ssh_halt"
+
+fn rv64_ssh_boot_main(hart_id: u64, dtb_addr: u64):
+    riscv_noalloc_log_init()
+    riscv_noalloc_handoff(hart_id, dtb_addr)
+    rt_riscv_noalloc_pmm_init(
+        rt_riscv_qemu_ram_base(),
+        rt_riscv_qemu_ram_size(),
+        rt_riscv_qemu_reserved_end(),
+        rt_riscv_qemu_heap_start()
+    )
+    riscv_noalloc_heap_init(rt_riscv_qemu_heap_start(), rt_riscv_qemu_heap_size())
+    # PMM/heap are live; initialize generated module state exactly once before
+    # service owners begin mutating it. Do not call display_boot_memory_init.
+    __simple_call_module_inits()
+    riscv_noalloc_services_init(true)
+    riscv_noalloc_log_boot_ok()
+    spl_start()
+    riscv_noalloc_boot_idle()
+
+@export("C")
+fn spl_start():
+    serial_println("")
+    serial_println("=== SimpleOS RV64 SSH Live Boot ===")
+    serial_println("")
+    var gate = Rv64BootGateRuntime.create()
+
+    val sv39 = rv64_sv39_activate_and_readback()
+    if not gate.observe_sv39(sv39):
+        serial_println("[FATAL] Sv39 activation/readback gate failed")
+        return
+
+    val pid1 = rv64_pid1_create_and_confirm_live()
+    if not gate.observe_pid1(pid1):
+        serial_println("[FATAL] PID1 ownership/liveness gate failed")
+        return
+
+    serial_println("[boot] Initializing RV64 VirtIO network runtime")
+    val network = rv64_network_init_facts()
+    if not gate.observe_network(network):
+        serial_println("[FATAL] SSH network gate failed")
+        return
+
+    if not riscv64_display_initialize():
+        serial_println("[FATAL] RV64 WM scanout initialization failed")
+        gate.block_missing_wm_producer()
+        return
+    val display_address = riscv64_display_framebuffer_address()
+    val display_width = riscv64_display_width()
+    val display_height = riscv64_display_height()
+    val display_pitch = riscv64_display_pitch()
+    val display_bpp = riscv64_display_bpp()
+    if not rv64_wm_scanout_metadata_valid(
+        display_address, display_width, display_height, display_pitch, display_bpp
+    ):
+        serial_println("[FATAL] RV64 WM scanout metadata invalid")
+        gate.block_missing_wm_producer()
+        return
+    if not vfs_boot_init_riscv64_virtio_fat32():
+        serial_println("[FATAL] RV64 WM media mount unavailable")
+        gate.block_missing_wm_producer()
+        return
+    if not launcher_path_exists(RV64_WM_BOOT_BINARY_PATH):
+        serial_println("[FATAL] RV64 WM canonical binary missing path=" + RV64_WM_BOOT_BINARY_PATH)
+        gate.block_missing_wm_producer()
+        return
+    val _theme = install_generated_simpleos_wm_theme()
+    val _theme_override = apply_simpleos_css_theme_override(g_vfs_read_file_text("/THEME.CSS"))
+    if not simpleos_desktop_register_selected_fonts_from_vfs():
+        serial_println("[FATAL] RV64 WM font resources unavailable")
+        gate.block_missing_wm_producer()
+        return
+    var framebuffer = FramebufferDriver.from_scanout_raw(
+        display_address, display_width, display_height, display_pitch, display_bpp
+    )
+    var engine = create_fb_engine_sized(
+        framebuffer, display_width.to_i32(), display_height.to_i32()
+    )
+    val compositor_backend = Engine2dCompositorBackend.create(engine)
+    val input_backend = Arm64VirtioInputBackend.create_with_poller(
+        display_width.to_i64(), display_height.to_i64(),
+        riscv64_virtio_input_poll, false
+    )
+    val compositor = Compositor.with_backends(
+        compositor_backend, input_backend,
+        display_width.to_i32(), display_height.to_i32()
+    )
+    var shell = DesktopShell.new(compositor)
+    shell.init_baremetal()
+    var executor = Engine2dWmFrameExecutor.create(
+        engine, framebuffer, 0, 0, false
+    )
+    var wm_producer = Rv64ProductionWmProducer.launch(
+        RV64_WM_BOOT_BINARY_PATH, []
+    )
+    if wm_producer.process_id == 0u64 or wm_producer.verdict().failed:
+        serial_println("[FATAL] RV64 WM process launch failed")
+        gate.block_missing_wm_producer()
+        return
+    dual_backend_set_default_config(dual_backend_alpha_default_mode())
+    serial_println("[boot] Live host key policy: Ed25519 enabled; RV64 live dual-backend mode=alpha runtime-first")
+    serial_println("[boot] Starting production SSH daemon on port 2222")
+    serial_println("[ssh-live] production-daemon-starting arch=riscv64 port=2222 hostfwd=2222")
+    var daemon = SshDaemon.new(2222)
+    match daemon.bind_and_ready():
+        Ok(ready):
+            if not gate.observe_sshd_ready(ready):
+                serial_println("[FATAL] SSH daemon readiness gate failed")
+                return
+            serial_println("[sshd] accept loop start")
+            var wm_pump_attempts: i64 = 0
+            var wm_gate_complete = false
+            var wm_last_scene_revision: i64 = 0
+            var wm_last_taskbar_revision: i64 = 0
+            var wm_last_scanout_generation: i64 = 0
+            while true:
+                val progress = daemon.accept_and_handle_once_result()
+                if progress.accepted:
+                    if not gate.observe_ssh_progress(progress):
+                        serial_println("[FATAL] SSH session/accept recovery gate failed")
+                        return
+                # The accept owner and WM owner each perform at most one unit of
+                # work per service-loop turn.  Snapshot only after the action is
+                # committed so render inputs describe one stable compositor
+                # revision owned by the launched WM PID.
+                val _pumped = wm_producer.pump_one_published_action(shell)
+                val snapshot = wm_producer.snapshot_published_scene(shell)
+                val snapshot_ready = rv64_wm_snapshot_facts_ready(
+                    wm_producer.process_id,
+                    snapshot.owned_scene.process_id,
+                    snapshot.owned_scene.process_surface_count,
+                    snapshot.ready_to_present,
+                    snapshot.render_inputs.consistent,
+                    snapshot.render_inputs.content_frames.len(),
+                    snapshot.render_inputs.taskbar_revision
+                )
+                if not wm_gate_complete:
+                    wm_pump_attempts = wm_pump_attempts + 1
+                    if gate.ssh_progress_observed and snapshot_ready:
+                        val wm_result = wm_producer.present_snapshot(executor, snapshot)
+                        if wm_result.failed or not wm_result.ready:
+                            serial_println("[FATAL] RV64 WM first frame presentation failed")
+                            gate.block_missing_wm_producer()
+                            return
+                        if not riscv64_display_present():
+                            serial_println("[FATAL] RV64 WM scanout present failed")
+                            gate.block_missing_wm_producer()
+                            return
+                        val scanout_generation = riscv64_display_generation()
+                        if scanout_generation <= 0:
+                            serial_println("[FATAL] RV64 WM scanout generation missing")
+                            gate.block_missing_wm_producer()
+                            return
+                        if not gate.observe_wm(wm_result):
+                            serial_println("[FATAL] RV64 WM ordered receipt rejected")
+                            return
+                        val terminal_verdict = gate.verdict()
+                        if terminal_verdict != "PASS":
+                            serial_println("[FATAL] RV64 boot gate did not reach terminal PASS")
+                            return
+                        wm_last_scene_revision = snapshot.owned_scene.scene_revision
+                        wm_last_taskbar_revision = snapshot.render_inputs.taskbar_revision
+                        wm_last_scanout_generation = scanout_generation
+                        wm_gate_complete = true
+                        serial_println("[rv64-boot-gate] verdict=" + terminal_verdict + "; sshd remains accepting")
+                    elif wm_producer.verdict().failed or (not snapshot_ready and wm_pump_attempts >= RV64_WM_BOOT_MAX_PUMP_ATTEMPTS):
+                        serial_println("[FATAL] RV64 WM publication pump exhausted")
+                        gate.block_missing_wm_producer()
+                        return
+                else:
+                    val producer_live = rv64_wm_process_liveness(wm_producer.process_id)
+                    if (wm_producer.verdict().failed or not producer_live.queried or
+                        not producer_live.alive or producer_live.process_id != wm_producer.process_id):
+                        serial_println("[FATAL] RV64 WM producer continuity failed")
+                        gate.block_missing_wm_producer()
+                        return
+                    if not snapshot_ready:
+                        serial_println("[FATAL] RV64 WM consistent PID-owned snapshot lost")
+                        gate.block_missing_wm_producer()
+                        return
+                    if snapshot.owned_scene.scene_revision < wm_last_scene_revision:
+                        serial_println("[FATAL] RV64 WM scene revision regressed")
+                        gate.block_missing_wm_producer()
+                        return
+                    val frame_changed = (
+                        snapshot.owned_scene.scene_revision != wm_last_scene_revision or
+                        snapshot.render_inputs.taskbar_revision != wm_last_taskbar_revision
+                    )
+                    if frame_changed:
+                        val presented_revision = executor.render(
+                            snapshot.owned_scene.scene,
+                            snapshot.render_inputs.taskbar,
+                            snapshot.render_inputs.content_frames,
+                            snapshot.owned_scene.scene_revision,
+                            snapshot.render_inputs.taskbar_revision,
+                            snapshot.render_inputs.clock_label
+                        )
+                        if (presented_revision <= 0 or
+                            presented_revision != snapshot.owned_scene.scene_revision):
+                            serial_println("[FATAL] RV64 WM continuity frame presentation failed")
+                            gate.block_missing_wm_producer()
+                            return
+                        if not riscv64_display_present():
+                            serial_println("[FATAL] RV64 WM continuity scanout present failed")
+                            gate.block_missing_wm_producer()
+                            return
+                        val next_scanout_generation = riscv64_display_generation()
+                        if next_scanout_generation <= wm_last_scanout_generation:
+                            serial_println("[FATAL] RV64 WM continuity scanout generation stalled")
+                            gate.block_missing_wm_producer()
+                            return
+                        wm_last_scene_revision = snapshot.owned_scene.scene_revision
+                        wm_last_taskbar_revision = snapshot.render_inputs.taskbar_revision
+                        wm_last_scanout_generation = next_scanout_generation
+        Err(err):
+            gate.observe_sshd_ready(false)
+            serial_println("[FATAL] SSH daemon bind/listen failed: {err}")

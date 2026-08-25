@@ -1,0 +1,37 @@
+{
+  "help": {
+    "args": ["--help"],
+    "exitCode": 0,
+    "stderr": "",
+    "stdoutBytes": 5594,
+    "stdoutSha256": "caf2eee8ec15ec0f74383f8397a2fa437b49f3f3eab69552f156744e798f6809",
+    "stdoutStartsWith": "Usage: spipe <command> [args]\n\nCommands:\n",
+    "stdoutContains": [
+      "  info                 Print module paths and available surfaces.",
+      "  doctor [host]        Check module files and host link status.",
+      "  skill                Print the SPipe skill guide.",
+      "  fine-tune-verify <record.sdn>"
+    ]
+  },
+  "version": {
+    "args": ["--version"],
+    "exitCode": 0,
+    "stdout": "0.1.0\n",
+    "stderr": ""
+  },
+  "info": {
+    "args": ["info"],
+    "exitCode": 0,
+    "stderr": "",
+    "normalizedStdout": [
+      "spipe_module=<MODULE_ROOT>",
+      "spipe_skill=<MODULE_ROOT>/doc/00_llm_process/spipe/skill.md",
+      "surface=doc/00_llm_process/skill_command",
+      "surface=doc/00_llm_process/spipe",
+      "surface=doc/00_llm_process/template",
+      "surface=doc/00_llm_process/project_expert",
+      "surface=doc/00_llm_process/domain_expert",
+      "surface=doc/00_llm_process/tool_expert"
+    ]
+  }
+}

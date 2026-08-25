@@ -1,0 +1,98 @@
+# Web Dashboard — self-contained HTML KPI dashboard
+#
+# Renders one Fiori-like dashboard document: a KPI tile row (revenue /
+# accepted / denied totals) plus one card per lane with a colored status
+# chip. No external assets, no JS — a single inline <style> block only, so
+# the output can be written to disk or served as-is.
+
+use report.summary.{LaneKpi, lane_status, total_revenue, total_accepted, total_denied}
+
+# Escape order matters: & first, so escaping < > " afterwards never
+# re-escapes the ampersands introduced by this step. Double quotes are escaped
+# so values are safe in BOTH text content and double-quoted attributes.
+fn html_escape(s: text) -> text:
+    val step1 = s.replace("&", "&amp;")
+    val step2 = step1.replace("<", "&lt;")
+    val step3 = step2.replace(">", "&gt;")
+    val step4 = step3.replace("\"", "&quot;")
+    return step4
+
+# Integer-only "12.34" style display: whole part is minor/100, fractional
+# part is minor%100 zero-padded to two digits. Negative amounts format the
+# absolute value and prefix "-" (truncating / and % misbehave on negatives).
+fn money_display(minor: i64) -> text:
+    var abs_minor = minor
+    var sign = ""
+    if minor < 0:
+        abs_minor = 0 - minor
+        sign = "-"
+    val whole = abs_minor / 100
+    val frac = abs_minor % 100
+    if frac < 10:
+        return "{sign}{whole}.0{frac}"
+    return "{sign}{whole}.{frac}"
+
+fn dashboard_style() -> text:
+    var css = ""
+    css = css + "*{box-sizing:border-box;}"
+    css = css + "body{margin:0;padding:24px;background:#f4f6f8;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#1a1f26;}"
+    css = css + "h1{font-size:20px;margin:0 0 16px 0;}"
+    css = css + ".kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin-bottom:24px;}"
+    css = css + ".lanes{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;}"
+    css = css + ".tile,.card{background:#ffffff;border-radius:10px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,0.12),0 1px 2px rgba(0,0,0,0.08);}"
+    css = css + ".tile .label{font-size:12px;color:#5b6572;text-transform:uppercase;letter-spacing:0.04em;}"
+    css = css + ".tile .value{font-size:28px;font-weight:600;margin-top:4px;}"
+    css = css + ".card .lane-name{font-size:15px;font-weight:600;margin-bottom:8px;}"
+    css = css + ".card .row{display:flex;justify-content:space-between;font-size:13px;color:#3c4652;margin-bottom:4px;}"
+    css = css + ".chip{display:inline-block;border-radius:10px;padding:2px 10px;font-size:12px;font-weight:600;margin-top:8px;}"
+    css = css + ".chip.ok{color:#0a7d33;background:#e4f5e9;}"
+    css = css + ".chip.attention{color:#8a5a00;background:#fff3d6;}"
+    return css
+
+fn render_kpi_tile(label: text, value: text) -> text:
+    var tile = "<div class=\"tile\">"
+    tile = tile + "<div class=\"label\">" + html_escape(label) + "</div>"
+    tile = tile + "<div class=\"value\">" + value + "</div>"
+    tile = tile + "</div>"
+    return tile
+
+fn render_lane_card(k: LaneKpi) -> text:
+    val status = lane_status(k)
+    val lane_escaped = html_escape(k.lane)
+    var card = "<div class=\"card\" data-lane=\"" + lane_escaped + "\">"
+    card = card + "<div class=\"lane-name\">" + lane_escaped + "</div>"
+    card = card + "<div class=\"row\"><span>Accepted</span><span>{k.accepted}</span></div>"
+    card = card + "<div class=\"row\"><span>Denied</span><span>{k.denied}</span></div>"
+    card = card + "<div class=\"row\"><span>Revenue</span><span>" + money_display(k.revenue_minor) + "</span></div>"
+    card = card + "<span class=\"chip " + status + "\">" + status + "</span>"
+    card = card + "</div>"
+    return card
+
+fn render_dashboard(title: text, kpis: [LaneKpi]) -> text:
+    val escaped_title = html_escape(title)
+
+    var html = "<!doctype html><html>"
+    html = html + "<head><meta charset=\"utf-8\">"
+    html = html + "<title>" + escaped_title + "</title>"
+    html = html + "<style>" + dashboard_style() + "</style>"
+    html = html + "</head>"
+
+    html = html + "<body>"
+    html = html + "<h1>" + escaped_title + "</h1>"
+
+    var kpi_row = "<div class=\"kpis\">"
+    kpi_row = kpi_row + render_kpi_tile("Revenue", money_display(total_revenue(kpis)))
+    kpi_row = kpi_row + render_kpi_tile("Accepted", "{total_accepted(kpis)}")
+    kpi_row = kpi_row + render_kpi_tile("Denied", "{total_denied(kpis)}")
+    kpi_row = kpi_row + "</div>"
+    html = html + kpi_row
+
+    var lanes = "<div class=\"lanes\">"
+    for k in kpis:
+        lanes = lanes + render_lane_card(k)
+    lanes = lanes + "</div>"
+    html = html + lanes
+
+    html = html + "</body>"
+    html = html + "</html>"
+    return html

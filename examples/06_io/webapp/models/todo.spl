@@ -1,0 +1,97 @@
+use std.database.{DbCodec, DbValue, DbRow, TableSchema, Column, ColumnType, Database}
+use std.web_framework.model.{ActiveModel, Repository}
+use std.web_framework.validation.{Validator, Required, MinLength, MaxLength}
+use std.web_framework.pagination.{Paginator, Page}
+
+class Todo:
+    id: i64
+    title: text
+    description: text
+    completed: bool
+    user_id: i64
+    created_at: text
+    updated_at: text
+
+class TodoCodec:
+    fn table_name() -> text:
+        "todos"
+
+    fn columns() -> List<text>:
+        ["title", "description", "completed", "user_id", "created_at", "updated_at"]
+
+    fn encode(todo: Todo) -> List<DbValue>:
+        val completed_int = if todo.completed: 1 else: 0
+        [
+            DbValue.text(todo.title),
+            DbValue.text(todo.description),
+            DbValue.integer(completed_int),
+            DbValue.integer(todo.user_id),
+            DbValue.text(todo.created_at),
+            DbValue.text(todo.updated_at)
+        ]
+
+    fn decode(row: DbRow) -> Todo:
+        Todo(
+            id: row.get_i64("id"),
+            title: row.get_text("title"),
+            description: row.get_text("description"),
+            completed: row.get_i64("completed") != 0,
+            user_id: row.get_i64("user_id"),
+            created_at: row.get_text("created_at"),
+            updated_at: row.get_text("updated_at")
+        )
+
+    fn schema() -> TableSchema:
+        TableSchema(
+            name: "todos",
+            columns: [
+                Column(name: "id", col_type: ColumnType.integer, primary_key: true, auto_increment: true),
+                Column(name: "title", col_type: ColumnType.text, nullable: false),
+                Column(name: "description", col_type: ColumnType.text, nullable: false),
+                Column(name: "completed", col_type: ColumnType.integer, nullable: false),
+                Column(name: "user_id", col_type: ColumnType.integer, nullable: false),
+                Column(name: "created_at", col_type: ColumnType.text, nullable: false),
+                Column(name: "updated_at", col_type: ColumnType.text, nullable: false)
+            ]
+        )
+
+fn create_todo_repository(db: Database) -> Repository<Todo>:
+    Repository<Todo>(db: db, codec: TodoCodec())
+
+fn todo_validator() -> Validator:
+    val v = Validator.new()
+    v.add_rule("title", Required())
+    v.add_rule("title", MinLength(length: 1))
+    v.add_rule("title", MaxLength(length: 255))
+    v.add_rule("description", MaxLength(length: 2000))
+    v
+
+fn find_todos_for_user(repo: Repository<Todo>, user_id: i64, page: i64, per_page: i64) -> Page<Todo>:
+    val paginator = Paginator<Todo>(repo: repo, per_page: per_page)
+    paginator.page_where("user_id = ? ORDER BY created_at DESC", [DbValue.integer(user_id)], page)
+
+fn count_todos_for_user(repo: Repository<Todo>, user_id: i64) -> Dict<text, i64>:
+    val all = repo.where("user_id = ?", [DbValue.integer(user_id)])
+    var total = 0
+    var completed = 0
+    var pending = 0
+    for todo in all:
+        total = total + 1
+        if todo.completed:
+            completed = completed + 1
+        else:
+            pending = pending + 1
+    val counts = Dict<text, i64>.new()
+    counts.set("total", total)
+    counts.set("completed", completed)
+    counts.set("pending", pending)
+    counts
+
+fn find_todo_by_id(repo: Repository<Todo>, id: i64) -> Option<Todo>:
+    repo.find(id)
+
+fn verify_todo_ownership(todo: Todo, user_id: i64) -> Result<Todo, text>:
+    if todo.user_id == user_id:
+        Result.ok(todo)
+    else:
+        Result.err("You do not have permission to access this todo")

@@ -1,0 +1,91 @@
+/* simply glass theme — derived from SimpleOS glass tokens
+   (ormastes/simple src/lib/common/ui/glass/), reworked for a content site:
+   higher text contrast, light/dark via prefers-color-scheme.
+   Keep in sync with the OS theme when either side changes. */
+:root {
+  --bg: #eef1f7;
+  --bg-glow-a: #c7d6ff;
+  --bg-glow-b: #ffd9ec;
+  --text: #1b2233;
+  --muted: #5a6478;
+  --card: rgba(255, 255, 255, 0.55);
+  --card-border: rgba(255, 255, 255, 0.75);
+  --accent: #3b6cff;
+  --accent2: #9a4dff;
+  --ok: #1c9e5a;
+  --warn: #c78a00;
+  --shadow: 0 8px 32px rgba(27, 34, 51, 0.12);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0e1220;
+    --bg-glow-a: #1c2c5e;
+    --bg-glow-b: #4a1e46;
+    --text: #e8ecf6;
+    --muted: #98a2ba;
+    --card: rgba(255, 255, 255, 0.06);
+    --card-border: rgba(255, 255, 255, 0.14);
+    --accent: #7b9dff;
+    --accent2: #c08aff;
+    --ok: #4cd68a;
+    --warn: #ffc94d;
+    --shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font: 16px/1.55 system-ui, "Segoe UI", sans-serif;
+  color: var(--text);
+  background:
+    radial-gradient(60rem 40rem at 15% -10%, var(--bg-glow-a), transparent 60%),
+    radial-gradient(50rem 35rem at 110% 20%, var(--bg-glow-b), transparent 60%),
+    var(--bg);
+  min-height: 100vh;
+  padding: 2rem clamp(1rem, 5vw, 4rem) 4rem;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.hero { max-width: 60rem; margin: 0 auto 2rem; text-align: center; }
+.hero h1 {
+  font-size: clamp(2.5rem, 7vw, 4.5rem);
+  margin: 0.5rem 0 0;
+  background: linear-gradient(90deg, var(--accent), var(--accent2));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  letter-spacing: -0.02em;
+}
+.hero .big { font-size: clamp(2rem, 5vw, 3rem); font-weight: 700; margin: 0.6rem 0; }
+.hero .big span { font-size: 1rem; font-weight: 400; color: var(--muted); margin-left: 0.5rem; }
+.card {
+  max-width: 72rem;
+  margin: 1.2rem auto;
+  padding: 1.2rem 1.4rem;
+  background: var(--card);
+  border: 1px solid var(--card-border);
+  border-radius: 18px;
+  backdrop-filter: blur(18px) saturate(1.3);
+  -webkit-backdrop-filter: blur(18px) saturate(1.3);
+  box-shadow: var(--shadow);
+}
+.card h2 { margin: 0 0 0.5rem; font-size: 1.15rem; display: flex; justify-content: space-between; }
+.pct { color: var(--accent); }
+.bar {
+  height: 8px; border-radius: 4px; overflow: hidden;
+  background: rgba(127, 127, 127, 0.2); margin-bottom: 0.8rem;
+}
+.bar div { height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent2)); }
+.tblwrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 0.88rem; }
+th, td { text-align: left; padding: 0.35rem 0.6rem; border-bottom: 1px solid var(--card-border); }
+th { color: var(--muted); font-weight: 600; }
+td.id { color: var(--muted); font-family: ui-monospace, monospace; }
+td.done b { color: var(--accent); }
+td.sspec { color: var(--muted); font-family: ui-monospace, monospace; font-size: 0.8rem; }
+.st { padding: 0.1rem 0.5rem; border-radius: 999px; font-size: 0.75rem; white-space: nowrap; }
+.st-usable, .st-system_verified { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
+.st-unit_verified { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent); }
+.st-source_present { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
+.st-declared { background: rgba(127, 127, 127, 0.15); color: var(--muted); }
+footer { max-width: 72rem; margin: 2rem auto 0; color: var(--muted); font-size: 0.85rem; text-align: center; }

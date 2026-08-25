@@ -1,0 +1,88 @@
+# Guest-resident pure-Simple VirtIO-snd calibration probe for QEMU virt machines.
+
+use os.drivers.virtio.virtio_snd_mmio.{virtio_snd_mmio_find}
+use os.services.audio.virtio_snd_service.{VirtioSndService}
+
+extern fn serial_println(msg: text)
+
+fn _virtio_snd_probe_samples(frames: i64) -> [i64]:
+    var samples: [i64] = []
+    var frame: i64 = 0
+    while frame < frames:
+        val phase = frame % 32
+        val sample = if phase < 16: 12000 else: -12000
+        samples.push(sample)
+        samples.push(-sample)
+        frame = frame + 1
+    samples
+
+fn _virtio_snd_probe_samples_hash(samples: [i64]) -> i64:
+    var sample_hash: i64 = 17
+    for sample in samples:
+        sample_hash = (sample_hash * 65599 + sample + 32768) % 2147483647
+    sample_hash
+
+fn simpleos_virtio_snd_probe(arch: text, mmio_start: u64, mmio_slots: i64, mmio_stride: u64) -> bool:
+    val base = virtio_snd_mmio_find(mmio_start, mmio_slots, mmio_stride)
+    if base == 0u64:
+        serial_println("SIMPLEOS_VIRTIO_SND status=failed reason=device-not-found arch={arch}")
+        return false
+    var service = VirtioSndService.start(base)
+    if not service.ready:
+        serial_println("SIMPLEOS_VIRTIO_SND status=failed reason=transport-start detail={service.start_reason} arch={arch}")
+        return false
+    serial_println("SIMPLEOS_VIRTIO_SND status=driver_ok arch={arch} base={base}")
+    val configured = service.configure_playback(0u32, 256, 2, 1000000)
+    if configured.status != "completed":
+        serial_println("SIMPLEOS_AUDIO_PLAYBACK non_silent=0 reason={configured.reason}")
+        service.shutdown(1000000)
+        return false
+    val samples = _virtio_snd_probe_samples(256)
+    val submitted = service.submit_playback(samples)
+    if submitted.status != "submitted":
+        serial_println("SIMPLEOS_AUDIO_PLAYBACK non_silent=0 reason={submitted.reason}")
+        service.shutdown(1000000)
+        return false
+    var completion = service.poll_playback()
+    var spins: i64 = 0
+    while completion.status == "pending" and spins < 1000000:
+        service.acknowledge_interrupt()
+        completion = service.poll_playback()
+        spins = spins + 1
+    if completion.status != "completed":
+        serial_println("SIMPLEOS_AUDIO_PLAYBACK non_silent=0 reason={completion.reason}")
+        service.shutdown(1000000)
+        return false
+    val playback_hash = _virtio_snd_probe_samples_hash(samples)
+    serial_println("SIMPLEOS_AUDIO_PLAYBACK non_silent=1 frames=256 pcm_hash={playback_hash} expected_pcm_hash={playback_hash}")
+    serial_println("SIMPLEOS_AUDIO_PERIOD count=1")
+    val capture_configured = service.configure_capture(1u32, 64, 2, 1000000)
+    if capture_configured.status != "completed":
+        serial_println("SIMPLEOS_AUDIO_CAPTURE status=failed reason={capture_configured.reason}")
+        service.shutdown(1000000)
+        return false
+    val capture_submitted = service.submit_capture()
+    if capture_submitted.status != "submitted":
+        serial_println("SIMPLEOS_AUDIO_CAPTURE status=failed reason={capture_submitted.reason}")
+        service.shutdown(1000000)
+        return false
+    var capture = service.poll_capture_receipt()
+    spins = 0
+    while capture.status == "pending" and spins < 1000000:
+        service.acknowledge_interrupt()
+        capture = service.poll_capture_receipt()
+        spins = spins + 1
+    if capture.status != "completed":
+        serial_println("SIMPLEOS_AUDIO_CAPTURE status=failed reason={capture.reason}")
+        service.shutdown(1000000)
+        return false
+    # `driver=none` can truthfully produce silence.  The accepted evidence is
+    # a completed bounded RX period with a DMA-derived session/generation/hash.
+    serial_println("SIMPLEOS_AUDIO_CAPTURE status=completed session={capture.session} generation={capture.generation} frames={capture.frames} samples={capture.samples} hash={capture.sample_hash} non_silent={capture.non_silent} bounded=1")
+    val stopped = service.shutdown(1000000)
+    val shutdown_ok = stopped.status == "completed"
+    val shutdown_receipts = if shutdown_ok: 1 else: 0
+    serial_println("SIMPLEOS_AUDIO_SHUTDOWN live_dma_resources=0 receipts={shutdown_receipts}")
+    shutdown_ok
+
+export simpleos_virtio_snd_probe

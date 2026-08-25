@@ -1,0 +1,8 @@
+use logic_namespace_guard_core.*
+
+fn rv32_namespace_guard_invalid_header_cases_selftest() -> i32:
+    if _rv32_namespace_cmd_valid(0, 0, 1, 1024) == 0:
+        return 1
+    if _rv32_namespace_cmd_valid(1, 0, 0, 1024) == 0:
+        return 1
+    0

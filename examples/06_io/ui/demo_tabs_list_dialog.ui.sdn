@@ -1,0 +1,68 @@
+app:
+    title: "Tabs List Dialog Demo"
+    theme: glass_dark
+
+layout:
+    type: vbox
+    id: root
+    children:
+        nav_tabs:
+            type: tabs
+            id: nav_tabs
+            items:
+                0:
+                    label: "Overview"
+                1:
+                    label: "Details"
+                2:
+                    label: "Settings"
+        content_panel:
+            type: panel
+            id: content_panel
+            title: "Content"
+            children:
+                content:
+                    type: hbox
+                    id: content
+                    children:
+                        sidebar:
+                            type: list
+                            id: sidebar
+                            items:
+                                0:
+                                    label: "Dashboard"
+                                1:
+                                    label: "Reports"
+                                2:
+                                    label: "Settings"
+                                3:
+                                    label: "Help"
+                        main:
+                            type: panel
+                            id: main
+                            title: "Main"
+                            flex: 3
+                            children:
+                                main_text:
+                                    type: text
+                                    id: main_text
+                                    content: "Select an item from the list"
+        confirm_dialog:
+            type: dialog
+            id: confirm_dialog
+            title: "Confirm Action"
+            children:
+                dialog_msg:
+                    type: text
+                    id: dialog_msg
+                    content: "Are you sure?"
+                dialog_ok:
+                    type: button
+                    id: dialog_ok
+                    label: "OK"
+                    action: "confirm"
+                dialog_cancel:
+                    type: button
+                    id: dialog_cancel
+                    label: "Cancel"
+                    action: "cancel"

@@ -1,0 +1,175 @@
+#!/bin/sh
+# TRACE32 Python RCL bridge — mimics t32rem CLI using lauterbach-trace32-rcl.
+#
+# Usage: t32_python_bridge.shs <host> port=<port> [INTERCOM=<name>] <command...>
+#
+# This script is a thin shell wrapper that delegates to the Python RCL bridge.
+# It requires Python 3 and the lauterbach-trace32-rcl package:
+#   pip install lauterbach-trace32-rcl
+#
+# Environment variables:
+#   T32_RCL_PACKLEN  — RCL packet length (default: 1024)
+#   T32_RCL_TIMEOUT  — Connection timeout in seconds (default: 10)
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Locate a Python 3 interpreter
+PYTHON3=""
+for candidate in python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+        version=$("$candidate" --version 2>&1 | sed 's/Python //')
+        major=$(printf '%s' "$version" | cut -d. -f1)
+        if [ "$major" -ge 3 ] 2>/dev/null; then
+            PYTHON3="$candidate"
+            break
+        fi
+    fi
+done
+
+if [ -z "$PYTHON3" ]; then
+    echo "t32_python_bridge: Python 3 not found in PATH. Install Python 3 and lauterbach-trace32-rcl." >&2
+    exit 1
+fi
+
+# Check the lauterbach-trace32-rcl package is importable
+if ! "$PYTHON3" -c "import lauterbach.trace32.rcl" 2>/dev/null; then
+    echo "t32_python_bridge: lauterbach-trace32-rcl not installed." >&2
+    echo "  Run: pip install lauterbach-trace32-rcl" >&2
+    exit 1
+fi
+
+if [ $# -lt 2 ]; then
+    echo "Usage: t32_python_bridge.shs <host> port=<port> [INTERCOM=<name>] <command...>" >&2
+    exit 1
+fi
+
+HOST="$1"
+shift
+
+PORT=20000
+INTERCOM=""
+CMD_ARGS=""
+FOUND_CMD=0
+
+for arg in "$@"; do
+    case "$arg" in
+        port=*)
+            PORT="${arg#port=}"
+            ;;
+        INTERCOM=*)
+            INTERCOM="${arg#INTERCOM=}"
+            ;;
+        *)
+            if [ "$FOUND_CMD" = "0" ]; then
+                FOUND_CMD=1
+                CMD_ARGS="$arg"
+            else
+                CMD_ARGS="$CMD_ARGS $arg"
+            fi
+            ;;
+    esac
+done
+
+if [ -z "$CMD_ARGS" ]; then
+    echo "Usage: t32_python_bridge.shs <host> port=<port> [INTERCOM=<name>] <command...>" >&2
+    exit 1
+fi
+
+PACKLEN="${T32_RCL_PACKLEN:-1024}"
+TIMEOUT="${T32_RCL_TIMEOUT:-10}"
+
+# Delegate to inline Python using the rcl API
+exec "$PYTHON3" - "$HOST" "$PORT" "$INTERCOM" "$PACKLEN" "$TIMEOUT" "$CMD_ARGS" <<'PYEOF'
+import sys
+import os
+import tempfile
+
+host, port, intercom, packlen, timeout_s, command = (
+    sys.argv[1],
+    int(sys.argv[2]),
+    sys.argv[3],
+    int(sys.argv[4]),
+    int(sys.argv[5]),
+    sys.argv[6],
+)
+
+try:
+    import lauterbach.trace32.rcl as t32
+except ImportError:
+    print("python-rcl error: lauterbach-trace32-rcl not installed. Run: pip install lauterbach-trace32-rcl", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    t32.init()
+    t32.config(node=host, port=port, packlen=packlen, timeout=timeout_s)
+    if intercom:
+        t32.config(intercom=intercom)
+    t32.attach(dev=1)
+except Exception as e:
+    print(f"python-rcl connection error: {e}", file=sys.stderr)
+    sys.exit(2)
+
+def run_command(t32, command):
+    upper = command.strip().upper()
+    if upper == "PING":
+        t32.ping()
+        return "OK"
+    if upper.startswith("EVAL "):
+        expr = command.strip()[5:]
+        try:
+            return str(t32.eval_string(expr))
+        except Exception:
+            try:
+                return str(t32.eval_int(expr))
+            except Exception as e:
+                return f"eval error: {e}"
+    if upper == "EVAL PRACTICE.STATE()":
+        try:
+            return str(t32.get_practice_state())
+        except Exception:
+            return "0"
+    if upper.startswith("WINPRINT."):
+        tmp = tempfile.mktemp(suffix=".txt", prefix="t32_bridge_")
+        try:
+            t32.cmd(f"PRinTer.FILE {tmp}")
+            t32.cmd(command)
+            t32.cmd("PRinTer.FILE")
+            try:
+                with open(tmp) as f:
+                    return f.read()
+            except FileNotFoundError:
+                return ""
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    if (upper.startswith("DIALOG.SET ") or upper.startswith("DIALOG.DESELECT ") or
+            upper.startswith("DIALOG.DISABLE ") or upper.startswith("DIALOG.ENABLE ") or
+            upper.startswith("DIALOG.EXECUTE ") or upper == "DIALOG.END"):
+        t32.cmd(command)
+        return "OK"
+    if upper.startswith("DO ") or upper.startswith("CD ") or upper.startswith("CD.DO ") or \
+            upper.startswith("CHDIR ") or upper.startswith("MENU."):
+        t32.cmd(command)
+        return ""
+    t32.cmd(command)
+    return ""
+
+try:
+    result = run_command(t32, command)
+    if result:
+        print(result)
+except Exception as e:
+    print(f"python-rcl error: {e}", file=sys.stderr)
+    sys.exit(3)
+finally:
+    try:
+        t32.exit()
+    except Exception:
+        pass
+
+sys.exit(0)
+PYEOF

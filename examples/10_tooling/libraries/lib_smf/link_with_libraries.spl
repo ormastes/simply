@@ -1,0 +1,79 @@
+#!/usr/bin/env simple
+# Example: Link object files with library support
+#
+# This example shows how to use the linker wrapper library support to link
+# object files while resolving symbols from library archives.
+# Note: This must be run in compiled mode, not interpreter mode.
+
+use compiler.linker.linker_wrapper_lib_support.{scan_libraries, extract_undefined_symbols, link_with_libraries}
+use compiler.linker.linker_wrapper.{NativeLinkConfig, NativeLinkConfig__default}
+use app.io.{file_exists}
+
+fn main():
+    print "========================================="
+    print "Library-Aware Linking Example"
+    print "========================================="
+    print ""
+
+    # Example configuration
+    var config = NativeLinkConfig__default()
+    config.verbose = true
+    config.library_paths = [
+        "./lib",           # Local lib directory
+        "/usr/lib/simple", # System libraries
+        "./examples/lib_smf" # Example libraries
+    ]
+
+    print "Configuration:"
+    print "  Library paths: {config.library_paths.len()}"
+    for lp in config.library_paths:
+        print "    - {lp}"
+    print ""
+
+    # Step 1: Scan for libraries
+    print "Step 1: Scanning for libraries..."
+    val scan_result = scan_libraries(config.library_paths, config.verbose)
+
+    if scan_result.is_err():
+        print "Error scanning libraries: {scan_result.unwrap_err()}"
+        exit(1)
+
+    val libraries = scan_result.unwrap()
+    print "Found {libraries.len()} libraries"
+    print ""
+
+    if libraries.len() > 0:
+        print "Library Details:"
+        for lib in libraries:
+            print "  {lib.name} ({lib.path})"
+            print "    Modules: {lib.modules.len()}"
+            for mod_name in lib.modules:
+                print "      - {mod_name}"
+        print ""
+
+    # Step 2: Example undefined symbols
+    print "Step 2: Example undefined symbols..."
+    print "  In a real scenario, these would be extracted from object files"
+    print "  using nm or similar tools."
+    print ""
+
+    # Note: Actual linking would require real object files
+    print "Step 3: Linking..."
+    print "  NOTE: This example shows the API, but requires actual object files"
+    print "  to perform real linking."
+    print ""
+
+    print "========================================="
+    print "Library Linking Example Complete"
+    print "========================================="
+    print ""
+    print "Key Features:"
+    print "  ✓ Automatic library discovery in library paths"
+    print "  ✓ Module listing from .lsm archives"
+    print "  ✓ Symbol resolution from library modules"
+    print "  ✓ Integration with native linker"
+    print ""
+    print "Next Steps:"
+    print "  - Create library with create_sample_library.spl"
+    print "  - Compile Simple code to object files"
+    print "  - Use link_with_libraries() to link with library support"

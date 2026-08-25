@@ -1,0 +1,255 @@
+#!/usr/bin/env simple
+# Unified Execution Demo
+# Shows how to use the unified execution system with different targets
+
+use std.execution.mod.{ExecutionConfig, TestExecutor, parse_target}
+use std.execution.cli_integration.{ExecutionArgs, run_with_cli_args}
+use std.qemu.mod.QemuArch
+use std.qemu.test_session.{QemuTestSession, QemuMultiTestRunner}
+
+# Process result (for shell commands)
+class ProcessResult:
+    stdout: text
+    stderr: text
+    exit_code: i64
+
+extern fn rt_process_run(cmd: text, args: [text]) -> (text, text, i64)
+
+fn shell(cmd: text) -> ProcessResult:
+    val (stdout, stderr, exit_code) = rt_process_run("/bin/sh", ["-c", cmd])
+    ProcessResult(stdout: stdout, stderr: stderr, exit_code: exit_code)
+
+fn print_section(title: text):
+    print("\n╔════════════════════════════════════════════╗")
+    print("║  {title}")
+    val padding = 44 - title.len()
+    var spaces = ""
+    var i = 0
+    while i < padding:
+        spaces = spaces + " "
+        i = i + 1
+    print("║{spaces}║")
+    print("╚════════════════════════════════════════════╝\n")
+
+fn main():
+    print("\n" + "═" * 50)
+    print("  Unified Execution System - Complete Demo")
+    print("═" * 50)
+
+    # Demo 1: Local execution
+    print_section("Demo 1: Local Execution")
+    demo_local_execution()
+
+    # Demo 2: QEMU x86_64 execution
+    print_section("Demo 2: QEMU x86_64 Execution")
+    demo_qemu_x86_64()
+
+    # Demo 3: CLI argument parsing
+    print_section("Demo 3: CLI Argument Parsing")
+    demo_cli_args()
+
+    # Demo 4: Configuration comparison
+    print_section("Demo 4: Target Configuration")
+    demo_target_configs()
+
+    # Demo 5: RISC-V readiness (when compiler available)
+    print_section("Demo 5: RISC-V Readiness Check")
+    demo_riscv_readiness()
+
+    print("\n" + "═" * 50)
+    print("  Demo Complete!")
+    print("═" * 50 + "\n")
+
+# Demo 1: Local execution
+fn demo_local_execution():
+    print("Creating local execution config...")
+
+    val config = ExecutionConfig.local("test/example.spl")
+
+    print("✓ Config created:")
+    print("  - Target: {config.target}")
+    print("  - Program: {config.program}")
+    print("  - Clear context: {config.clear_context}")
+    print("  - Is local: {config.is_local()}")
+    print("  - Is remote: {config.is_remote()}")
+
+    print("\nLocal execution provides:")
+    print("  • Direct interpreter execution")
+    print("  • Fast iteration (no QEMU overhead)")
+    print("  • Context clearing for test isolation")
+    print("  • Full variable inspection")
+
+# Demo 2: QEMU x86_64
+fn demo_qemu_x86_64():
+    print("Creating QEMU x86_64 config...")
+
+    val config = ExecutionConfig.qemu_x86_64(
+        "examples/baremetal/hello_x86_64.elf",
+        1234
+    )
+
+    print("✓ Config created:")
+    print("  - Target: {config.target}")
+    print("  - Program: {config.program}")
+    print("  - Host: {config.host}")
+    print("  - Port: {config.port}")
+    print("  - Uses GDB: {config.uses_gdb()}")
+    print("  - Reload program: {config.reload_program}")
+
+    print("\nQEMU execution provides:")
+    print("  • Bare-metal testing")
+    print("  • Hardware simulation")
+    print("  • GDB debugging support")
+    print("  • Memory/register access")
+
+    # Check if binary exists
+    val check = shell("test -f examples/baremetal/hello_x86_64.elf")
+    if check.exit_code == 0:
+        print("\n✓ Binary exists and ready to test!")
+        print("  Run: bin/simple test --target=x86_64-qemu")
+    else:
+        print("\n⚠ Binary not built yet")
+        print("  Build: cd examples/baremetal && bash build.sh")
+
+# Demo 3: CLI argument parsing
+fn demo_cli_args():
+    print("Demonstrating CLI argument parsing...\n")
+
+    # Example 1: Local
+    print("Example 1: Local execution")
+    print("  Command: simple test test/my_spec.spl")
+    val args1 = ["test/my_spec.spl"]
+    val parsed1 = ExecutionArgs.parse(args1)
+    match parsed1:
+        Ok(exec_args):
+            print("  ✓ Parsed:")
+            print("    Target: {exec_args.target}")
+            print("    Test file: {exec_args.test_file}")
+        Err(e):
+            print("  ✗ Error: {e}")
+
+    # Example 2: QEMU
+    print("\nExample 2: QEMU execution")
+    print("  Command: simple test --target=riscv32-qemu test/boot_spec.spl")
+    val args2 = ["--target", "riscv32-qemu", "test/boot_spec.spl"]
+    val parsed2 = ExecutionArgs.parse(args2)
+    match parsed2:
+        Ok(exec_args):
+            print("  ✓ Parsed:")
+            print("    Target: {exec_args.target}")
+            print("    Test file: {exec_args.test_file}")
+        Err(e):
+            print("  ✗ Error: {e}")
+
+    # Example 3: Custom port
+    print("\nExample 3: Custom GDB port")
+    print("  Command: simple test --target=x86_64-qemu --gdb-port=5555 test/spec.spl")
+    val args3 = ["--target", "x86_64-qemu", "--gdb-port", "5555", "test/spec.spl"]
+    val parsed3 = ExecutionArgs.parse(args3)
+    match parsed3:
+        Ok(exec_args):
+            print("  ✓ Parsed:")
+            print("    Target: {exec_args.target}")
+            print("    GDB port: {exec_args.gdb_port}")
+        Err(e):
+            print("  ✗ Error: {e}")
+
+# Demo 4: Target configurations
+fn demo_target_configs():
+    print("Comparing target configurations...\n")
+
+    val targets = [
+        ("local", "test.spl"),
+        ("riscv32-qemu", "test.elf"),
+        ("x86_64-qemu", "test.elf"),
+        ("arm32-qemu", "test.elf")
+    ]
+
+    for (target, program) in targets:
+        val result = parse_target(target, program)
+        match result:
+            Ok(config):
+                print("Target: {target}")
+                print("  • Program: {config.program}")
+                print("  • Host: {config.host}")
+                print("  • Port: {config.port}")
+                print("  • Clear context: {config.clear_context}")
+                print("  • Reload: {config.reload_program}")
+                print("")
+            Err(e):
+                print("Target: {target}")
+                print("  ✗ Error: {e}\n")
+
+# Demo 5: RISC-V readiness
+fn demo_riscv_readiness():
+    print("Checking RISC-V toolchain availability...\n")
+
+    # Check for QEMU
+    print("1. QEMU RISC-V 32:")
+    val qemu_check = shell("which qemu-system-riscv32 2>/dev/null")
+    if qemu_check.exit_code == 0:
+        val qemu_path = qemu_check.stdout.trim()
+        print("   ✓ Found: {qemu_path}")
+
+        # Check version
+        val version = shell("qemu-system-riscv32 --version | head -1")
+        print("   ✓ Version: {version.stdout.trim()}")
+    else:
+        print("   ⚠ Not found in PATH")
+        print("   • Check project binaries: resources/qemu/bin/qemu-system-riscv32")
+
+    # Check for compiler
+    print("\n2. RISC-V Compiler:")
+    val gcc_check = shell("which riscv64-unknown-elf-gcc 2>/dev/null")
+    if gcc_check.exit_code == 0:
+        val gcc_path = gcc_check.stdout.trim()
+        print("   ✓ Found: {gcc_path}")
+
+        # Check version
+        val version = shell("riscv64-unknown-elf-gcc --version | head -1")
+        print("   ✓ Version: {version.stdout.trim()}")
+    else:
+        print("   ⚠ Not installed")
+        print("   • Install: sudo apt install gcc-riscv64-unknown-elf")
+
+    # Check for examples
+    print("\n3. RISC-V Examples:")
+    val examples = [
+        "examples/baremetal/hello_riscv32.elf",
+        "examples/baremetal/timer_riscv32.elf"
+    ]
+
+    var found_count = 0
+    for example in examples:
+        val check = shell("test -f {example}")
+        if check.exit_code == 0:
+            print("   ✓ {example}")
+            found_count = found_count + 1
+        else:
+            print("   ⚠ {example} (not built)")
+
+    if found_count == 0:
+        print("\n   To build examples:")
+        print("   1. Install compiler (see above)")
+        print("   2. Run: cd examples/baremetal && bash build.sh")
+
+    # Ready status
+    print("\n4. Readiness Status:")
+    val qemu_ready = qemu_check.exit_code == 0
+    val gcc_ready = gcc_check.exit_code == 0
+    val examples_ready = found_count > 0
+
+    if qemu_ready and gcc_ready and examples_ready:
+        print("   ✅ READY - All components available!")
+        print("\n   Try:")
+        print("   bin/simple test --target=riscv32-qemu test/boot_spec.spl")
+    elif qemu_ready and gcc_ready:
+        print("   🔧 ALMOST - Just need to build examples")
+        print("\n   Run:")
+        print("   cd examples/baremetal && bash build.sh")
+    else:
+        print("   ⚠ NOT READY - Install missing components")
+        if not qemu_ready:
+            print("     • Install QEMU or use project binaries")
+        if not gcc_ready:
+            print("     • Install RISC-V compiler")

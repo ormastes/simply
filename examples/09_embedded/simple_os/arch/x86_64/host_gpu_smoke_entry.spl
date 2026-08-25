@@ -1,0 +1,7 @@
+use arch.common.host_gpu_ivshmem_probe_entry.{host_gpu_ivshmem_probe_main}
+
+extern fn rt_debug_exit_success()
+
+fn spl_start():
+    host_gpu_ivshmem_probe_main()
+    rt_debug_exit_success()

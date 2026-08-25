@@ -1,0 +1,339 @@
+# GPU Test Helpers
+#
+# Shared utilities for the CUDA example modules. Everything here is built on
+# the raw i64-handle driver API in `std.cuda` (src/lib/nogc_sync_mut/cuda),
+# which is the ONLY path in the Rust seed that executes real kernels:
+#
+#   - `kernel<<<grid: g, block: b>>>(...)` is a documented NO-OP in the
+#     interpreter (compiler_rust/compiler/src/interpreter/expr/calls.rs:94),
+#     so `@gpu_kernel` Simple functions never touch device memory under
+#     `bin/simple test` / `SIMPLE_EXECUTION_MODE=interpreter`.
+#   - `gpu_upload_f32` / `gpu_download_f32` (std.gpu) copy raw bytes through
+#     `Array.data_ptr()` of a boxed-Value array; download SEGVs (rc=139).
+#
+# So the modules ship their kernels as hand-written PTX text (the same
+# pattern as src/lib/gc_async_mut/gpu_lane/svmg_cuda_kernel.ptx), load them
+# with `cuda_module_load_data`, and launch through `cuda_launch_kernel`.
+# Host<->device transfer is byte-marshalled ([u8]) so no Simple array is
+# ever aliased by the runtime.
+#
+# Verified on 2x NVIDIA (RTX A6000 / TITAN RTX), Rust seed, 2026-08-25:
+# scale/atomic/shared-memory reduction all return correct values.
+
+use std.common.string_core.{text_to_bytes}
+use std.cuda.{
+    cuda_available, cuda_init, cuda_device_count, cuda_device_get, cuda_device_name,
+    cuda_ctx_create, cuda_ctx_destroy,
+    cuda_mem_alloc, cuda_mem_free, cuda_memcpy_dtod, cuda_memset,
+    cuda_module_load_data, cuda_module_unload, cuda_launch_kernel,
+    cuda_sync, cuda_get_error_string
+}
+
+# Raw runtime hooks (all implemented by the seed interpreter, see
+# compiler_rust/compiler/src/interpreter_extern/{gpu,memory}.rs).
+extern fn rt_cuda_memcpy_htod_array(dst: i64, src: [u8], size: i64) -> i64
+extern fn rt_cuda_memcpy_dtoh(dst_host: i64, src_device: i64, size: i64) -> i64
+extern fn rt_alloc(size: i64) -> i64
+extern fn rt_free(ptr: i64)
+extern fn rt_ptr_read_u8(ptr: i64, offset: i64) -> i64
+extern fn rt_ptr_write_i64(addr: i64, offset: i64, value: i64)
+extern fn rt_cuda_module_load_data_bytes(ptx_ptr: i64, ptx_len: i64) -> i64
+
+# ============================================================================
+# Device setup
+# ============================================================================
+
+# Initialise the driver and make a context current on `device_id`.
+# Returns the context handle (> 0) or 0 when no usable GPU exists.
+fn gpu_setup(device_id: i64) -> i64:
+    if not cuda_available():
+        return 0
+    if cuda_init() != 0:
+        return 0
+    if cuda_device_count() <= device_id:
+        return 0
+    val dev = cuda_device_get(device_id)
+    if dev < 0:
+        return 0
+    val ctx = cuda_ctx_create(dev)
+    if ctx <= 0:
+        return 0
+    ctx
+
+fn gpu_teardown(ctx: i64):
+    if ctx > 0:
+        cuda_ctx_destroy(ctx)
+
+# Check whether a CUDA device is available. Prints a warning when not.
+fn assert_gpu_available() -> bool:
+    val ok = cuda_available() and cuda_init() == 0 and cuda_device_count() > 0
+    if not ok:
+        eprint("WARNING: No CUDA device detected. GPU demos will be skipped.")
+    ok
+
+# ============================================================================
+# f32 <-> IEEE-754 bit patterns (pure integer arithmetic, engine-independent)
+# ============================================================================
+
+fn _pow2(e: i64) -> f64:
+    var r = 1.0
+    var k = e
+    if k >= 0:
+        while k > 0:
+            r = r * 2.0
+            k = k - 1
+    else:
+        while k < 0:
+            r = r / 2.0
+            k = k + 1
+    r
+
+fn f32_bits(x: f32) -> i64:
+    val v = x as f64
+    if v == 0.0:
+        return 0
+    var sign = 0
+    var a = v
+    if a < 0.0:
+        sign = 1
+        a = 0.0 - a
+    var e = 0
+    while a >= 2.0:
+        a = a / 2.0
+        e = e + 1
+    while a < 1.0:
+        a = a * 2.0
+        e = e - 1
+    val frac = ((a - 1.0) * 8388608.0 + 0.5) as i64
+    (sign << 31) | ((e + 127) << 23) | frac
+
+fn f32_from_bits_i64(bits: i64) -> f32:
+    val sign = (bits >> 31) & 1
+    val exp = (bits >> 23) & 0xFF
+    val frac = bits & 0x7FFFFF
+    var r = 0.0
+    if exp == 0:
+        r = ((frac as f64) / 8388608.0) * _pow2(-126)
+    else:
+        r = (1.0 + (frac as f64) / 8388608.0) * _pow2(exp - 127)
+    if sign == 1:
+        r = 0.0 - r
+    r as f32
+
+# ============================================================================
+# Byte marshalling
+# ============================================================================
+
+fn f32s_to_bytes(xs: [f32]) -> [u8]:
+    var out: [u8] = []
+    for x in xs:
+        val b = f32_bits(x)
+        out.push((b & 0xFF) as u8)
+        out.push(((b >> 8) & 0xFF) as u8)
+        out.push(((b >> 16) & 0xFF) as u8)
+        out.push(((b >> 24) & 0xFF) as u8)
+    out
+
+fn bytes_to_f32s(bs: [u8]) -> [f32]:
+    var out: [f32] = []
+    val n = bs.len() / 4
+    for i in 0..n:
+        val b = (bs[i * 4] as i64) | ((bs[i * 4 + 1] as i64) << 8) | ((bs[i * 4 + 2] as i64) << 16) | ((bs[i * 4 + 3] as i64) << 24)
+        out.push(f32_from_bits_i64(b))
+    out
+
+fn i32s_to_bytes(xs: [i64]) -> [u8]:
+    var out: [u8] = []
+    for x in xs:
+        val b = x & 0xFFFFFFFF
+        out.push((b & 0xFF) as u8)
+        out.push(((b >> 8) & 0xFF) as u8)
+        out.push(((b >> 16) & 0xFF) as u8)
+        out.push(((b >> 24) & 0xFF) as u8)
+    out
+
+fn bytes_to_i32s(bs: [u8]) -> [i64]:
+    var out: [i64] = []
+    val n = bs.len() / 4
+    for i in 0..n:
+        var b = (bs[i * 4] as i64) | ((bs[i * 4 + 1] as i64) << 8) | ((bs[i * 4 + 2] as i64) << 16) | ((bs[i * 4 + 3] as i64) << 24)
+        if b >= 2147483648:
+            b = b - 4294967296
+        out.push(b)
+    out
+
+# ============================================================================
+# Device memory (raw device pointers as i64, 0 = invalid)
+# ============================================================================
+
+fn gpu_alloc_bytes(size: i64) -> i64:
+    val p = cuda_mem_alloc(size)
+    if p > 0: p else: 0
+
+fn gpu_free_ptr(ptr: i64):
+    if ptr > 0:
+        cuda_mem_free(ptr)
+
+fn gpu_upload_bytes(dev: i64, bs: [u8]) -> bool:
+    if dev <= 0 or bs.len() == 0:
+        return false
+    rt_cuda_memcpy_htod_array(dev, bs, bs.len()) == 0
+
+fn gpu_download_bytes(dev: i64, size: i64) -> [u8]:
+    var out: [u8] = []
+    if dev <= 0 or size <= 0:
+        return out
+    val staging = rt_alloc(size)
+    val rc = rt_cuda_memcpy_dtoh(staging, dev, size)
+    if rc == 0:
+        for i in 0..size:
+            out.push(rt_ptr_read_u8(staging, i) as u8)
+    rt_free(staging)
+    out
+
+# Allocate + upload an f32 array. Returns the device pointer (0 on failure).
+fn gpu_upload_f32s(xs: [f32]) -> i64:
+    val dev = gpu_alloc_bytes(xs.len() * 4)
+    if dev == 0:
+        return 0
+    if not gpu_upload_bytes(dev, f32s_to_bytes(xs)):
+        gpu_free_ptr(dev)
+        return 0
+    dev
+
+fn gpu_download_f32s(dev: i64, count: i64) -> [f32]:
+    bytes_to_f32s(gpu_download_bytes(dev, count * 4))
+
+fn gpu_upload_i32s(xs: [i64]) -> i64:
+    val dev = gpu_alloc_bytes(xs.len() * 4)
+    if dev == 0:
+        return 0
+    if not gpu_upload_bytes(dev, i32s_to_bytes(xs)):
+        gpu_free_ptr(dev)
+        return 0
+    dev
+
+fn gpu_download_i32s(dev: i64, count: i64) -> [i64]:
+    bytes_to_i32s(gpu_download_bytes(dev, count * 4))
+
+# Zero-filled device buffer of `count` 32-bit words.
+fn gpu_alloc_zeroed_words(count: i64) -> i64:
+    val dev = gpu_alloc_bytes(count * 4)
+    if dev == 0:
+        return 0
+    cuda_memset(dev, 0, count * 4)
+    dev
+
+fn gpu_copy_d2d(dst: i64, src: i64, size: i64) -> bool:
+    cuda_memcpy_dtod(dst, src, size) == 0
+
+# ============================================================================
+# PTX modules and kernel launch
+# ============================================================================
+
+# Load PTX text. Returns module handle (> 0) or 0 on failure (error printed).
+#
+# The text is copied into a NUL-padded host buffer and loaded through the
+# (ptr, len) entry point. `cuda_module_load_data(text)` is NOT used because
+# under the seed's JIT (`bin/simple run`) `rt_cuda_module_load_data`
+# (compiler_rust/runtime/src/cuda_runtime.rs) hands the un-terminated text
+# span straight to cuModuleLoadData, so whatever heap bytes follow the text
+# decide between success and CUDA_ERROR_INVALID_PTX (-218) -- 23 and 24
+# silently did nothing on every `run` because of it. Both engines copy and
+# NUL-terminate on the `_bytes` path. Appending "\0" to the text instead is
+# rejected by the interpreter ("does not accept embedded NUL bytes").
+fn gpu_load_ptx(ptx: text) -> i64:
+    val bs = text_to_bytes(ptx)
+    val n = bs.len()
+    val words = n / 8 + 1
+    val buf = rt_alloc(words * 8)
+    for w in 0..words:
+        var v = 0
+        for k in 0..8:
+            val i = w * 8 + k
+            if i < n:
+                v = v + ((bs[i] as i64) << (8 * k))
+        rt_ptr_write_i64(buf, 8 * w, v)
+    val m = rt_cuda_module_load_data_bytes(buf, n)
+    rt_free(buf)
+    if m <= 0:
+        eprint("PTX load failed: {cuda_get_error_string(0 - m)}")
+        return 0
+    m
+
+fn gpu_unload(module: i64):
+    if module > 0:
+        cuda_module_unload(module)
+
+# Launch `name` from `module`. Every kernel parameter is passed as one 8-byte
+# slot (device pointers and .u64 scalars), which is how every PTX kernel in
+# these modules declares its parameters. Returns the driver status (0 = OK).
+fn gpu_launch_3d(module: i64, name: text, gx: i64, gy: i64, gz: i64,
+                 bx: i64, by: i64, bz: i64, args: [i64]) -> i64:
+    val n = args.len()
+    val values = rt_alloc(8 * n)
+    val ptrs = rt_alloc(8 * n)
+    for i in 0..n:
+        rt_ptr_write_i64(values, 8 * i, args[i])
+        rt_ptr_write_i64(ptrs, 8 * i, values + 8 * i)
+    val rc = cuda_launch_kernel(module, name, gx, gy, gz, bx, by, bz, ptrs)
+    rt_free(values)
+    rt_free(ptrs)
+    rc
+
+fn gpu_launch_1d(module: i64, name: text, grid: i64, block: i64, args: [i64]) -> i64:
+    gpu_launch_3d(module, name, grid, 1, 1, block, 1, 1, args)
+
+# Launch + synchronise. Returns true when both succeeded.
+fn gpu_run_1d(module: i64, name: text, grid: i64, block: i64, args: [i64]) -> bool:
+    if gpu_launch_1d(module, name, grid, block, args) != 0:
+        return false
+    cuda_sync() == 0
+
+fn gpu_run_3d(module: i64, name: text, gx: i64, gy: i64, gz: i64,
+              bx: i64, by: i64, bz: i64, args: [i64]) -> bool:
+    if gpu_launch_3d(module, name, gx, gy, gz, bx, by, bz, args) != 0:
+        return false
+    cuda_sync() == 0
+
+fn gpu_sync_all() -> bool:
+    cuda_sync() == 0
+
+fn gpu_device_display_name(device_id: i64) -> text:
+    cuda_device_name(cuda_device_get(device_id))
+
+# Grid size for `n` elements with `block` threads per block.
+fn grid_for(n: i64, block: i64) -> i64:
+    (n + block - 1) / block
+
+# ============================================================================
+# Floating-Point Comparison
+# ============================================================================
+
+# Return true if |a - b| <= epsilon.
+fn close_enough(a: f32, b: f32, epsilon: f32) -> bool:
+    val diff = a - b
+    var abs_diff = diff
+    if abs_diff < 0.0:
+        abs_diff = 0.0 - abs_diff
+    abs_diff <= epsilon
+
+fn all_close(xs: [f32], expected: f32, epsilon: f32) -> bool:
+    for x in xs:
+        if not close_enough(x, expected, epsilon):
+            return false
+    true
+
+# ============================================================================
+# Exports
+# ============================================================================
+
+export gpu_setup, gpu_teardown, assert_gpu_available
+export f32_bits, f32_from_bits_i64
+export f32s_to_bytes, bytes_to_f32s, i32s_to_bytes, bytes_to_i32s
+export gpu_alloc_bytes, gpu_free_ptr, gpu_upload_bytes, gpu_download_bytes
+export gpu_upload_f32s, gpu_download_f32s, gpu_upload_i32s, gpu_download_i32s
+export gpu_alloc_zeroed_words, gpu_copy_d2d
+export gpu_load_ptx, gpu_unload, gpu_launch_1d, gpu_launch_3d, gpu_run_1d, gpu_run_3d
+export gpu_sync_all, gpu_device_display_name, grid_for
+export close_enough, all_close

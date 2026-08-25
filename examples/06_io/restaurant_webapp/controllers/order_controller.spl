@@ -1,0 +1,166 @@
+use std.web_framework.controller.{ControllerContext, HttpResponseData, ViewData, render_page, render_redirect, render_error, render_json, render_text}
+use std.web_framework.session.{session_get}
+use std.web_framework.flash.{flash_add}
+use std.web_framework.csrf_integration.{csrf_token_for_session, verify_csrf_token}
+use std.database.{DbValue}
+use std.nogc_sync_mut.io.time_ops.{time_now_unix_micros}
+
+use models.order.{
+    Order, create_order_repository,
+    find_all_orders, find_orders_by_status, find_order_by_id,
+    format_order_sticker
+}
+
+fn require_admin(ctx: ControllerContext) -> Result<text, text>:
+    val username = session_get(ctx, "admin_username")
+    if username.?:
+        Result.ok(username.unwrap())
+    else:
+        Result.err("Not authenticated")
+
+# --- Admin Order Management ---
+
+fn action_index(ctx: ControllerContext) -> HttpResponseData:
+    val admin = require_admin(ctx)?
+    val status_filter = ctx.query_param("status").unwrap_or("")
+
+    val repo = create_order_repository(ctx.db())
+    val orders = if status_filter == "":
+        find_all_orders(repo)
+    else:
+        find_orders_by_status(repo, status_filter)
+
+    val data = ViewData.new()
+        .set("title", "Orders")
+        .set("csrf_token", csrf_token_for_session(ctx))
+        .set("status_filter", status_filter)
+    render_page(ctx, "orders/index", data.to_dict())
+
+fn action_show(ctx: ControllerContext) -> HttpResponseData:
+    val admin = require_admin(ctx)?
+    val id = ctx.params.get("id").unwrap_or("0").parse_i64().unwrap_or(0)
+    val repo = create_order_repository(ctx.db())
+    val order = find_order_by_id(repo, id)?
+
+    val data = ViewData.new()
+        .set("title", "Order #{order.id}")
+        .set("order_id", "{order.id}")
+        .set("table_number", order.table_number)
+        .set("status", order.status)
+        .set("items_json", order.items_json)
+        .set("total", "{order.total}")
+        .set("payment_status", order.payment_status)
+        .set("notes", order.notes)
+        .set("csrf_token", csrf_token_for_session(ctx))
+    render_page(ctx, "orders/show", data.to_dict())
+
+fn action_update(ctx: ControllerContext) -> HttpResponseData:
+    val admin = require_admin(ctx)?
+    val csrf = ctx.form_value("csrf_token")
+    if not verify_csrf_token(ctx, csrf):
+        flash_add(ctx, "error", "Invalid form submission.")
+        return render_redirect(ctx, "/admin/orders")
+
+    val id = ctx.params.get("id").unwrap_or("0").parse_i64().unwrap_or(0)
+    val repo = create_order_repository(ctx.db())
+    val order = find_order_by_id(repo, id)?
+
+    val notes = ctx.form_value("notes")
+    val items_json = ctx.form_value("items_json")
+    val status = ctx.form_value("status")
+
+    val updated = Order(
+        id: order.id,
+        table_number: order.table_number,
+        status: if status == "": order.status else: status,
+        items_json: if items_json == "": order.items_json else: items_json,
+        subtotal: order.subtotal,
+        tax: order.tax,
+        total: order.total,
+        payment_method: order.payment_method,
+        payment_status: order.payment_status,
+        notes: if notes == "": order.notes else: notes,
+        created_at: order.created_at,
+        updated_at: "{time_now_unix_micros()}"
+    )
+    repo.update(updated)?
+
+    flash_add(ctx, "success", "Order updated.")
+    render_redirect(ctx, "/admin/orders/{id}")
+
+fn action_send_to_cook(ctx: ControllerContext) -> HttpResponseData:
+    val admin = require_admin(ctx)?
+    val csrf = ctx.form_value("csrf_token")
+    if not verify_csrf_token(ctx, csrf):
+        flash_add(ctx, "error", "Invalid form submission.")
+        return render_redirect(ctx, "/admin/orders")
+
+    val id = ctx.params.get("id").unwrap_or("0").parse_i64().unwrap_or(0)
+    val repo = create_order_repository(ctx.db())
+    val order = find_order_by_id(repo, id)?
+
+    val updated = Order(
+        id: order.id,
+        table_number: order.table_number,
+        status: "cooking",
+        items_json: order.items_json,
+        subtotal: order.subtotal,
+        tax: order.tax,
+        total: order.total,
+        payment_method: order.payment_method,
+        payment_status: order.payment_status,
+        notes: order.notes,
+        created_at: order.created_at,
+        updated_at: "{time_now_unix_micros()}"
+    )
+    repo.update(updated)?
+
+    flash_add(ctx, "success", "Order #{id} sent to cook.")
+    render_redirect(ctx, "/admin/orders")
+
+fn action_print_sticker(ctx: ControllerContext) -> HttpResponseData:
+    val admin = require_admin(ctx)?
+    val id = ctx.params.get("id").unwrap_or("0").parse_i64().unwrap_or(0)
+    val repo = create_order_repository(ctx.db())
+    val order = find_order_by_id(repo, id)?
+    val sticker = format_order_sticker(order)
+    render_text(sticker)
+
+# --- Customer Ordering ---
+
+@public
+fn action_create(ctx: ControllerContext) -> HttpResponseData:
+    val table_number = ctx.form_value("table_number")
+    val items_json = ctx.form_value("items_json")
+    val notes = ctx.form_value("notes")
+
+    val subtotal = ctx.form_value("subtotal").parse_i64().unwrap_or(0)
+    val tax = subtotal * 10 / 100
+    val total = subtotal + tax
+
+    val now = "{time_now_unix_micros()}"
+    val repo = create_order_repository(ctx.db())
+    val order = Order(
+        id: 0,
+        table_number: table_number,
+        status: "pending",
+        items_json: items_json,
+        subtotal: subtotal,
+        tax: tax,
+        total: total,
+        payment_method: "",
+        payment_status: "unpaid",
+        notes: notes,
+        created_at: now,
+        updated_at: now
+    )
+    repo.save(order)?
+
+    render_json("{\"status\": \"ok\", \"message\": \"Order placed\"}")
+
+@public
+fn action_status(ctx: ControllerContext) -> HttpResponseData:
+    val id = ctx.params.get("id").unwrap_or("0").parse_i64().unwrap_or(0)
+    val repo = create_order_repository(ctx.db())
+    val order = find_order_by_id(repo, id)?
+    render_json("{\"id\": {order.id}, \"status\": \"{order.status}\", \"payment_status\": \"{order.payment_status}\"}")

@@ -1,0 +1,28 @@
+use logic_ecc_bits.*
+
+fn _rv32_ecc_hamming_payload(data: i64) -> i64:
+    var p1: i64 = 0
+    var p2: i64 = 0
+    var p4: i64 = 0
+    var p8: i64 = 0
+    var p16: i64 = 0
+    var overall: i64 = 0
+    var pos: i64 = 1
+    var data_bit: i64 = 0
+    while pos <= 22:
+        if _rv32_ecc_parity_pos(pos) == 0:
+            val bit: i64 = _rv32_ecc_bit(data, data_bit)
+            overall = overall ^ bit
+            if (pos & 1) != 0:
+                p1 = p1 ^ bit
+            if (pos & 2) != 0:
+                p2 = p2 ^ bit
+            if (pos & 4) != 0:
+                p4 = p4 ^ bit
+            if (pos & 8) != 0:
+                p8 = p8 ^ bit
+            if (pos & 16) != 0:
+                p16 = p16 ^ bit
+            data_bit = data_bit + 1
+        pos = pos + 1
+    p1 | (p2 << 1) | (p4 << 2) | (p8 << 3) | (p16 << 4) | (overall << 5)

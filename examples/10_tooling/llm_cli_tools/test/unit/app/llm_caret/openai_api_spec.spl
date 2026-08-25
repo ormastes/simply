@@ -1,0 +1,300 @@
+# LLM Caret OpenAI API Specification
+
+# Inline helpers
+fn _LB() -> text:
+    "{(123 as char)}"
+
+fn _RB() -> text:
+    "{(125 as char)}"
+
+fn _Q() -> text:
+    "\""
+
+fn _unwrap_idx(opt) -> i64:
+    match opt:
+        Some(i): return i
+        nil: return -1
+
+fn _escape_json(s: text) -> text:
+    var result = ""
+    var i = 0
+    while i < s.len():
+        val ch = s[i]
+        if ch == "\\":
+            result = result + "\\\\"
+        elif ch == "\"":
+            result = result + "\\\""
+        elif ch == "\n":
+            result = result + "\\n"
+        elif ch == "\r":
+            result = result + "\\r"
+        elif ch == "\t":
+            result = result + "\\t"
+        else:
+            result = result + ch
+        i = i + 1
+    result
+
+fn _extract_json_string(json: text, key: text) -> text:
+    val quote = "\""
+    val search = quote + key + quote + ":"
+    val idx = _unwrap_idx(json.index_of(search))
+    if idx < 0:
+        return ""
+    val slen = search.len()
+    val start = idx + slen
+    val after = json.substring(start)
+    val trimmed = after.trim()
+    if trimmed.starts_with(quote):
+        val rest = trimmed.substring(1)
+        var end = 0
+        var escaped = false
+        while end < rest.len():
+            val ch = rest[end]
+            if escaped:
+                escaped = false
+            elif ch == "\\":
+                escaped = true
+            elif ch == "\"":
+                return rest.substring(0, end)
+            end = end + 1
+    ""
+
+fn _extract_json_value(json: text, key: text) -> text:
+    val search = _Q() + key + _Q() + ":"
+    val idx = _unwrap_idx(json.index_of(search))
+    if idx < 0:
+        return "null"
+    val slen = search.len()
+    val start = idx + slen
+    val after = json.substring(start)
+    val trimmed = after.trim()
+    var end = 0
+    while end < trimmed.len():
+        val ch = trimmed[end]
+        if ch == "," or ch == _RB() or ch == "]":
+            break
+        end = end + 1
+    trimmed.substring(0, end).trim()
+
+fn _extract_json_int(json: text, key: text) -> i64:
+    val raw = _extract_json_value(json, key)
+    if raw == "null" or raw == "":
+        return 0
+    int(raw)
+
+# Inline struct
+struct OpenAIResponse:
+    content: text
+    model: text
+    finish_reason: text
+    prompt_tokens: i64
+    completion_tokens: i64
+    total_tokens: i64
+    error: text
+    is_error: bool
+    raw: text
+
+# Functions under test
+fn build_openai_body(model: text, messages_json: text, max_tokens: i64, temperature: f64) -> text:
+    var parts: [text] = []
+    var model_val = model
+    if model_val == "":
+        model_val = "gpt-4o"
+    parts = parts + [_Q() + "model" + _Q() + ":" + _Q() + model_val + _Q()]
+    parts = parts + [_Q() + "messages" + _Q() + ":" + messages_json]
+    if max_tokens > 0:
+        parts = parts + [_Q() + "max_tokens" + _Q() + ":" + "{max_tokens}"]
+    if temperature >= 0.0:
+        parts = parts + [_Q() + "temperature" + _Q() + ":" + "{temperature}"]
+    var body = _LB()
+    var i = 0
+    for part in parts:
+        if i > 0:
+            body = body + ","
+        body = body + part
+        i = i + 1
+    body = body + _RB()
+    body
+
+fn build_openai_headers(api_key: text) -> text:
+    var h = "Authorization: Bearer " + api_key + "\n"
+    h = h + "Content-Type: application/json"
+    h
+
+fn build_openai_messages_json(roles: [text], contents: [text]) -> text:
+    var items: [text] = []
+    var i = 0
+    while i < roles.len():
+        var msg = _LB()
+        msg = msg + _Q() + "role" + _Q() + ":" + _Q() + roles[i] + _Q() + ","
+        var c = ""
+        if i < contents.len():
+            c = contents[i]
+        msg = msg + _Q() + "content" + _Q() + ":" + _Q() + _escape_json(c) + _Q()
+        msg = msg + _RB()
+        items = items + [msg]
+        i = i + 1
+    var result = "["
+    var j = 0
+    for item in items:
+        if j > 0:
+            result = result + ","
+        result = result + item
+        j = j + 1
+    result = result + "]"
+    result
+
+fn parse_openai_response(raw: text) -> OpenAIResponse:
+    if raw.trim() == "":
+        return OpenAIResponse(
+            content: "",
+            model: "",
+            finish_reason: "",
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            error: "empty response",
+            is_error: true,
+            raw: ""
+        )
+    val error_msg = _extract_json_string(raw, "message")
+    val has_content = _extract_json_string(raw, "content")
+    if error_msg != "" and has_content == "":
+        return OpenAIResponse(
+            content: "",
+            model: "",
+            finish_reason: "error",
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            error: error_msg,
+            is_error: true,
+            raw: raw
+        )
+    val content_text = _extract_json_string(raw, "content")
+    val model_val = _extract_json_string(raw, "model")
+    val finish = _extract_json_string(raw, "finish_reason")
+    val p_tok = _extract_json_int(raw, "prompt_tokens")
+    val c_tok = _extract_json_int(raw, "completion_tokens")
+    val t_tok = _extract_json_int(raw, "total_tokens")
+    var final_finish = finish
+    if final_finish == "":
+        final_finish = "stop"
+    OpenAIResponse(
+        content: content_text,
+        model: model_val,
+        finish_reason: final_finish,
+        prompt_tokens: p_tok,
+        completion_tokens: c_tok,
+        total_tokens: t_tok,
+        error: "",
+        is_error: false,
+        raw: raw
+    )
+
+# ============================================================================
+# Tests
+# ============================================================================
+
+describe "build_openai_body":
+    it "includes model":
+        val body = build_openai_body("gpt-4-turbo", "[]", 0, -1.0)
+        expect(body).to_contain("gpt-4-turbo")
+
+    it "defaults to gpt-4o":
+        val body = build_openai_body("", "[]", 0, -1.0)
+        expect(body).to_contain("gpt-4o")
+
+    it "includes messages":
+        val msgs = build_openai_messages_json(["user"], ["Hello"])
+        val body = build_openai_body("", msgs, 0, -1.0)
+        expect(body).to_contain("messages")
+        expect(body).to_contain("Hello")
+
+    it "includes max_tokens when set":
+        val body = build_openai_body("", "[]", 2048, -1.0)
+        expect(body).to_contain("2048")
+
+    it "omits max_tokens when zero":
+        val body = build_openai_body("", "[]", 0, -1.0)
+        expect(body).to_contain("model")
+
+    it "includes temperature when non-negative":
+        val body = build_openai_body("", "[]", 0, 0.7)
+        expect(body).to_contain("temperature")
+
+    it "omits temperature when negative":
+        val body = build_openai_body("", "[]", 0, -1.0)
+        expect(body).to_contain("model")
+
+describe "build_openai_headers":
+    it "includes bearer token":
+        val h = build_openai_headers("sk-test")
+        expect(h).to_contain("Authorization: Bearer sk-test")
+
+    it "includes content type":
+        val h = build_openai_headers("key")
+        expect(h).to_contain("Content-Type: application/json")
+
+describe "build_openai_messages_json":
+    it "builds single message":
+        val json = build_openai_messages_json(["user"], ["Hello"])
+        expect(json).to_start_with("[")
+        expect(json).to_end_with("]")
+        expect(json).to_contain("user")
+        expect(json).to_contain("Hello")
+
+    it "builds multi-turn conversation":
+        val json = build_openai_messages_json(["user", "assistant", "user"], ["Hi", "Hello!", "How are you?"])
+        expect(json).to_contain("user")
+        expect(json).to_contain("assistant")
+        expect(json).to_contain("Hi")
+        expect(json).to_contain("Hello!")
+        expect(json).to_contain("How are you?")
+
+describe "parse_openai_response":
+    it "parses success response":
+        var raw = _LB()
+        raw = raw + _Q() + "content" + _Q() + ":" + _Q() + "Hi there!" + _Q() + ","
+        raw = raw + _Q() + "model" + _Q() + ":" + _Q() + "gpt-4o" + _Q() + ","
+        raw = raw + _Q() + "finish_reason" + _Q() + ":" + _Q() + "stop" + _Q() + ","
+        raw = raw + _Q() + "prompt_tokens" + _Q() + ":50,"
+        raw = raw + _Q() + "completion_tokens" + _Q() + ":25,"
+        raw = raw + _Q() + "total_tokens" + _Q() + ":75"
+        raw = raw + _RB()
+        val resp = parse_openai_response(raw)
+        expect(resp.content).to_equal("Hi there!")
+        expect(resp.model).to_equal("gpt-4o")
+        expect(resp.finish_reason).to_equal("stop")
+        expect(resp.prompt_tokens).to_equal(50)
+        expect(resp.completion_tokens).to_equal(25)
+        expect(resp.total_tokens).to_equal(75)
+        expect(resp.is_error).to_equal(false)
+
+    it "handles empty response":
+        val resp = parse_openai_response("")
+        expect(resp.is_error).to_equal(true)
+        expect(resp.error).to_equal("empty response")
+
+    it "defaults finish reason to stop":
+        var raw = _LB()
+        raw = raw + _Q() + "content" + _Q() + ":" + _Q() + "Hello" + _Q()
+        raw = raw + _RB()
+        val resp = parse_openai_response(raw)
+        expect(resp.finish_reason).to_equal("stop")
+
+    it "preserves raw response":
+        var raw = _LB()
+        raw = raw + _Q() + "content" + _Q() + ":" + _Q() + "test" + _Q()
+        raw = raw + _RB()
+        val resp = parse_openai_response(raw)
+        expect(resp.raw).to_equal(raw)
+
+    it "handles zero token counts":
+        var raw = _LB()
+        raw = raw + _Q() + "content" + _Q() + ":" + _Q() + "Hi" + _Q()
+        raw = raw + _RB()
+        val resp = parse_openai_response(raw)
+        expect(resp.prompt_tokens).to_equal(0)
+        expect(resp.completion_tokens).to_equal(0)

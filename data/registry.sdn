@@ -1,0 +1,72 @@
+# simply capability registry — id|group|name|F|U|P|done|status|sspec
+# Scores: repo-audit estimates 2026-08-23, ±10pt. done = 55F+25U+20P (renorm when P=-).
+# status: declared|source_present|unit_verified|system_verified|usable
+I01|2A Programming foundation|Language semantics and type system|100|80|70|89|system_verified|planned
+I02|2A Programming foundation|Compiler, IR, backends, linker, loader|82|62|65|74|system_verified|planned
+I03|2A Programming foundation|Runtime, memory, concurrency|75|55|58|67|unit_verified|planned
+I04|2A Programming foundation|Standard library|65|48|55|59|unit_verified|planned
+I05|2A Programming foundation|FFI, ABI, interoperability|65|50|60|60|unit_verified|planned
+I06|2A Programming foundation|Build, package, dependency system|62|50|50|57|unit_verified|planned
+I07|2A Programming foundation|Testing, specification, assurance|86|72|70|79|system_verified|planned
+I08|2A Programming foundation|IDE, editor, debugger, docs|65|48|48|57|source_present|planned
+I09|2A Programming foundation|SCM, CI/CD, software forge|40|28|38|37|source_present|planned
+I10|2B OS/cloud/data foundation|CPU, accelerator, hardware toolchain|42|24|35|36|source_present|planned
+I11|2B OS/cloud/data foundation|General OS and hypervisor|48|30|42|42|unit_verified|planned
+I12|2B OS/cloud/data foundation|Embedded, RTOS, specialized profiles|45|28|45|41|unit_verified|planned
+I13|2B OS/cloud/data foundation|HAL, drivers, firmware, devices|38|23|38|34|source_present|planned
+I14|2B OS/cloud/data foundation|Storage and filesystem platform|38|24|40|35|unit_verified|planned
+I15|2B OS/cloud/data foundation|Networking and protocol platform|40|24|40|36|unit_verified|planned
+I16|2B OS/cloud/data foundation|Security, IAM, supply chain|35|22|42|33|source_present|planned
+I17|2B OS/cloud/data foundation|Observability, diagnostics, replay|45|32|48|42|source_present|planned
+I18|2B OS/cloud/data foundation|Database engine and server|32|18|28|28|unit_verified|planned
+I19|2B OS/cloud/data foundation|Data, search, analytics platform|22|12|22|20|source_present|planned
+I20|2B OS/cloud/data foundation|Messaging, event, workflow platform|32|20|30|29|source_present|planned
+I21|2B OS/cloud/data foundation|Distributed-systems substrate|15|8|18|14|declared|planned
+I22|2B OS/cloud/data foundation|Cloud, containers, orchestration|14|8|18|13|declared|planned
+I23|2B OS/cloud/data foundation|Web, API, integration platform|24|15|25|22|source_present|planned
+I24|2C UX/documents/AI/science|Browser and web platform|32|20|30|29|unit_verified|planned
+I25|2C UX/documents/AI/science|UI, TUI, GUI, accessibility, i18n|60|42|58|55|unit_verified|planned
+I26|2C UX/documents/AI/science|2D, 3D, scene, game, XR graphics|50|32|58|47|unit_verified|planned
+I27|2C UX/documents/AI/science|Image, audio, video, media pipeline|15|8|22|15|source_present|planned
+I28|2C UX/documents/AI/science|Document, Office, collaboration|45|26|32|38|source_present|planned
+I29|2C UX/documents/AI/science|Universal application kernel|35|20|28|30|source_present|planned
+I30|2C UX/documents/AI/science|AI, ML, agent platform|50|35|45|45|unit_verified|planned
+I31|2C UX/documents/AI/science|Mathematics, science, HPC|42|28|48|40|unit_verified|planned
+I32|2D Engineering/physical world|Simulation, multiphysics, twin, HIL|15|8|18|14|declared|planned
+I33|2D Engineering/physical world|Control, navigation, robotics|8|4|-|7|declared|planned
+I34|2D Engineering/physical world|CAD, CAE, CAM, EDA, PLM, MBSE|14|8|18|13|declared|planned
+I35|2D Engineering/physical world|Industrial, PLC, SCADA, MES|8|4|-|7|declared|planned
+I36|2D Engineering/physical world|GIS, mapping, terrain, ocean, weather|10|6|12|9|declared|planned
+I37|2D Engineering/physical world|Communications and collaboration|20|12|22|18|source_present|planned
+I38|2D Engineering/physical world|Universal resource/control plane|18|10|20|16|declared|planned
+A01|App: information domains|Productivity and collaboration|45|28|-|40|source_present|planned
+A02|App: information domains|Enterprise operations|35|20|-|30|source_present|planned
+A03|App: information domains|Commerce, hospitality, travel|28|16|-|24|source_present|planned
+A04|App: information domains|Education and training|15|8|-|13|declared|planned
+A05|App: information domains|Healthcare, clinical, biotech|7|4|-|6|declared|planned
+A06|App: information domains|Government, legal, public safety|10|6|-|9|declared|planned
+A07|App: information domains|Banking, insurance, capital markets|20|10|20|18|source_present|planned
+A08|App: information domains|Logistics, supply chain, postal|20|12|-|18|source_present|planned
+A09|App: information domains|Consumer, home, social, personal|12|8|-|11|declared|planned
+A10|App: software factory|Developer and software factory|78|60|65|71|system_verified|planned
+A11|App: software factory|IT, cloud, security operations|28|18|30|26|source_present|planned
+A12|App: media and interactive|Media, creative, publishing|10|6|18|11|declared|planned
+A13|App: media and interactive|Games, XR, interactive simulation|18|10|25|17|source_present|planned
+A14|App: physical industry|Manufacturing, factory automation|15|8|20|14|declared|planned
+A15|App: physical industry|Semiconductor design and fab|28|14|28|25|source_present|planned
+A16|App: physical industry|Robotics and autonomous machines|8|4|-|7|declared|planned
+A17|App: mobility|Automotive and road mobility|7|4|-|6|declared|planned
+A18|App: mobility|Rail and mass transit|4|2|-|3|declared|planned
+A19|App: mobility|Ship, maritime, port, offshore|5|3|-|4|declared|planned
+A20|App: mobility|Submarine, AUV, ROV, deep ocean|4|2|-|3|declared|planned
+A21|App: aerospace|Aircraft, helicopter, UAV, airport|7|4|-|6|declared|planned
+A22|App: aerospace|Rocket, launch vehicle, launch site|8|4|-|7|declared|planned
+A23|App: aerospace|Satellite, spacecraft, ground station|10|5|-|8|declared|planned
+A24|App: aerospace|Deep-space probe, robot, habitat|5|2|-|4|declared|planned
+A25|App: energy and industry|Energy, utilities, nuclear, grid|6|3|-|5|declared|planned
+A26|App: energy and industry|Mining, oil, gas, process industries|5|3|-|4|declared|planned
+A27|App: built and natural world|Architecture, civil, BIM, smart city|8|5|-|7|declared|planned
+A28|App: built and natural world|Agriculture, food, environment|6|4|-|5|declared|planned
+A29|App: telecom and science|Telecom, radio, network operator|14|8|18|13|source_present|planned
+A30|App: telecom and science|Science, HPC, lab, Earth, astronomy|30|18|40|29|source_present|planned
+A31|App: telecom and science|Safety-critical and mission systems|22|12|25|20|source_present|planned

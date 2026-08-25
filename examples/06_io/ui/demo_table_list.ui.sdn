@@ -1,0 +1,63 @@
+app:
+    title: "Table List Demo"
+    theme: glass_dark
+
+layout:
+    type: vbox
+    id: root
+    children:
+        table_panel:
+            type: panel
+            id: table_panel
+            title: "People Table"
+            children:
+                people:
+                    type: table
+                    id: people
+                    headers: "Name|Age|City"
+                    sort_column: ""
+                    sort_dir: "asc"
+                    filter_text: ""
+                    children:
+                        row_0:
+                            type: text
+                            id: people_row_0
+                            label: "Alice|30|Seoul"
+                        row_1:
+                            type: text
+                            id: people_row_1
+                            label: "Bob|25|Busan"
+                        row_2:
+                            type: text
+                            id: people_row_2
+                            label: "Carol|35|Incheon"
+                        row_3:
+                            type: text
+                            id: people_row_3
+                            label: "Dave|28|Daejeon"
+                        row_4:
+                            type: text
+                            id: people_row_4
+                            label: "Eve|32|Gwangju"
+        list_panel:
+            type: panel
+            id: list_panel
+            title: "Fruit List"
+            children:
+                fruits:
+                    type: list
+                    id: fruits
+                    selected_index: "2"
+                    items:
+                        0:
+                            label: "Apple"
+                        1:
+                            label: "Banana"
+                        2:
+                            label: "Cherry"
+                        3:
+                            label: "Date"
+                        4:
+                            label: "Elderberry"
+                        5:
+                            label: "Fig"

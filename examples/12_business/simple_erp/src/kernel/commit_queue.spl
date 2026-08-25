@@ -1,0 +1,58 @@
+# UBS Kernel — Per-tenant Commit Queue
+#
+# Multi-tenant writes are staged into one shared pending queue, then drained
+# per tenant: every pending write belonging to that tenant is staged into a
+# single Tx, in FIFO order, and committed atomically (all-or-nothing). Writes
+# belonging to OTHER tenants are left in the queue, in their original relative
+# order, untouched. This gives a single-writer-per-tenant property without any
+# lock: draining tenant A never observes or reorders tenant B's writes.
+#
+# ponytail: single-threaded queue proves the serialization property; wire to
+# one writer actor per tenant (std nogc_async_mut actors) when real
+# concurrency is needed.
+
+use kernel.event_log.{EventLog, append}
+use kernel.commit_loop.{Tx, begin, stage, commit}
+
+# One write waiting to be committed, tagged with the tenant it belongs to.
+struct PendingWrite:
+    val tenant_id: text
+    val kind: text
+    val entity: i64
+    val payload: text
+
+# The shared multi-tenant pending queue. Value type: enqueue returns a new
+# queue so callers cannot mutate history in place.
+struct CommitQueue:
+    val pending: [PendingWrite]
+
+# The result of draining one tenant: the committed log plus the queue with
+# that tenant's writes removed.
+struct DrainResult:
+    val log: EventLog
+    val queue: CommitQueue
+
+fn queue_new() -> CommitQueue:
+    var p: [PendingWrite] = []
+    return CommitQueue { pending: p }
+
+fn enqueue(q: CommitQueue, w: PendingWrite) -> CommitQueue:
+    var p = q.pending
+    p.push(w)
+    return CommitQueue { pending: p }
+
+# Stage every pending write of `tenant_id`, in FIFO order, into one Tx and
+# commit it atomically into `base`. Returns the new log and the queue with
+# that tenant's writes removed — other tenants' writes keep their relative
+# order. Draining an unknown/absent tenant is a no-op: base and queue pass
+# through unchanged.
+fn drain_tenant(q: CommitQueue, tenant_id: text, base: EventLog) -> DrainResult:
+    var tx = begin(base)
+    var remaining: [PendingWrite] = []
+    for w in q.pending:
+        if w.tenant_id == tenant_id:
+            tx = stage(tx, w.kind, w.entity, w.payload)
+        else:
+            remaining.push(w)
+    val new_log = commit(tx)
+    return DrainResult { log: new_log, queue: CommitQueue { pending: remaining } }

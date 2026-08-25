@@ -1,0 +1,92 @@
+# Unit tests for graph module
+
+use src.core.indexer.{IndexDb, open_index_memory, close_index_db, create_schema, index_note}
+use src.core.graph.{find_backlinks, find_forward_links, find_related, compute_authority, graph_walk, strip_extension, note_name_from_path}
+
+describe "Graph":
+    """Tests for link graph, backlinks, authority, and BFS traversal"""
+
+    context "backlinks":
+        """Finding notes that link TO a given note"""
+
+        it "finds backlinks":
+            val db = open_index_memory()
+            create_schema(db)
+            index_note(db, "/v/a.md", "a.md", "# A\n\nLinks to [[b]]", 1000)
+            index_note(db, "/v/b.md", "b.md", "# B\n\nTarget note", 1000)
+            val results = find_backlinks(db, "b.md")
+            # a.md links to b, so a.md should appear as a backlink
+            expect(results.len()).to_be_greater_than(0)
+            close_index_db(db)
+
+        it "returns empty when no backlinks":
+            val db = open_index_memory()
+            create_schema(db)
+            index_note(db, "/v/a.md", "a.md", "# A\n\nNo links", 1000)
+            val results = find_backlinks(db, "a.md")
+            expect(results.len()).to_equal(0)
+            close_index_db(db)
+
+    context "forward links":
+        """Finding notes that a given note links TO"""
+
+        it "finds forward links":
+            val db = open_index_memory()
+            create_schema(db)
+            index_note(db, "/v/a.md", "a.md", "# A\n\nLinks to [[b]]", 1000)
+            index_note(db, "/v/b.md", "b.md", "# B\n\nTarget", 1000)
+            val results = find_forward_links(db, "a.md")
+            expect(results.len()).to_be_greater_than(0)
+            close_index_db(db)
+
+    context "related notes":
+        """Finding related notes via backlinks + forward + shared tags"""
+
+        it "finds related notes":
+            val db = open_index_memory()
+            create_schema(db)
+            index_note(db, "/v/a.md", "a.md", "---\ntags: [project]\n---\n# A\n\n[[b]]", 1000)
+            index_note(db, "/v/b.md", "b.md", "---\ntags: [project]\n---\n# B\n\n[[a]]", 1000)
+            index_note(db, "/v/c.md", "c.md", "---\ntags: [project]\n---\n# C\n\nUnrelated", 1000)
+            val results = find_related(db, "a.md")
+            # Should find b (backlink + forward) and c (shared tag)
+            expect(results.len()).to_be_greater_than(0)
+            close_index_db(db)
+
+    context "authority score":
+        """Computing authority based on inbound links"""
+
+        it "computes higher authority for well-linked notes":
+            val db = open_index_memory()
+            create_schema(db)
+            index_note(db, "/v/hub.md", "hub.md", "# Hub\n\nCentral note", 1000)
+            index_note(db, "/v/a.md", "a.md", "# A\n\n[[hub]]", 1000)
+            index_note(db, "/v/b.md", "b.md", "# B\n\n[[hub]]", 1000)
+            index_note(db, "/v/c.md", "c.md", "# C\n\n[[hub]]", 1000)
+            val auth = compute_authority(db, "hub.md")
+            expect(auth).to_be_greater_than(0.0)
+            close_index_db(db)
+
+    context "graph walk":
+        """BFS traversal of the note graph"""
+
+        it "traverses connected notes":
+            val db = open_index_memory()
+            create_schema(db)
+            index_note(db, "/v/a.md", "a.md", "# A\n\n[[b]]", 1000)
+            index_note(db, "/v/b.md", "b.md", "# B\n\n[[c]]", 1000)
+            index_note(db, "/v/c.md", "c.md", "# C\n\nEnd", 1000)
+            val nodes = graph_walk(db, "a.md", 2)
+            expect(nodes.len()).to_be_greater_than(0)
+            close_index_db(db)
+
+    context "helpers":
+        """Utility functions"""
+
+        it "strips file extension":
+            expect(strip_extension("test.md")).to_equal("test")
+            expect(strip_extension("path/to/note.md")).to_equal("path/to/note")
+
+        it "extracts note name from path":
+            expect(note_name_from_path("projects/alpha.md")).to_equal("alpha")
+            expect(note_name_from_path("simple.md")).to_equal("simple")

@@ -1,0 +1,4 @@
+use logic_dram_durability_cases.*
+
+fn rv32_dram_durability_selftest() -> i32:
+    rv32_dram_durability_cases_selftest()

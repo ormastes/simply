@@ -1,0 +1,58 @@
+extern fn spl_dlopen(path: text) -> i64
+extern fn spl_dlsym(handle: i64, name: text) -> i64
+extern fn spl_wffi_call_i64(fptr: i64, args: [i64], nargs: i64) -> i64
+extern fn rt_env_get(name: text) -> text
+extern fn rt_file_exists(path: text) -> bool
+
+fn _call0(handle: i64, symbol: text) -> i64:
+    val fptr = spl_dlsym(handle, symbol)
+    if fptr == 0:
+        return 0
+    var args: [i64] = []
+    spl_wffi_call_i64(fptr, args, 0)
+
+fn _call1(handle: i64, symbol: text, arg0: i64) -> i64:
+    val fptr = spl_dlsym(handle, symbol)
+    if fptr == 0:
+        return 0
+    var args: [i64] = []
+    args.push(arg0)
+    spl_wffi_call_i64(fptr, args, 1)
+
+fn _find_bridge_path() -> text:
+    val env_path = rt_env_get("SIMPLE_ZLIB_BRIDGE_PATH")
+    if env_path != "" and rt_file_exists(env_path):
+        return env_path
+    val candidates = [
+        "build/examples/external_compression/libsimple_zlib_bridge.so",
+        "build/examples/external_compression/libsimple_zlib_bridge.dylib",
+        "build/examples/external_compression/simple_zlib_bridge.dll",
+        "examples/10_tooling/libraries/external_compression/build/libsimple_zlib_bridge.so",
+        "examples/10_tooling/libraries/external_compression/build/libsimple_zlib_bridge.dylib",
+        "examples/10_tooling/libraries/external_compression/build/simple_zlib_bridge.dll"
+    ]
+    for candidate in candidates:
+        if rt_file_exists(candidate):
+            return candidate
+    ""
+
+fn main() -> i64:
+    val bridge_path = _find_bridge_path()
+    if bridge_path == "":
+        print "missing external compression bridge"
+        print "set SIMPLE_ZLIB_BRIDGE_PATH or build examples/10_tooling/libraries/external_compression"
+        return 1
+
+    val handle = spl_dlopen(bridge_path)
+    if handle == 0:
+        print "failed to load bridge: " + bridge_path
+        return 2
+
+    val ok = _call0(handle, "simple_zlib_roundtrip_selftest")
+    if ok == 0:
+        print "bridge selftest failed"
+        print "inspect simple_zlib_last_error() from a debugger or host harness"
+        return 3
+
+    print "external zlib bridge roundtrip ok"
+    0

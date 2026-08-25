@@ -1,0 +1,153 @@
+app:
+    title: "Layout Demo"
+    theme: glass_dark
+
+layout:
+    type: vbox
+    children:
+        vbox_panel:
+            type: panel
+            title: "Vertical Layout (VBox)"
+            children:
+                vbox_content:
+                    type: vbox
+                    children:
+                        row1:
+                            type: text
+                            content: "Row 1"
+                        row2:
+                            type: text
+                            content: "Row 2"
+                        row3:
+                            type: text
+                            content: "Row 3"
+        hbox_panel:
+            type: panel
+            title: "Horizontal Layout (HBox)"
+            children:
+                hbox_content:
+                    type: hbox
+                    children:
+                        left:
+                            type: panel
+                            title: "Left (flex:1)"
+                            flex: 1
+                        center:
+                            type: panel
+                            title: "Center (flex:1)"
+                            flex: 1
+                        right:
+                            type: panel
+                            title: "Right (flex:1)"
+                            flex: 1
+        flex_panel:
+            type: panel
+            title: "Flex Sizing"
+            children:
+                flex_content:
+                    type: hbox
+                    children:
+                        narrow:
+                            type: panel
+                            title: "Narrow (1)"
+                            flex: 1
+                        medium:
+                            type: panel
+                            title: "Medium (2)"
+                            flex: 2
+                        wide:
+                            type: panel
+                            title: "Wide (3)"
+                            flex: 3
+        fixed_panel:
+            type: panel
+            title: "Fixed Width/Height"
+            children:
+                fixed_content:
+                    type: hbox
+                    children:
+                        fixed_left:
+                            type: panel
+                            title: "W:20"
+                            width: 20
+                            children:
+                                fixed_left_text:
+                                    type: text
+                                    content: "Fixed width"
+                        flex_mid:
+                            type: panel
+                            title: "Flex"
+                            flex: 1
+                            children:
+                                flex_mid_text:
+                                    type: text
+                                    content: "Fills remaining"
+                        fixed_right:
+                            type: panel
+                            title: "W:15"
+                            width: 15
+                            children:
+                                fixed_right_text:
+                                    type: text
+                                    content: "Fixed width"
+        grid_panel:
+            type: panel
+            title: "Grid Layout"
+            children:
+                grid_content:
+                    type: grid
+                    children:
+                        cell1:
+                            type: text
+                            content: "Cell 1"
+                        cell2:
+                            type: text
+                            content: "Cell 2"
+                        cell3:
+                            type: text
+                            content: "Cell 3"
+                        cell4:
+                            type: text
+                            content: "Cell 4"
+                        cell5:
+                            type: text
+                            content: "Cell 5"
+                        cell6:
+                            type: text
+                            content: "Cell 6"
+        nesting_panel:
+            type: panel
+            title: "Deep Nesting"
+            children:
+                nesting_content:
+                    type: vbox
+                    children:
+                        level1:
+                            type: panel
+                            title: "Level 1"
+                            children:
+                                level1_content:
+                                    type: hbox
+                                    children:
+                                        level2a:
+                                            type: panel
+                                            title: "Level 2A"
+                                            children:
+                                                level3:
+                                                    type: panel
+                                                    title: "Level 3"
+                                                    children:
+                                                        deep_text:
+                                                            type: text
+                                                            content: "Deeply nested content"
+                                        level2b:
+                                            type: panel
+                                            title: "Level 2B"
+                                            children:
+                                                sibling_text:
+                                                    type: text
+                                                    content: "Sibling branch"
+        status:
+            type: statusbar
+            left: "NORMAL MODE"
+            right: "Layout Demo"

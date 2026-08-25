@@ -1,0 +1,27 @@
+app:
+    title: "Hello Tauri"
+    theme: glass_dark
+
+layout:
+    type: vbox
+    id: root
+    children:
+        main:
+            type: panel
+            id: main
+            title: "Hello Tauri"
+            flex: 1
+            children:
+                greeting:
+                    type: text
+                    id: greeting
+                    content: "Hello World from Tauri!"
+                info:
+                    type: text
+                    id: info
+                    content: "Running inside a native Tauri window."
+        status:
+            type: statusbar
+            id: status
+            left: "NORMAL MODE"
+            right: "Hello Tauri"

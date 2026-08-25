@@ -1,0 +1,8 @@
+# llm-process-gen: managed source=pipe_release_repo_and_pull_req_tools source_sha256=597e07db61bbeaac71c0da6fbf123a1cc0baddd381bf528258cf3c2c573a9b75 content_sha256=053cfefede41c323f1bf0d7027ff078e9b508230b91cd81ce67d1405eeb87dbd
+skill_tools |skill, stage|
+    repo_and_pull_req, release
+
+tools |id, type, name, purpose|
+    git, cli, "git", "Commit, tag, and inspect release state"
+    version_files, cli, "VERSION / CHANGELOG.md updates", "Apply version bump and release notes"
+    npm, cli, "npm", "Run package checks when release/package paths changed"

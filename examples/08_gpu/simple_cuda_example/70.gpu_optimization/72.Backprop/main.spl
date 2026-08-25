@@ -1,0 +1,264 @@
+# 72. Backpropagation - one linear layer + ReLU + softmax cross-entropy
+#
+# The original exercise (72.Backprop_CPU_PyCUDA) hand-writes the CUDA kernels
+# for a forward pass, the backward pass, and an SGD update, and checks them
+# against a CPU implementation.
+#
+# Simple version keeps the same decomposition:
+#   linear_forward          y = x W + b
+#   relu_forward / backward
+#   softmax_xent_backward   d_logits = softmax(logits) - onehot(label)  (per row)
+#   linear_backward_input   dx = dy W^T
+#   linear_backward_weights dW = x^T dy,  db = sum_rows(dy)
+#   sgd_update              w -= lr * g
+#
+# Each step is a host function over flat row-major [f32] (the verified path)
+# plus the matching @gpu_kernel formulation (one thread per output element,
+# atomics for the weight gradient - exactly the kernels of the original).
+#
+# Status on this seed: the @gpu_kernel bodies are device-side documentation;
+# the host functions are what spec.spl verifies. The two linear products go
+# through gpu_gemm from std.gpu, which runs a CPU fallback here.
+
+use std.gpu.*
+
+# ============================================================================
+# Device-side formulations (one thread per output element)
+# ============================================================================
+
+@gpu_kernel
+fn relu_forward_kernel(input: GpuPtr, output: GpuPtr, n: i64):
+    val i = gpu_global_id_x()
+    if i < n:
+        val x = gpu_load_f32(input, i)
+        if x > 0.0:
+            gpu_store_f32(output, i, x)
+        else:
+            gpu_store_f32(output, i, 0.0)
+
+@gpu_kernel
+fn relu_backward_kernel(d_output: GpuPtr, input: GpuPtr, d_input: GpuPtr, n: i64):
+    val i = gpu_global_id_x()
+    if i < n:
+        if gpu_load_f32(input, i) > 0.0:
+            gpu_store_f32(d_input, i, gpu_load_f32(d_output, i))
+        else:
+            gpu_store_f32(d_input, i, 0.0)
+
+@gpu_kernel
+fn linear_backward_weights_kernel(d_output: GpuPtr, input: GpuPtr, d_weights: GpuPtr,
+                                  batch: i64, in_features: i64, out_features: i64):
+    # thread (i, o) accumulates over the batch with an atomic add
+    val i = gpu_global_id_x()
+    val o = gpu_global_id_y()
+    if i < in_features and o < out_features:
+        var b = 0
+        while b < batch:
+            gpu_atomic_add_f32(d_weights, i * out_features + o,
+                               gpu_load_f32(input, b * in_features + i) * gpu_load_f32(d_output, b * out_features + o))
+            b = b + 1
+
+@gpu_kernel
+fn sgd_update_kernel(weights: GpuPtr, gradients: GpuPtr, lr: f32, n: i64):
+    val i = gpu_global_id_x()
+    if i < n:
+        gpu_store_f32(weights, i, gpu_load_f32(weights, i) - lr * gpu_load_f32(gradients, i))
+
+# ============================================================================
+# Host implementations (verified path)
+# ============================================================================
+
+fn zeros(count: i64) -> [f32]:
+    [for i in 0..count: 0.0]
+
+fn transpose(mat: [f32], rows: i64, cols: i64) -> [f32]:
+    var result = zeros(rows * cols)
+    var i = 0
+    while i < rows:
+        var j = 0
+        while j < cols:
+            result[j * rows + i] = mat[i * cols + j]
+            j = j + 1
+        i = i + 1
+    result
+
+# y[b, o] = sum_i x[b, i] * w[i, o] + bias[o]
+fn linear_forward(input: [f32], weights: [f32], bias: [f32],
+                  batch: i64, in_features: i64, out_features: i64) -> Result<[f32], GpuError>:
+    var y = gpu_gemm(input, weights, batch, out_features, in_features)?
+    var b = 0
+    while b < batch:
+        var o = 0
+        while o < out_features:
+            y[b * out_features + o] = y[b * out_features + o] + bias[o]
+            o = o + 1
+        b = b + 1
+    Ok(y)
+
+fn relu_forward(input: [f32]) -> [f32]:
+    [for x in input: if x > 0.0: x else: 0.0]
+
+fn relu_backward(d_output: [f32], input: [f32]) -> [f32]:
+    var d_input = zeros(input.len())
+    var i = 0
+    while i < input.len():
+        if input[i] > 0.0:
+            d_input[i] = d_output[i]
+        i = i + 1
+    d_input
+
+fn softmax_row(logits: [f32], row: i64, classes: i64) -> [f32]:
+    var max_logit = logits[row * classes]
+    var c = 1
+    while c < classes:
+        if logits[row * classes + c] > max_logit:
+            max_logit = logits[row * classes + c]
+        c = c + 1
+    var probs = zeros(classes)
+    var total = 0.0
+    c = 0
+    while c < classes:
+        probs[c] = (logits[row * classes + c] - max_logit).exp()
+        total = total + probs[c]
+        c = c + 1
+    c = 0
+    while c < classes:
+        probs[c] = probs[c] / total
+        c = c + 1
+    probs
+
+# d_logits = (softmax(logits) - onehot(label)) / batch
+fn softmax_xent_backward(logits: [f32], labels: [i64], batch: i64, classes: i64) -> [f32]:
+    var d_logits = zeros(batch * classes)
+    var b = 0
+    while b < batch:
+        val probs = softmax_row(logits, b, classes)
+        var c = 0
+        while c < classes:
+            var g = probs[c]
+            if c == labels[b]:
+                g = g - 1.0
+            d_logits[b * classes + c] = g / (batch * 1.0)
+            c = c + 1
+        b = b + 1
+    d_logits
+
+# dx = dy W^T
+fn linear_backward_input(d_output: [f32], weights: [f32],
+                         batch: i64, in_features: i64, out_features: i64) -> Result<[f32], GpuError>:
+    gpu_gemm(d_output, transpose(weights, in_features, out_features), batch, in_features, out_features)
+
+# dW = x^T dy (the atomic-add kernel above computes exactly this sum)
+fn linear_backward_weights(d_output: [f32], input: [f32],
+                           batch: i64, in_features: i64, out_features: i64) -> [f32]:
+    var d_weights = zeros(in_features * out_features)
+    var i = 0
+    while i < in_features:
+        var o = 0
+        while o < out_features:
+            var b = 0
+            while b < batch:
+                d_weights[i * out_features + o] = d_weights[i * out_features + o] + input[b * in_features + i] * d_output[b * out_features + o]
+                b = b + 1
+            o = o + 1
+        i = i + 1
+    d_weights
+
+fn linear_backward_bias(d_output: [f32], batch: i64, out_features: i64) -> [f32]:
+    var d_bias = zeros(out_features)
+    var b = 0
+    while b < batch:
+        var o = 0
+        while o < out_features:
+            d_bias[o] = d_bias[o] + d_output[b * out_features + o]
+            o = o + 1
+        b = b + 1
+    d_bias
+
+fn sgd_update(weights: [f32], gradients: [f32], lr: f32) -> [f32]:
+    var updated = zeros(weights.len())
+    var i = 0
+    while i < weights.len():
+        updated[i] = weights[i] - lr * gradients[i]
+        i = i + 1
+    updated
+
+# ============================================================================
+# Layer + training step
+# ============================================================================
+
+class LinearLayer:
+    in_features: i64
+    out_features: i64
+    weights: [f32]
+    bias: [f32]
+    d_weights: [f32]
+    d_bias: [f32]
+
+    fn zero_grad():
+        self.d_weights = zeros(self.in_features * self.out_features)
+        self.d_bias = zeros(self.out_features)
+
+    fn apply_sgd(lr: f32):
+        self.weights = sgd_update(self.weights, self.d_weights, lr)
+        self.bias = sgd_update(self.bias, self.d_bias, lr)
+
+fn make_layer(in_features: i64, out_features: i64, init: f32) -> LinearLayer:
+    LinearLayer(in_features: in_features, out_features: out_features,
+                weights: [for i in 0..(in_features * out_features): init],
+                bias: zeros(out_features),
+                d_weights: zeros(in_features * out_features),
+                d_bias: zeros(out_features))
+
+fn cross_entropy_loss(logits: [f32], labels: [i64], batch: i64, classes: i64) -> f32:
+    var loss = 0.0
+    var b = 0
+    while b < batch:
+        val probs = softmax_row(logits, b, classes)
+        loss = loss - probs[labels[b]].log()
+        b = b + 1
+    loss / (batch * 1.0)
+
+# forward (linear -> relu -> linear as logits) is folded into one layer here:
+# logits = relu(x W + b); loss = CE(logits, labels). Returns the loss.
+fn train_step(layer: LinearLayer, input: [f32], labels: [i64], batch: i64, lr: f32) -> Result<f32, GpuError>:
+    val pre = linear_forward(input, layer.weights, layer.bias, batch, layer.in_features, layer.out_features)?
+    val logits = relu_forward(pre)
+    val loss = cross_entropy_loss(logits, labels, batch, layer.out_features)
+    val d_logits = softmax_xent_backward(logits, labels, batch, layer.out_features)
+    val d_pre = relu_backward(d_logits, pre)
+    layer.zero_grad()
+    layer.d_weights = linear_backward_weights(d_pre, input, batch, layer.in_features, layer.out_features)
+    layer.d_bias = linear_backward_bias(d_pre, batch, layer.out_features)
+    layer.apply_sgd(lr)
+    Ok(loss)
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn main():
+    val batch = 4
+    val in_features = 3
+    val classes = 2
+    val layer = make_layer(in_features, classes, 0.1)
+    # class 0 when the first feature dominates, class 1 otherwise
+    val input = [1.0, 0.0, 0.0,  0.0, 1.0, 1.0,  1.0, 0.1, 0.0,  0.0, 0.5, 1.0]
+    val labels = [0, 1, 0, 1]
+
+    print "Training a {in_features}->{classes} linear layer on batch={batch}"
+    var step = 0
+    var first_loss = 0.0
+    var last_loss = 0.0
+    while step < 20:
+        match train_step(layer, input, labels, batch, 0.5):
+            case Ok(loss):
+                if step == 0:
+                    first_loss = loss
+                last_loss = loss
+                if step % 5 == 0:
+                    print "  step {step}: loss={loss}"
+            case Err(e):
+                print "  error: {e.message}"
+        step = step + 1
+    print "loss decreased: {last_loss < first_loss}"

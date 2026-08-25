@@ -1,0 +1,12 @@
+use logic_band_address_cases.*
+use logic_band_count_cases.*
+use logic_band_valid_cases.*
+
+fn rv32_band_geometry_cases_selftest() -> i32:
+    if rv32_band_valid_cases_selftest() != 0:
+        return 1
+    if rv32_band_address_cases_selftest() != 0:
+        return 1
+    if rv32_band_count_cases_selftest() != 0:
+        return 1
+    0

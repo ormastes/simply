@@ -1,0 +1,77 @@
+# Layer Normalization — from scratch
+# Chapter 4: "Build a Large Language Model From Scratch" (Rasbt)
+#
+# Normalizes the last dimension of the input:
+#   y = (x - mean) / sqrt(var + eps) * gamma + beta
+#
+# Unlike BatchNorm, LayerNorm normalizes across features (not batch).
+
+use std.pure.tensor.{PureTensor, tensor_from_data, tensor_ones, tensor_zeros}
+use examples.simple_deeplearning_study.lib.util.math_helpers.{dl_sqrt}
+
+class StudyLayerNorm:
+    normalized_shape: i64      # Size of last dimension
+    eps: f64                   # Small constant for numerical stability
+    gamma: PureTensor<f64>     # Learnable scale [normalized_shape]
+    beta: PureTensor<f64>      # Learnable shift [normalized_shape]
+
+    static fn create(normalized_shape: i64) -> StudyLayerNorm:
+        StudyLayerNorm(
+            normalized_shape: normalized_shape,
+            eps: 0.00001,
+            gamma: tensor_ones([normalized_shape]),
+            beta: tensor_zeros([normalized_shape])
+        )
+
+    static fn create_with_eps(normalized_shape: i64, eps: f64) -> StudyLayerNorm:
+        StudyLayerNorm(
+            normalized_shape: normalized_shape,
+            eps: eps,
+            gamma: tensor_ones([normalized_shape]),
+            beta: tensor_zeros([normalized_shape])
+        )
+
+    # Forward pass
+    # x shape: [batch, normalized_shape] or [seq_len, normalized_shape]
+    # Normalizes along last dimension
+    fn forward(x: PureTensor<f64>) -> PureTensor<f64>:
+        val rows = x.shape[0]
+        val cols = x.shape[1]
+        var data: [f64] = []
+
+        var r = 0
+        while r < rows:
+            # Compute mean of this row
+            var row_sum = 0.0
+            var c = 0
+            while c < cols:
+                row_sum = row_sum + x.get([r, c])
+                c = c + 1
+            val row_mean = row_sum / (cols as f64)
+
+            # Compute variance of this row
+            var var_sum = 0.0
+            c = 0
+            while c < cols:
+                val diff = x.get([r, c]) - row_mean
+                var_sum = var_sum + diff * diff
+                c = c + 1
+            val row_var = var_sum / (cols as f64)
+
+            # Normalize: (x - mean) / sqrt(var + eps) * gamma + beta
+            val inv_std = 1.0 / dl_sqrt(row_var + self.eps)
+            c = 0
+            while c < cols:
+                val normalized = (x.get([r, c]) - row_mean) * inv_std
+                val scaled = normalized * self.gamma.get([c]) + self.beta.get([c])
+                data.push(scaled)
+                c = c + 1
+
+            r = r + 1
+
+        tensor_from_data(data, [rows, cols])
+
+fn study_layer_norm_create(size: i64) -> StudyLayerNorm:
+    StudyLayerNorm.create(size)
+
+export StudyLayerNorm, study_layer_norm_create

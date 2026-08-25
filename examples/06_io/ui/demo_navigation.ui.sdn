@@ -1,0 +1,66 @@
+app:
+    title: "Navigation Demo"
+    theme: glass_dark
+
+layout:
+    type: vbox
+    children:
+        main_menu:
+            type: menubar
+            id: main_menu
+            items:
+                0:
+                    label: "File"
+                1:
+                    label: "Edit"
+                2:
+                    label: "View"
+                3:
+                    label: "Help"
+        main_tabs:
+            type: tabs
+            id: main_tabs
+            children:
+                tab_dashboard:
+                    type: text
+                    label: "Dashboard"
+                tab_reports:
+                    type: text
+                    label: "Reports"
+                tab_settings:
+                    type: text
+                    label: "Settings"
+                tab_about:
+                    type: text
+                    label: "About"
+        dashboard:
+            type: panel
+            title: "Dashboard"
+            flex: 1
+            children:
+                welcome:
+                    type: text
+                    content: "Welcome to the Dashboard view."
+                menu_hint:
+                    type: text
+                    content: "Use the menu bar above to access application features."
+                tab_hint:
+                    type: text
+                    content: "Switch between tabs to see different content areas."
+                quick_stats:
+                    type: panel
+                    title: "Quick Stats"
+                    children:
+                        stat_users:
+                            type: text
+                            content: "Active Users: 1,234"
+                        stat_projects:
+                            type: text
+                            content: "Total Projects: 56"
+                        stat_tasks:
+                            type: text
+                            content: "Open Tasks: 89"
+        status:
+            type: statusbar
+            left: "NORMAL MODE"
+            right: "Navigation Demo"

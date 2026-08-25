@@ -1,0 +1,17 @@
+use os.game.steam.sffi_backend.{
+    steam_sffi_probe_configured_bridge
+}
+use os.game.steam.support_api.{
+    steam_api_backend_required_os_capabilities
+}
+
+fn main() -> i64:
+    val status = steam_sffi_probe_configured_bridge(true, steam_api_backend_required_os_capabilities())
+    if status.ready:
+        print "[steam-sffi-probe] ready=true symbols=20/20 os=11/11 mock_bridge=false real_steam_backend=true"
+        return 0
+    if status.mock_bridge:
+        print "[steam-sffi-probe] ready=false symbols=20/20 os=11/11 mock_bridge=true real_steam_backend=false blocker=" + status.blocker
+        return 1
+    print "[steam-sffi-probe] ready=false symbols=20/20 os=11/11 mock_bridge=false real_steam_backend=false blocker=" + status.blocker
+    1

@@ -1,0 +1,201 @@
+# 3D Rolling Ball — minimal playable-game skeleton proof (offscreen only).
+#
+# A dynamic physics sphere drops onto a static box floor (PhysicsWorld3D)
+# while drifting sideways; each sampled fixed step the sphere position is
+# read back and rendered through Engine3D (CPU backend, 160x120):
+#   - floor as a quad (2 triangles), ball as a triangle marker at its position
+# Proofs (PASS/FAIL lines + PPMs under build/):
+#   MOTION — ball screen centroid differs between early and late frames (G4.3)
+#   CAMERA — same late frame from a 2nd camera position yields a different framebuffer (G4.3)
+#   REST   — after ~40 steps the ball y settles above the floor top (physics+render integration)
+#
+# Run: SIMPLE_TIMEOUT_SECONDS=120 bin/simple run examples/11_advanced/game3d_rolling/main.spl
+
+use std.gpu.engine3d.engine.{Engine3D}
+use std.gpu.engine3d.types3d.{
+    vertex3d_pos_normal, material_unlit,
+    mat4_identity, mat4_perspective, mat4_look_at,
+    CULL_NONE, color3d_r, color3d_g, color3d_b
+}
+use std.common.engine.ids.{NodeId}
+use std.nogc_sync_mut.engine.physics.config.{default_physics_config_3d}
+use std.nogc_sync_mut.engine.physics.world3d.{PhysicsWorld3D}
+use std.io_runtime.{write_file}
+
+val W: i32 = 160
+val H: i32 = 120
+val BG: u32 = 0xFF202020
+val FLOOR_COLOR: u32 = 0xFF3060A0
+val BALL_COLOR: u32 = 0xFFCC3020
+val BALL_R: f64 = 0.5
+
+# Render floor quad + ball marker at (bx, by, bz), return framebuffer.
+fn render_frame(mut engine: Engine3D, bx: f64, by: f64, bz: f64) -> [u32]:
+    engine.begin_frame()
+    engine.clear(BG)
+    engine.clear_depth()
+    val model = mat4_identity()
+    val fm = material_unlit(FLOOR_COLOR)
+    # Floor top surface at y = 0.5, spanning x,z in [-6, 6].
+    engine.submit_triangle(
+        vertex3d_pos_normal(-6.0, 0.5, -6.0, 0.0, 1.0, 0.0),
+        vertex3d_pos_normal(6.0, 0.5, -6.0, 0.0, 1.0, 0.0),
+        vertex3d_pos_normal(6.0, 0.5, 6.0, 0.0, 1.0, 0.0),
+        fm, model)
+    engine.submit_triangle(
+        vertex3d_pos_normal(-6.0, 0.5, -6.0, 0.0, 1.0, 0.0),
+        vertex3d_pos_normal(6.0, 0.5, 6.0, 0.0, 1.0, 0.0),
+        vertex3d_pos_normal(-6.0, 0.5, 6.0, 0.0, 1.0, 0.0),
+        fm, model)
+    # Ball as a camera-facing triangle marker at the physics position.
+    val x = bx as f32
+    val y = by as f32
+    val z = bz as f32
+    val r = BALL_R as f32
+    engine.submit_triangle(
+        vertex3d_pos_normal(x, y + r, z, 0.0, 0.0, 1.0),
+        vertex3d_pos_normal(x - r, y - r, z, 0.0, 0.0, 1.0),
+        vertex3d_pos_normal(x + r, y - r, z, 0.0, 0.0, 1.0),
+        material_unlit(BALL_COLOR), model)
+    engine.end_frame()
+    engine.read_pixels()
+
+# Centroid of pixels matching color: [cx, cy, count].
+fn find_centroid(pixels: [u32], color: u32) -> [i64]:
+    var sx: i64 = 0
+    var sy: i64 = 0
+    var n: i64 = 0
+    var y = 0
+    while y < H:
+        var x = 0
+        while x < W:
+            if pixels[y * W + x] == color:
+                sx = sx + x
+                sy = sy + y
+                n = n + 1
+            x = x + 1
+        y = y + 1
+    if n == 0:
+        return [-1, -1, 0]
+    [sx / n, sy / n, n]
+
+fn diff_count(a: [u32], b: [u32]) -> i64:
+    var n: i64 = 0
+    var i = 0
+    while i < W * H:
+        if a[i] != b[i]:
+            n = n + 1
+        i = i + 1
+    n
+
+fn dump_ppm(path: text, pixels: [u32]) -> bool:
+    var body = ""
+    var y = 0
+    while y < H:
+        var row = ""
+        var x = 0
+        while x < W:
+            val p = pixels[y * W + x]
+            row = row + "{color3d_r(p)} {color3d_g(p)} {color3d_b(p)}\n"
+            x = x + 1
+        body = body + row
+        y = y + 1
+    write_file(path, "P3\n{W} {H}\n255\n" + body)
+
+fn abs_i(v: i64) -> i64:
+    if v < 0: -v else: v
+
+fn main():
+    # --- Physics world: static box floor + dynamic sphere with x drift ---
+    val config = default_physics_config_3d()
+    var world = PhysicsWorld3D.create(config)
+    val floor = NodeId(raw: 0)
+    world.add_static_body(floor, 0.0, 0.0, 0.0)
+    world.add_box_collider(floor, 6.0, 0.5, 6.0)
+    val ball = NodeId(raw: 1)
+    val ball_idx = world.add_dynamic_body(ball, -1.5, 3.0, 0.0, 1.0)
+    world.add_sphere_collider(ball, BALL_R)
+    world.bodies.vel_x[ball_idx] = 1.5  # sideways drift so it rolls along the floor
+
+    # --- Renderer ---
+    var engine = Engine3D.create(W, H)
+    print "backend: {engine.backend_name()}"
+    val proj = mat4_perspective(1.0472, (W as f32) / (H as f32), 0.1, 100.0)
+    val view1 = mat4_look_at(0.0, 3.0, 8.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0)
+    val view2 = mat4_look_at(5.0, 5.0, 6.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0)
+    engine.set_camera(view1, proj)
+    engine.set_cull_mode(CULL_NONE)
+
+    # --- Simulate 40 fixed steps, sampling early/mid/late frames ---
+    val dt = 1.0 / 30.0
+    var early: [u32] = []
+    var mid: [u32] = []
+    var late: [u32] = []
+    var step = 1
+    while step <= 40:
+        world.step(dt)
+        if step == 6:
+            val p = world.get_position(ball)
+            print "step {step}: ball=({p.x},{p.y},{p.z})"
+            early = render_frame(engine, p.x, p.y, p.z)
+        if step == 20:
+            val p = world.get_position(ball)
+            print "step {step}: ball=({p.x},{p.y},{p.z})"
+            mid = render_frame(engine, p.x, p.y, p.z)
+        if step == 40:
+            val p = world.get_position(ball)
+            print "step {step}: ball=({p.x},{p.y},{p.z})"
+            late = render_frame(engine, p.x, p.y, p.z)
+        step = step + 1
+
+    var ok = true
+
+    # --- MOTION: ball screen centroid moves between early and late frames ---
+    val c_early = find_centroid(early, BALL_COLOR)
+    val c_late = find_centroid(late, BALL_COLOR)
+    print "ball centroid early=({c_early[0]},{c_early[1]}) n={c_early[2]} late=({c_late[0]},{c_late[1]}) n={c_late[2]}"
+    val moved = abs_i(c_late[0] - c_early[0]) + abs_i(c_late[1] - c_early[1])
+    if (c_early[2] > 0 and c_late[2] > 0 and moved > 3):
+        print "PASS MOTION ball moved {moved}px in screen space between early and late frames"
+    else:
+        print "FAIL MOTION moved={moved}px early_n={c_early[2]} late_n={c_late[2]}"
+        ok = false
+
+    # --- CAMERA: same late scene from a second camera differs ---
+    val fp = world.get_position(ball)
+    engine.set_camera(view2, proj)
+    val late_cam2 = render_frame(engine, fp.x, fp.y, fp.z)
+    val ndiff = diff_count(late, late_cam2)
+    if ndiff > 50:
+        print "PASS CAMERA second camera framebuffer differs in {ndiff} pixels"
+    else:
+        print "FAIL CAMERA framebuffers differ in only {ndiff} pixels"
+        ok = false
+
+    # --- REST: ball settled above floor top (y=0.5) near contact height ---
+    if (fp.y > 0.55 and fp.y < 1.4):
+        print "PASS REST ball settled at y={fp.y} above floor top 0.5"
+    else:
+        print "FAIL REST ball y={fp.y} not in (0.55, 1.4)"
+        ok = false
+
+    # --- Dump PPMs ---
+    if not dump_ppm("build/game3d_rolling_early.ppm", early):
+        print "FAIL could not write early ppm"
+        ok = false
+    if not dump_ppm("build/game3d_rolling_mid.ppm", mid):
+        print "FAIL could not write mid ppm"
+        ok = false
+    if not dump_ppm("build/game3d_rolling_late.ppm", late):
+        print "FAIL could not write late ppm"
+        ok = false
+    if not dump_ppm("build/game3d_rolling_late_cam2.ppm", late_cam2):
+        print "FAIL could not write late cam2 ppm"
+        ok = false
+    print "wrote build/game3d_rolling_{{early,mid,late,late_cam2}}.ppm"
+
+    world.destroy()
+    if ok:
+        print "GAME3D_ROLLING PASS"
+    else:
+        print "GAME3D_ROLLING FAIL"

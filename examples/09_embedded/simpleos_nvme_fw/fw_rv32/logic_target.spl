@@ -1,0 +1,4 @@
+use logic_target_cases.*
+
+pub fn rv32_target_profile_selftest() -> i32:
+    rv32_target_cases_selftest()

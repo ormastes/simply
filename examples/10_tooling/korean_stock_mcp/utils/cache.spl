@@ -1,0 +1,60 @@
+#![allow(unnamed_duplicate_typed_args)]
+# Korean Stock MCP - TTL-based in-memory cache
+#
+# Simple key-value cache with expiry timestamps.
+# Uses Unix epoch seconds for TTL tracking.
+
+var CACHE_KEYS: [text] = []
+var CACHE_VALUES: [text] = []
+var CACHE_EXPIRY: [i64] = []
+
+fn get_unix_time() -> i64:
+    var out = ""
+    var err = ""
+    var rc: i64 = 0
+    (out, err, rc) = rt_process_run("/bin/sh", ["-c", "date +%s"])
+    int(out.trim()) ?? 0
+
+fn cache_get(key: text) -> text:
+    val now = get_unix_time()
+    var i = 0
+    var cache_len = CACHE_KEYS.len()
+    while i < cache_len:
+        if CACHE_KEYS[i] == key:
+            if CACHE_EXPIRY[i] > now:
+                return CACHE_VALUES[i]
+            # Expired - remove entry
+            CACHE_KEYS.remove(i)
+            CACHE_VALUES.remove(i)
+            CACHE_EXPIRY.remove(i)
+            return ""
+        i = i + 1
+    ""
+
+fn cache_set(key: text, value: text, ttl_seconds: i64):
+    val now = get_unix_time()
+    val expiry = now + ttl_seconds
+    # Check if key exists and update
+    var i = 0
+    var cache_len = CACHE_KEYS.len()
+    while i < cache_len:
+        if CACHE_KEYS[i] == key:
+            CACHE_VALUES[i] = value
+            CACHE_EXPIRY[i] = expiry
+            return
+        i = i + 1
+    # Add new entry
+    CACHE_KEYS.push(key)
+    CACHE_VALUES.push(value)
+    CACHE_EXPIRY.push(expiry)
+
+fn cache_clear():
+    CACHE_KEYS = []
+    CACHE_VALUES = []
+    CACHE_EXPIRY = []
+
+# TTL constants
+val CACHE_TTL_PRICE: i64 = 60       # 1 minute for live prices
+val CACHE_TTL_LIST: i64 = 86400     # 24 hours for stock lists
+val CACHE_TTL_NEWS: i64 = 300       # 5 minutes for news
+val CACHE_TTL_INDEX: i64 = 60       # 1 minute for market index

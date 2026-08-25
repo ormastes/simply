@@ -1,0 +1,179 @@
+use os.kernel.boot.riscv_noalloc_handoff.{riscv_noalloc_handoff, riscv_noalloc_boot_idle}
+use os.kernel.boot.riscv_noalloc_heap.{riscv_noalloc_heap_init}
+use os.kernel.boot.riscv_noalloc_log.{riscv_noalloc_log_init, riscv_noalloc_log_boot_ok}
+use os.kernel.boot.riscv_noalloc_services.{riscv_noalloc_services_init}
+use os.crypto.curve25519.{x25519_base}
+use os.crypto.curve25519_smalllimb.{x25519_smalllimb_base_point_probe, x25519_smalllimb_clamp_probe, x25519_smalllimb_mask_probe, x25519_smalllimb_roundtrip_probe}
+
+extern fn serial_println(msg: text)
+extern fn rt_bytes_u8_at(arr: [u8], idx: i64) -> i64
+extern fn rt_riscv_qemu_ram_base() -> u64
+extern fn rt_riscv_qemu_ram_size() -> u64
+extern fn rt_riscv_qemu_reserved_end() -> u64
+extern fn rt_riscv_qemu_heap_start() -> u64
+extern fn rt_riscv_qemu_heap_size() -> u64
+extern fn rt_riscv_noalloc_pmm_init(ram_base: u64, ram_size: u64, reserved_end: u64, heap_start: u64) -> bool
+
+@section(".text.entry")
+@naked
+fn _start():
+    asm volatile:
+        "mv      s0, a0"
+        "mv      s1, a1"
+        "bnez    s0, .Lrv64_x25519_halt"
+        "la      sp, _stack_top"
+        "la      t0, _sbss"
+        "la      t1, _ebss"
+        ".Lrv64_x25519_bss_loop:"
+        "bgeu    t0, t1, .Lrv64_x25519_bss_done"
+        "sd      zero, 0(t0)"
+        "addi    t0, t0, 8"
+        "j       .Lrv64_x25519_bss_loop"
+        ".Lrv64_x25519_bss_done:"
+        "mv      a0, s0"
+        "mv      a1, s1"
+        "call    m_09_embedded__simple_os__arch__riscv64__x25519_probe_entry__rv64_x25519_probe_boot_main"
+        ".Lrv64_x25519_halt:"
+        "wfi"
+        "j       .Lrv64_x25519_halt"
+
+fn _byte_at(data: [u8], idx: i64) -> u8:
+    rt_bytes_u8_at(data, idx).to_u8()
+
+fn _push_byte(out: [u8], byte_val: i64) -> [u8]:
+    var next = out
+    next.push((byte_val & 0xFF).to_u8())
+    next
+
+fn _hex_digit(n: u8) -> text:
+    if n == 0x0: return "0"
+    if n == 0x1: return "1"
+    if n == 0x2: return "2"
+    if n == 0x3: return "3"
+    if n == 0x4: return "4"
+    if n == 0x5: return "5"
+    if n == 0x6: return "6"
+    if n == 0x7: return "7"
+    if n == 0x8: return "8"
+    if n == 0x9: return "9"
+    if n == 0xA: return "a"
+    if n == 0xB: return "b"
+    if n == 0xC: return "c"
+    if n == 0xD: return "d"
+    if n == 0xE: return "e"
+    "f"
+
+fn _hex(data: [u8]) -> text:
+    var out = ""
+    var i: i64 = 0
+    while i < data.len().to_i64():
+        val b = _byte_at(data, i)
+        out = out + _hex_digit((b / 16) & 0x0F)
+        out = out + _hex_digit(b & 0x0F)
+        i = i + 1
+    out
+
+fn _live_bootstrap_private() -> [u8]:
+    var key: [u8] = []
+    key = _push_byte(key, 0x48)
+    key = _push_byte(key, 0x9c)
+    key = _push_byte(key, 0x2a)
+    key = _push_byte(key, 0x61)
+    key = _push_byte(key, 0xf5)
+    key = _push_byte(key, 0x33)
+    key = _push_byte(key, 0x17)
+    key = _push_byte(key, 0xb8)
+    key = _push_byte(key, 0x2d)
+    key = _push_byte(key, 0x74)
+    key = _push_byte(key, 0xa1)
+    key = _push_byte(key, 0x0e)
+    key = _push_byte(key, 0xcc)
+    key = _push_byte(key, 0x59)
+    key = _push_byte(key, 0x83)
+    key = _push_byte(key, 0x42)
+    key = _push_byte(key, 0x91)
+    key = _push_byte(key, 0x06)
+    key = _push_byte(key, 0xdf)
+    key = _push_byte(key, 0x38)
+    key = _push_byte(key, 0xbe)
+    key = _push_byte(key, 0x27)
+    key = _push_byte(key, 0x65)
+    key = _push_byte(key, 0xaa)
+    key = _push_byte(key, 0x14)
+    key = _push_byte(key, 0xe7)
+    key = _push_byte(key, 0x90)
+    key = _push_byte(key, 0x4b)
+    key = _push_byte(key, 0x6c)
+    key = _push_byte(key, 0x21)
+    key = _push_byte(key, 0xd3)
+    key = _push_byte(key, 0x7f)
+    key
+
+fn _live_bootstrap_public_expected() -> [u8]:
+    var expected: [u8] = []
+    expected = _push_byte(expected, 0x8c)
+    expected = _push_byte(expected, 0x16)
+    expected = _push_byte(expected, 0xc1)
+    expected = _push_byte(expected, 0xdd)
+    expected = _push_byte(expected, 0x75)
+    expected = _push_byte(expected, 0xb7)
+    expected = _push_byte(expected, 0x97)
+    expected = _push_byte(expected, 0xa2)
+    expected = _push_byte(expected, 0x9b)
+    expected = _push_byte(expected, 0xa2)
+    expected = _push_byte(expected, 0xc1)
+    expected = _push_byte(expected, 0x7e)
+    expected = _push_byte(expected, 0xb5)
+    expected = _push_byte(expected, 0xa7)
+    expected = _push_byte(expected, 0x68)
+    expected = _push_byte(expected, 0xe4)
+    expected = _push_byte(expected, 0x4a)
+    expected = _push_byte(expected, 0x76)
+    expected = _push_byte(expected, 0x0b)
+    expected = _push_byte(expected, 0x9a)
+    expected = _push_byte(expected, 0x0d)
+    expected = _push_byte(expected, 0x0f)
+    expected = _push_byte(expected, 0x8c)
+    expected = _push_byte(expected, 0x59)
+    expected = _push_byte(expected, 0x72)
+    expected = _push_byte(expected, 0xca)
+    expected = _push_byte(expected, 0xfb)
+    expected = _push_byte(expected, 0x72)
+    expected = _push_byte(expected, 0xef)
+    expected = _push_byte(expected, 0xe1)
+    expected = _push_byte(expected, 0x03)
+    expected = _push_byte(expected, 0x37)
+    expected
+
+fn rv64_x25519_probe_boot_main(hart_id: u64, dtb_addr: u64):
+    riscv_noalloc_log_init()
+    riscv_noalloc_handoff(hart_id, dtb_addr)
+    rt_riscv_noalloc_pmm_init(
+        rt_riscv_qemu_ram_base(),
+        rt_riscv_qemu_ram_size(),
+        rt_riscv_qemu_reserved_end(),
+        rt_riscv_qemu_heap_start()
+    )
+    riscv_noalloc_heap_init(rt_riscv_qemu_heap_start(), rt_riscv_qemu_heap_size())
+    riscv_noalloc_services_init(true)
+    riscv_noalloc_log_boot_ok()
+    spl_start()
+    riscv_noalloc_boot_idle()
+
+@export("C")
+fn spl_start():
+    serial_println("=== RV64 X25519 pure probe ===")
+    val private = _live_bootstrap_private()
+    val expected = _live_bootstrap_public_expected()
+    val base_point = x25519_smalllimb_base_point_probe()
+    serial_println("X25519_PROBE_PRIVATE=" + _hex(private))
+    serial_println("X25519_PROBE_CLAMP=" + _hex(x25519_smalllimb_clamp_probe(private)))
+    serial_println("X25519_PROBE_BASE=" + _hex(base_point))
+    serial_println("X25519_PROBE_MASK=" + _hex(x25519_smalllimb_mask_probe(base_point)))
+    serial_println("X25519_PROBE_ROUNDTRIP=" + _hex(x25519_smalllimb_roundtrip_probe(base_point)))
+    serial_println("X25519_PROBE_SHALLOW_DONE")
+
+    val actual = x25519_base(private)
+    serial_println("X25519_PROBE_ACTUAL=" + _hex(actual))
+    serial_println("X25519_PROBE_EXPECTED=" + _hex(expected))
+    serial_println("X25519_PROBE_FULL_DONE")

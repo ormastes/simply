@@ -1,0 +1,124 @@
+use std.web_framework.controller.{ControllerContext, HttpResponseData, ViewData, render_page, render_redirect, render_json}
+use std.web_framework.session.{session_get}
+use std.web_framework.flash.{flash_add}
+use std.web_framework.csrf_integration.{csrf_token_for_session, verify_csrf_token}
+use std.web_framework.form_validation.{Validator, Required, MinLength}
+use std.nogc_sync_mut.io.time_ops.{time_now_unix_micros}
+
+use models.order.{Order, create_order_repository, find_order_by_id}
+use models.delivery.{
+    DeliveryRequest, create_delivery_repository,
+    find_delivery_for_order, find_pending_deliveries, find_delivery_by_id
+}
+use services.email_service.{
+    build_delivery_confirmation_email, build_order_status_email, send_notification
+}
+
+fn require_admin(ctx: ControllerContext) -> Result<text, text>:
+    val username = session_get(ctx, "admin_username")
+    if username.?:
+        Result.ok(username.unwrap())
+    else:
+        Result.err("Not authenticated")
+
+# --- Customer Delivery Request ---
+
+@public
+fn action_request_form(ctx: ControllerContext) -> HttpResponseData:
+    val order_id = ctx.params.get("order_id").unwrap_or("0").parse_i64().unwrap_or(0)
+    val orepo = create_order_repository(ctx.db())
+    val order = find_order_by_id(orepo, order_id)?
+
+    val data = ViewData.new()
+        .set("title", "Request Delivery")
+        .set("order_id", "{order.id}")
+        .set("csrf_token", csrf_token_for_session(ctx))
+    render_page(ctx, "delivery/request_form", data.to_dict())
+
+@public
+fn action_request_delivery(ctx: ControllerContext) -> HttpResponseData:
+    val csrf = ctx.form_value("csrf_token")
+    if not verify_csrf_token(ctx, csrf):
+        flash_add(ctx, "error", "Invalid form submission.")
+        return render_redirect(ctx, "/")
+
+    val order_id = ctx.params.get("order_id").unwrap_or("0").parse_i64().unwrap_or(0)
+    val name = ctx.form_value("customer_name")
+    val phone = ctx.form_value("customer_phone")
+    val email = ctx.form_value("customer_email")
+    val address = ctx.form_value("address")
+    val notes = ctx.form_value("delivery_notes")
+
+    val now = "{time_now_unix_micros()}"
+    val drepo = create_delivery_repository(ctx.db())
+    val delivery = DeliveryRequest(
+        id: 0,
+        order_id: order_id,
+        customer_name: name,
+        customer_phone: phone,
+        customer_email: email,
+        address: address,
+        delivery_notes: notes,
+        status: "requested",
+        estimated_time: "",
+        created_at: now,
+        updated_at: now
+    )
+    drepo.save(delivery)?
+
+    if email != "":
+        val body = build_delivery_confirmation_email(delivery)
+        send_notification(email, "Delivery Confirmation - Order #{order_id}", body)
+
+    flash_add(ctx, "success", "Delivery requested!")
+    render_redirect(ctx, "/order/{order_id}/status")
+
+# --- Admin Delivery Management ---
+
+fn action_index(ctx: ControllerContext) -> HttpResponseData:
+    val admin = require_admin(ctx)?
+    val drepo = create_delivery_repository(ctx.db())
+    val deliveries = find_pending_deliveries(drepo)
+
+    val data = ViewData.new()
+        .set("title", "Deliveries")
+        .set("csrf_token", csrf_token_for_session(ctx))
+    render_page(ctx, "delivery/index", data.to_dict())
+
+fn action_update_status(ctx: ControllerContext) -> HttpResponseData:
+    val admin = require_admin(ctx)?
+    val csrf = ctx.form_value("csrf_token")
+    if not verify_csrf_token(ctx, csrf):
+        flash_add(ctx, "error", "Invalid form submission.")
+        return render_redirect(ctx, "/admin/deliveries")
+
+    val id = ctx.params.get("id").unwrap_or("0").parse_i64().unwrap_or(0)
+    val new_status = ctx.form_value("status")
+    val estimated_time = ctx.form_value("estimated_time")
+
+    val drepo = create_delivery_repository(ctx.db())
+    val delivery = find_delivery_by_id(drepo, id)?
+
+    val updated = DeliveryRequest(
+        id: delivery.id,
+        order_id: delivery.order_id,
+        customer_name: delivery.customer_name,
+        customer_phone: delivery.customer_phone,
+        customer_email: delivery.customer_email,
+        address: delivery.address,
+        delivery_notes: delivery.delivery_notes,
+        status: if new_status == "": delivery.status else: new_status,
+        estimated_time: if estimated_time == "": delivery.estimated_time else: estimated_time,
+        created_at: delivery.created_at,
+        updated_at: "{time_now_unix_micros()}"
+    )
+    drepo.update(updated)?
+
+    if delivery.customer_email != "" and new_status != "":
+        val orepo = create_order_repository(ctx.db())
+        val order = find_order_by_id(orepo, delivery.order_id)?
+        val body = build_order_status_email(order, delivery.customer_email)
+        send_notification(delivery.customer_email, "Delivery Update - Order #{delivery.order_id}", body)
+
+    flash_add(ctx, "success", "Delivery #{id} updated.")
+    render_redirect(ctx, "/admin/deliveries")

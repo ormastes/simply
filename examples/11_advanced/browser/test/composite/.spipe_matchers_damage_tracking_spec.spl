@@ -1,0 +1,179 @@
+#![allow(REQC001)]
+#![allow(REQC004)]
+#![allow(unnamed_duplicate_typed_args)]
+"""
+# Damage Tracking
+
+Tests for damage tracking functionality.
+"""
+#![allow(unnamed_duplicate_typed_args)]
+use std.spec
+use std.common.engine.rect.{Rect2}
+# Check if two rects overlap
+fn rects_overlap(a: Rect2, b: Rect2) -> bool:
+    if a.x >= b.right():
+        return false
+    if b.x >= a.right():
+        return false
+    if a.y >= b.bottom():
+        return false
+    if b.y >= a.bottom():
+        return false
+    true
+
+# Compute union bounding box of two rects
+fn union_rect(a: Rect2, b: Rect2) -> Rect2:
+    var min_x = a.x
+    if b.x < min_x:
+        min_x = b.x
+    var min_y = a.y
+    if b.y < min_y:
+        min_y = b.y
+    var max_right = a.right()
+    if b.right() > max_right:
+        max_right = b.right()
+    var max_bottom = a.bottom()
+    if b.bottom() > max_bottom:
+        max_bottom = b.bottom()
+    Rect2.new(min_x, min_y, max_right - min_x, max_bottom - min_y)
+
+# Damage tracker: collects damaged regions
+class DamageTracker:
+    regions: [Rect2]
+    viewport_width: f64
+    viewport_height: f64
+
+    static fn create(vw: f64, vh: f64) -> DamageTracker:
+        DamageTracker(regions: [], viewport_width: vw, viewport_height: vh)
+
+    me add_damage(rect: Rect2):
+        # Try to merge with existing overlapping region
+        var merged = false
+        var i = 0
+        while i < self.regions.len():
+            val current = self.regions[i]
+            if rects_overlap(current, rect):
+                self.regions[i] = union_rect(current, rect)
+                merged = true
+                i = self.regions.len()  # break
+            i = i + 1
+        if not merged:
+            self.regions = self.regions + [rect]
+
+    me clear():
+        self.regions = []
+
+    fn total_damage_area() -> f64:
+        var total = 0.0
+        for r in self.regions:
+            total = total + (r.width * r.height)
+        total
+
+    fn is_full_repaint() -> bool:
+        var viewport_area = self.viewport_width * self.viewport_height
+        var damage = self.total_damage_area()
+        damage >= viewport_area * 0.8
+
+# Tile dirty marking
+class Tile:
+    x: i64
+    y: i64
+    dirty: bool
+
+    static fn create(x: i64, y: i64) -> Tile:
+        Tile(x: x, y: y, dirty: false)
+
+fn mark_tiles_dirty(tiles: [Tile], damage: Rect2, tile_size: f64) -> [Tile]:
+    var result = []
+    for tile in tiles:
+        var tile_x = tile.x.to_f64() * tile_size
+        var tile_y = tile.y.to_f64() * tile_size
+        var tile_rect = Rect2.new(tile_x, tile_y, tile_size, tile_size)
+        if rects_overlap(tile_rect, damage):
+            var dirty_tile = Tile.create(tile.x, tile.y)
+            dirty_tile.dirty = true
+            result = result + [dirty_tile]
+        else:
+            result = result + [tile]
+    result
+
+describe "DamageTracking":
+    """
+    ## Damagetracking Tests
+
+    Validates DamageTracking functionality.
+    """
+
+    describe "region management":
+        it "add_damage records region":
+            var tracker = DamageTracker.create(800.0, 600.0)
+            tracker.add_damage(Rect2.new(10.0, 20.0, 100.0, 50.0))
+            expect tracker.regions.len() == 1
+            expect tracker.regions[0].x == 10.0
+            expect tracker.regions[0].y == 20.0
+
+        it "clear removes all regions":
+            var tracker = DamageTracker.create(800.0, 600.0)
+            tracker.add_damage(Rect2.new(0.0, 0.0, 50.0, 50.0))
+            tracker.add_damage(Rect2.new(200.0, 200.0, 50.0, 50.0))
+            expect tracker.regions.len() == 2
+            tracker.clear()
+            expect tracker.regions.len() == 0
+
+    describe "merging":
+        it "overlapping rects merge":
+            var tracker = DamageTracker.create(800.0, 600.0)
+            tracker.add_damage(Rect2.new(10.0, 10.0, 100.0, 100.0))
+            tracker.add_damage(Rect2.new(50.0, 50.0, 100.0, 100.0))
+            # Should merge into one region
+            expect tracker.regions.len() == 1
+
+        it "non-overlapping rects stay separate":
+            var tracker = DamageTracker.create(800.0, 600.0)
+            tracker.add_damage(Rect2.new(0.0, 0.0, 50.0, 50.0))
+            tracker.add_damage(Rect2.new(200.0, 200.0, 50.0, 50.0))
+            expect tracker.regions.len() == 2
+
+        it "merge produces union bounding box":
+            var a = Rect2.new(10.0, 10.0, 100.0, 100.0)
+            var b = Rect2.new(50.0, 50.0, 100.0, 100.0)
+            var merged = union_rect(a, b)
+            expect merged.x == 10.0
+            expect merged.y == 10.0
+            expect merged.width == 140.0
+            expect merged.height == 140.0
+
+    describe "area and repaint":
+        it "total_damage_area sums all regions":
+            var tracker = DamageTracker.create(800.0, 600.0)
+            tracker.add_damage(Rect2.new(0.0, 0.0, 100.0, 100.0))
+            tracker.add_damage(Rect2.new(500.0, 500.0, 50.0, 50.0))
+            var total = tracker.total_damage_area()
+            # 100*100 + 50*50 = 10000 + 2500 = 12500
+            expect total == 12500.0
+
+        it "is_full_repaint detects large damage":
+            var tracker = DamageTracker.create(800.0, 600.0)
+            # viewport area = 480000, 80% = 384000
+            tracker.add_damage(Rect2.new(0.0, 0.0, 800.0, 500.0))
+            # damage area = 400000 > 384000
+            expect tracker.is_full_repaint() == true
+
+    describe "tile integration":
+        it "damage triggers tile dirty marking":
+            var tiles = [
+                Tile.create(0, 0),
+                Tile.create(1, 0),
+                Tile.create(2, 0),
+                Tile.create(0, 1)
+            ]
+            var damage = Rect2.new(10.0, 10.0, 50.0, 50.0)
+            var result = mark_tiles_dirty(tiles, damage, 256.0)
+            # Tile (0,0) covers 0..256 x 0..256, overlaps with damage at 10,10
+            expect result[0].dirty == true
+            # Tile (1,0) covers 256..512 x 0..256, no overlap
+            expect result[1].dirty == false
+            # Tile (2,0) covers 512..768 x 0..256, no overlap
+            expect result[2].dirty == false
+            # Tile (0,1) covers 0..256 x 256..512, no overlap
+            expect result[3].dirty == false

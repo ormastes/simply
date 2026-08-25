@@ -1,0 +1,22 @@
+use logic_media_retire_core.*
+
+fn rv32_media_result_cases_selftest() -> i32:
+    if _rv32_media_result_retires(3) != 1:
+        return 1
+    if _rv32_media_result_retires(4) != 1:
+        return 1
+    if _rv32_media_result_retires(5) != 1:
+        return 1
+    if _rv32_media_result_retires(0) != 0:
+        return 1
+    if _rv32_media_bad_count_clamped(-1) != 0:
+        return 1
+    if _rv32_media_bad_count_clamped(65) != 64:
+        return 1
+    if _rv32_media_program_allowed(5, 0) != 0:
+        return 1
+    if _rv32_media_program_allowed(5, 1) == 0:
+        return 1
+    if _rv32_media_program_allowed(64, 0) == 0:
+        return 1
+    0

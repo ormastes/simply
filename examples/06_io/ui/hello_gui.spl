@@ -1,0 +1,67 @@
+# Hello GUI — Interactive TUI Demo
+#
+# A standalone TUI application using the Builder API.
+# Displays a panel with text widgets, a progress bar, and a status bar.
+# Supports j/k navigation, : command mode, and q to quit.
+
+use common.ui.builder.{column, panel, text_widget, progress, statusbar, build_tree_with_title, with_icon}
+use common.ui.widget.{UIState, UIEvent}
+use common.ui.layout.{compute_layout}
+use common.ui.state.{init_state, update_state}
+use app.ui.tui.screen.{Screen, get_terminal_size, ansi_cursor_home, ansi_hide_cursor,
+    ansi_show_cursor, ansi_enable_alt_screen, ansi_disable_alt_screen}
+use app.ui.tui.input.{read_user_input, parse_input_line}
+use app.ui.render.widgets.{render_tui_tree}
+
+fn build_gui_tree() -> UIState:
+    """Build the widget tree and return initial UIState."""
+    val greeting = text_widget("greeting", "Hello from Simple! This is a working GUI.")
+    val help = text_widget("help", "Press q to quit, j/k to navigate, : for commands.")
+    val bar = progress("build_progress", 75)
+    val header = panel("header", "Simple GUI Demo", [greeting, help, bar])
+    val status = statusbar("status", "NORMAL MODE", "Hello Simple GUI")
+    val root = column("root", [header, status])
+    val root_with_icon = with_icon(root, "terminal")
+    val tree = build_tree_with_title(root_with_icon, "Hello Simple GUI", "glass_dark")
+    return init_state(tree)
+
+fn render_frame(state: UIState):
+    """Render a single frame to the terminal."""
+    val size = get_terminal_size()
+    val width = size.0
+    val height = size.1 - 1
+
+    var screen = Screen.new(width, height)
+    val rects = compute_layout(state.tree.root_node(), 0, 0, width, height)
+    screen = render_tui_tree(screen, state.tree.root_node(), rects, state)
+
+    val home = ansi_cursor_home()
+    val output = screen.render()
+    print "{home}{output}"
+
+fn main() -> i64:
+    print ansi_enable_alt_screen()
+    print ansi_hide_cursor()
+
+    var state = build_gui_tree()
+    var running = true
+
+    render_frame(state)
+
+    while running:
+        val user_input = read_user_input()
+        if user_input == "":
+            render_frame(state)
+        else:
+            val event = parse_input_line(user_input)
+            match event:
+                UIEvent.Quit =>
+                    running = false
+                _ =>
+                    state = update_state(state, event)
+                    render_frame(state)
+
+    print ansi_show_cursor()
+    print ansi_disable_alt_screen()
+    print "UI closed."
+    return 0

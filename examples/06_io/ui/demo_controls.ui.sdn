@@ -1,0 +1,63 @@
+app:
+    title: "Interactive Controls Demo"
+    theme: glass_dark
+
+layout:
+    type: vbox
+    children:
+        buttons_panel:
+            type: panel
+            title: "Buttons"
+            children:
+                submit_btn:
+                    type: button
+                    label: "Submit"
+                    action: "submit"
+                cancel_btn:
+                    type: button
+                    label: "Cancel"
+                    action: "cancel"
+                disabled_btn:
+                    type: button
+                    label: "Disabled"
+                    disabled: true
+        checkboxes_panel:
+            type: panel
+            title: "Checkboxes"
+            children:
+                notifications_cb:
+                    type: checkbox
+                    label: "Enable notifications"
+                    checked: true
+                darkmode_cb:
+                    type: checkbox
+                    label: "Dark mode"
+                    checked: false
+                unavailable_cb:
+                    type: checkbox
+                    label: "Unavailable option"
+                    disabled: true
+        dropdown_panel:
+            type: panel
+            title: "Dropdown"
+            children:
+                color_select:
+                    type: dropdown
+                    id: color_select
+                    children:
+                        option1:
+                            type: text
+                            label: "Red"
+                        option2:
+                            type: text
+                            label: "Green"
+                        option3:
+                            type: text
+                            label: "Blue"
+                        option4:
+                            type: text
+                            label: "Yellow"
+        status:
+            type: statusbar
+            left: "NORMAL MODE"
+            right: "Controls Demo"

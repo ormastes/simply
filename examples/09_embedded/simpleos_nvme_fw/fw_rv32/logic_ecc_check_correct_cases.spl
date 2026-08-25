@@ -1,0 +1,14 @@
+use logic_ecc_core.{_rv32_ecc_compute, _rv32_ecc_check, _rv32_ecc_correct}
+
+fn rv32_ecc_check_correct_cases_selftest() -> i32:
+    val data: i64 = 66
+    val lba: i64 = 100
+    val seq: i64 = 5
+    val ecc: i64 = _rv32_ecc_compute(data, lba, seq)
+    if _rv32_ecc_check(data ^ 1, lba, seq, ecc, 0) != 1:
+        return 1
+    if _rv32_ecc_correct(data ^ 1, lba, seq, ecc) != data:
+        return 1
+    if _rv32_ecc_check(data ^ 3, lba, seq, ecc, 0) != 2:
+        return 1
+    0

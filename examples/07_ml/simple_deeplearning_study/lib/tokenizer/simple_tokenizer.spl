@@ -1,0 +1,68 @@
+# Character-Level Tokenizer — from scratch
+# Chapter 2: "Build a Large Language Model From Scratch" (Rasbt)
+#
+# Simple character-level tokenizer for educational purposes.
+# Maps each unique character to an integer ID.
+
+class CharTokenizer:
+    vocab: [text]          # Index -> character mapping
+    vocab_size: i64
+
+    # Build vocabulary from a text corpus
+    static fn from_text(corpus: text) -> CharTokenizer:
+        var seen: [text] = []
+        var i = 0
+        while i < corpus.len():
+            val ch = corpus.char_at(i)
+            # Check if already in vocab
+            var found = false
+            var j = 0
+            while j < seen.len():
+                if seen[j] == ch:
+                    found = true
+                j = j + 1
+            if not found:
+                seen.push(ch)
+            i = i + 1
+        # Sort for determinism (simple bubble sort)
+        var s = 0
+        while s < seen.len():
+            var t = s + 1
+            while t < seen.len():
+                if seen[t] < seen[s]:
+                    val tmp = seen[s]
+                    seen[s] = seen[t]
+                    seen[t] = tmp
+                t = t + 1
+            s = s + 1
+        CharTokenizer(vocab: seen, vocab_size: seen.len())
+
+    # Encode text to token IDs
+    fn encode(input: text) -> [i64]:
+        var ids: [i64] = []
+        var i = 0
+        while i < input.len():
+            val ch = input.char_at(i)
+            var j = 0
+            while j < self.vocab.len():
+                if self.vocab[j] == ch:
+                    ids.push(j)
+                j = j + 1
+            i = i + 1
+        ids
+
+    # Decode token IDs to text
+    fn decode(ids: [i64]) -> text:
+        var result = ""
+        var i = 0
+        while i < ids.len():
+            val idx = ids[i]
+            if idx >= 0 and idx < self.vocab.len():
+                result = result + self.vocab[idx]
+            i = i + 1
+        result
+
+fn char_tokenizer_from_text(corpus: text) -> CharTokenizer:
+    CharTokenizer.from_text(corpus)
+
+export CharTokenizer, char_tokenizer_from_text

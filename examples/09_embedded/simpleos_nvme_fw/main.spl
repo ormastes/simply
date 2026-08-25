@@ -1,0 +1,141 @@
+"""
+SimpleOS NVMe Firmware — log-structured FTL + P2L crash recovery (simulation)
+
+Simulation only — no hardware, no QEMU, no real MMIO. Host-runnable in pure Simple.
+Demonstrates the recovery heart of the firmware research design:
+  - simulated NAND: each page stores data + OOB {logical addr, write sequence}
+  - log-structured FTL: L2P map, monotonic write sequence, append-only physical pages
+  - crash + P2L recovery: rebuild L2P by scanning page OOB (newest seq wins per LBA),
+    the committed-prefix property in miniature
+  - offload-op seam: a checksum op with a software fallback
+
+The generation-checked object pool is in the sibling `pool_demo.spl`.
+
+NOTE: `bin/simple check`/lint has a non-deterministic superlinear blowup on
+array-field structs with several `me` methods — see
+doc/08_tracking/bug/sspec_simple_check_superlinear_two_impls_2026-06-29.md.
+The deterministic verification gate is `bin/simple run` (real assertions below).
+
+Run: bin/simple run examples/09_embedded/simpleos_nvme_fw/main.spl
+"""
+
+val NAND_PAGES: i64 = 64
+val LBA_COUNT: i64  = 32
+val UNMAP: i64      = -1   # sentinel: unmapped / invalid
+
+# ── Offload-op seam ───────────────────────────────────────────────────────────
+# ponytail: production calls common.bytes.checksum.Crc32 or a hardware CRC engine;
+# the indirection lets firmware swap to an accelerator without touching FTL logic.
+
+fn sw_checksum(data: i64, lba: i64) -> i64:
+    (data + lba) & 0xFF
+
+fn offload_checksum(data: i64, lba: i64) -> i64:
+    sw_checksum(data, lba)
+
+# ── Ftl — log-structured FTL over a simulated NAND ────────────────────────────
+
+struct Ftl:
+    l2p:       [i64]   # logical-to-physical map: l2p[lba] = ppn, or UNMAP
+    lba_count: i64
+    nand_data: [i64]   # simulated NAND: page data byte
+    nand_lba:  [i64]   # simulated NAND OOB: logical addr written to this page
+    nand_seq:  [i64]   # simulated NAND OOB: write sequence number
+    seq:       i64     # monotonically increasing write sequence
+    free_ppn:  i64     # next free physical page number (log append point)
+
+fn make_ftl(lba_count: i64, page_count: i64) -> Ftl:
+    var l2p:       [i64] = []
+    var nand_data: [i64] = []
+    var nand_lba:  [i64] = []
+    var nand_seq:  [i64] = []
+    var i: i64 = 0
+    while i < lba_count:
+        l2p.push(UNMAP)
+        i = i + 1
+    i = 0
+    while i < page_count:
+        nand_data.push(0)
+        nand_lba.push(UNMAP)
+        nand_seq.push(0)
+        i = i + 1
+    Ftl(l2p: l2p, lba_count: lba_count, nand_data: nand_data,
+        nand_lba: nand_lba, nand_seq: nand_seq, seq: 0, free_ppn: 0)
+
+impl Ftl:
+    # Write one byte to lba: append a NAND page with OOB {lba, seq}, then update L2P.
+    me write(lba: i64, data: i64):
+        me.seq      = me.seq + 1
+        val ppn     = me.free_ppn
+        me.free_ppn = me.free_ppn + 1
+        val _cs = offload_checksum(data, lba)        # offload-op seam
+        me.nand_data[ppn] = data
+        me.nand_lba[ppn]  = lba
+        me.nand_seq[ppn]  = me.seq
+        me.l2p[lba] = ppn
+
+    # Read one byte from lba via L2P. UNMAP if unmapped.
+    me read(lba: i64) -> i64:
+        val ppn = me.l2p[lba]
+        if ppn == UNMAP:
+            return UNMAP
+        me.nand_data[ppn]
+
+    # Simulate dirty shutdown: lose the in-RAM L2P table.
+    me crash_reset():
+        var fresh: [i64] = []
+        var i: i64 = 0
+        while i < me.lba_count:
+            fresh.push(UNMAP)
+            i = i + 1
+        me.l2p = fresh
+
+    # P2L recovery: scan written pages, newest OOB sequence wins per logical addr.
+    me recover():
+        var p: i64 = 0
+        while p < me.free_ppn:
+            val lba = me.nand_lba[p]
+            val cur = me.l2p[lba]
+            if cur == UNMAP:
+                me.l2p[lba] = p
+            else:
+                if me.nand_seq[p] > me.nand_seq[cur]:
+                    me.l2p[lba] = p
+            p = p + 1
+
+# ── self-check ────────────────────────────────────────────────────────────────
+
+fn check_eq(got: i64, want: i64, label: text) -> i64:
+    if got == want:
+        print "PASS: {label} ({got})"
+        return 0
+    print "FAIL: {label} -- expected {want} got {got}"
+    1
+
+fn main():
+    var fails: i64 = 0
+    var ftl = make_ftl(LBA_COUNT, NAND_PAGES)
+
+    print "=== FTL: write / read / overwrite ==="
+    ftl.write(10, 0xAB)
+    ftl.write(20, 0xCD)
+    fails = fails + check_eq(ftl.read(10), 0xAB, "LBA 10 reads 0xAB")
+    fails = fails + check_eq(ftl.read(20), 0xCD, "LBA 20 reads 0xCD")
+    ftl.write(10, 0x99)
+    fails = fails + check_eq(ftl.read(10), 0x99, "LBA 10 reads 0x99 after overwrite (newest seq wins)")
+
+    print "=== FTL: crash + P2L recovery ==="
+    ftl.crash_reset()
+    fails = fails + check_eq(ftl.read(10), UNMAP, "L2P cleared after simulated crash")
+    ftl.recover()
+    fails = fails + check_eq(ftl.read(10), 0x99, "LBA 10 recovered to 0x99 (committed state survives)")
+    fails = fails + check_eq(ftl.read(20), 0xCD, "LBA 20 recovered to 0xCD (committed state survives)")
+
+    print "=== OffloadOps: software checksum fallback ==="
+    fails = fails + check_eq(offload_checksum(0xAB, 10), (0xAB + 10) & 0xFF, "offload_checksum sw fallback")
+
+    print ""
+    if fails == 0:
+        print "PASS"
+    else:
+        print "FAIL ({fails} assertions failed)"

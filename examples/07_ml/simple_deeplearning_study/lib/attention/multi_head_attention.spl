@@ -1,0 +1,93 @@
+# Multi-Head Attention — from scratch
+# Chapter 3: "Build a Large Language Model From Scratch" (Rasbt)
+#
+# Splits the input into multiple "heads", applies attention independently,
+# then concatenates and projects back.
+#
+#   MultiHead(Q, K, V) = Concat(head_1, ..., head_h) @ W_o
+#   where head_i = Attention(Q @ W_q_i, K @ W_k_i, V @ W_v_i)
+
+use std.pure.tensor.{PureTensor, tensor_from_data, tensor_zeros}
+use std.pure.tensor_ops.{matmul, transpose}
+use examples.simple_deeplearning_study.lib.prim.linear.{StudyLinear}
+use examples.simple_deeplearning_study.lib.prim.dropout.{StudyDropout}
+use examples.simple_deeplearning_study.lib.attention.self_attention.{scaled_dot_product}
+use examples.simple_deeplearning_study.lib.attention.causal_mask.{create_causal_mask}
+
+class StudyMultiHeadAttention:
+    num_heads: i64
+    d_model: i64
+    d_k: i64                            # d_model / num_heads
+    w_queries: [StudyLinear]             # One per head
+    w_keys: [StudyLinear]               # One per head
+    w_values: [StudyLinear]             # One per head
+    w_out: StudyLinear                   # Output projection
+    dropout: StudyDropout
+
+    static fn create(d_model: i64, num_heads: i64, drop_rate: f64) -> StudyMultiHeadAttention:
+        val d_k = d_model / num_heads
+
+        # Create per-head projection weights
+        var wq: [StudyLinear] = []
+        var wk: [StudyLinear] = []
+        var wv: [StudyLinear] = []
+        var h = 0
+        while h < num_heads:
+            wq.push(StudyLinear.create(d_model, d_k, false))
+            wk.push(StudyLinear.create(d_model, d_k, false))
+            wv.push(StudyLinear.create(d_model, d_k, false))
+            h = h + 1
+
+        val w_out = StudyLinear.create(d_model, d_model, true)
+
+        StudyMultiHeadAttention(
+            num_heads: num_heads,
+            d_model: d_model,
+            d_k: d_k,
+            w_queries: wq,
+            w_keys: wk,
+            w_values: wv,
+            w_out: w_out,
+            dropout: StudyDropout.create(drop_rate)
+        )
+
+    # Forward: x [seq_len, d_model] -> output [seq_len, d_model]
+    fn forward(x: PureTensor<f64>) -> PureTensor<f64>:
+        val seq_len = x.shape[0]
+        val mask = create_causal_mask(seq_len)
+
+        # Process each head
+        var head_outputs: [[f64]] = []
+        var h = 0
+        while h < self.num_heads:
+            val q = self.w_queries[h].forward(x)   # [seq_len, d_k]
+            val k = self.w_keys[h].forward(x)      # [seq_len, d_k]
+            val v = self.w_values[h].forward(x)     # [seq_len, d_k]
+            val result = scaled_dot_product(q, k, v, mask)
+            head_outputs.push(result.output.data)
+            h = h + 1
+
+        # Concatenate heads: [seq_len, num_heads * d_k] = [seq_len, d_model]
+        var concat_data: [f64] = []
+        var s = 0
+        while s < seq_len:
+            h = 0
+            while h < self.num_heads:
+                var d = 0
+                while d < self.d_k:
+                    val idx = s * self.d_k + d
+                    concat_data.push(head_outputs[h][idx])
+                    d = d + 1
+                h = h + 1
+            s = s + 1
+
+        val concat = tensor_from_data(concat_data, [seq_len, self.d_model])
+
+        # Output projection + dropout
+        val projected = self.w_out.forward(concat)
+        self.dropout.forward(projected)
+
+fn study_mha_create(d_model: i64, num_heads: i64, drop_rate: f64) -> StudyMultiHeadAttention:
+    StudyMultiHeadAttention.create(d_model, num_heads, drop_rate)
+
+export StudyMultiHeadAttention, study_mha_create

@@ -1,0 +1,269 @@
+# smux — Simple Mux Terminal GUI App
+# Entry point: CLI args, SDN config loading, platform detection, runs SmuxApp.
+
+use src.app.{SmuxApp, SmuxConfig, smux_config_defaults, smux_app_create}
+use src.quick_text.{QuickTextEntry}
+use src.platform.{detect_platform, Platform}
+
+use std.io_runtime.{read_file, file_exists}
+
+extern fn sys_get_args() -> [text]
+
+# ============================================================================
+# SDN Config Loader
+# ============================================================================
+
+fn _strip_quotes(s: text) -> text:
+    val trimmed = s.trim()
+    if trimmed.len() >= 2:
+        if trimmed[0] == "\"" and trimmed[trimmed.len() - 1] == "\"":
+            return trimmed[1:trimmed.len() - 1]
+    return trimmed
+
+fn _find_config_path() -> text:
+    if file_exists("config.sdn"):
+        return "config.sdn"
+    if file_exists("examples/smux/config.sdn"):
+        return "examples/smux/config.sdn"
+    return ""
+
+fn _parse_int_or(s: text, fallback: i64) -> i64:
+    val result = s.to_int()
+    if result == nil:
+        return fallback
+    return result
+
+fn load_config(path: text) -> SmuxConfig:
+    if path == "" or not file_exists(path):
+        return smux_config_defaults()
+    val content_raw = read_file(path)
+    if content_raw == nil:
+        return smux_config_defaults()
+    val content = "{content_raw}"
+    if content == "":
+        return smux_config_defaults()
+
+    var title = "smux"
+    var theme = "dark"
+    var mobile_keybar_mode = "auto"
+    var nerd_font = true
+    var hook_script = "hooks/check_done.spl"
+    var hook_timeout_ms: i64 = 30000
+    var auto_continue = true
+    var notification_mode = "auto"
+    var tmux_hooks_enabled = true
+    var quick_texts: [QuickTextEntry] = []
+
+    var section = ""
+    var qt_label = ""
+    var qt_snippet = ""
+    var qt_shortcut = ""
+
+    val lines = content.split("\n")
+    var li = 0
+    while li < lines.len():
+        val line = lines[li]
+        val trimmed = line.trim()
+        li = li + 1
+
+        if trimmed == "" or trimmed.starts_with("#"):
+            continue
+
+        # Top-level section: no leading whitespace, ends with :, no value
+        if line.len() > 0 and line[0] != " " and trimmed.ends_with(":"):
+            if not trimmed.contains(": "):
+                section = trimmed[0:trimmed.len() - 1]
+                continue
+
+        # Numbered sub-key in quick_texts (e.g., "  0:")
+        if section == "quick_texts" and trimmed.ends_with(":") and not trimmed.contains(": "):
+            if qt_label != "":
+                quick_texts.push(QuickTextEntry(label: qt_label, snippet: qt_snippet, shortcut: qt_shortcut))
+                qt_label = ""
+                qt_snippet = ""
+                qt_shortcut = ""
+            continue
+
+        # Key: value pair — split on first ":"
+        if not trimmed.contains(":"):
+            continue
+        val kv_parts = trimmed.split(":")
+        if kv_parts.len() < 2:
+            continue
+        val key = kv_parts[0].trim()
+        # Rejoin remaining parts (value may contain ":")
+        var value = kv_parts[1]
+        var kvi = 2
+        while kvi < kv_parts.len():
+            value = "{value}:{kv_parts[kvi]}"
+            kvi = kvi + 1
+        value = _strip_quotes(value)
+
+        if section == "app":
+            if key == "title":
+                title = value
+            elif key == "theme":
+                theme = value
+        elif section == "platform":
+            if key == "mobile_keybar":
+                mobile_keybar_mode = value
+            elif key == "nerd_font":
+                nerd_font = value == "true"
+        elif section == "quick_texts":
+            if key == "label":
+                qt_label = value
+            elif key == "snippet":
+                qt_snippet = value
+            elif key == "shortcut":
+                qt_shortcut = value
+        elif section == "llm_hooks":
+            if key == "on_done_script":
+                hook_script = value
+            elif key == "timeout_ms":
+                hook_timeout_ms = _parse_int_or(value, 30000)
+            elif key == "notification":
+                notification_mode = value
+            elif key == "auto_continue":
+                auto_continue = value == "true"
+        elif section == "tmux":
+            if key == "hooks_enabled":
+                tmux_hooks_enabled = value == "true"
+
+    # Push last quick text entry
+    if qt_label != "":
+        quick_texts.push(QuickTextEntry(label: qt_label, snippet: qt_snippet, shortcut: qt_shortcut))
+
+    # Fallback defaults if no quick texts parsed
+    if quick_texts.len() == 0:
+        quick_texts.push(QuickTextEntry(label: "Continue", snippet: "Please continue.", shortcut: "1"))
+        quick_texts.push(QuickTextEntry(label: "Approve", snippet: "Looks good, proceed.", shortcut: "2"))
+        quick_texts.push(QuickTextEntry(label: "Fix tests", snippet: "Fix the failing tests.", shortcut: "3"))
+
+    SmuxConfig(
+        title: title,
+        theme: theme,
+        mobile_keybar_mode: mobile_keybar_mode,
+        nerd_font: nerd_font,
+        quick_texts: quick_texts,
+        hook_script: hook_script,
+        hook_timeout_ms: hook_timeout_ms,
+        auto_continue: auto_continue,
+        notification_mode: notification_mode,
+        tmux_hooks_enabled: tmux_hooks_enabled
+    )
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn _has_flag(args: [text], flag: text) -> bool:
+    var i = 0
+    while i < args.len():
+        if args[i] == flag:
+            return true
+        i = i + 1
+    return false
+
+fn _get_flag_value(args: [text], flag: text) -> text:
+    var i = 0
+    while i < args.len():
+        if args[i].starts_with("{flag}="):
+            return args[i].substring(flag.len() + 1)
+        if args[i] == flag and i + 1 < args.len():
+            return args[i + 1]
+        i = i + 1
+    return ""
+
+fn _render_preview():
+    """Render one frame as plain text (no raw mode needed)."""
+    val config = load_config(_find_config_path())
+    val nerd = false
+    val w = 80
+
+    # Menu bar
+    var menu = " > {config.title}  F File  V View  ? Help"
+    while menu.len() < w:
+        menu = "{menu} "
+    print "\u{001b}[7m{menu}\u{001b}[0m"
+
+    # Content
+    print "Welcome to smux - Simple Mux Terminal GUI"
+    print "Platform: preview | Nerd Font: no"
+    print ""
+    print "Keybindings:"
+    print "  i       - Enter input mode"
+    print "  Esc     - Return to normal mode"
+    print "  Tab     - Toggle quick text panel"
+    print "  Alt+1-9 - Send quick text"
+    print "  d       - Check LLM done hook"
+    print "  q       - Quit (in normal mode)"
+    print "  Ctrl+C  - Force quit"
+    print "  Up/Down - Scroll"
+    print ""
+
+    # Quick text bar
+    var qt_bar = ""
+    var qi = 0
+    while qi < config.quick_texts.len():
+        val qt = config.quick_texts[qi]
+        if qi > 0:
+            qt_bar = "{qt_bar} "
+        qt_bar = "{qt_bar}\u{001b}[44m\u{001b}[37m Alt+{qt.shortcut}:{qt.label} \u{001b}[0m"
+        qi = qi + 1
+    print qt_bar
+
+    # Status bar
+    var status = " [N NORMAL] Ready"
+    val size = "80x24"
+    val gap = w - status.len() - size.len() - 1
+    var pad = 0
+    while pad < gap:
+        status = "{status} "
+        pad = pad + 1
+    status = "{status}{size} "
+    print "\u{001b}[7m{status}\u{001b}[0m"
+
+var _main_ran = false
+
+fn main():
+    if _main_ran:
+        return
+    _main_ran = true
+
+    val args = sys_get_args()
+
+    if _has_flag(args, "--help") or _has_flag(args, "-h"):
+        print "smux - Simple Mux Terminal GUI"
+        print ""
+        print "Usage: bin/simple run examples/smux/main.spl [options]"
+        print ""
+        print "Options:"
+        print "  --help, -h            Show this help"
+        print "  --version             Show version"
+        print "  --backend=tui         Terminal UI (default)"
+        print "  --backend=tauri       Desktop GUI via Tauri"
+        print "  --gui                 Shortcut for --backend=tauri"
+        return
+    if _has_flag(args, "--version"):
+        print "smux 0.1.0"
+        return
+
+    if _has_flag(args, "--render"):
+        _render_preview()
+        return
+
+    # Backend selection: --gui or --backend=tui|tauri
+    var backend_name = "tui"
+    if _has_flag(args, "--gui"):
+        backend_name = "tauri"
+    val explicit_backend = _get_flag_value(args, "--backend")
+    if explicit_backend != "":
+        backend_name = explicit_backend
+
+    val platform = detect_platform()
+    val config_path = _find_config_path()
+    val config = load_config(config_path)
+    var app = smux_app_create(config, platform.name(), backend_name)
+    app.run()
+
+main()

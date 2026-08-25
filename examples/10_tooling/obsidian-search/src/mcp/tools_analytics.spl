@@ -1,0 +1,68 @@
+# MCP Tool schemas — 3 analytics tools (Phase D)
+#
+# Defines tool schemas for vault_structure, find_orphan_notes, vault_stats.
+
+use src.util.json_helpers.{js, jp, jo, jo1, jo2, jo3, ja, LB, RB, SB_L, SB_R}
+
+# --- Tool schema builder helpers ---
+
+fn make_string_prop(description: text) -> text:
+    jo2(jp("type", js("string")), jp("description", js(description)))
+
+fn make_tool_analytics(name: text, description: text, props: text, required: text) -> text:
+    val schema = jo3(
+        jp("type", js("object")),
+        jp("properties", props),
+        jp("required", required)
+    )
+    val annotations = jo3(
+        jp("readOnlyHint", "true"),
+        jp("destructiveHint", "false"),
+        jp("idempotentHint", "true")
+    )
+    var tool_obj = LB()
+    tool_obj = tool_obj + jp("name", js(name))
+    tool_obj = tool_obj + "," + jp("description", js(description))
+    tool_obj = tool_obj + "," + jp("inputSchema", schema)
+    tool_obj = tool_obj + "," + jp("annotations", annotations)
+    tool_obj = tool_obj + RB()
+    tool_obj
+
+# --- Analytics tool schemas ---
+
+fn make_analytics_tools() -> [text]:
+    var tools: [text] = []
+
+    # 1. vault_structure
+    var vs_props = LB()
+    vs_props = vs_props + jp("directory", make_string_prop("Filter to a specific directory path (default '' for entire vault)"))
+    vs_props = vs_props + RB()
+    tools.push(make_tool_analytics(
+        "vault_structure",
+        "Get folder hierarchy with file counts for the vault",
+        vs_props,
+        ja([])
+    ))
+
+    # 2. find_orphan_notes
+    var fo_props = LB()
+    fo_props = fo_props + jp("include_daily", make_string_prop("Include daily notes in orphan detection ('true' or 'false', default 'false')"))
+    fo_props = fo_props + RB()
+    tools.push(make_tool_analytics(
+        "find_orphan_notes",
+        "Find notes with no incoming wikilinks (orphan/unlinked notes)",
+        fo_props,
+        ja([])
+    ))
+
+    # 3. vault_stats
+    var vst_props = LB()
+    vst_props = vst_props + RB()
+    tools.push(make_tool_analytics(
+        "vault_stats",
+        "Get comprehensive vault statistics: notes, links, tags, tasks, words",
+        vst_props,
+        ja([])
+    ))
+
+    tools

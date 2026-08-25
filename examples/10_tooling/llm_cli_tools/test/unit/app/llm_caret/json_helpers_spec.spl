@@ -1,0 +1,265 @@
+# LLM Caret JSON Helpers Specification
+
+# Inline helpers for test isolation
+fn LB() -> text:
+    "{(123 as char)}"
+
+fn RB() -> text:
+    "{(125 as char)}"
+
+fn Q() -> text:
+    "\""
+
+fn escape_json_text(s: text) -> text:
+    var result = ""
+    var i = 0
+    while i < s.len():
+        val ch = s[i]
+        if ch == "\\":
+            result = result + "\\\\"
+        elif ch == "\"":
+            result = result + "\\\""
+        elif ch == "\n":
+            result = result + "\\n"
+        elif ch == "\r":
+            result = result + "\\r"
+        elif ch == "\t":
+            result = result + "\\t"
+        else:
+            result = result + ch
+        i = i + 1
+    result
+
+fn js(s: text) -> text:
+    var r = Q()
+    r = r + escape_json_text(s)
+    r = r + Q()
+    r
+
+fn jp(key: text, val_str: text) -> text:
+    var r = Q()
+    r = r + key
+    r = r + Q()
+    r = r + ":"
+    r = r + val_str
+    r
+
+fn jo1(pair: text) -> text:
+    var r = LB()
+    r = r + pair
+    r = r + RB()
+    r
+
+fn jo2(p1: text, p2: text) -> text:
+    var r = LB()
+    r = r + p1
+    r = r + ","
+    r = r + p2
+    r = r + RB()
+    r
+
+fn jo3(p1: text, p2: text, p3: text) -> text:
+    var r = LB()
+    r = r + p1
+    r = r + ","
+    r = r + p2
+    r = r + ","
+    r = r + p3
+    r = r + RB()
+    r
+
+fn ja(items: [text]) -> text:
+    var r = "["
+    var i = 0
+    for item in items:
+        if i > 0:
+            r = r + ","
+        r = r + item
+        i = i + 1
+    r = r + "]"
+    r
+
+fn _unwrap_idx(opt) -> i64:
+    match opt:
+        Some(i): return i
+        nil: return -1
+
+fn extract_json_string(json: text, key: text) -> text:
+    val quote = "\""
+    val search = quote + key + quote + ":"
+    val idx = _unwrap_idx(json.index_of(search))
+    if idx < 0:
+        return ""
+    val slen = search.len()
+    val start = idx + slen
+    val after = json.substring(start)
+    val trimmed = after.trim()
+    if trimmed.starts_with(quote):
+        val rest = trimmed.substring(1)
+        var end = 0
+        var escaped = false
+        while end < rest.len():
+            val ch = rest[end]
+            if escaped:
+                escaped = false
+            elif ch == "\\":
+                escaped = true
+            elif ch == "\"":
+                return rest.substring(0, end)
+            end = end + 1
+    ""
+
+fn extract_json_value(json: text, key: text) -> text:
+    val search = Q() + key + Q() + ":"
+    val idx = _unwrap_idx(json.index_of(search))
+    if idx < 0:
+        return "null"
+    val slen = search.len()
+    val start = idx + slen
+    val after = json.substring(start)
+    val trimmed = after.trim()
+    var end = 0
+    while end < trimmed.len():
+        val ch = trimmed[end]
+        if ch == "," or ch == RB() or ch == "]":
+            break
+        end = end + 1
+    trimmed.substring(0, end).trim()
+
+fn extract_json_int(json: text, key: text) -> i64:
+    val raw = extract_json_value(json, key)
+    if raw == "null" or raw == "":
+        return 0
+    int(raw)
+
+fn extract_json_bool(json: text, key: text) -> bool:
+    val raw = extract_json_value(json, key)
+    raw == "true"
+
+fn extract_nested_string(json: text, outer_key: text, inner_key: text) -> text:
+    val search = Q() + outer_key + Q() + ":"
+    val idx = _unwrap_idx(json.index_of(search))
+    if idx < 0:
+        return ""
+    val slen = search.len()
+    val start = idx + slen
+    val after = json.substring(start)
+    extract_json_string(after, inner_key)
+
+fn build_message_json(role: text, content: text) -> text:
+    jo2(jp("role", js(role)), jp("content", js(content)))
+
+fn build_messages_json(roles: [text], contents: [text]) -> text:
+    var items: [text] = []
+    var i = 0
+    while i < roles.len():
+        var r = roles[i]
+        var c = ""
+        if i < contents.len():
+            c = contents[i]
+        items = items + [build_message_json(r, c)]
+        i = i + 1
+    ja(items)
+
+# ============================================================================
+# Tests
+# ============================================================================
+
+describe "JSON Escaping":
+    it "escapes plain text unchanged":
+        expect(escape_json_text("hello")).to_equal("hello")
+
+    it "escapes double quotes":
+        expect(escape_json_text("say \"hi\"")).to_equal("say \\\"hi\\\"")
+
+    it "escapes backslashes":
+        expect(escape_json_text("a\\b")).to_equal("a\\\\b")
+
+    it "escapes newlines":
+        expect(escape_json_text("line1\nline2")).to_equal("line1\\nline2")
+
+    it "escapes tabs":
+        expect(escape_json_text("a\tb")).to_equal("a\\tb")
+
+describe "JSON Building":
+    it "builds string value":
+        val result = js("hello")
+        expect(result).to_equal("\"hello\"")
+
+    it "builds key-value pair":
+        val result = jp("name", js("Alice"))
+        expect(result).to_contain("\"name\"")
+        expect(result).to_contain("\"Alice\"")
+
+    it "builds single-pair object":
+        val result = jo1(jp("key", js("val")))
+        expect(result).to_start_with(LB())
+        expect(result).to_end_with(RB())
+
+    it "builds two-pair object":
+        val result = jo2(jp("a", js("1")), jp("b", js("2")))
+        expect(result).to_contain(",")
+        expect(result).to_contain("\"a\"")
+        expect(result).to_contain("\"b\"")
+
+    it "builds array from items":
+        val result = ja([js("a"), js("b"), js("c")])
+        expect(result).to_start_with("[")
+        expect(result).to_end_with("]")
+        expect(result).to_contain("\"a\"")
+        expect(result).to_contain(",")
+
+    it "builds empty array":
+        val result = ja([])
+        expect(result).to_equal("[]")
+
+describe "JSON Parsing":
+    it "extracts string value":
+        val json = jo1(jp("name", js("Alice")))
+        val result = extract_json_string(json, "name")
+        expect(result).to_equal("Alice")
+
+    it "returns empty for missing key":
+        val json = jo1(jp("name", js("Alice")))
+        expect(extract_json_string(json, "missing")).to_equal("")
+
+    it "extracts numeric value":
+        val json = jo2(jp("count", "42"), jp("name", js("test")))
+        val result = extract_json_value(json, "count")
+        expect(result).to_equal("42")
+
+    it "extracts integer value":
+        val json = jo1(jp("count", "99"))
+        expect(extract_json_int(json, "count")).to_equal(99)
+
+    it "returns 0 for missing int":
+        val json = jo1(jp("name", js("test")))
+        expect(extract_json_int(json, "missing")).to_equal(0)
+
+    it "extracts boolean value":
+        val json = jo1(jp("active", "true"))
+        expect(extract_json_bool(json, "active")).to_equal(true)
+
+    it "extracts false boolean":
+        val json = jo1(jp("active", "false"))
+        expect(extract_json_bool(json, "active")).to_equal(false)
+
+    it "extracts nested string":
+        val inner = jo1(jp("name", js("Bob")))
+        val json = jo1(jp("user", inner))
+        expect(extract_nested_string(json, "user", "name")).to_equal("Bob")
+
+describe "Message JSON":
+    it "builds single message":
+        val result = build_message_json("user", "Hello")
+        expect(result).to_contain("\"role\"")
+        expect(result).to_contain("\"user\"")
+        expect(result).to_contain("\"content\"")
+        expect(result).to_contain("\"Hello\"")
+
+    it "builds messages array":
+        val result = build_messages_json(["user", "assistant"], ["Hi", "Hello!"])
+        expect(result).to_start_with("[")
+        expect(result).to_end_with("]")
+        expect(result).to_contain("\"user\"")
+        expect(result).to_contain("\"assistant\"")

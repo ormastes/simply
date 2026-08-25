@@ -1,0 +1,71 @@
+"""
+rel_wear — SREA-lite dwell-aware static wear leveling.
+
+Contract: doc/05_design/hardware/nand_recovery/recovery_algorithms_design.md §6
+(design §9 lane L7). Taxonomy lineage: §3.7 static wear leveling + SREA (include
+self-recovery / dwell effects in wear-leveling decisions). Wired to the EXISTING
+`wear_level_once` mechanism (ftl.spl:619-625) and the coldest-victim picker
+`gc_select_wear_victim` (ftl_gc.spl:15-27) — this module supplies the VERDICT that
+drives them; it does not call them (pure-policy leaf, no Fil/Ftl handle).
+
+Pure-policy leaf (design §0 / architecture §0 LAW): `use nvme_types.* + nd_types.*
++ rel_types.*` ONLY — never fil/ftl, so both may import this without a cycle.
+
+Dwell proxy without a clock (design §6). SREA wants "idle recovery time since last
+erase"; the FW has no wall clock (inventory A10). Proxy: the GLOBAL-erase-count
+delta — `dwell = total_erases - last_global_erase[blk]`, how many P/E cycles
+happened ELSEWHERE since this block was last erased. A large delta means the block
+has sat idle and its cold data can be relocated; a small delta means it was just
+erased -> defer (SREA deferral avoids premature churn / WL thrash).
+
+Typed-dimensions law (rel_types.spl docstring, guide "NdBlock typed params"): every
+public block coordinate parameter is `NdBlock`; `RelWearState.last_global_erase` is
+a dense `[i64]` array INDEXED by the flat block id (design §0 "no Dict, dense array
+indexed by physical block") — convert at the array-index / RelAction.arg flat
+boundary via `.idx`, exactly as `rel_types.spl`'s L4 consequence note prescribes.
+"""
+
+use nvme_types.*
+use nd_types.*
+use rel_types.*
+
+# ── Constants (design §6) ──────────────────────────────────────────────────────
+# WL_THRESHOLD is the EXISTING nvme_types.spl constant (reused unchanged, design
+# §6 table: "reused unchanged — preserves the existing static-WL trigger").
+fn REL_WL_DWELL_MIN() -> i64:
+    8  # require the cold block to have sat through >=8 P/E cycles elsewhere
+       # before churning it — phenomenological dwell floor preventing WL thrash
+       # on a just-erased block (design §6 constants table).
+
+# ── Constructor (this lane's *_new fn — rel_types.spl deliberately provides no ─
+# per-policy state-struct constructors; each lane owns its own, per rel_types.spl
+# header docstring "Module-boundary law").
+fn rel_wear_new() -> RelWearState:
+    var last_global_erase: [i64] = []
+    var i: i64 = 0
+    while i < NUM_BLOCKS:
+        last_global_erase.push(0)
+        i = i + 1
+    RelWearState(last_global_erase: last_global_erase)
+
+# ── State transition: erase resets the dwell clock for this block ─────────────
+# Called from the erase/reclaim path (parallel to rel_vref_decay_on_erase,
+# rel_disturb_clear, rel_health_on_erase) so a freshly-erased block's dwell
+# proxy starts at zero again. Return-the-object.
+fn rel_wear_on_erase(st: RelWearState, blk: NdBlock, total_erases: i64) -> RelWearState:
+    var out = st
+    out.last_global_erase[blk.idx] = total_erases
+    return out
+
+# ── Decision: static-WL verdict, dwell-gated (SREA-lite) ──────────────────────
+# cold_blk = the min-erase victim from ftl_gc.gc_select_wear_victim; erase_min is
+# that victim's OWN erase count (it is the coldest block by definition); erase_max
+# is the FTL's Ftl.max_erase() aggregate; total_erases is Ftl.total_erases().
+fn rel_wear_due(st: RelWearState, cold_blk: NdBlock, erase_min: i64,
+                erase_max: i64, total_erases: i64) -> RelAction:
+    if (erase_max - erase_min) <= WL_THRESHOLD:
+        return rel_action(rel_act_accept(), 0)             # spread acceptable
+    val dwell: i64 = total_erases - st.last_global_erase[cold_blk.idx]
+    if dwell >= REL_WL_DWELL_MIN():                          # cold block has rested -> cycle it
+        return rel_action(rel_act_reclaim(), cold_blk.idx)  # static WL: relocate cold data off it
+    return rel_action(rel_act_accept(), 0)                  # SREA deferral: not dwelled enough

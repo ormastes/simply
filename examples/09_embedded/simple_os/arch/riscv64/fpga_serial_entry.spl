@@ -1,0 +1,17 @@
+extern fn serial_println(msg: text)
+extern fn rt_riscv_harden_canary_value() -> i64
+
+fn spl_start():
+    serial_println("")
+    serial_println("=== SimpleOS FPGA RV64 serial boot ===")
+    serial_println("SimpleOS RV64 boot OK")
+    serial_println("SIMPLEOS_FPGA_RISCV64_SERIAL_BOOT")
+    serial_println("[fpga-riscv64] terminal=uart-serial")
+    serial_println("[fpga-riscv64] ssh=blocked")
+    serial_println("[fpga-riscv64] http=blocked")
+    serial_println("[fpga-riscv64] gpu=blocked")
+    serial_println("[fpga-riscv64] wm=blocked")
+    serial_println("[fpga-riscv64] vulkan=blocked")
+    serial_println("[fpga-riscv64] renderdoc=blocked")
+    serial_println("[harden] canary arch=riscv64 value=" + rt_riscv_harden_canary_value().to_text())
+    serial_println("TEST PASSED")

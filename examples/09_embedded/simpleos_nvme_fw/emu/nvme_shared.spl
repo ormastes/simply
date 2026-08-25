@@ -1,0 +1,67 @@
+"""
+nvme_shared — RAM-backed shared-memory region for the pure-Simple NVMe host/device
+emulator. A flat [i64] word array addressed by `Addr` word offsets (the emulator's
+"PRP" pointers). The region is OWNED by a single SharedMem struct and mutated via
+`me.*`, so writes persist past the value-semantics copy boundary (gotcha 4). Reads
+return freshly built arrays (gotcha 3 — never write into a caller's array arg).
+"""
+use nvme_ct.*
+
+val SHARED_WORDS: i64 = 256
+
+struct SharedMem:
+    words: [i64]
+
+# Fresh region of SHARED_WORDS zeroed i64 words.
+fn shared_mem_new() -> SharedMem:
+    var w: [i64] = []
+    var i: i64 = 0
+    while i < SHARED_WORDS:
+        w.push(0)
+        i = i + 1
+    SharedMem(words: w)
+
+impl SharedMem:
+    # Copy src into the owned region starting at off.value. Every touched index is
+    # bounds-checked against [0, SHARED_WORDS) so a transfer can never overrun the
+    # region — this is the runtime guard that establishes proofs/Memcpy.lean's
+    # precondition (memcpy_index_in_bounds). src is read-only; writes land in the
+    # owned me.words field so they persist.
+    me store(off: Addr, src: [i64]):
+        var i: i64 = 0
+        while i < src.length():
+            val idx: i64 = off.value + i
+            if idx >= 0 and idx < SHARED_WORDS:
+                me.words[idx] = src[i]
+            i = i + 1
+
+    # Read n words from off.value and RETURN them in a new array (gotcha 3).
+    # Out-of-region indices read as 0 (never an out-of-bounds access — Memcpy.lean).
+    me load(off: Addr, n: i64) -> [i64]:
+        var out: [i64] = []
+        var i: i64 = 0
+        while i < n:
+            val idx: i64 = off.value + i
+            if idx >= 0 and idx < SHARED_WORDS:
+                out.push(me.words[idx])
+            else:
+                out.push(0)
+            i = i + 1
+        out
+
+    # Single-word store: v (second param) lands at me.words[off.value] if in range.
+    me store1(off: Addr, v: i64):
+        if off.value >= 0 and off.value < SHARED_WORDS:
+            me.words[off.value] = v
+
+    me load1(off: Addr) -> i64:
+        if off.value >= 0 and off.value < SHARED_WORDS:
+            return me.words[off.value]
+        0
+
+    # Zero the whole region.
+    me clear():
+        var i: i64 = 0
+        while i < me.words.length():
+            me.words[i] = 0
+            i = i + 1

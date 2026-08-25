@@ -1,0 +1,4 @@
+use logic_admin_cases.*
+
+fn rv32_admin_selftest() -> i32:
+    rv32_admin_cases_selftest()

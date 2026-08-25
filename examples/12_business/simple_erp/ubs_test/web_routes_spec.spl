@@ -1,0 +1,108 @@
+# @cover src/web/routes.spl 80%
+"""
+# Web Route Layer
+
+Pure, testable request routing over the shared guarded-write framework: a
+declarative route table, route lookup, and a dispatcher that funnels every
+request through the ONE gate (role_can for reads, framework.gate_write for
+writes).
+"""
+
+use std.spec
+use web.routes.{Route, route_table, find_route, dispatch}
+use framework.guarded.{Tenant, Actor, Session}
+use std.nogc_sync_mut.enterprise_store.store.{EnterpriseStore, store_open}
+use std.io_runtime.{file_exists, file_delete, dir_create_all}
+
+# Each scenario opens its own durable store: the interpreter backend caches
+# open databases per path in-process, so every it-block gets a fresh path.
+fn fresh_store(name: text) -> EnterpriseStore:
+    dir_create_all("build/test-artifacts")
+    val db = "build/test-artifacts/erp_web_routes_" + name + ".db"
+    if file_exists(db):
+        file_delete(db)
+    store_open(db)
+
+describe "Route table — declarative map":
+    it "covers every lane write route and both read routes":
+        val routes = route_table()
+        expect(routes.length()).to_equal(7)
+        val crm = find_route("POST", "/api/crm/leads")
+        expect(crm.action).to_equal("crm.write")
+        val reservation = find_route("POST", "/api/reservations")
+        expect(reservation.action).to_equal("reservation.write")
+        val sale = find_route("POST", "/api/sales")
+        expect(sale.action).to_equal("sale.write")
+        val market = find_route("POST", "/api/market/listings")
+        expect(market.action).to_equal("market.write")
+        val restaurant = find_route("POST", "/api/restaurant/orders")
+        expect(restaurant.action).to_equal("restaurant.write")
+        val audit = find_route("GET", "/api/audit")
+        expect(audit.action).to_equal("audit.read")
+        val report = find_route("GET", "/api/reports/summary")
+        expect(report.action).to_equal("report.read")
+
+    it "finds a known route":
+        val route = find_route("POST", "/api/market/listings")
+        expect(route.method).to_equal("POST")
+        expect(route.action).to_equal("market.write")
+        expect(route.requires_write).to_equal(true)
+
+    it "returns a not-found sentinel for an unknown route":
+        val route = find_route("DELETE", "/api/nope")
+        expect(route.action).to_equal("")
+
+describe "Dispatch — routes through the shared gate":
+    it "denies an unknown route":
+        val tenant = Tenant { id: "t1", name: "Demo" }
+        val user = Actor { id: 1, name: "Mina", role: "operator" }
+        val session = Session { token: "sess-1", user_id: 1, tenant_id: "t1", active: true }
+        val store = fresh_store("s1")
+        val r = dispatch(session, tenant, user, "DELETE", "/api/nope", true, "key-1", store)
+        assert_false(r.ok)
+        expect(r.reason).to_equal("not-found")
+
+    it "allows a GET read route for an auditor":
+        val tenant = Tenant { id: "t1", name: "Demo" }
+        val user = Actor { id: 3, name: "Jae", role: "auditor" }
+        val session = Session { token: "sess-3", user_id: 3, tenant_id: "t1", active: true }
+        val store = fresh_store("s2")
+        val r = dispatch(session, tenant, user, "GET", "/api/audit", true, "", store)
+        expect(r.ok).to_equal(true)
+        expect(r.reason).to_equal("accepted")
+
+    it "denies a GET read route for an inactive session":
+        val tenant = Tenant { id: "t1", name: "Demo" }
+        val user = Actor { id: 3, name: "Jae", role: "auditor" }
+        val session = Session { token: "sess-3", user_id: 3, tenant_id: "t1", active: false }
+        val store = fresh_store("s3")
+        val r = dispatch(session, tenant, user, "GET", "/api/audit", true, "", store)
+        assert_false(r.ok)
+        expect(r.reason).to_equal("invalid-session")
+
+    it "forbids a write route for an auditor":
+        val tenant = Tenant { id: "t1", name: "Demo" }
+        val user = Actor { id: 3, name: "Jae", role: "auditor" }
+        val session = Session { token: "sess-3", user_id: 3, tenant_id: "t1", active: true }
+        val store = fresh_store("s4")
+        val r = dispatch(session, tenant, user, "POST", "/api/market/listings", true, "key-1", store)
+        assert_false(r.ok)
+        expect(r.reason).to_equal("forbidden")
+
+    it "accepts a write route for an operator with a valid record":
+        val tenant = Tenant { id: "t1", name: "Demo" }
+        val user = Actor { id: 1, name: "Mina", role: "operator" }
+        val session = Session { token: "sess-1", user_id: 1, tenant_id: "t1", active: true }
+        val store = fresh_store("s5")
+        val r = dispatch(session, tenant, user, "POST", "/api/restaurant/orders", true, "key-1", store)
+        expect(r.ok).to_equal(true)
+        expect(r.reason).to_equal("accepted")
+
+    it "rejects a write route for an operator with an invalid record":
+        val tenant = Tenant { id: "t1", name: "Demo" }
+        val user = Actor { id: 1, name: "Mina", role: "operator" }
+        val session = Session { token: "sess-1", user_id: 1, tenant_id: "t1", active: true }
+        val store = fresh_store("s6")
+        val r = dispatch(session, tenant, user, "POST", "/api/restaurant/orders", false, "key-1", store)
+        assert_false(r.ok)
+        expect(r.reason).to_equal("invalid-record")

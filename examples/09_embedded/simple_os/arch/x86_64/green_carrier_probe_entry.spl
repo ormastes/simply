@@ -1,0 +1,317 @@
+# FR-SOS-017 green carrier SMP live proof entry.
+#
+# Diagnostic QEMU lane: start a two-CPU qemu64 guest, observe the AP 64-bit
+# entry marker, then run both fixed-slot and scheduler-owned SimpleOS
+# green-carrier dispatch against CPU1 inside the guest.
+
+use os.kernel.smp.smp.{
+    smp_ap_startup_sent,
+    smp_init,
+    smp_num_cpus,
+    smp_online_count,
+    smp_register_firmware_apic_ids,
+    smp_take_ipi
+}
+use os.kernel.smp.percpu.{percpu_is_online, percpu_is_present}
+use os.kernel.arch.x86_64.cpu.{
+    install_syscall_entry,
+    kernel_syscall_entry_addr,
+    syscall_entry_installed,
+    x86_ap_trampoline_vector,
+    x86_registered_ap_boot_started_count,
+    x86_send_startup_to_cpu
+}
+use os.kernel.arch.x86_64.interrupt.{X86Interrupt}
+use os.kernel.arch.x86_64.user_entry.{dispatch_enter_user_blocking}
+use os.kernel.arch.x86_64.user_entry_validation.{validate_enter_user_blocking_handoff}
+use os.kernel.abi.syscall_shim.{shim_init}
+use os.kernel.abi.syscall_shim_process.{spl_handle_debug_write}
+use os.kernel.boot.mmio.{mmio_read8, mmio_write64, mmio_disable_test_mode}
+use os.kernel.ipc.ipc.{IpcManager}
+use os.kernel.log.klog.{KernelLog}
+use os.kernel.scheduler.scheduler.{Scheduler}
+use os.kernel.scheduler.green_carrier.{
+    GreenCarrierRunQueueState,
+    green_carrier_fixed_preempt_running_task,
+    green_carrier_fixed_run_task
+}
+use os.kernel.types.capability_types.{CapabilitySet}
+use os.kernel.types.task_types.{TaskId, TaskPriority, UserLoadSegment, UserProcessImage}
+
+extern fn serial_println(msg: text)
+extern fn rt_x86_install_syscall_entry_raw() -> u64
+
+fn _final_probe_pml4() -> u64: 0x10000000
+fn _final_probe_pdpt() -> u64: 0x10001000
+fn _final_probe_pd() -> u64: 0x10002000
+fn _final_probe_entry() -> u64: 0x10100000
+fn _final_probe_stack_top() -> u64: 0x10130000
+fn _final_probe_table_flags() -> u64: 1 | 2 | 4
+fn _final_probe_huge_flags() -> u64: _final_probe_table_flags() | 128
+
+fn _spin_for_ap_marker():
+    var i: u64 = 0
+    while i < 200000000u64:
+        i = i + 1
+
+fn _pass(value: bool) -> text:
+    if value:
+        "true"
+    else:
+        "false"
+
+fn _make_user_handoff_image() -> UserProcessImage:
+    val payload: [u8] = [0xC3.to_u8(), 0x90.to_u8(), 0x90.to_u8(), 0x90.to_u8()]
+    UserProcessImage(
+        binary_path: "/sys/apps/green_ring3_probe",
+        entry: 0x400000,
+        stack_top: 0x00007FFFFFFFF000,
+        stack_size: 65536,
+        argv: ["/sys/apps/green_ring3_probe"],
+        envp: [],
+        segments: [UserLoadSegment(
+            virt_addr: 0x400000,
+            mem_size: 4,
+            file_size: 4,
+            flags: 5,
+            align: 0x1000,
+            data: payload
+        )],
+        segment_count: 1,
+        file_bytes: payload,
+        initial_sp: 0x00007FFFFFFFEF80,
+        initial_stack_bytes: [0x01.to_u8(), 0x02.to_u8(), 0x03.to_u8(), 0x04.to_u8()]
+    )
+
+fn _make_final_marker_payload() -> [u8]:
+    [0xEB.to_u8(), 0xFE.to_u8()]
+
+fn _make_final_user_handoff_image(payload: [u8]) -> UserProcessImage:
+    val payload_len = payload.len().to_u64()
+    UserProcessImage(
+        binary_path: "/sys/apps/green_ring3_final_probe",
+        entry: _final_probe_entry(),
+        stack_top: _final_probe_stack_top(),
+        stack_size: 4096,
+        argv: ["/sys/apps/green_ring3_final_probe"],
+        envp: [],
+        segments: [UserLoadSegment(
+            virt_addr: _final_probe_entry(),
+            mem_size: payload_len,
+            file_size: payload_len,
+            flags: 5,
+            align: 0x1000,
+            data: payload
+        )],
+        segment_count: 1,
+        file_bytes: payload,
+        initial_sp: _final_probe_stack_top() - 16,
+        initial_stack_bytes: []
+    )
+
+fn _zero_page(addr: u64):
+    var i: u64 = 0
+    while i < 512:
+        mmio_write64(addr + (i * 8), 0)
+        i = i + 1
+
+fn _write_final_probe_payload():
+    """Install compact ring-3 payload bytes.
+
+    The payload emits the two direct user-entry markers through COM1, performs
+    syscall 60 once, emits the syscall-pass marker after returning to user mode,
+    then spins. It is written as 64-bit chunks because the freestanding u8-array
+    path boxes values before MMIO.
+    """
+    mmio_write64(_final_probe_entry() + 0u64, 0x3F358D4803F8BA66u64)
+    mmio_write64(_final_probe_entry() + 8u64, 0x0000002AB9000000u64)
+    mmio_write64(_final_probe_entry() + 16u64, 0x03F8BA66FCE2EEACu64)
+    mmio_write64(_final_probe_entry() + 24u64, 0xB900000055358D48u64)
+    mmio_write64(_final_probe_entry() + 32u64, 0xFCE2EEAC0000002Au64)
+    mmio_write64(_final_probe_entry() + 40u64, 0x002EBF0000003CB8u64)
+    mmio_write64(_final_probe_entry() + 48u64, 0x03F8BA66050F0000u64)
+    mmio_write64(_final_probe_entry() + 56u64, 0xB90000005F358D48u64)
+    mmio_write64(_final_probe_entry() + 64u64, 0xFCE2EEAC0000002Eu64)
+    mmio_write64(_final_probe_entry() + 72u64, 0x6E656572675BFEEBu64)
+    mmio_write64(_final_probe_entry() + 80u64, 0x726569727261632Du64)
+    mmio_write64(_final_probe_entry() + 88u64, 0x48205D756D65712Du64)
+    mmio_write64(_final_probe_entry() + 96u64, 0x464F444E41485F57u64)
+    mmio_write64(_final_probe_entry() + 104u64, 0x743D535341505F46u64)
+    mmio_write64(_final_probe_entry() + 112u64, 0x6572675B0A657572u64)
+    mmio_write64(_final_probe_entry() + 120u64, 0x69727261632D6E65u64)
+    mmio_write64(_final_probe_entry() + 128u64, 0x5D756D65712D7265u64)
+    mmio_write64(_final_probe_entry() + 136u64, 0x4E455F5245535520u64)
+    mmio_write64(_final_probe_entry() + 144u64, 0x535341505F595254u64)
+    mmio_write64(_final_probe_entry() + 152u64, 0x675B0A657572743Du64)
+    mmio_write64(_final_probe_entry() + 160u64, 0x7261632D6E656572u64)
+    mmio_write64(_final_probe_entry() + 168u64, 0x6D65712D72656972u64)
+    mmio_write64(_final_probe_entry() + 176u64, 0x5F52455355205D75u64)
+    mmio_write64(_final_probe_entry() + 184u64, 0x5F4C4C4143535953u64)
+    mmio_write64(_final_probe_entry() + 192u64, 0x7572743D53534150u64)
+    mmio_write64(_final_probe_entry() + 200u64, 0x9090909090900A65u64)
+
+fn _install_final_probe_identity_cr3(payload: [u8]) -> u64:
+    _zero_page(_final_probe_pml4())
+    _zero_page(_final_probe_pdpt())
+    _zero_page(_final_probe_pd())
+    _write_final_probe_payload()
+    val table_flags = _final_probe_table_flags()
+    val huge_flags = _final_probe_huge_flags()
+    mmio_write64(_final_probe_pml4(), _final_probe_pdpt() | table_flags)
+    mmio_write64(_final_probe_pdpt(), _final_probe_pd() | table_flags)
+    var i: u64 = 0
+    while i < 512:
+        mmio_write64(_final_probe_pd() + (i * 8), (i * 0x200000) | huge_flags)
+        i = i + 1
+    _final_probe_pml4()
+
+fn _run_fixed_green_carrier_probe():
+    serial_println("[green-carrier-qemu] probe-step=fixed-run")
+    val result = green_carrier_fixed_run_task(701, 2, 0, 5, 0, 0, 0, 0)
+    val pending = smp_take_ipi(1u32)
+    val probe_ok = result.enqueued and result.ipi_sent and result.dispatched and result.current_task == 701u64 and result.context_switches == 1
+    val preempt = green_carrier_fixed_preempt_running_task(result.current_task as i64, 1, 2, 1, "timer_interrupt")
+    val preempt_ok = preempt.accepted and preempt.ticked and preempt.yielded and preempt.current_task == 0u64 and preempt.queued_task == 701
+
+    serial_println("[green-carrier-qemu] target-cpu={result.target_cpu} enqueued={_pass(result.enqueued)} ipi={_pass(result.ipi_sent)} pending={pending}")
+    serial_println("[green-carrier-qemu] dispatched={_pass(result.dispatched)} task={result.task_id}")
+    serial_println("[green-carrier-qemu] cpu1-task={result.current_task} cpu1-switches={result.context_switches}")
+    serial_println("[green-carrier-qemu] preempt-source={preempt.source} ticked={_pass(preempt.ticked)} yielded={_pass(preempt.yielded)} queued={preempt.queued_task}")
+    serial_println("[green-carrier-qemu] PREEMPT_PASS={_pass(preempt_ok)}")
+    serial_println("[green-carrier-qemu] PASS={_pass(probe_ok)}")
+
+fn _run_scheduler_green_carrier_handoff_probe():
+    serial_println("[green-carrier-qemu] probe-step=scheduler-handoff")
+    serial_println("[green-carrier-qemu] scheduler-step=create")
+    var scheduler = Scheduler.new_with_cpu_count(2u32)
+    serial_println("[green-carrier-qemu] scheduler-step=parallelism")
+    val parallelism = scheduler.set_green_carrier_parallelism(2)
+    serial_println("[green-carrier-qemu] scheduler-step=queues")
+    val queues = GreenCarrierRunQueueState(
+        queued_task_ids: [701],
+        queued_cpus: [1],
+        queue_depth_by_cpu: [0, 1],
+        capacity: 4,
+        dropped_count: 0
+    )
+    serial_println("[green-carrier-qemu] scheduler-step=run-once")
+    val step = scheduler.run_green_carrier_once(queues, 1)
+    serial_println("[green-carrier-qemu] scheduler-step=verify")
+    val handoff_ok =
+        parallelism.active_limit == 2 and
+        step.ran and
+        step.dispatch.dispatched and
+        step.dispatch.task_id == 701 and
+        step.execution.applied and
+        scheduler.green_current_task_on_cpu(1u32) == 701u64 and
+        scheduler.green_context_switches_on_cpu(1u32) == 1 and
+        scheduler.get_current_on_cpu(1u32).id == 0
+
+    serial_println("[green-carrier-qemu] scheduler-limit={parallelism.active_limit} queued-cpu1=1")
+    serial_println("[green-carrier-qemu] scheduler-ran={_pass(step.ran)} task={step.dispatch.task_id} applied={_pass(step.execution.applied)}")
+    serial_println("[green-carrier-qemu] scheduler-cpu1-task={scheduler.green_current_task_on_cpu(1u32)} scheduler-cpu1-switches={scheduler.green_context_switches_on_cpu(1u32)} normal-cpu1-task={scheduler.get_current_on_cpu(1u32).id}")
+    serial_println("[green-carrier-qemu] SCHED_HANDOFF_PASS={_pass(handoff_ok)}")
+
+fn _run_scheduler_user_handoff_ready_probe():
+    serial_println("[green-carrier-qemu] probe-step=user-handoff-ready")
+    val image = _make_user_handoff_image()
+    var scheduler = Scheduler.new_with_cpu_count(2u32)
+    val pid = scheduler.create_user_task_pid(image, TaskPriority.Normal, CapabilitySet.full())
+    val task = scheduler.get_task(TaskId(id: pid))
+    val task_present = if task == nil: 0 else: 1
+    val queues = GreenCarrierRunQueueState(
+        queued_task_ids: [pid as i64],
+        queued_cpus: [1],
+        queue_depth_by_cpu: [0, 1],
+        capacity: 4,
+        dropped_count: 0
+    )
+    val step = scheduler.run_green_carrier_once(queues, 1)
+    val validation = validate_enter_user_blocking_handoff(pid, scheduler)
+    val ready =
+        pid > 0u64 and
+        task_present == 1 and
+        step.ran and
+        step.dispatch.dispatched and
+        step.dispatch.task_id == (pid as i64) and
+        scheduler.green_current_task_on_cpu(1u32) == pid and
+        scheduler.green_context_switches_on_cpu(1u32) == 1 and
+        scheduler.get_current_on_cpu(1u32).id == 0 and
+        validation.ok and
+        validation.pid == pid and
+        validation.cr3 > 0u64 and
+        validation.context != nil
+
+    serial_println("[green-carrier-qemu] user-pid={pid} task-present={task_present} validation={_pass(validation.ok)} cr3={validation.cr3}")
+    serial_println("[green-carrier-qemu] USER_HANDOFF_READY={_pass(ready)}")
+
+fn _run_user_entry_bridge_ready_probe():
+    serial_println("[green-carrier-qemu] probe-step=user-entry-bridge-ready")
+    if not X86Interrupt.runtime_installed():
+        X86Interrupt.install_bootstrap_runtime(64)
+    shim_init(Scheduler.new_bootstrap(), IpcManager.new(), KernelLog.new(64))
+    install_syscall_entry()
+    val entry_addr = kernel_syscall_entry_addr()
+    val ready = X86Interrupt.runtime_installed() and syscall_entry_installed() and entry_addr > 0u64
+    serial_println("[green-carrier-qemu] syscall-entry={entry_addr} installed={_pass(syscall_entry_installed())} runtime={_pass(X86Interrupt.runtime_installed())}")
+    serial_println("[green-carrier-qemu] USER_ENTRY_BRIDGE_READY={_pass(ready)}")
+
+fn _run_user_syscall_bridge_ready_probe():
+    serial_println("[green-carrier-qemu] probe-step=user-syscall-bridge-ready")
+    val debug_write_result = spl_handle_debug_write(0x2E, 0, 0, 0, 0, 0)
+    val ready = debug_write_result == 0
+    serial_println("[green-carrier-qemu] syscall-debug-write-result={debug_write_result}")
+    serial_println("[green-carrier-qemu] USER_SYSCALL_BRIDGE_READY={_pass(ready)}")
+
+fn _run_final_ring_user_handoff_probe():
+    serial_println("[green-carrier-qemu] probe-step=final-ring-user-handoff")
+    if not X86Interrupt.runtime_installed():
+        X86Interrupt.install_bootstrap_runtime(64)
+    install_syscall_entry()
+    val payload = _make_final_marker_payload()
+    val cr3 = _install_final_probe_identity_cr3(payload)
+    val image = _make_final_user_handoff_image(payload)
+    var scheduler = Scheduler.new_with_cpu_count(2u32)
+    val pid = scheduler.create_user_task_pid(image, TaskPriority.Normal, CapabilitySet.full())
+    val cr3_set = scheduler.set_user_task_address_space_for_probe(pid, cr3)
+    val queues = GreenCarrierRunQueueState(
+        queued_task_ids: [pid as i64],
+        queued_cpus: [1],
+        queue_depth_by_cpu: [0, 1],
+        capacity: 4,
+        dropped_count: 0
+    )
+    val step = scheduler.run_green_carrier_once(queues, 1)
+    val validation = validate_enter_user_blocking_handoff(pid, scheduler)
+    val ready = pid > 0u64 and cr3_set and step.ran and validation.ok and validation.cr3 == cr3
+    serial_println("[green-carrier-qemu] final-pid={pid} cr3={validation.cr3} cr3-set={_pass(cr3_set)} green-ran={_pass(step.ran)} validation={_pass(validation.ok)} ready={_pass(ready)}")
+    if validation.context != nil:
+        val ctx = validation.context.unwrap()
+        serial_println("[green-carrier-qemu] final-frame rip={ctx.rip} rsp={ctx.rsp} cs={ctx.cs} ss={ctx.ss} rflags={ctx.rflags}")
+    serial_println("[green-carrier-qemu] final-payload b0={mmio_read8(_final_probe_entry())} b1={mmio_read8(_final_probe_entry() + 1)} b2={mmio_read8(_final_probe_entry() + 2)} b3={mmio_read8(_final_probe_entry() + 3)} b4={mmio_read8(_final_probe_entry() + 4)} b5={mmio_read8(_final_probe_entry() + 5)} b6={mmio_read8(_final_probe_entry() + 6)} b41={mmio_read8(_final_probe_entry() + 41)}")
+    serial_println("[green-carrier-qemu] USER_CR3_READY={_pass(ready)}")
+    if ready:
+        rt_x86_install_syscall_entry_raw()
+        dispatch_enter_user_blocking(pid, scheduler)
+    serial_println("[green-carrier-qemu] final-entry-returned")
+
+fn _start():
+    mmio_disable_test_mode()
+    serial_println("[green-carrier-qemu] boot")
+    smp_init()
+    val registered = smp_register_firmware_apic_ids([0u32, 1u32])
+    serial_println("[green-carrier-qemu] registered-cpus={registered} count={smp_num_cpus()}")
+    serial_println("[green-carrier-qemu] cpu1-present={_pass(percpu_is_present(1u32))} online-before={_pass(percpu_is_online(1u32))}")
+    X86Interrupt.init()
+    val vec = x86_ap_trampoline_vector()
+    serial_println("[green-carrier-qemu] startup-sent-before={_pass(smp_ap_startup_sent(1u32))} vector={vec}")
+    val manual_sent = x86_send_startup_to_cpu(1u32, vec)
+    serial_println("[green-carrier-qemu] manual-startup={_pass(manual_sent)} startup-count={x86_registered_ap_boot_started_count()}")
+    _spin_for_ap_marker()
+    serial_println("[green-carrier-qemu] online-after={_pass(percpu_is_online(1u32))} online-count={smp_online_count()}")
+    _run_fixed_green_carrier_probe()
+    _run_scheduler_green_carrier_handoff_probe()
+    _run_scheduler_user_handoff_ready_probe()
+    _run_user_entry_bridge_ready_probe()
+    _run_user_syscall_bridge_ready_probe()
+    _run_final_ring_user_handoff_probe()

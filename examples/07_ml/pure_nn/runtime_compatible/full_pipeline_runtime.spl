@@ -1,0 +1,229 @@
+#![allow(unnamed_duplicate_typed_args)]
+#!/usr/bin/env simple
+# Pure Simple Deep Learning - Complete Demonstration (Runtime Compatible)
+# 100% Pure Simple - Zero External Dependencies
+# Self-contained implementation without generics
+
+class SimpleTensor:
+    data: [f64]
+    shape: [i64]
+
+fn create_tensor(data: [f64], shape: [i64]) -> SimpleTensor:
+    SimpleTensor(data: data, shape: shape)
+
+fn tensor_zeros(shape: [i64]) -> SimpleTensor:
+    var numel = 1
+    for dim in shape:
+        numel = numel * dim
+    var data: [f64] = []
+    var i = 0
+    while i < numel:
+        data.push(0.0)
+        i = i + 1
+    SimpleTensor(data: data, shape: shape)
+
+fn tensor_ones(shape: [i64]) -> SimpleTensor:
+    var numel = 1
+    for dim in shape:
+        numel = numel * dim
+    var data: [f64] = []
+    var i = 0
+    while i < numel:
+        data.push(1.0)
+        i = i + 1
+    SimpleTensor(data: data, shape: shape)
+
+fn tensor_add(a: SimpleTensor, b: SimpleTensor) -> SimpleTensor:
+    var result: [f64] = []
+    var i = 0
+    # Broadcasting: if b has fewer elements, repeat them
+    if b.data.len() < a.data.len():
+        while i < a.data.len():
+            val b_idx = i % b.data.len()
+            result.push(a.data[i] + b.data[b_idx])
+            i = i + 1
+    else:
+        while i < a.data.len():
+            result.push(a.data[i] + b.data[i])
+            i = i + 1
+    SimpleTensor(data: result, shape: a.shape)
+
+fn tensor_matmul(a: SimpleTensor, b: SimpleTensor) -> SimpleTensor:
+    val M = a.shape[0]
+    val K = a.shape[1]
+    val N = b.shape[1]
+    var result: [f64] = []
+    var i = 0
+    while i < M:
+        var j = 0
+        while j < N:
+            var sum = 0.0
+            var k = 0
+            while k < K:
+                sum = sum + a.data[i * K + k] * b.data[k * N + j]
+                k = k + 1
+            result.push(sum)
+            j = j + 1
+        i = i + 1
+    SimpleTensor(data: result, shape: [M, N])
+
+fn tensor_relu(t: SimpleTensor) -> SimpleTensor:
+    var result: [f64] = []
+    for v in t.data:
+        result.push(if v > 0.0: v else: 0.0)
+    SimpleTensor(data: result, shape: t.shape)
+
+fn tensor_sigmoid(t: SimpleTensor) -> SimpleTensor:
+    var result: [f64] = []
+    for v in t.data:
+        val exp_neg = 2.718281828459045
+        var exp_v = 1.0
+        var term = 1.0
+        var n = 1
+        while n < 10:
+            term = term * (-v) / n
+            exp_v = exp_v + term
+            n = n + 1
+        result.push(1.0 / (1.0 + exp_v))
+    SimpleTensor(data: result, shape: t.shape)
+
+fn print_tensor_2d(t: SimpleTensor, name: text):
+    print "{name} ({t.shape[0]}x{t.shape[1]}):"
+    var i = 0
+    while i < t.shape[0]:
+        var row = "  ["
+        var j = 0
+        while j < t.shape[1]:
+            val val_str = "{t.data[i * t.shape[1] + j]}"
+            row = row + val_str
+            if j < t.shape[1] - 1:
+                row = row + ", "
+            j = j + 1
+        row = row + "]"
+        print row
+        i = i + 1
+
+fn print_tensor_1d(t: SimpleTensor, name: text):
+    var result = "{name}: ["
+    var i = 0
+    while i < t.data.len():
+        result = result + "{t.data[i]}"
+        if i < t.data.len() - 1:
+            result = result + ", "
+        i = i + 1
+    result = result + "]"
+    print result
+
+class NeuralNetwork:
+    # Layer 1: 2 inputs -> 4 hidden
+    w1: SimpleTensor
+    b1: SimpleTensor
+    # Layer 2: 4 hidden -> 1 output
+    w2: SimpleTensor
+    b2: SimpleTensor
+
+fn create_network() -> NeuralNetwork:
+    # Initialize weights with small values
+    val w1 = create_tensor([0.5, 0.3, -0.2, 0.7, 0.1, -0.4, 0.6, 0.2], [2, 4])
+    val b1 = tensor_zeros([1, 4])
+    val w2 = create_tensor([0.3, -0.5, 0.4, 0.2], [4, 1])
+    val b2 = tensor_zeros([1, 1])
+    NeuralNetwork(w1: w1, b1: b1, w2: w2, b2: b2)
+
+fn forward_pass(net: NeuralNetwork, x: SimpleTensor) -> SimpleTensor:
+    # Layer 1: z1 = x @ w1 + b1, h1 = ReLU(z1)
+    val z1 = tensor_matmul(x, net.w1)
+    val z1_bias = tensor_add(z1, net.b1)
+    val h1 = tensor_relu(z1_bias)
+
+    # Layer 2: z2 = h1 @ w2 + b2, output = sigmoid(z2)
+    val z2 = tensor_matmul(h1, net.w2)
+    val z2_bias = tensor_add(z2, net.b2)
+    val output = tensor_sigmoid(z2_bias)
+
+    output
+
+fn main():
+    print "╔════════════════════════════════════════════════════════════╗"
+    print "║   Pure Simple Deep Learning - Complete Demonstration      ║"
+    print "║   100% Pure Simple - Zero External Dependencies           ║"
+    print "║   Runtime Compatible (No Generics)                         ║"
+    print "╚════════════════════════════════════════════════════════════╝"
+    print ""
+
+    # Demo 1: Basic tensor operations
+    print "━━━ Demo 1: Tensor Operations ━━━"
+    print ""
+    val A = create_tensor([1.0, 2.0, 3.0, 4.0], [2, 2])
+    val B = create_tensor([5.0, 6.0, 7.0, 8.0], [2, 2])
+    print_tensor_2d(A, "Tensor A")
+    print_tensor_2d(B, "Tensor B")
+    print ""
+    val C_add = tensor_add(A, B)
+    print_tensor_2d(C_add, "A + B")
+    val C_matmul = tensor_matmul(A, B)
+    print_tensor_2d(C_matmul, "A @ B")
+    print ""
+
+    # Demo 2: Activation functions
+    print "━━━ Demo 2: Activation Functions ━━━"
+    print ""
+    val x_act = create_tensor([-2.0, -1.0, 0.0, 1.0, 2.0], [5])
+    print_tensor_1d(x_act, "Input")
+    val relu_out = tensor_relu(x_act)
+    print_tensor_1d(relu_out, "ReLU(x)")
+    val sig_in = create_tensor([0.0, 1.0, 2.0], [3])
+    val sigmoid_out = tensor_sigmoid(sig_in)
+    print_tensor_1d(sigmoid_out, "Sigmoid([0, 1, 2])")
+    print ""
+
+    # Demo 3: Neural network forward pass
+    print "━━━ Demo 3: Neural Network (2 → 4 → 1) ━━━"
+    print ""
+    val net = create_network()
+    print "Network architecture:"
+    print "  Input layer: 2 neurons"
+    print "  Hidden layer: 4 neurons (ReLU activation)"
+    print "  Output layer: 1 neuron (Sigmoid activation)"
+    print ""
+
+    # XOR problem data
+    val x_xor = create_tensor([
+        0.0, 0.0,
+        0.0, 1.0,
+        1.0, 0.0,
+        1.0, 1.0
+    ], [4, 2])
+
+    print "Testing on XOR inputs:"
+    print_tensor_2d(x_xor, "Inputs")
+    print ""
+
+    val predictions = forward_pass(net, x_xor)
+    print_tensor_2d(predictions, "Predictions (before training)")
+    print ""
+
+    # Demo 4: Tensor factory functions
+    print "━━━ Demo 4: Tensor Creation ━━━"
+    print ""
+    val zeros = tensor_zeros([2, 3])
+    print_tensor_2d(zeros, "Zeros(2x3)")
+    val ones = tensor_ones([3, 2])
+    print_tensor_2d(ones, "Ones(3x2)")
+    print ""
+
+    print "╔════════════════════════════════════════════════════════════╗"
+    print "║                    Demo Complete!                          ║"
+    print "╚════════════════════════════════════════════════════════════╝"
+    print ""
+    print "✓ Tensor operations (add, matmul)"
+    print "✓ Activation functions (ReLU, Sigmoid)"
+    print "✓ Neural network forward pass"
+    print "✓ Factory functions (zeros, ones)"
+    print ""
+    print "Next steps:"
+    print "  - See autograd_example_runtime.spl for differentiation"
+    print "  - See xor_training_example.spl for full training loop"
+    print "  - For compiled mode: Use lib.pure.* modules with generics"
+
+main()

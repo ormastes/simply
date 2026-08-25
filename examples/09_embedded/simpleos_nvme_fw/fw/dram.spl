@@ -1,0 +1,251 @@
+"""
+dram — bounded DRAM write arena floor for the NVMe firmware simulation (gap-closure P5).
+
+Pure fixed arena: host write bytes allocate a span here before the FTL programs media.
+"""
+
+use nvme_types.*
+
+val WRITE_BUFFER_CAP_BLOCKS: i64 = 16
+val WRITE_BUFFER_ENTRY_BYTES: i64 = 4096
+val WRITE_BUFFER_DRAM_BUDGET_BYTES: i64 = 65536
+val DRAM_COUNTER_MAX: i64 = 1000000000000000000
+
+fn dram_fill(size: i64, fill: i64) -> [i64]:
+    var arr: [i64] = []
+    var i: i64 = 0
+    while i < size:
+        arr.push(fill)
+        i = i + 1
+    arr
+
+fn dram_counter_next(v: i64) -> i64:
+    if v < 0:
+        return 1
+    if v >= DRAM_COUNTER_MAX:
+        return DRAM_COUNTER_MAX
+    v + 1
+
+struct DramWriteBuffer:
+    data: [i64]
+    used_slots: [i64]
+    cap: i64
+    count: i64
+    overflows: i64
+
+struct DramSpan:
+    base: i64
+    len: i64
+    ok: bool
+
+fn dram_write_buffer_new() -> DramWriteBuffer:
+    DramWriteBuffer(data: dram_fill(WRITE_BUFFER_CAP_BLOCKS, 0), used_slots: dram_fill(WRITE_BUFFER_CAP_BLOCKS, 0), cap: WRITE_BUFFER_CAP_BLOCKS, count: 0, overflows: 0)
+
+impl DramWriteBuffer:
+    me effective_cap() -> i64:
+        var c: i64 = me.cap
+        if c < 0:
+            return 0
+        if c > WRITE_BUFFER_CAP_BLOCKS:
+            c = WRITE_BUFFER_CAP_BLOCKS
+        if c > me.data.len():
+            c = me.data.len()
+        if c > me.used_slots.len():
+            c = me.used_slots.len()
+        c
+
+    me clear():
+        me.count = 0
+        val cap: i64 = me.effective_cap()
+        var i: i64 = 0
+        while i < cap:
+            me.used_slots[i] = 0
+            i = i + 1
+
+    me actual_used() -> i64:
+        val cap: i64 = me.effective_cap()
+        var i: i64 = 0
+        var n: i64 = 0
+        while i < cap:
+            if me.used_slots[i] != 0:
+                n = n + 1
+            i = i + 1
+        n
+
+    me span_ready(span: DramSpan, cap: i64) -> bool:
+        if span.base < 0 or span.len < 0:
+            return false
+        if span.len > cap:
+            return false
+        span.base <= cap - span.len
+
+    me alloc(nblocks: i64) -> DramSpan:
+        val cap: i64 = me.effective_cap()
+        if nblocks <= 0:
+            return DramSpan(base: 0, len: 0, ok: true)
+        if nblocks > cap:
+            me.overflows = dram_counter_next(me.overflows)
+            return DramSpan(base: NULL_IDX, len: 0, ok: false)
+        var start: i64 = 0
+        while start + nblocks <= cap:
+            var i: i64 = 0
+            var free: bool = true
+            while i < nblocks:
+                if me.used_slots[start + i] != 0:
+                    free = false
+                i = i + 1
+            if free:
+                i = 0
+                while i < nblocks:
+                    me.used_slots[start + i] = 1
+                    me.data[start + i] = 0
+                    i = i + 1
+                me.count = me.actual_used()
+                return DramSpan(base: start, len: nblocks, ok: true)
+            start = start + 1
+        me.overflows = dram_counter_next(me.overflows)
+        DramSpan(base: NULL_IDX, len: 0, ok: false)
+
+    me release(span: DramSpan):
+        if not span.ok:
+            return
+        val cap: i64 = me.effective_cap()
+        if not me.span_ready(span, cap):
+            return
+        var i: i64 = 0
+        while i < span.len:
+            val idx: i64 = span.base + i
+            if idx >= 0 and idx < cap:
+                if me.used_slots[idx] != 0:
+                    me.used_slots[idx] = 0
+                    me.data[idx] = 0
+            i = i + 1
+        me.count = me.actual_used()
+
+    me stage(span: DramSpan, index: i64, byte: i64) -> i64:
+        val cap: i64 = me.effective_cap()
+        if not span.ok:
+            me.overflows = dram_counter_next(me.overflows)
+            return SC_NS_NOT_READY
+        if index < 0:
+            me.overflows = dram_counter_next(me.overflows)
+            return SC_NS_NOT_READY
+        if index >= span.len:
+            me.overflows = dram_counter_next(me.overflows)
+            return SC_NS_NOT_READY
+        if not me.span_ready(span, cap):
+            me.overflows = dram_counter_next(me.overflows)
+            return SC_NS_NOT_READY
+        val slot: i64 = span.base + index
+        if slot < 0 or slot >= cap:
+            me.overflows = dram_counter_next(me.overflows)
+            return SC_NS_NOT_READY
+        if me.used_slots[slot] == 0:
+            me.overflows = dram_counter_next(me.overflows)
+            return SC_NS_NOT_READY
+        me.data[slot] = byte & 0xFF
+        SC_SUCCESS
+
+    me byte(span: DramSpan, index: i64) -> i64:
+        val cap: i64 = me.effective_cap()
+        if not span.ok:
+            return 0
+        if index < 0:
+            return 0
+        if index >= span.len:
+            return 0
+        if not me.span_ready(span, cap):
+            return 0
+        val slot: i64 = span.base + index
+        if slot < 0 or slot >= cap:
+            return 0
+        if me.used_slots[slot] == 0:
+            return 0
+        me.data[slot]
+
+    me used() -> i64:
+        if me.count < 0:
+            return 0
+        val cap: i64 = me.effective_cap()
+        if me.count > cap:
+            return cap
+        me.count
+
+    me overflow_count() -> i64:
+        if me.overflows < 0:
+            return 0
+        me.overflows
+
+fn dram_selftest() -> i64:
+    var fail: i64 = 0
+    var b: DramWriteBuffer = dram_write_buffer_new()
+    fail = fail + expect_eq(b.cap * WRITE_BUFFER_ENTRY_BYTES, WRITE_BUFFER_DRAM_BUDGET_BYTES, "write buffer fits DRAM budget")
+    val s: DramSpan = b.alloc(2)
+    fail = fail + expect_eq(if s.ok: 1 else: 0, 1, "alloc span")
+    fail = fail + expect_eq(b.stage(s, 0, 0x123), SC_SUCCESS, "stage byte 0")
+    fail = fail + expect_eq(b.stage(s, 1, 0x45), SC_SUCCESS, "stage byte 1")
+    fail = fail + expect_eq(b.byte(s, 0), 0x23, "stage masks byte")
+    fail = fail + expect_eq(b.byte(s, 1), 0x45, "stage keeps byte")
+    fail = fail + expect_eq(b.used(), 2, "used count")
+    b.count = -3
+    fail = fail + expect_eq(b.used(), 0, "corrupted negative DRAM usage clamps to zero")
+    b.count = WRITE_BUFFER_CAP_BLOCKS + 3
+    fail = fail + expect_eq(b.used(), WRITE_BUFFER_CAP_BLOCKS, "corrupted oversized DRAM usage clamps to capacity")
+    val recover_high_count: DramSpan = b.alloc(1)
+    fail = fail + expect_eq(if recover_high_count.ok: 1 else: 0, 1, "corrupted oversized DRAM usage still allocates")
+    fail = fail + expect_eq(b.used(), 3, "alloc recovers corrupted oversized DRAM usage count")
+    b.release(recover_high_count)
+    fail = fail + expect_eq(b.used(), 2, "release rebuilds usage count from live slots")
+    b.count = 2
+    b.cap = WRITE_BUFFER_CAP_BLOCKS + 5
+    fail = fail + expect_eq(b.effective_cap(), WRITE_BUFFER_CAP_BLOCKS, "corrupted oversized DRAM cap clamps to backing arena")
+    fail = fail + expect_eq(b.stage(DramSpan(base: WRITE_BUFFER_CAP_BLOCKS, len: 1, ok: true), 0, 1), SC_NS_NOT_READY, "corrupted oversized DRAM cap cannot stage past backing arena")
+    b.cap = -1
+    fail = fail + expect_eq(b.effective_cap(), 0, "corrupted negative DRAM cap clamps to zero")
+    fail = fail + expect_eq(if b.alloc(1).ok: 1 else: 0, 0, "corrupted negative DRAM cap rejects allocation")
+    b.cap = WRITE_BUFFER_CAP_BLOCKS
+    b.count = -5
+    val recover_count: DramSpan = b.alloc(1)
+    fail = fail + expect_eq(if recover_count.ok: 1 else: 0, 1, "corrupted negative DRAM usage still allocates")
+    fail = fail + expect_eq(b.used(), 3, "alloc recovers corrupted negative DRAM usage count")
+    b.release(recover_count)
+    b.count = 2
+    b.overflows = -4
+    fail = fail + expect_eq(b.overflow_count(), 0, "corrupted negative DRAM overflow count clamps to zero")
+    fail = fail + expect_eq(b.stage(s, 2, 1), SC_NS_NOT_READY, "corrupted negative DRAM overflow count recovers on stage error")
+    fail = fail + expect_eq(b.overflow_count(), 1, "corrupted negative DRAM overflow count increments from zero")
+    b.overflows = DRAM_COUNTER_MAX
+    fail = fail + expect_eq(b.stage(s, 2, 1), SC_NS_NOT_READY, "saturated DRAM overflow count still fails closed")
+    fail = fail + expect_eq(b.overflow_count(), DRAM_COUNTER_MAX, "DRAM overflow count saturates")
+    b.overflows = 0
+    fail = fail + expect_eq(b.stage(s, 2, 1), SC_NS_NOT_READY, "over-span stage fails")
+    fail = fail + expect_eq(b.overflow_count(), 1, "overflow counted")
+    val forged: DramSpan = DramSpan(base: 5, len: 1, ok: true)
+    fail = fail + expect_eq(b.stage(forged, 0, 0xAA), SC_NS_NOT_READY, "forged unallocated span stage fails")
+    fail = fail + expect_eq(b.byte(forged, 0), 0, "forged unallocated span read returns zero")
+    b.release(DramSpan(base: -1, len: 3, ok: true))
+    fail = fail + expect_eq(b.used(), 2, "forged negative release leaves live slots")
+    b.release(DramSpan(base: 1, len: WRITE_BUFFER_CAP_BLOCKS, ok: true))
+    fail = fail + expect_eq(b.used(), 2, "forged overrun release leaves live slots")
+    val huge_span: DramSpan = DramSpan(base: 1, len: DRAM_COUNTER_MAX, ok: true)
+    b.release(huge_span)
+    fail = fail + expect_eq(b.used(), 2, "forged huge release leaves live slots")
+    fail = fail + expect_eq(b.stage(huge_span, 0, 0xAA), SC_NS_NOT_READY, "forged huge stage fails closed")
+    fail = fail + expect_eq(b.byte(huge_span, 0), 0, "forged huge read returns zero")
+    b.release(s)
+    fail = fail + expect_eq(b.used(), 0, "release resets live usage")
+    val f0: DramSpan = b.alloc(1)
+    val f1: DramSpan = b.alloc(1)
+    b.release(f0)
+    fail = fail + expect_eq(b.stage(f1, 0, 0x77), SC_SUCCESS, "fragmented span stage succeeds")
+    fail = fail + expect_eq(b.used(), 1, "fragmented span stage does not overcount usage")
+    b.release(f1)
+    val full: DramSpan = b.alloc(WRITE_BUFFER_CAP_BLOCKS)
+    fail = fail + expect_eq(if full.ok: 1 else: 0, 1, "release frees arena")
+    fail = fail + expect_eq(b.used(), WRITE_BUFFER_CAP_BLOCKS, "full alloc tracks live usage")
+    val over: DramSpan = b.alloc(1)
+    fail = fail + expect_eq(if over.ok: 1 else: 0, 0, "over-budget alloc fails")
+    fail = fail + expect_eq(b.overflow_count(), 4, "alloc overflow counted")
+    b.release(full)
+    fail = fail + expect_eq(b.used(), 0, "full release resets live usage")
+    fail

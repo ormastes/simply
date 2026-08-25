@@ -1,0 +1,30 @@
+{{#layout "application"}}
+
+<h1>{{title}}</h1>
+
+<form method="POST" action="{{#if template_id}}/admin/templates/{{template_id}}/update{{else}}/admin/templates{{/if}}" class="form">
+    <input type="hidden" name="csrf_token" value="{{csrf_token}}">
+
+    <div class="form-group">
+        <label for="name">Name</label>
+        <input type="text" id="name" name="name" value="{{template_name}}" required>
+    </div>
+
+    <div class="form-group">
+        <label for="template_type">Type</label>
+        <select id="template_type" name="template_type">
+            <option value="restaurant" {{#if template_type_restaurant}}selected{{/if}}>Restaurant</option>
+            <option value="store" {{#if template_type_store}}selected{{/if}}>Store</option>
+        </select>
+    </div>
+
+    <div class="form-group">
+        <label for="description">Description</label>
+        <textarea id="description" name="description" rows="3">{{template_description}}</textarea>
+    </div>
+
+    <button type="submit" class="btn btn-primary">Save</button>
+    <a href="/admin/templates" class="btn">Cancel</a>
+</form>
+
+{{/layout}}

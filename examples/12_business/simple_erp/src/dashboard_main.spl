@@ -1,0 +1,28 @@
+# Dashboard Entrypoint — renders the Simple Business Suite KPI dashboard
+#
+# Builds the five suite lanes' KPIs from their known demo-run tallies and
+# prints the full self-contained HTML dashboard document, followed by a
+# machine-checkable trailer line for system specs.
+
+use report.summary.{LaneKpi, kpi}
+use web.dashboard.{render_dashboard}
+
+fn suite_kpis() -> [LaneKpi]:
+    var kpis: [LaneKpi] = []
+    kpis.push(kpi("crm", 1, 1, 0))
+    kpis.push(kpi("reservation", 1, 1, 2000))
+    kpis.push(kpi("sale", 1, 1, 11000))
+    kpis.push(kpi("market", 1, 1, 5000))
+    kpis.push(kpi("restaurant", 1, 1, 15000))
+    return kpis
+
+fn main():
+    val kpis = suite_kpis()
+    val html = render_dashboard("Simple Business Suite", kpis)
+
+    var total_revenue = 0
+    for k in kpis:
+        total_revenue = total_revenue + k.revenue_minor
+
+    print html
+    print "dashboard-ok lanes={kpis.length()} revenue={total_revenue}"

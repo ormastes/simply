@@ -1,0 +1,37 @@
+# @cover src/units/money.spl 80%
+"""
+# Money & Units
+
+Money is nominal: currencies never silently coerce. Same-currency arithmetic
+succeeds; mixing currencies is rejected (the runtime stand-in for the design
+target where wrong-currency math is a compile error).
+"""
+
+use std.spec
+use units.money.{money, zero, money_add, money_sub, money_neg, money_eq, is_zero}
+
+describe "Money — nominal currency arithmetic":
+    it "adds same-currency amounts":
+        val r = money_add(money("USD", 100), money("USD", 50))
+        expect(r.ok).to_equal(true)
+        expect(r.value.minor).to_equal(150)
+
+    it "rejects cross-currency addition":
+        val r = money_add(money("USD", 100), money("EUR", 50))
+        expect(r.ok).to_equal(false)
+
+    it "subtracts same-currency amounts":
+        val r = money_sub(money("USD", 100), money("USD", 30))
+        expect(r.ok).to_equal(true)
+        expect(r.value.minor).to_equal(70)
+
+    it "negates an amount":
+        val n = money_neg(money("USD", 100))
+        expect(n.minor).to_equal(-100)
+
+    it "treats a zero amount as zero":
+        expect(is_zero(zero("USD"))).to_equal(true)
+
+    it "compares amounts by currency and magnitude":
+        expect(money_eq(money("USD", 100), money("USD", 100))).to_equal(true)
+        expect(money_eq(money("USD", 100), money("EUR", 100))).to_equal(false)

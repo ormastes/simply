@@ -1,0 +1,115 @@
+"""
+SimpleOS NVMe Firmware — generation-checked object pool (simulation)
+
+Simulation only — host-runnable in pure Simple. Demonstrates the index-pointer /
+object-pool requirement from the firmware research design: bounded slots addressed
+by a {index, generation} Handle instead of a raw pointer. Releasing a slot bumps
+its generation, so any still-live Handle becomes stale and is rejected — this is
+the use-after-free guard the design relies on across coroutine yields.
+
+The state-machine WriteTask phases (INIT -> PROGRAM -> JOURNAL -> UPDATE_L2P ->
+DONE) are advanced cooperatively by `step`, with the phase held in the slot (task
+context), not in a call-stack local.
+
+ponytail: production firmware uses a shared engine.core.object_pool.ObjectPool.
+
+Run: bin/simple run examples/09_embedded/simpleos_nvme_fw/pool_demo.spl
+"""
+
+val POOL_CAP: i64 = 4
+val UNMAP: i64    = -1
+
+val PHASE_INIT: i64 = 0
+val PHASE_DONE: i64 = 4   # INIT -> PROGRAM -> JOURNAL -> UPDATE_L2P -> DONE
+
+struct Handle:
+    index:      i64
+    generation: i64
+
+struct TaskPool:
+    gens:       [i64]   # per-slot generation counter
+    used:       [i64]   # 0 = free, 1 = occupied
+    slot_phase: [i64]   # cooperative WriteTask phase, held in the slot
+    capacity:   i64
+
+fn make_pool(cap: i64) -> TaskPool:
+    var gens:       [i64] = []
+    var used:       [i64] = []
+    var slot_phase: [i64] = []
+    var i: i64 = 0
+    while i < cap:
+        gens.push(0)
+        used.push(0)
+        slot_phase.push(PHASE_INIT)
+        i = i + 1
+    TaskPool(gens: gens, used: used, slot_phase: slot_phase, capacity: cap)
+
+impl TaskPool:
+    # Claim a free slot; invalid Handle if the pool is full.
+    me acquire() -> Handle:
+        var i: i64 = 0
+        while i < me.capacity:
+            if me.used[i] == 0:
+                me.used[i]       = 1
+                me.slot_phase[i] = PHASE_INIT
+                return Handle(index: i, generation: me.gens[i])
+            i = i + 1
+        Handle(index: UNMAP, generation: UNMAP)
+
+    # Current phase if h is still valid, else UNMAP (generation/used guard).
+    me get_phase(h: Handle) -> i64:
+        if h.index < 0 or h.index >= me.capacity:
+            return UNMAP
+        if me.gens[h.index] != h.generation or me.used[h.index] == 0:
+            return UNMAP
+        me.slot_phase[h.index]
+
+    # Advance the task one phase; UNMAP for a stale handle.
+    me step(h: Handle) -> i64:
+        if h.index < 0 or h.index >= me.capacity:
+            return UNMAP
+        if me.gens[h.index] != h.generation or me.used[h.index] == 0:
+            return UNMAP
+        if me.slot_phase[h.index] < PHASE_DONE:
+            me.slot_phase[h.index] = me.slot_phase[h.index] + 1
+        me.slot_phase[h.index]
+
+    # Release slot; bumps generation so any live Handle becomes stale.
+    me release(h: Handle):
+        if h.index >= 0 and h.index < me.capacity:
+            me.used[h.index] = 0
+            me.gens[h.index] = me.gens[h.index] + 1
+
+fn check_eq(got: i64, want: i64, label: text) -> i64:
+    if got == want:
+        print "PASS: {label} ({got})"
+        return 0
+    print "FAIL: {label} -- expected {want} got {got}"
+    1
+
+fn main():
+    var fails: i64 = 0
+    print "=== TaskPool: generation-checked handle ==="
+    var pool = make_pool(POOL_CAP)
+
+    val h0 = pool.acquire()
+    val h1 = pool.acquire()
+    fails = fails + check_eq(pool.get_phase(h0), PHASE_INIT, "h0 acquired at PHASE_INIT")
+
+    pool.release(h0)
+    fails = fails + check_eq(pool.get_phase(h0), UNMAP, "stale handle rejected after release")
+
+    var phase: i64 = PHASE_INIT
+    var steps: i64 = 0
+    while phase < PHASE_DONE and steps < 10:
+        phase = pool.step(h1)
+        steps = steps + 1
+    fails = fails + check_eq(phase, PHASE_DONE, "WriteTask h1 reached PHASE_DONE")
+    fails = fails + check_eq(steps, PHASE_DONE, "advanced in exactly 4 cooperative steps")
+    pool.release(h1)
+
+    print ""
+    if fails == 0:
+        print "PASS"
+    else:
+        print "FAIL ({fails} assertions failed)"

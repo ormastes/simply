@@ -1,0 +1,34 @@
+{{#layout "application"}}
+
+<h1>Gate Pay &mdash; Order #{{order_id}}</h1>
+<a href="/admin/orders/{{order_id}}" class="btn">&larr; Back to Order</a>
+
+<div class="card">
+    <h2>Total: ${{total_display}}</h2>
+    <p>Payment method: Gate Pay (End of Meal)</p>
+    <p class="help-text">Customer pays when leaving the restaurant.</p>
+</div>
+
+<form method="POST" action="/admin/orders/{{order_id}}/gate-pay" class="form">
+    <input type="hidden" name="csrf_token" value="{{csrf_token}}">
+
+    <div class="form-group">
+        <label for="card_number">Card Number</label>
+        <input type="text" id="card_number" name="card_number" placeholder="4242424242424242" required>
+        <span class="help-text">Mock: cards starting with 4 succeed</span>
+    </div>
+
+    <div class="form-group">
+        <label for="card_expiry">Expiry (MM/YY)</label>
+        <input type="text" id="card_expiry" name="card_expiry" placeholder="12/28">
+    </div>
+
+    <div class="form-group">
+        <label for="card_cvc">CVC</label>
+        <input type="text" id="card_cvc" name="card_cvc" placeholder="123">
+    </div>
+
+    <button type="submit" class="btn btn-primary">Complete Meal &amp; Pay</button>
+</form>
+
+{{/layout}}

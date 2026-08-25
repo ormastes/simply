@@ -1,0 +1,4 @@
+use logic_map_cases.*
+
+fn rv32_map_selftest() -> i32:
+    rv32_map_cases_selftest()

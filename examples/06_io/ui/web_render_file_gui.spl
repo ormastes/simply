@@ -1,0 +1,604 @@
+# web_render_file_gui.spl — render an HTML file through the pure-Simple web
+# renderer backed by a caller-selected Engine2D backend and present it to a
+# window with structured rendering and input evidence.
+#
+# This is intended as a web-renderer sanity view, so prefer sample pages with
+# class/id selectors; those route through the generic layout renderer instead of
+# the legacy corpus heuristic path.
+#
+# Run (window):
+#   SIMPLE_TIMEOUT_SECONDS=0 scripts/gui/macos-gui-run.shs examples/06_io/ui/web_render_file_gui.spl \
+#     examples/06_io/ui/browser_common_elements_showcase.html
+# Headless: drop SIMPLE_GUI / use bin/simple run.
+#
+# Resolution convention (shared across all showcase apps): SHOWCASE_RESOLUTION
+# env var selects the render size — "4k" (default) => 3840x2160, "8k" =>
+# 7680x4320, or an explicit "WIDTHxHEIGHT" (e.g. "1920x1080"). See
+# `showcase_resolution_dims()` below.
+#
+# DPI: SHOWCASE_DPI (default 300) drives the live gate's 24pt vector-font
+# witness through the exact points-to-pixels formula. The shared layout engine
+# (simple_web_html_layout_renderer.spl) still has no device-pixel-ratio /
+# logical-vs-physical-viewport concept — `width`/`height` serve as both the
+# raster buffer size and the CSS viewport in one unified value, so there is no
+# hook to lay out at a scaled logical size while rasterizing denser without a
+# naive upscale (which the DPI requirement explicitly forbids). This is a real
+# engine gap, not implemented here — see
+# doc/08_tracking/bug/web_render_dpi_scaling_unsupported_2026-07-12.md.
+#
+# Interpreted-mode (`bin/simple run`, no AOT/JIT) runs of this showcase can
+# fail closed with reason=blank-or-uniform: the shared layout engine's
+# per-render wall-clock budget (WEB_RENDER_BUDGET_MS, 10s default in
+# simple_web_html_layout_renderer.spl) is sized for compiled execution and
+# routinely expires mid-paint under the interpreter, so only the canvas
+# background command survives. Set SIMPLE_WEB_RENDER_BUDGET_MS (milliseconds)
+# to a much larger value for interpreted-mode evidence/debugging runs — the
+# default is intentionally left unscaled so it does not mask the underlying
+# interpreter-perf gap.
+
+use std.gc_async_mut.gpu.browser_engine.simple_web_renderer.{
+    simple_web_render_html_to_readback_result_with_engine2d_backend,
+    simple_web_resolved_engine2d_backend_name}
+use std.io.window_winit.{WinitInput, WinitLoop, WinitWindow, winit_loop_new, winit_loop_free, winit_window_new, winit_window_free, winit_present_rgba, winit_poll_input_into}
+use std.nogc_sync_mut.io.window_winit_input_event.{WinitInputEvent}
+use std.nogc_sync_mut.io.time_ops.{time_now_unix_micros}
+
+use std.io_runtime.{read_file, file_exists, env_get, file_write}
+use std.common.encoding.font_registry.{
+    selected_font_asset_candidates, selected_font_asset_identity}
+use common.ui.widget.{UIEvent, UIState, UITree, UIMode, WidgetNode}
+use common.ui.event.{process_event}
+use common.ui.wm_app_process_contract.{web_standards_showcase_window_title}
+
+class ShowcaseDims:
+    w: i32
+    h: i32
+
+class WebLiveFocusReceipt:
+    state: UIState
+    state_revision: i64
+    before_focus: text
+    before_state_revision: i64
+    after_focus: text
+    after_state_revision: i64
+    raw_kind: i64
+    observed: bool
+    reduced: bool
+    admitted: bool
+    receipt_revision: i64
+
+fn web_live_focus_receipt_new() -> WebLiveFocusReceipt:
+    val root = WidgetNode(id: "simple-web-viewport")
+    val tree = UITree.new(root)
+    val state = UIState(
+        tree: tree, mode: UIMode.Normal, focused_id: "",
+        command_buffer: "")
+    WebLiveFocusReceipt(
+        state: state, state_revision: 0, before_focus: "",
+        before_state_revision: 0, after_focus: "",
+        after_state_revision: 0, raw_kind: 0, observed: false,
+        reduced: false, admitted: false, receipt_revision: 0)
+
+fn web_live_reduce_raw_focus(
+    receipt: WebLiveFocusReceipt, raw_kind: i64,
+    delivery_revision: i64
+) -> WebLiveFocusReceipt:
+    if raw_kind != 5 and raw_kind != 6:
+        return receipt
+    val before = receipt.state
+    val before_revision = receipt.state_revision
+    val target_id = before.tree.root_id
+    val focus_kind = if raw_kind == 5: "focus" else: "blur"
+    val canonical = process_event(
+        before, UIEvent.FocusEvent(target_id: target_id, kind: focus_kind))
+    # The shared reducer deliberately keeps blur state unchanged. This web
+    # owner consumes that canonical blur event, then clears its owned focus
+    # slot so admission cannot survive native kind 6.
+    val after = if raw_kind == 6 and before.focused_id == target_id:
+        UIState(
+            tree: canonical.tree, mode: canonical.mode, focused_id: "",
+            command_buffer: canonical.command_buffer)
+    else:
+        canonical
+    val changed = before.focused_id != after.focused_id
+    val after_revision = if changed:
+        before_revision + 1
+    else:
+        before_revision
+    WebLiveFocusReceipt(
+        state: after, state_revision: after_revision,
+        before_focus: before.focused_id,
+        before_state_revision: before_revision,
+        after_focus: after.focused_id,
+        after_state_revision: after_revision,
+        raw_kind: raw_kind, observed: true, reduced: changed,
+        admitted: raw_kind == 5 and changed and after.focused_id != "",
+        receipt_revision: delivery_revision)
+
+fn web_live_interaction_admitted(
+    focus: WebLiveFocusReceipt, keyboard_revision: i64,
+    committed_text_revision: i64, pointer_revision: i64,
+    click_revision: i64
+) -> bool:
+    focus.admitted and focus.raw_kind == 5 and
+        focus.after_state_revision > focus.before_state_revision and
+        keyboard_revision > focus.receipt_revision and
+        committed_text_revision > keyboard_revision and
+        pointer_revision > focus.receipt_revision and
+        click_revision > focus.receipt_revision
+
+# Resolve the render resolution from SHOWCASE_RESOLUTION: "4k" (or unset) =>
+# 3840x2160 (DEFAULT), "8k" => 7680x4320, or an explicit "WIDTHxHEIGHT".
+pub fn showcase_resolution_dims() -> ShowcaseDims:
+    val raw = (env_get("SHOWCASE_RESOLUTION") ?? "").trim().lower()
+    if raw == "" or raw == "4k":
+        return ShowcaseDims(w: 3840, h: 2160)
+    if raw == "8k":
+        return ShowcaseDims(w: 7680, h: 4320)
+    if raw.contains("x"):
+        val parts = raw.split("x")
+        if parts.len() == 2:
+            val pw = parts[0].trim().to_i64()
+            val ph = parts[1].trim().to_i64()
+            if pw != nil and ph != nil and pw > 0 and ph > 0:
+                return ShowcaseDims(w: pw.to_i32(), h: ph.to_i32())
+    ShowcaseDims(w: 3840, h: 2160)
+
+# Resolve SHOWCASE_DPI (default 300). It sizes the explicit vector-font witness;
+# the broader layout/paint engine still has no full-page DPI hook.
+pub fn showcase_dpi() -> i32:
+    val raw = (env_get("SHOWCASE_DPI") ?? "").trim()
+    if raw == "":
+        return 300
+    val n = raw.to_i64()
+    if n == nil or n <= 0:
+        return 300
+    n.to_i32()
+
+val SHOWCASE_DIMS: ShowcaseDims = showcase_resolution_dims()
+val RW: i32 = SHOWCASE_DIMS.w
+val RH: i32 = SHOWCASE_DIMS.h
+val W: i32 = SHOWCASE_DIMS.w
+val H: i32 = SHOWCASE_DIMS.h
+val SHOWCASE_DPI_VALUE: i32 = showcase_dpi()
+val WEB_LIVE_FONT_POINTS: i32 = 24
+
+fn web_live_font_pixels() -> i32:
+    (WEB_LIVE_FONT_POINTS * SHOWCASE_DPI_VALUE + 36) / 72
+
+fn web_live_font_expected_identity() -> text:
+    # Shared with widget_showcase_gui: the bounded pinned Bungee face.
+    selected_font_asset_identity(selected_font_asset_candidates()[9])
+
+fn web_live_evidence_html(raw_html: text) -> text:
+    val marker = "<div id='simple-web-vector-font-evidence' style='font-family:Bungee;font-size:" +
+        web_live_font_pixels().to_text() +
+        "px'>Simple Web 300 DPI</div>"
+    if raw_html.contains("</body>"):
+        return raw_html.replace("</body>", marker + "</body>")
+    raw_html + marker
+
+fn pack_pixels(src: [u32]) -> [i64]:
+    var out: [i64] = [0; src.len()]
+    var i = 0
+    while i < src.len():
+        out[i] = src[i].to_i64() & 0xFFFFFF
+        i = i + 1
+    out
+
+fn showcase_checksum(pixels: [u32]) -> i64:
+    var checksum: i64 = 0
+    var i = 0
+    while i < pixels.len():
+        checksum = (checksum + (pixels[i].to_i64() & 0xFFFFFFFF) * ((i % 251) + 1)) % 2147483647
+        i = i + 1
+    checksum
+
+fn web_readback_checksum(pixels: [u32]) -> i64:
+    var checksum: i64 = 0
+    var i = 0
+    while i < pixels.len():
+        checksum = (checksum + pixels[i].to_i64()) % 2147483647
+        i = i + 1
+    checksum
+
+fn configured_web_backend() -> text:
+    val configured = (env_get("SIMPLE_GUI_BACKEND") ?? "").trim().lower()
+    if configured == "":
+        return "cpu_simd"
+    configured
+
+fn web_should_close(input: WinitInput) -> bool:
+    if input.close:
+        return true
+    for key in input.keys:
+        if key == 27 or key == 81 or key == 113:
+            return true
+    false
+
+fn interactive_web_html(
+    raw_html: text, revision: i64, committed_text: text
+) -> text:
+    val marker = "<div id='simple-web-live-input' style='position:absolute;right:20px;bottom:20px;width:190px;height:54px;background:#22c55e;color:#ffffff;border:4px solid #ffffff;font-size:18px'>INPUT " + committed_text + " REV " + revision.to_text() + "</div>"
+    if raw_html.contains("</body>"):
+        return raw_html.replace("</body>", marker + "</body>")
+    raw_html + marker
+
+fn write_web_event_evidence(path: text, backend: text, source: text,
+                            backend_handle: i64, initial_checksum: i64,
+                            interaction_checksum: i64, keyboard_events: i64,
+                            pointer_events: i64, click_events: i64,
+                            focus_events: i64,
+                            focus: WebLiveFocusReceipt,
+                            keyboard_receipt_revision: i64,
+                            committed_text: text,
+                            committed_text_events: i64,
+                            committed_text_receipt_revision: i64,
+                            pointer_receipt_revision: i64,
+                            click_receipt_revision: i64,
+                            interaction_revision: i64,
+                            font_expected_identity: text,
+                            font_identity: text,
+                            font_pixel_size: i32,
+                            font_execution_target: text,
+                            font_batch_identity: text,
+                            font_readback_source: text,
+                            font_device_checksum: i64,
+                            font_oracle_checksum: i64,
+                            font_readback_nonblank_pixels: i64,
+                            font_device_executed: bool,
+                            font_promotion_ready: bool,
+                            font_frame_revision: i64,
+                            font_focus_receipt_revision: i64) -> bool:
+    if path == "":
+        return true
+    val font_loaded = font_identity != ""
+    file_write(path,
+        "web_standards_event_backend={backend}\n" +
+        "web_standards_event_source={source}\n" +
+        "web_standards_event_backend_handle={backend_handle}\n" +
+        "web_standards_event_initial_checksum={initial_checksum}\n" +
+        "web_standards_event_interaction_checksum={interaction_checksum}\n" +
+        "web_standards_event_keyboard_events={keyboard_events}\n" +
+        "web_standards_event_pointer_events={pointer_events}\n" +
+        "web_standards_event_click_events={click_events}\n" +
+        "web_standards_event_focus_events={focus_events}\n" +
+        "web_standards_event_native_focus_kind={focus.raw_kind}\n" +
+        "web_standards_event_native_focus_observed={focus.observed}\n" +
+        "web_standards_event_native_focus_reduced={focus.reduced}\n" +
+        "web_standards_event_focus_admitted={focus.admitted}\n" +
+        "web_standards_event_before_focus={focus.before_focus}\n" +
+        "web_standards_event_after_focus={focus.after_focus}\n" +
+        "web_standards_event_before_focus_state_revision={focus.before_state_revision}\n" +
+        "web_standards_event_after_focus_state_revision={focus.after_state_revision}\n" +
+        "web_standards_event_focus_receipt_revision={focus.receipt_revision}\n" +
+        "web_standards_event_keyboard_receipt_revision={keyboard_receipt_revision}\n" +
+        "web_standards_event_committed_text={committed_text}\n" +
+        "web_standards_event_committed_text_events={committed_text_events}\n" +
+        "web_standards_event_committed_text_receipt_revision={committed_text_receipt_revision}\n" +
+        "web_standards_event_pointer_receipt_revision={pointer_receipt_revision}\n" +
+        "web_standards_event_click_receipt_revision={click_receipt_revision}\n" +
+        "web_standards_event_focus_changed={focus.reduced}\n" +
+        "web_standards_event_font_expected_identity={font_expected_identity}\n" +
+        "web_standards_event_font_identity={font_identity}\n" +
+        "web_standards_event_font_loaded={font_loaded}\n" +
+        "web_standards_event_font_point_size={WEB_LIVE_FONT_POINTS}\n" +
+        "web_standards_event_font_dpi={SHOWCASE_DPI_VALUE}\n" +
+        "web_standards_event_font_pixel_size={font_pixel_size}\n" +
+        "web_standards_event_font_execution_target={font_execution_target}\n" +
+        "web_standards_event_font_batch_identity={font_batch_identity}\n" +
+        "web_standards_event_font_readback_source={font_readback_source}\n" +
+        "web_standards_event_font_device_checksum={font_device_checksum}\n" +
+        "web_standards_event_font_oracle_checksum={font_oracle_checksum}\n" +
+        "web_standards_event_font_readback_nonblank_pixels={font_readback_nonblank_pixels}\n" +
+        "web_standards_event_font_device_executed={font_device_executed}\n" +
+        "web_standards_event_font_promotion_ready={font_promotion_ready}\n" +
+        "web_standards_event_font_frame_revision={font_frame_revision}\n" +
+        "web_standards_event_font_focus_receipt_revision={font_focus_receipt_revision}\n" +
+        "web_standards_event_interaction_revision={interaction_revision}\n")
+
+pub fn run_web_standards_showcase(gui: bool, path: text) -> i64:
+    if not file_exists(path):
+        print "HTML file not found: {path}"
+        return 1
+    val raw_html = read_file(path)
+    val evidence_html = web_live_evidence_html(raw_html)
+    val requested = configured_web_backend()
+    val resolved = simple_web_resolved_engine2d_backend_name(RW, RH, requested)
+    val initial_result = simple_web_render_html_to_readback_result_with_engine2d_backend(evidence_html, RW, RH, requested)
+    val initial_readback = initial_result.readback
+    val pixels = initial_readback.pixels
+    if pixels.len() != RW * RH:
+        print "web_standards_showcase status=fail reason=wrong-pixel-count expected={RW * RH} actual={pixels.len()}"
+        return 2
+    val checksum = showcase_checksum(pixels)
+    val initial_pixel_readback_checksum = web_readback_checksum(pixels)
+    val font_expected_identity = web_live_font_expected_identity()
+    val render_degraded = initial_result.render_degraded
+    val font_identity = initial_result.vector_font_identity
+    val font_pixel_size = initial_result.vector_font_pixel_size
+    val font_execution_target = initial_result.vector_font_execution_target
+    val font_batch_identity = initial_result.vector_font_batch_identity
+    val font_readback_source = initial_result.vector_font_readback_source
+    val font_device_checksum = initial_result.vector_font_device_checksum
+    val font_oracle_checksum = initial_result.vector_font_oracle_checksum
+    val font_readback_nonblank_pixels =
+        initial_result.vector_font_readback_nonblank_pixels
+    val font_device_executed = initial_result.vector_font_device_executed
+    val font_promotion_ready = initial_result.vector_font_promotion_ready
+    if initial_readback.checksum != initial_pixel_readback_checksum:
+        print "web_standards_showcase status=fail reason=initial-checksum-mismatch pixels_checksum={initial_pixel_readback_checksum} readback_checksum={initial_readback.checksum}"
+        return 9
+    var first = pixels[0]
+    var varied = false
+    var nonzero = 0
+    var i = 0
+    while i < pixels.len():
+        if pixels[i] != first:
+            varied = true
+        if (pixels[i] & 0x00FFFFFFu32) != 0u32:
+            nonzero = nonzero + 1
+        i = i + 1
+    if not varied or nonzero == 0 or checksum == 0:
+        print "web_standards_showcase status=fail reason=blank-or-uniform pixels={pixels.len()} nonzero={nonzero} checksum={checksum}"
+        return 3
+    val gpu_requested = requested == "vulkan" or requested == "metal"
+    if (resolved != requested or (gpu_requested and
+            (initial_readback.source != "device_readback" or
+             initial_readback.backend_handle <= 0))):
+        print "web_standards_showcase status=fail reason=backend-provenance requested={requested} resolved={resolved} source={initial_readback.source} handle={initial_readback.backend_handle}"
+        return 6
+    # Fail CLOSED on a truncated render before any font comparison. The style
+    # cascade breaks on wall-clock budget expiry, and the evidence marker is the
+    # LAST element in the document, so a break leaves it on
+    # renderer_default_style() -- sans-serif/16px. The vector_font_* fields are
+    # then a plausible-looking DEFAULT-face reading, not this document's font,
+    # and comparing them against the pinned identity reports a font mismatch
+    # that misdirects investigation at font selection. Naming the truncation
+    # here keeps the two failures distinguishable. This strengthens the gate: it
+    # rejects a render the old code silently accepted as valid evidence, and it
+    # relaxes neither the pinned identity nor expected_pixels.
+    # See doc/08_tracking/bug/web_showcase_vector_font_evidence_style_budget_truncation_2026-08-01.md
+    if render_degraded:
+        print "web_standards_showcase status=fail reason=vector-font-evidence-degraded render_degraded=true expected_identity={font_expected_identity} identity={font_identity} expected_pixels={web_live_font_pixels()} pixels={font_pixel_size}"
+        return 12
+    if (font_expected_identity == "" or font_identity != font_expected_identity or
+            font_pixel_size != web_live_font_pixels()):
+        print "web_standards_showcase status=fail reason=vector-font-evidence expected_identity={font_expected_identity} identity={font_identity} expected_pixels={web_live_font_pixels()} pixels={font_pixel_size}"
+        return 10
+    if (requested == "vulkan" and
+            (font_execution_target != "vulkan" or font_batch_identity == "" or
+             font_readback_source != "device_readback" or
+             font_device_checksum <= 0 or
+             font_device_checksum != font_oracle_checksum or
+             font_readback_nonblank_pixels <= 0 or
+             not font_device_executed or not font_promotion_ready)):
+        print "web_standards_showcase status=fail reason=vector-font-device-evidence target={font_execution_target} batch={font_batch_identity} source={font_readback_source} device_checksum={font_device_checksum} oracle_checksum={font_oracle_checksum} nonblank={font_readback_nonblank_pixels} executed={font_device_executed} promotion={font_promotion_ready}"
+        return 11
+    print "web_standards_showcase status=pass path={path} html_bytes={raw_html.len()} width={RW} height={RH} pixels={pixels.len()} nonzero={nonzero} checksum={checksum} readback_checksum={initial_readback.checksum} requested={requested} resolved={resolved} source={initial_readback.source} backend_handle={initial_readback.backend_handle} dpi={SHOWCASE_DPI_VALUE} dpi_scale_applied=false render_degraded={render_degraded} font_dpi_applied=true font_expected_identity={font_expected_identity} font_identity={font_identity} font_loaded=true font_point_size={WEB_LIVE_FONT_POINTS} font_dpi={SHOWCASE_DPI_VALUE} font_pixel_size={font_pixel_size} font_execution_target={font_execution_target} font_batch_identity={font_batch_identity} font_readback_source={font_readback_source} font_device_checksum={font_device_checksum} font_oracle_checksum={font_oracle_checksum} font_readback_nonblank_pixels={font_readback_nonblank_pixels} font_device_executed={font_device_executed} font_promotion_ready={font_promotion_ready}"
+
+    if not gui:
+        return 0
+
+    val lp = winit_loop_new()
+    if not lp.is_valid:
+        print "No GUI runtime available."
+        return 4
+    val win = winit_window_new(lp, W.to_i64(), H.to_i64(), web_standards_showcase_window_title(resolved))
+    if not win.is_valid:
+        print "Window creation failed."
+        winit_loop_free(lp)
+        return 5
+    var current_packed = pack_pixels(pixels)
+    winit_present_rgba(win, RW.to_i64(), RH.to_i64(), current_packed)
+    val event_path = env_get("SIMPLE_GUI_EVENT_EVIDENCE_PATH") ?? ""
+    val exit_after_interaction = (env_get("SIMPLE_GUI_EXIT_AFTER_INTERACTION") ?? "") == "1"
+    var keyboard_events: i64 = 0
+    var pointer_events: i64 = 0
+    var click_events: i64 = 0
+    var focus_events: i64 = 0
+    var focus = web_live_focus_receipt_new()
+    var delivery_revision: i64 = 0
+    var keyboard_receipt_revision: i64 = 0
+    var committed_text = ""
+    var committed_text_events: i64 = 0
+    var committed_text_receipt_revision: i64 = 0
+    var pointer_receipt_revision: i64 = 0
+    var click_receipt_revision: i64 = 0
+    var interaction_revision: i64 = 0
+    var interaction_checksum = initial_readback.checksum
+    var current_source = initial_readback.source
+    var current_handle = initial_readback.backend_handle
+    var current_font_identity = font_identity
+    var current_font_pixel_size = font_pixel_size
+    var current_font_execution_target = font_execution_target
+    var current_font_batch_identity = font_batch_identity
+    var current_font_readback_source = font_readback_source
+    var current_font_device_checksum = font_device_checksum
+    var current_font_oracle_checksum = font_oracle_checksum
+    var current_font_readback_nonblank_pixels = font_readback_nonblank_pixels
+    var current_font_device_executed = font_device_executed
+    var current_font_promotion_ready = font_promotion_ready
+    var current_font_frame_revision: i64 = 0
+    var current_font_focus_receipt_revision: i64 = 0
+    if not write_web_event_evidence(
+            event_path, resolved, initial_readback.source,
+            initial_readback.backend_handle, initial_readback.checksum,
+            interaction_checksum, keyboard_events, pointer_events,
+            click_events, focus_events, focus,
+            keyboard_receipt_revision, committed_text,
+            committed_text_events, committed_text_receipt_revision,
+            pointer_receipt_revision,
+            click_receipt_revision, interaction_revision,
+            font_expected_identity, current_font_identity,
+            current_font_pixel_size, current_font_execution_target,
+            current_font_batch_identity, current_font_readback_source,
+            current_font_device_checksum, current_font_oracle_checksum,
+            current_font_readback_nonblank_pixels,
+            current_font_device_executed, current_font_promotion_ready,
+            current_font_frame_revision,
+            current_font_focus_receipt_revision):
+        winit_window_free(win)
+        winit_loop_free(lp)
+        return 7
+    var running = true
+    var frames = 0
+    val end_at = time_now_unix_micros() + 60000000
+    while running and time_now_unix_micros() < end_at:
+        var input_events: [WinitInputEvent] = []
+        val input = winit_poll_input_into(lp, input_events)
+        running = not web_should_close(input)
+        val keyboard_delta = input.keys.len().to_i64()
+        val pointer_delta = input.mouse_moves
+        val click_delta = input.click_buttons.len().to_i64()
+        var committed_text_delta: i64 = 0
+        focus_events = focus_events + input.focus_events
+        for event in input_events:
+            val raw_kind = event.kind
+            delivery_revision = delivery_revision + 1
+            if raw_kind == 5 or raw_kind == 6:
+                focus = web_live_reduce_raw_focus(
+                    focus, raw_kind, delivery_revision)
+                keyboard_receipt_revision = 0
+                committed_text = ""
+                committed_text_events = 0
+                committed_text_receipt_revision = 0
+                pointer_receipt_revision = 0
+                click_receipt_revision = 0
+                interaction_revision = 0
+            elif (focus.admitted and
+                    delivery_revision > focus.receipt_revision):
+                if raw_kind == 10 and keyboard_receipt_revision == 0:
+                    keyboard_receipt_revision = delivery_revision
+                elif (raw_kind == 11 and event.committed_text != ""):
+                    committed_text_delta = committed_text_delta + 1
+                    committed_text_events = committed_text_events + 1
+                    # The live wrapper commits one `g`. Admit only its first
+                    # record after the paired physical keyboard receipt so a
+                    # duplicate key/text path cannot satisfy this evidence.
+                    if (event.committed_text == "g" and
+                            committed_text_receipt_revision == 0 and
+                            keyboard_receipt_revision >
+                                focus.receipt_revision):
+                        committed_text = event.committed_text
+                        committed_text_receipt_revision = delivery_revision
+                elif raw_kind == 21 and pointer_receipt_revision == 0:
+                    pointer_receipt_revision = delivery_revision
+                elif raw_kind == 20 and click_receipt_revision == 0:
+                    click_receipt_revision = delivery_revision
+        keyboard_events = keyboard_events + keyboard_delta
+        pointer_events = pointer_events + pointer_delta
+        click_events = click_events + click_delta
+        if (input.focus_events > 0 or keyboard_delta > 0 or
+                committed_text_delta > 0 or
+                pointer_delta > 0 or click_delta > 0):
+            # Do not turn an incidental pointer move during window activation
+            # into interaction proof. The visible rerender is evidence only
+            # after this same window has received every required event class.
+            if (interaction_revision == 0 and
+                    web_live_interaction_admitted(
+                        focus, keyboard_receipt_revision,
+                        committed_text_receipt_revision,
+                        pointer_receipt_revision, click_receipt_revision) and
+                    committed_text == "g" and
+                    committed_text_events == 1 and
+                    keyboard_events > 0 and pointer_events > 0 and
+                    click_events > 0):
+                interaction_revision = delivery_revision
+                # Append the vector witness after the INPUT marker so the
+                # completed Engine2D font receipt is unambiguously keyed to
+                # this Bungee 300-DPI command, not a later generic text batch.
+                val updated_html = web_live_evidence_html(
+                    interactive_web_html(
+                        raw_html, interaction_revision, committed_text))
+                val updated_result = simple_web_render_html_to_readback_result_with_engine2d_backend(updated_html, RW, RH, requested)
+                val updated = updated_result.readback
+                if updated.pixels.len() != RW * RH:
+                    winit_window_free(win)
+                    winit_loop_free(lp)
+                    return 8
+                val updated_pixel_checksum = web_readback_checksum(updated.pixels)
+                interaction_checksum = updated.checksum
+                current_source = updated.source
+                current_handle = updated.backend_handle
+                current_packed = pack_pixels(updated.pixels)
+                current_font_identity = updated_result.vector_font_identity
+                # Kept on one line each: a bare `name =` followed by the RHS on the
+                # next line does NOT parse ("expected expression, found Newline") —
+                # only parenthesised continuations (see the `if ((...` below) span
+                # lines. This whole file failed to parse because of the 10 splits
+                # that used to be here, which silently took the web showcase child
+                # down with it. See
+                # doc/08_tracking/bug/assign_rhs_newline_continuation_parse_2026-07-25.md
+                current_font_pixel_size = updated_result.vector_font_pixel_size
+                current_font_execution_target = updated_result.vector_font_execution_target
+                current_font_batch_identity = updated_result.vector_font_batch_identity
+                current_font_readback_source = updated_result.vector_font_readback_source
+                current_font_device_checksum = updated_result.vector_font_device_checksum
+                current_font_oracle_checksum = updated_result.vector_font_oracle_checksum
+                current_font_readback_nonblank_pixels = updated_result.vector_font_readback_nonblank_pixels
+                current_font_device_executed = updated_result.vector_font_device_executed
+                current_font_promotion_ready = updated_result.vector_font_promotion_ready
+                current_font_frame_revision = interaction_revision
+                current_font_focus_receipt_revision = focus.receipt_revision
+                if ((gpu_requested and
+                        (current_source != "device_readback" or current_handle <= 0)) or
+                        interaction_checksum != updated_pixel_checksum or
+                        interaction_checksum == initial_readback.checksum or
+                        current_font_identity != font_expected_identity or
+                        current_font_pixel_size != web_live_font_pixels() or
+                        (requested == "vulkan" and
+                         (current_font_execution_target != "vulkan" or
+                          current_font_batch_identity == "" or
+                          current_font_readback_source != "device_readback" or
+                          current_font_device_checksum <= 0 or
+                          current_font_device_checksum !=
+                              current_font_oracle_checksum or
+                          current_font_readback_nonblank_pixels <= 0 or
+                          not current_font_device_executed or
+                          not current_font_promotion_ready))):
+                    winit_window_free(win)
+                    winit_loop_free(lp)
+                    return 8
+                winit_present_rgba(
+                    win, RW.to_i64(), RH.to_i64(), current_packed)
+                print "web_standards_event_revision={interaction_revision}"
+                print "web_standards_event_checksum={interaction_checksum}"
+            if not write_web_event_evidence(
+                    event_path, resolved, current_source, current_handle,
+                    initial_readback.checksum, interaction_checksum,
+                    keyboard_events, pointer_events, click_events,
+                    focus_events, focus, keyboard_receipt_revision,
+                    committed_text, committed_text_events,
+                    committed_text_receipt_revision,
+                    pointer_receipt_revision, click_receipt_revision,
+                    interaction_revision, font_expected_identity,
+                    current_font_identity, current_font_pixel_size,
+                    current_font_execution_target,
+                    current_font_batch_identity,
+                    current_font_readback_source,
+                    current_font_device_checksum,
+                    current_font_oracle_checksum,
+                    current_font_readback_nonblank_pixels,
+                    current_font_device_executed,
+                    current_font_promotion_ready,
+                    current_font_frame_revision,
+                    current_font_focus_receipt_revision):
+                winit_window_free(win)
+                winit_loop_free(lp)
+                return 8
+            if (exit_after_interaction and focus.admitted and
+                    keyboard_events > 0 and
+                    committed_text == "g" and
+                    committed_text_events == 1 and
+                    pointer_events > 0 and click_events > 0):
+                running = false
+        if frames % 15 == 0:
+            winit_present_rgba(win, RW.to_i64(), RH.to_i64(), current_packed)
+        frames = frames + 1
+    winit_window_free(win)
+    winit_loop_free(lp)
+    return 0
+
+fn main() -> i64:
+    run_web_standards_showcase(false, "examples/06_io/ui/browser_common_elements_showcase.html")

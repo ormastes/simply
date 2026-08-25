@@ -1,0 +1,88 @@
+#![allow(unnamed_duplicate_typed_args)]
+@allow(unnamed_duplicate_typed_args)
+# mcpgdb MCP — lightweight state/session registry runner
+
+extern fn rt_cli_get_args() -> [text]
+
+use std.io_runtime.{read_file}
+use examples.mcpgdb.json_helpers.{extract_id, extract_field, extract_nested, make_tool_error, make_tool_result, LB, RB, jp, js}
+use examples.mcpgdb.state.{MCPGDB_CURRENT_SESSION, MCPGDB_WORKSPACE, MCPGDB_SESSIONS, load_persisted_state, save_persisted_state, set_current_session, current_or_named_session}
+
+fn debug_json_message(fields: [text]) -> text:
+    LB() + fields.join(",") + RB()
+
+fn session_count_local() -> i64:
+    var count = 0
+    for _session in MCPGDB_SESSIONS:
+        count = count + 1
+    count
+
+fn handle_workspace_open(id: text, body: text) -> text:
+    val root = extract_field(body, "root")
+    if root != "":
+        MCPGDB_WORKSPACE.root = root
+    val compile_dir = extract_field(body, "compile_commands_dir")
+    if compile_dir != "":
+        MCPGDB_WORKSPACE.compile_commands_dir = compile_dir
+    make_tool_result(id, debug_json_message([
+        jp("workspace_root", js(MCPGDB_WORKSPACE.root)),
+        jp("compile_commands_dir", js(MCPGDB_WORKSPACE.compile_commands_dir)),
+        jp("session_count", str(session_count_local()))
+    ]))
+
+fn handle_workspace_status(id: text) -> text:
+    make_tool_result(id, debug_json_message([
+        jp("workspace_root", js(MCPGDB_WORKSPACE.root)),
+        jp("compile_commands_dir", js(MCPGDB_WORKSPACE.compile_commands_dir)),
+        jp("current_session", js(MCPGDB_CURRENT_SESSION)),
+        jp("session_count", str(session_count_local()))
+    ]))
+
+fn handle_debug_session_list(id: text) -> text:
+    var items: [text] = []
+    for session in MCPGDB_SESSIONS:
+        var current = "false"
+        if session.session_id == MCPGDB_CURRENT_SESSION:
+            current = "true"
+        items.push(debug_json_message([
+            jp("session_id", js(session.session_id)),
+            jp("backend", js(session.backend)),
+            jp("state", js(session.state)),
+            jp("current", current)
+        ]))
+    make_tool_result(id, "[" + items.join(",") + "]")
+
+fn handle_debug_session_select(id: text, body: text) -> text:
+    val session_id = extract_field(body, "session_id")
+    if session_id == "":
+        return make_tool_error(id, "missing session_id")
+    if val session = current_or_named_session(session_id):
+        set_current_session(session.session_id)
+        return make_tool_result(id, debug_json_message([
+            jp("current_session", js(session.session_id)),
+            jp("backend", js(session.backend))
+        ]))
+    make_tool_error(id, "session not found: " + session_id)
+
+fn main():
+    val argv = rt_cli_get_args()
+    if argv.len < 3:
+        print make_tool_error("null", "missing request body path")
+        return
+    val body = read_file(argv[2]) ?? ""
+    if body == "":
+        print make_tool_error("null", "empty request body")
+        return
+    val id = extract_id(body)
+    load_persisted_state()
+    var response = make_tool_error(id, "Unknown state tool")
+    if body.contains("\"name\":\"workspace_open\"") or body.contains("\"name\": \"workspace_open\""):
+        response = handle_workspace_open(id, body)
+    elif body.contains("\"name\":\"workspace_status\"") or body.contains("\"name\": \"workspace_status\""):
+        response = handle_workspace_status(id)
+    elif body.contains("\"name\":\"debug_session_list\"") or body.contains("\"name\": \"debug_session_list\""):
+        response = handle_debug_session_list(id)
+    elif body.contains("\"name\":\"debug_session_select\"") or body.contains("\"name\": \"debug_session_select\""):
+        response = handle_debug_session_select(id, body)
+    save_persisted_state()
+    print response

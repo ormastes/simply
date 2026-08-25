@@ -1,0 +1,48 @@
+# entity/agent_profile — Agent profile data structure
+
+struct AgentProfile:
+    id: text
+    capabilities: [text]
+    max_concurrent: i64
+    priority: i64
+    current_load: i64
+    status: text         # "idle", "busy", "offline"
+
+fn agent_profile(id: text, capabilities: [text]) -> AgentProfile:
+    AgentProfile(
+        id: id,
+        capabilities: capabilities,
+        max_concurrent: 3,
+        priority: 5,
+        current_load: 0,
+        status: "idle"
+    )
+
+fn agent_profile_full(id: text, capabilities: [text],
+                      max_concurrent: i64, priority: i64) -> AgentProfile:
+    AgentProfile(
+        id: id,
+        capabilities: capabilities,
+        max_concurrent: max_concurrent,
+        priority: priority,
+        current_load: 0,
+        status: "idle"
+    )
+
+impl AgentProfile:
+    fn has_capability(cap: text) -> bool:
+        for c in self.capabilities:
+            if c == cap:
+                return true
+        false
+
+    fn is_available() -> bool:
+        self.status != "offline" and self.current_load < self.max_concurrent
+
+    fn load_ratio() -> i64:
+        if self.max_concurrent == 0:
+            return 100
+        (self.current_load * 100) / self.max_concurrent
+
+    fn to_text() -> text:
+        "Agent(" + self.id + ", load=" + self.current_load.to_text() + "/" + self.max_concurrent.to_text() + ", " + self.status + ")"

@@ -1,0 +1,6 @@
+# spipe:artifact uid=A-00000000000000000000000003 key=spec.wave3
+describe "Wave 3":
+    # spipe:scenario uid=SS-11111111111111111111111111 key=spec.wave3.graph status=accepted requires=NFR-11111111111111111111111111,RQ-11111111111111111111111111
+    # spipe:test uid=T-11111111111111111111111111 kind=system status=accepted scenario=SS-11111111111111111111111111 verifies=NFR-11111111111111111111111111,RQ-11111111111111111111111111
+    it "publishes 💡 graph":
+        expect(true).to_be(true)

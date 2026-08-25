@@ -1,0 +1,153 @@
+# SimpleOS x86_64 QEMU evidence for memory leveling, swap, GPU, NIC, and DMA.
+
+extern fn serial_println(msg: text)
+extern fn rt_port_outb(port: u16, value: u8)
+extern fn simpleos_virtio_gpu_memory_init() -> u64
+extern fn simpleos_virtio_gpu_dma_addr() -> u64
+extern fn simpleos_virtio_gpu_dma_len() -> u64
+extern fn simpleos_virtio_gpu_flush_selftest() -> u64
+extern fn simpleos_memory_leveling_virtio_net_init() -> u64
+extern fn simpleos_memory_leveling_virtio_net_selftest() -> u64
+extern fn simpleos_virtio_net_rx_dma_addr() -> u64
+extern fn simpleos_virtio_net_rx_dma_len() -> u64
+extern fn simpleos_virtio_net_tx_dma_addr() -> u64
+extern fn simpleos_virtio_net_tx_dma_len() -> u64
+extern fn simpleos_virtio_blk_swap_selftest() -> u64
+
+use std.memory_leveling.{simple_memory_iso_cpu_cold, simple_memory_placement_config_from_intent, memory_leveling_policy_from_intent}
+use os.kernel.memory.memory_leveling_manager.{memory_leveling_manager_new, simpleos_memory_leveling_config_default}
+use os.kernel.memory.memory_leveling_device_adapters.{memory_leveling_device_migration_unavailable}
+use os.kernel.memory.memory_leveling_capabilities.{memory_leveling_qemu_capabilities}
+use os.kernel.memory.memory_swap.{memory_swap_checksum, memory_swap_store_new}
+use os.kernel.arch.x86_64.interrupt.{}
+
+fn _memory_leveling_qemu_fail(reason: text):
+    serial_println("[memory-leveling] FAIL reason=" + reason)
+    serial_println("TEST FAILED")
+    rt_port_outb(0xf4, 1)
+
+fn _memory_leveling_qemu_bytes_equal(left: [u8], right: [u8]) -> bool:
+    if left.len() != right.len():
+        return false
+    var i: i64 = 0
+    while i < left.len():
+        if left[i] != right[i]:
+            return false
+        i = i + 1
+    true
+
+fn _start():
+    serial_println("[memory-leveling] qemu-start")
+
+    val intent = simple_memory_iso_cpu_cold()
+    val placement = simple_memory_placement_config_from_intent(intent)
+    var os_config = simpleos_memory_leveling_config_default()
+    os_config.pressure_batch_limit = 7
+    if placement.preferred_tier.name != "cpu_cold" or os_config.pressure_batch_limit != 7:
+        _memory_leveling_qemu_fail("config-separation")
+        return
+    serial_println("[memory-leveling] config-separation=pass")
+
+    val manager = memory_leveling_manager_new(os_config)
+    val policy = memory_leveling_policy_from_intent(intent)
+    val allocation = manager.request(placement, policy, 4, 1, 41)
+    if not allocation.ok:
+        _memory_leveling_qemu_fail("cpu-allocation")
+        return
+    val store = memory_swap_store_new(true, 2)
+    val expected: [u8] = [17, 34, 51, 68]
+    if not manager.prepare_swap(allocation.allocation_id, 41).ok:
+        _memory_leveling_qemu_fail("swap-prepare")
+        return
+    val written = store.write(allocation.allocation_id, 0, expected)
+    if not written.ok or not manager.commit_swap(allocation.allocation_id, 41, written.slot_id).ok:
+        _memory_leveling_qemu_fail("swap-write")
+        return
+    if not manager.prepare_restore(allocation.allocation_id, 41).ok:
+        _memory_leveling_qemu_fail("restore-prepare")
+        return
+    val restored = store.read(written.slot_id, allocation.allocation_id, 0)
+    if not restored.ok:
+        _memory_leveling_qemu_fail("swap-read")
+        return
+    if restored.bytes.len() != expected.len():
+        serial_println("[memory-leveling] swap-length restored=" + restored.bytes.len().to_text() + " expected=" + expected.len().to_text())
+        _memory_leveling_qemu_fail("swap-length")
+        return
+    if not _memory_leveling_qemu_bytes_equal(restored.bytes, expected) or memory_swap_checksum(restored.bytes) != memory_swap_checksum(expected):
+        _memory_leveling_qemu_fail("swap-bytes")
+        return
+    if not manager.commit_restore(allocation.allocation_id, 41).ok or not store.release(written.slot_id, allocation.allocation_id).ok:
+        _memory_leveling_qemu_fail("restore-commit")
+        return
+    val block_result = simpleos_virtio_blk_swap_selftest()
+    if block_result != 0:
+        _memory_leveling_qemu_fail("virtio-blk-swap-{block_result}")
+        return
+    serial_println("[memory-leveling] swap-roundtrip=pass backend=virtio-blk bytes=512 checksum=" + memory_swap_checksum(restored.bytes).to_text())
+
+    var gpu_config = simpleos_memory_leveling_config_default()
+    gpu_config.gpu_capacity_bytes = 65536
+    gpu_config.gpu_reserved_bytes = 0
+    val gpu_manager = memory_leveling_manager_new(gpu_config)
+    val gpu_init = simpleos_virtio_gpu_memory_init()
+    val gpu_addr = simpleos_virtio_gpu_dma_addr()
+    val gpu_len = simpleos_virtio_gpu_dma_len()
+    if gpu_init != 0 or gpu_addr == 0 or gpu_len == 0:
+        _memory_leveling_qemu_fail("virtio-gpu-init-{gpu_init}")
+        return
+    if not gpu_manager.register_gpu_backing(501, 42, gpu_len, gpu_addr, true).ok:
+        _memory_leveling_qemu_fail("gpu-register")
+        return
+    if not gpu_manager.device_submit(501, 42).ok:
+        _memory_leveling_qemu_fail("gpu-submit")
+        return
+    val gpu_flush = simpleos_virtio_gpu_flush_selftest()
+    if gpu_flush != 0 or not gpu_manager.device_complete(501, 42).ok or not gpu_manager.device_unmap(501, 42).ok:
+        _memory_leveling_qemu_fail("gpu-lifecycle")
+        return
+    if memory_leveling_device_migration_unavailable(501).reason != "migration-unavailable":
+        _memory_leveling_qemu_fail("gpu-migration-truth")
+        return
+    if gpu_manager.release(501, 42).reason != "protected":
+        _memory_leveling_qemu_fail("gpu-backing-unpinned")
+        return
+    serial_println("[memory-leveling] gpu-lifecycle=pass backend=virtio-gpu backing-bytes=" + gpu_len.to_text() + " migration=unavailable")
+
+    var nic_config = simpleos_memory_leveling_config_default()
+    nic_config.nic_capacity_bytes = 1048576
+    nic_config.nic_reserved_bytes = 0
+    val nic_manager = memory_leveling_manager_new(nic_config)
+    val nic_init = simpleos_memory_leveling_virtio_net_init()
+    val rx_addr = simpleos_virtio_net_rx_dma_addr()
+    val rx_len = simpleos_virtio_net_rx_dma_len()
+    val tx_addr = simpleos_virtio_net_tx_dma_addr()
+    val tx_len = simpleos_virtio_net_tx_dma_len()
+    if nic_init != 0 or rx_addr == 0 or tx_addr == 0 or rx_len == 0 or tx_len == 0:
+        _memory_leveling_qemu_fail("virtio-net-init-{nic_init}")
+        return
+    if not nic_manager.register_nic_buffer(601, 43, rx_len, rx_addr, true).ok or not nic_manager.register_nic_buffer(602, 43, tx_len, tx_addr, true).ok:
+        _memory_leveling_qemu_fail("nic-register")
+        return
+    if not nic_manager.device_submit(601, 43).ok or not nic_manager.device_submit(602, 43).ok:
+        _memory_leveling_qemu_fail("nic-submit")
+        return
+    val nic_result = simpleos_memory_leveling_virtio_net_selftest()
+    if nic_result != 0:
+        _memory_leveling_qemu_fail("virtio-net-rx-tx-{nic_result}")
+        return
+    if not nic_manager.device_complete(601, 43).ok or not nic_manager.device_complete(602, 43).ok or not nic_manager.device_unmap(601, 43).ok or not nic_manager.device_unmap(602, 43).ok:
+        _memory_leveling_qemu_fail("nic-lifecycle")
+        return
+    if not nic_manager.release(601, 43).ok or not nic_manager.release(602, 43).ok:
+        _memory_leveling_qemu_fail("nic-release")
+        return
+    serial_println("[memory-leveling] nic-dma-lifecycle=pass backend=virtio-net rx-bytes=" + rx_len.to_text() + " tx-bytes=" + tx_len.to_text())
+
+    val capabilities = memory_leveling_qemu_capabilities()
+    if not capabilities.virtio_gpu_backing or not capabilities.virtio_nic_buffers or capabilities.gpu_physical_migration or capabilities.nic_physical_migration:
+        _memory_leveling_qemu_fail("capability-report")
+        return
+    serial_println("[memory-leveling] qemu-capabilities=pass virtio-block=true dma-map-unmap=true physical-migration=unavailable")
+    serial_println("TEST PASSED")
+    rt_port_outb(0xf4, 0)

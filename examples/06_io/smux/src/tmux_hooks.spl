@@ -1,0 +1,127 @@
+# tmux Hook Event System
+# Registers tmux hooks that write events to a temp file.
+# Main event loop polls this file for tmux state changes.
+
+extern fn rt_process_run(cmd: text, args: [text]) -> (text, text, i64)
+extern fn rt_getpid() -> i64
+extern fn rt_file_exists(path: text) -> bool
+extern fn rt_file_read_text(path: text) -> text
+extern fn rt_file_write_text(path: text, content: text) -> bool
+use std.io_runtime.{file_delete, dir_create}
+
+# ============================================================================
+# tmux Hook Events
+# ============================================================================
+
+enum TmuxHookEvent:
+    PaneFocused
+    PaneLostFocus
+    PaneResized
+    WindowChanged
+    CopyMode
+    NoEvent
+
+    fn name() -> text:
+        match self:
+            TmuxHookEvent.PaneFocused => "pane_focused"
+            TmuxHookEvent.PaneLostFocus => "pane_lost_focus"
+            TmuxHookEvent.PaneResized => "pane_resized"
+            TmuxHookEvent.WindowChanged => "window_changed"
+            TmuxHookEvent.CopyMode => "copy_mode"
+            TmuxHookEvent.NoEvent => "none"
+
+# ============================================================================
+# Hook Manager
+# ============================================================================
+
+class TmuxHookManager:
+    event_file: text
+    pid: i64
+    hooks_active: bool
+
+    static fn create() -> TmuxHookManager:
+        val pid = rt_getpid()
+        val event_file = ".build/smux/tmux_events_{pid}"
+        TmuxHookManager(
+            event_file: event_file,
+            pid: pid,
+            hooks_active: false
+        )
+
+    me register_hooks() -> bool:
+        # Ensure event dir exists
+        dir_create(".build/smux", true)
+
+        # Clear event file
+        rt_file_write_text(self.event_file, "")
+
+        val pid_tag = "smux_{self.pid}"
+        val ef = self.event_file
+
+        # Register hooks with PID-scoped names
+        _tmux_set_hook("pane-focus-in[{pid_tag}]", "run-shell 'echo pane_focused >> {ef}'")
+        _tmux_set_hook("pane-focus-out[{pid_tag}]", "run-shell 'echo pane_lost_focus >> {ef}'")
+        _tmux_set_hook("client-resized[{pid_tag}]", "run-shell 'echo pane_resized >> {ef}'")
+        _tmux_set_hook("window-linked[{pid_tag}]", "run-shell 'echo window_changed >> {ef}'")
+        _tmux_set_hook("after-copy-mode[{pid_tag}]", "run-shell 'echo copy_mode >> {ef}'")
+
+        self.hooks_active = true
+        return true
+
+    me unregister_hooks():
+        if not self.hooks_active:
+            return
+        val pid_tag = "smux_{self.pid}"
+        _tmux_unset_hook("pane-focus-in[{pid_tag}]")
+        _tmux_unset_hook("pane-focus-out[{pid_tag}]")
+        _tmux_unset_hook("client-resized[{pid_tag}]")
+        _tmux_unset_hook("window-linked[{pid_tag}]")
+        _tmux_unset_hook("after-copy-mode[{pid_tag}]")
+
+        # Clean up event file
+        if rt_file_exists(self.event_file):
+            file_delete(self.event_file)
+        self.hooks_active = false
+
+    # Poll for new events (non-blocking)
+    fn poll_events() -> [TmuxHookEvent]:
+        var events: [TmuxHookEvent] = []
+        if not rt_file_exists(self.event_file):
+            return events
+
+        val content = rt_file_read_text(self.event_file)
+        if content == "" or content == nil:
+            return events
+
+        # Clear the event file after reading
+        rt_file_write_text(self.event_file, "")
+
+        val lines = content.trim().split("\n")
+        for line in lines:
+            val trimmed = line.trim()
+            if trimmed != "":
+                val event = _parse_hook_event(trimmed)
+                events.push(event)
+        return events
+
+    fn is_active() -> bool:
+        self.hooks_active
+
+# ============================================================================
+# Internal Helpers
+# ============================================================================
+
+fn _tmux_set_hook(name: text, cmd: text):
+    rt_process_run("tmux", ["set-hook", "-g", name, cmd])
+
+fn _tmux_unset_hook(name: text):
+    rt_process_run("tmux", ["set-hook", "-gu", name])
+
+fn _parse_hook_event(name: text) -> TmuxHookEvent:
+    match name:
+        "pane_focused" => TmuxHookEvent.PaneFocused
+        "pane_lost_focus" => TmuxHookEvent.PaneLostFocus
+        "pane_resized" => TmuxHookEvent.PaneResized
+        "window_changed" => TmuxHookEvent.WindowChanged
+        "copy_mode" => TmuxHookEvent.CopyMode
+        _ => TmuxHookEvent.NoEvent

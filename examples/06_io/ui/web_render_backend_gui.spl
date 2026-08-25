@@ -1,0 +1,155 @@
+# Web Render Backend comparison GUI.
+#
+# Renders ONE real HTML page through the unified WebRenderBackend interface using
+# the backend selected by argv/WEB_RENDER_BACKEND (pure_simple | chromium), then
+# presents the result in a host window whose title shows the active backend. Same
+# .spl, same page, same interface — only the backend differs.
+#
+#   scripts/gui/macos-gui-run.shs examples/06_io/ui/web_render_backend_gui.spl pure_simple
+#   scripts/gui/macos-gui-run.shs examples/06_io/ui/web_render_backend_gui.spl chromium
+#
+# Env: WEB_RENDER_BACKEND, PAGE_W, PAGE_H, PAGE_SCALE, WEB_RENDER_HTML (a .html
+# path; default is the VanillaStyle demo). A .html argv also overrides the page.
+#
+# App code uses only library interfaces (no rt_* externs): renderer from
+# std.gpu.browser_engine.web_render_backend, window from std.io.window_winit,
+# env/args from std.env / std.cli.
+
+use std.gc_async_mut.gpu.browser_engine.web_render_backend.{WebRenderBackend, web_render_backend_names}
+use std.io.window_winit.{
+    WinitLoop, WinitWindow, WinitInput, winit_loop_new, winit_loop_free,
+    winit_window_new, winit_window_free, winit_present_rgba, winit_poll_input}
+use std.env.variables.{env_get_or}
+use std.cli.cli_util.{get_cli_args}
+
+fn _repo_root() -> text:
+    val lib = env_get_or("SIMPLE_LIB", "src")
+    if lib.ends_with("/src"):
+        return lib[0 : lib.len() - 4]
+    if lib == "" or lib == "src":
+        # absolute cwd so the chromium file:// URL is valid (a relative path
+        # makes Electron load a blank page).
+        return env_get_or("PWD", ".")
+    lib
+
+fn _backend_from_args(fallback: text) -> text:
+    """A recognized backend argv wins (survives the macOS .app launcher, which
+    does not forward arbitrary env vars), else WEB_RENDER_BACKEND, else fallback."""
+    val names = web_render_backend_names()
+    for arg in get_cli_args():
+        for n in names:
+            if arg == n:
+                return arg
+    fallback
+
+fn _html_path_from_args(fallback: text) -> text:
+    for arg in get_cli_args():
+        if arg.ends_with(".html"):
+            return arg
+    fallback
+
+fn _int_env(key: text, fallback: i32) -> i32:
+    val v = env_get_or(key, "")
+    if v == "":
+        return fallback
+    v.to_i32()
+
+fn _viewport_from_args(fw: i32, fh: i32) -> (i32, i32):
+    """A 'WxH' argv token (e.g. 1024x768) sets the CSS viewport the page lays out
+    in — survives the macOS .app launcher, which drops arbitrary env vars."""
+    for arg in get_cli_args():
+        if arg.contains("x"):
+            val parts = arg.split("x")
+            if parts.len() == 2:
+                val w = parts[0].to_i32()
+                val h = parts[1].to_i32()
+                if w > 0 and h > 0:
+                    return (w, h)
+    (fw, fh)
+
+fn shrink_render(src: [u32], sw: i32, sh: i32, div: i32, dw: i32, dh: i32) -> [i64]:
+    """Shrink the WHOLE render (sw x sh, 0xAARRGGBB) by `div` and blit it top-left
+    into a dw x dh window (0x00RRGGBB), the rest filled with a neutral background."""
+    var out: [i64] = [0x00222831; dw * dh]
+    val tw = sw / div
+    val th = sh / div
+    var dy = 0
+    while dy < th and dy < dh:
+        val sy = dy * div
+        var dx = 0
+        while dx < tw and dx < dw:
+            val sx = dx * div
+            out[dy * dw + dx] = src[sy * sw + sx].to_i64() & 0xFFFFFF
+            dx = dx + 1
+        dy = dy + 1
+    out
+
+fn main() -> i64:
+    val backend_name = _backend_from_args(env_get_or("WEB_RENDER_BACKEND", "pure_simple"))
+    val default_html = _repo_root() + "/test/09_baselines/web_html_input/vanillastyle_demo.html"
+    val html_path = _html_path_from_args(env_get_or("WEB_RENDER_HTML", default_html))
+
+    # ONE big window size shared by BOTH backends (a 'WxH' argv overrides). Both
+    # show the page at the SAME large size — same app code, same page, same window.
+    val (win_w, win_h) = _viewport_from_args(_int_env("PAGE_W", 1000), _int_env("PAGE_H", 740))
+    val title = "Simple Web Renderer — backend: " + backend_name
+
+    # chromium opens its own live, interactive window at the full window size.
+    if WebRenderBackend.create(backend_name, win_w, win_h).show_live_window(html_path, win_w, win_h, title):
+        print "Showing {html_path}"
+        print "Opened live '{backend_name}' window (interactive HTML) at {win_w}x{win_h}."
+        return 0
+
+    # pure_simple is a software rasterizer (interpreted + canvas-bound). Render the
+    # page once at a wide-ish internal resolution (PURE_SIMPLE_RENDER_W — wider =
+    # smaller, more chromium-like fonts, but slower) but TALL enough to span several
+    # screens, then run a LIVE, INTERACTIVE event loop: scroll with Up/Down arrows,
+    # quit with Esc or the close button. Each frame presents an upscaled slice of
+    # the pre-rendered page (with a scrollbar) — big, live, interactive, without
+    # re-rendering on every scroll.
+    val rw = _int_env("PURE_SIMPLE_RENDER_W", 560)
+    val rh_win = if win_w > 0: rw * win_h / win_w else: rw
+    val pages = _int_env("PURE_SIMPLE_PAGES", 2)
+    val full_rh = rh_win * pages
+    val renderer = WebRenderBackend.create(backend_name, rw, full_rh)
+    print "Showing {html_path}"
+    print "  via web-render backend '{renderer.name()}': render {rw}x{full_rh} -> window {win_w}x{win_h}  (scroll: Up/Down, quit: Esc)..."
+
+    val full_pixels = renderer.render_html_file_to_pixels(html_path)
+    if full_pixels.len() < rw * full_rh:
+        print "Backend '{renderer.name()}' produced too few pixels ({full_pixels.len()}); cannot present."
+        return 1
+    print "Backend '{renderer.name()}' rendered {full_pixels.len()} px."
+
+    if env_get_or("SIMPLE_GUI", "") != "1":
+        print "No GUI requested (set SIMPLE_GUI=1 to open a window); headless render only."
+        return 0
+
+    val lp = winit_loop_new()
+    if not lp.is_valid:
+        print "No GUI runtime available."
+        return 0
+    val win = winit_window_new(lp, win_w.to_i64(), win_h.to_i64(), title)
+    if not win.is_valid:
+        winit_loop_free(lp)
+        return 0
+
+    # Display the WHOLE rendered page shrunk to 1/DIV (pure_simple only; chromium
+    # is native, scale 1). Shrunk page sits top-left with a background fill.
+    val div = _int_env("PURE_SIMPLE_DISPLAY_DIV", 8)
+    val frame = shrink_render(full_pixels, rw, full_rh, div, win_w, win_h)
+    var running = true
+    var iters = 0
+    while running and iters < 20000000:
+        val input = winit_poll_input(lp)
+        if input.close:
+            running = false
+        for k in input.keys:
+            if k == 27:
+                running = false
+        winit_present_rgba(win, win_w.to_i64(), win_h.to_i64(), frame)
+        iters = iters + 1
+
+    winit_window_free(win)
+    winit_loop_free(lp)
+    0

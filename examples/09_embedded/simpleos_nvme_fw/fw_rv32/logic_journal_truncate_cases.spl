@@ -1,0 +1,8 @@
+use logic_journal_core.*
+
+fn rv32_journal_truncate_cases_selftest() -> i32:
+    if _rv32_journal_truncate_count(2, 1, 2, 3) != 1:
+        return 1
+    if _rv32_journal_truncate_count(3, 1, 2, 3) != 0:
+        return 1
+    0

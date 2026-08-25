@@ -1,0 +1,438 @@
+"""
+ftl_band — log-structured band/block allocator with per-page valid bitmap.
+
+Manages a pool of NAND blocks as a sequential write band.  Pages are allocated
+in order within the active block; when the active block is full it is closed and
+the next BLK_FREE block becomes the new active block.  A per-page valid[] bitmap
+tracks which physical pages hold the current (live) version of host data.
+"""
+
+use nvme_types.*
+
+# ── BandAlloc struct ──────────────────────────────────────────────────────────
+
+struct BandAlloc:
+    valid:      [i64]   # length NUM_PAGES; 1 = physical page holds current version
+    blk_state:  [i64]   # length NUM_BLOCKS; BLK_FREE / OPEN / CLOSED / BAD
+    blk_valid:  [i64]   # length NUM_BLOCKS; count of valid pages per block
+    active_blk: i64     # currently OPEN block, or UNMAP if none
+    active_wp:  i64     # write pointer within active block (0..PAGES_PER_BLOCK)
+    free_count: i64     # number of blocks in BLK_FREE state
+
+# ── Constructor ───────────────────────────────────────────────────────────────
+
+fn ftl_band_new() -> BandAlloc:
+    var valid:     [i64] = []
+    var blk_state: [i64] = []
+    var blk_valid: [i64] = []
+    var i: i64 = 0
+    while i < NUM_PAGES:
+        valid.push(0)
+        i = i + 1
+    i = 0
+    while i < NUM_BLOCKS:
+        blk_state.push(BLK_FREE)
+        blk_valid.push(0)
+        i = i + 1
+    BandAlloc(
+        valid:      valid,
+        blk_state:  blk_state,
+        blk_valid:  blk_valid,
+        active_blk: UNMAP,
+        active_wp:  0,
+        free_count: NUM_BLOCKS
+    )
+
+# ── Methods ───────────────────────────────────────────────────────────────────
+
+impl BandAlloc:
+    me block_ready(blk: i64) -> bool:
+        block_in_range(blk) and blk < me.blk_state.len() and blk < me.blk_valid.len()
+
+    me ppn_ready(ppn: i64) -> bool:
+        ppn_in_range(ppn) and ppn < me.valid.len() and me.block_ready(ppn_block(ppn))
+
+    me block_pages_ready(blk: i64) -> bool:
+        me.block_ready(blk) and block_first_ppn(blk) + PAGES_PER_BLOCK <= me.valid.len()
+
+    me active_ready() -> bool:
+        me.block_pages_ready(me.active_blk) and me.blk_state[me.active_blk] == BLK_OPEN
+
+    me valid_counter_next(blk: i64) -> i64:
+        val count: i64 = me.valid_count(blk)
+        if count >= PAGES_PER_BLOCK:
+            return PAGES_PER_BLOCK
+        count + 1
+
+    me valid_counter_prev(blk: i64) -> i64:
+        val count: i64 = me.valid_count(blk)
+        if count <= 0:
+            return 0
+        count - 1
+
+    me actual_free_blocks() -> i64:
+        var fc: i64 = 0
+        var b: i64 = 0
+        while b < NUM_BLOCKS and b < me.blk_state.len():
+            if me.blk_state[b] == BLK_FREE and me.block_pages_ready(b):
+                fc = fc + 1
+            b = b + 1
+        fc
+
+    me counted_free_blocks() -> i64:
+        val fc: i64 = me.actual_free_blocks()
+        if me.free_count < 0:
+            return 0
+        if me.free_count < fc:
+            return me.free_count
+        fc
+
+    # Allocate the next physical page.
+    # Opens a fresh block when there is no active block or the current one is full.
+    # Returns NO_PPN if no free block is available.
+    me alloc_page() -> i64:
+        val no_active: bool = me.active_blk == UNMAP or not me.active_ready() or me.active_wp < 0 or me.active_wp > PAGES_PER_BLOCK
+        val blk_full:  bool = me.active_wp == PAGES_PER_BLOCK
+        val need_new:  bool = (no_active or blk_full)
+        if need_new:
+            # Close the current block if one was open.
+            if me.active_ready():
+                me.blk_state[me.active_blk] = BLK_CLOSED
+            # Find the first BLK_FREE block.
+            var next_blk: i64 = UNMAP
+            var b: i64 = 0
+            while b < NUM_BLOCKS and b < me.blk_state.len():
+                if me.blk_state[b] == BLK_FREE and me.block_pages_ready(b):
+                    next_blk = b
+                    b = NUM_BLOCKS
+                b = b + 1
+            if next_blk == UNMAP:
+                return NO_PPN
+            me.active_blk = next_blk
+            me.blk_state[next_blk] = BLK_OPEN
+            me.active_wp  = 0
+            me.free_count = me.actual_free_blocks()
+        val ppn: i64 = block_first_ppn(me.active_blk) + me.active_wp
+        me.active_wp = me.active_wp + 1
+        ppn
+
+    # Host allocation: like alloc_page, but refuses to open a NEW block when doing so
+    # would leave fewer than `reserve` free blocks. Those blocks are held back as GC
+    # scratch so garbage collection can always relocate a victim's live pages and make
+    # forward progress — the host write path therefore stops (NO_PPN -> SC_NS_NOT_READY)
+    # before the device reaches a state where stale space exists but GC cannot reclaim it.
+    me alloc_page_host(reserve: i64) -> i64:
+        val no_active: bool = me.active_blk == UNMAP or not me.active_ready() or me.active_wp < 0 or me.active_wp > PAGES_PER_BLOCK
+        val blk_full:  bool = me.active_wp == PAGES_PER_BLOCK
+        val need_new:  bool = (no_active or blk_full)
+        if need_new:
+            if me.counted_free_blocks() <= reserve:
+                return NO_PPN
+        me.alloc_page()
+
+    me host_writable_pages(reserve: i64) -> i64:
+        var pages: i64 = 0
+        if me.active_ready() and me.active_wp >= 0 and me.active_wp < PAGES_PER_BLOCK:
+            pages = PAGES_PER_BLOCK - me.active_wp
+        val free: i64 = me.counted_free_blocks()
+        if free > reserve:
+            pages = pages + (free - reserve) * PAGES_PER_BLOCK
+        pages
+
+    # Mark a physical page as holding the current version of its LBA.
+    me mark_valid(ppn: i64):
+        if not me.ppn_ready(ppn):
+            return
+        val blk: i64 = ppn_block(ppn)
+        if me.blk_state[blk] == BLK_FREE or me.blk_state[blk] == BLK_BAD:
+            return
+        if me.valid[ppn] == 0:
+            me.valid[ppn] = 1
+            me.blk_valid[blk] = me.valid_counter_next(blk)
+
+    # Mark a physical page as stale (no longer the current version).
+    # No-op if the page is already invalid.
+    me mark_invalid(ppn: i64):
+        if not me.ppn_ready(ppn):
+            return
+        if me.valid[ppn] != 0:
+            me.valid[ppn] = 0
+            val blk: i64 = ppn_block(ppn)
+            me.blk_valid[blk] = me.valid_counter_prev(blk)
+
+    # Number of valid (live) pages in the given block.
+    me valid_count(blk: i64) -> i64:
+        if not me.block_ready(blk):
+            return 0
+        val count: i64 = me.blk_valid[blk]
+        if count < 0:
+            return 0
+        if count > PAGES_PER_BLOCK:
+            return PAGES_PER_BLOCK
+        count
+
+    # Whether the given physical page currently holds the live version.
+    me is_valid(ppn: i64) -> bool:
+        if not me.ppn_ready(ppn):
+            return false
+        me.valid[ppn] != 0
+
+    # Lifecycle state (BLK_FREE/OPEN/CLOSED/BAD) of the given block.
+    me block_state(blk: i64) -> i64:
+        if not me.block_ready(blk):
+            return BLK_BAD
+        me.blk_state[blk]
+
+    # Return a block to BLK_FREE after the FIL layer has erased it.
+    # Resets blk_valid to 0 and increments free_count.
+    me free_block(blk: i64):
+        if not me.block_ready(blk):
+            return
+        if block_first_ppn(blk) + PAGES_PER_BLOCK > me.valid.len():
+            return
+        if me.blk_state[blk] == BLK_FREE:
+            return
+        var p: i64 = block_first_ppn(blk)
+        val end: i64 = p + PAGES_PER_BLOCK
+        while p < end and p < me.valid.len():
+            me.valid[p] = 0
+            p = p + 1
+        if me.active_blk == blk:
+            me.active_blk = UNMAP
+            me.active_wp = 0
+        me.blk_state[blk] = BLK_FREE
+        me.blk_valid[blk] = 0
+        me.free_count = me.actual_free_blocks()
+
+    # Number of blocks currently in BLK_FREE state.
+    me free_blocks() -> i64:
+        me.counted_free_blocks()
+
+    # ── Power-loss volatile-state rebuild ─────────────────────────────────────
+    # The valid bitmap, per-block valid counts, lifecycle states, and the allocator
+    # frontier are volatile DRAM. On power loss they are cleared (reset_volatile)
+    # and reconstructed from the persistent L2P + bad-block table on recovery
+    # (rebuild_mark + set_bad + rebuild_finalize).
+
+    # Clear all volatile state. NAND contents are untouched (persistent); blocks read
+    # as FREE until rebuild marks the ones still holding live pages.
+    me reset_volatile():
+        var i: i64 = 0
+        while i < NUM_PAGES and i < me.valid.len():
+            me.valid[i] = 0
+            i = i + 1
+        i = 0
+        while i < NUM_BLOCKS and i < me.blk_state.len() and i < me.blk_valid.len():
+            me.blk_state[i] = BLK_FREE
+            me.blk_valid[i] = 0
+            i = i + 1
+        me.active_blk = UNMAP
+        me.active_wp = 0
+        me.free_count = NUM_BLOCKS
+
+    # Recovery: mark one physical page live (an L2P entry points at it) and close its
+    # block (it holds committed data, so it is not free for allocation).
+    me rebuild_mark(ppn: i64):
+        if not me.ppn_ready(ppn):
+            return
+        val blk: i64 = ppn_block(ppn)
+        if me.blk_state[blk] == BLK_BAD:
+            return
+        if me.valid[ppn] == 0:
+            me.valid[ppn] = 1
+            me.blk_valid[blk] = me.valid_counter_next(blk)
+            me.blk_state[blk] = BLK_CLOSED
+
+    # Recovery: a block that holds NO live L2P page but whose NAND was never erased before
+    # the crash (its pages are still physically programmed) must NOT be left BLK_FREE — the
+    # allocator would hand it out and the erase-before-program NAND would reject the write,
+    # wrongly retiring a healthy block. Mark it CLOSED with zero valid pages so the normal
+    # gc_once()/reclaim_block() path erases it before it can be reused.
+    me rebuild_close_stale(blk: i64):
+        if not me.block_ready(blk):
+            return
+        if me.blk_state[blk] != BLK_FREE:
+            return
+        me.blk_valid[blk] = 0
+        me.blk_state[blk] = BLK_CLOSED
+
+    # Recovery: retire a persistently-bad block so the allocator never selects it.
+    me set_bad(blk: i64):
+        if not me.block_ready(blk):
+            return
+        if block_first_ppn(blk) + PAGES_PER_BLOCK > me.valid.len():
+            return
+        if me.active_blk == blk:
+            me.active_blk = UNMAP
+            me.active_wp = 0
+        var p: i64 = block_first_ppn(blk)
+        val end: i64 = p + PAGES_PER_BLOCK
+        while p < end and p < me.valid.len():
+            me.valid[p] = 0
+            p = p + 1
+        me.blk_valid[blk] = 0
+        me.blk_state[blk] = BLK_BAD
+        me.free_count = me.actual_free_blocks()
+
+    # Recovery: recompute free_count after rebuild_mark/set_bad. A block holding no
+    # live page and not retired is free; its stale NAND contents are erased before
+    # reuse, and the allocator opens a fresh free block on the next write.
+    me rebuild_finalize():
+        me.free_count = me.actual_free_blocks()
+
+# ── Self-test ─────────────────────────────────────────────────────────────────
+
+fn ftl_band_selftest() -> i64:
+    var fail: i64 = 0
+    var ba: BandAlloc = ftl_band_new()
+
+    # 1. Initial free_count == NUM_BLOCKS (all blocks free).
+    fail = fail + expect_eq(ba.free_blocks(), NUM_BLOCKS, "initial free_count")
+
+    # 2. First alloc opens block 0, returns ppn 0, free_count drops.
+    var p0: i64 = ba.alloc_page()
+    fail = fail + expect_eq(p0, 0,                "first alloc ppn==0")
+    fail = fail + expect_eq(ba.free_blocks(), NUM_BLOCKS - 1, "free_count after open block 0")
+    fail = fail + expect_eq(ba.blk_state[0], BLK_OPEN,       "block 0 is OPEN")
+
+    # 3. Next 63 allocs stay in block 0 (sequential ppns 1..63).
+    var i: i64 = 1
+    while i < PAGES_PER_BLOCK:
+        var ppn: i64 = ba.alloc_page()
+        fail = fail + expect_eq(ppn, i, "sequential ppn in block 0")
+        i = i + 1
+
+    # 4. Block 0 now full (active_wp == PAGES_PER_BLOCK).
+    #    Next alloc must close block 0 and open block 1.
+    var p64: i64 = ba.alloc_page()
+    fail = fail + expect_eq(p64, PAGES_PER_BLOCK,       "first ppn in block 1")
+    fail = fail + expect_eq(ba.blk_state[0], BLK_CLOSED, "block 0 is CLOSED after overflow")
+    fail = fail + expect_eq(ba.blk_state[1], BLK_OPEN,   "block 1 is OPEN")
+    fail = fail + expect_eq(ba.free_blocks(), NUM_BLOCKS - 2, "free_count after open block 1")
+
+    # 5. mark_valid -> valid_count == 1.
+    ba.mark_valid(p0)
+    fail = fail + expect_eq(ba.valid_count(0), 1, "valid_count==1 after mark_valid")
+    ba.mark_valid(p0)
+    fail = fail + expect_eq(ba.valid_count(0), 1, "mark_valid idempotent")
+    ba.blk_valid[0] = -5
+    fail = fail + expect_eq(ba.valid_count(0), 0, "corrupted negative block valid count clamps to zero")
+    ba.valid[p0] = 0
+    ba.mark_valid(p0)
+    fail = fail + expect_eq(ba.valid_count(0), 1, "mark_valid recovers corrupted negative block valid count")
+    ba.mark_invalid(p0)
+    fail = fail + expect_eq(ba.valid_count(0), 0, "mark_invalid does not underflow recovered block valid count")
+    ba.valid[p0] = 7
+    ba.blk_valid[0] = 1
+    fail = fail + expect_eq(if ba.is_valid(p0): 1 else: 0, 1, "corrupted nonzero valid marker stays live")
+    ba.mark_invalid(p0)
+    fail = fail + expect_eq(ba.valid_count(0), 0, "mark_invalid clears corrupted nonzero valid marker")
+    ba.blk_valid[0] = PAGES_PER_BLOCK + 7
+    fail = fail + expect_eq(ba.valid_count(0), PAGES_PER_BLOCK, "corrupted oversized block valid count clamps to block pages")
+    ba.valid[p0] = 0
+    ba.mark_valid(p0)
+    fail = fail + expect_eq(ba.valid_count(0), PAGES_PER_BLOCK, "mark_valid saturates corrupted oversized block valid count")
+    ba.blk_valid[0] = 1
+    ba.mark_valid(NUM_PAGES)
+    fail = fail + expect_eq(ba.valid_count(NUM_BLOCKS), 0, "invalid block valid_count fails closed")
+    fail = fail + expect_eq(if ba.is_valid(NUM_PAGES): 1 else: 0, 0, "invalid ppn is_valid fails closed")
+    fail = fail + expect_eq(ba.block_state(NUM_BLOCKS), BLK_BAD, "invalid block state fails closed")
+    val bad_ppn: i64 = block_first_ppn(2)
+    ba.set_bad(2)
+    ba.mark_valid(bad_ppn)
+    fail = fail + expect_eq(ba.valid_count(2), 0, "mark_valid ignores bad block")
+    ba.rebuild_mark(bad_ppn)
+    fail = fail + expect_eq(ba.block_state(2), BLK_BAD, "rebuild_mark does not resurrect bad block")
+    fail = fail + expect_eq(ba.valid_count(2), 0, "rebuild_mark ignores bad block")
+
+    # 6. mark_invalid -> valid_count == 0.
+    ba.mark_invalid(p0)
+    fail = fail + expect_eq(ba.valid_count(0), 0, "valid_count==0 after mark_invalid")
+    ba.mark_invalid(NUM_PAGES)
+    fail = fail + expect_eq(ba.valid_count(0), 0, "invalid mark_invalid is inert")
+
+    # 7. mark_invalid on already-invalid page is a no-op.
+    ba.mark_invalid(p0)
+    fail = fail + expect_eq(ba.valid_count(0), 0, "mark_invalid idempotent")
+
+    val free_before_bad_free: i64 = ba.free_blocks()
+    ba.free_block(NUM_BLOCKS)
+    fail = fail + expect_eq(ba.free_blocks(), free_before_bad_free, "invalid free_block is inert")
+    ba.rebuild_mark(NUM_PAGES)
+    fail = fail + expect_eq(ba.free_blocks(), free_before_bad_free, "invalid rebuild_mark is inert")
+
+    ba.active_wp = PAGES_PER_BLOCK - 1
+    val reserve_all_free: i64 = ba.free_blocks()
+    fail = fail + expect_eq(ba.host_writable_pages(reserve_all_free), 1, "host writable pages includes current open block only")
+    val saved_active: i64 = ba.active_blk
+    ba.blk_state[saved_active] = BLK_CLOSED
+    fail = fail + expect_eq(ba.host_writable_pages(reserve_all_free), 0, "corrupted closed active block is not host writable")
+    fail = fail + expect_eq(ba.alloc_page_host(reserve_all_free), NO_PPN, "corrupted closed active block cannot bypass GC reserve")
+    ba.blk_state[saved_active] = BLK_OPEN
+    ba.active_wp = -5
+    fail = fail + expect_eq(ba.host_writable_pages(reserve_all_free), 0, "corrupted negative active write pointer does not overstate host capacity")
+    fail = fail + expect_eq(ba.alloc_page_host(reserve_all_free), NO_PPN, "corrupted negative active write pointer cannot bypass GC reserve")
+    ba.active_wp = PAGES_PER_BLOCK - 1
+    ba.free_count = NUM_BLOCKS + 99
+    fail = fail + expect_eq(ba.free_blocks(), free_before_bad_free, "corrupted free_count readout rebuilds from block states")
+    fail = fail + expect_eq(ba.host_writable_pages(NUM_BLOCKS), 1, "corrupted free_count does not overstate host capacity")
+    ba.free_count = -7
+    fail = fail + expect_eq(ba.free_blocks(), 0, "corrupted negative free_count clamps to zero")
+    ba.active_blk = UNMAP
+    ba.active_wp = 0
+    val corrupt_alloc_ppn: i64 = ba.alloc_page()
+    fail = fail + expect_eq(if ppn_in_range(corrupt_alloc_ppn): 1 else: 0, 1, "corrupted negative free_count still allocates from block state")
+    fail = fail + expect_eq(ba.free_blocks(), ba.actual_free_blocks(), "alloc recovers corrupted negative free_count from block state")
+    ba.free_count = free_before_bad_free
+    var bad_active: BandAlloc = ftl_band_new()
+    val bad_active_first: i64 = bad_active.alloc_page()
+    val bad_active_blk: i64 = ppn_block(bad_active_first)
+    bad_active.blk_state[bad_active_blk] = BLK_BAD
+    fail = fail + expect_eq(if ppn_in_range(bad_active.alloc_page()): 1 else: 0, 1, "corrupted bad active block falls back to a fresh free block")
+    fail = fail + expect_eq(bad_active.block_state(bad_active_blk), BLK_BAD, "corrupted bad active block is not resurrected")
+    ba.valid = []
+    fail = fail + expect_eq(if ba.is_valid(p0): 1 else: 0, 0, "truncated valid bitmap fails closed")
+    ba.mark_valid(p0)
+    ba.mark_invalid(p0)
+    ba.free_block(0)
+    fail = fail + expect_eq(ba.valid_count(0), 0, "truncated valid bitmap leaves counts untouched")
+    fail = fail + expect_eq(ba.free_blocks(), 0, "truncated valid bitmap reports no allocatable free blocks")
+    fail = fail + expect_eq(ba.alloc_page(), NO_PPN, "truncated valid bitmap blocks allocation")
+    ba.valid = ftl_fill(NUM_PAGES, 0)
+    ba.blk_state = []
+    fail = fail + expect_eq(ba.free_blocks(), 0, "truncated block state reports no free blocks")
+    fail = fail + expect_eq(ba.block_state(0), BLK_BAD, "truncated block state fails closed")
+    fail = fail + expect_eq(ba.alloc_page(), NO_PPN, "truncated block state blocks allocation")
+    ba.blk_state = ftl_fill(NUM_BLOCKS, BLK_FREE)
+    ba.blk_valid = []
+    fail = fail + expect_eq(ba.valid_count(0), 0, "truncated block valid count fails closed")
+    ba.blk_valid = ftl_fill(NUM_BLOCKS, 0)
+    ba.valid[p0] = 1
+    ba.blk_state[0] = BLK_CLOSED
+    ba.blk_valid[0] = 1
+    ba.active_blk = UNMAP
+    ba.active_wp = 0
+    ba.free_count = ba.actual_free_blocks()
+
+    # 8. free_block raises free_count and resets block state.
+    var fc_before: i64 = ba.free_blocks()
+    ba.free_block(0)
+    fail = fail + expect_eq(ba.free_blocks(),  fc_before + 1, "free_count rises after free_block")
+    fail = fail + expect_eq(ba.blk_state[0],  BLK_FREE,      "block 0 BLK_FREE after free_block")
+    fail = fail + expect_eq(ba.blk_valid[0],  0,             "blk_valid[0]==0 after free_block")
+    fail = fail + expect_eq(if ba.is_valid(p0): 1 else: 0, 0, "free_block clears page valid bit")
+    ba.free_count = -9
+    ba.blk_state[3] = BLK_CLOSED
+    ba.free_block(3)
+    fail = fail + expect_eq(ba.free_blocks(), ba.actual_free_blocks(), "free_block recovers corrupted negative free_count from block state")
+    ba.free_count = NUM_BLOCKS + 99
+    ba.set_bad(4)
+    fail = fail + expect_eq(ba.free_blocks(), ba.actual_free_blocks(), "set_bad recovers corrupted oversized free_count from block state")
+    ba.free_count = -9
+    ba.set_bad(5)
+    fail = fail + expect_eq(ba.free_blocks(), ba.actual_free_blocks(), "set_bad recovers corrupted negative free_count from block state")
+    ba.free_block(1)
+    fail = fail + expect_eq(ba.active_blk, UNMAP, "free_block clears active block")
+    fail = fail + expect_eq(ba.active_wp, 0, "free_block clears active write pointer")
+
+    fail

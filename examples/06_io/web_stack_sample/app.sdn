@@ -1,0 +1,11 @@
+app:
+  name: "web-stack-sample"
+  env: "development"
+  listen_addr: "127.0.0.1:3080"
+  worker_count: 2
+  backend_kind: "simpledb"
+  db_path: "var/lib/web_stack_sample/sample.sqlite3"
+  simpledb_path: "var/lib/web_stack_sample/sample.sdn"
+  session_store_type: "db"
+  session_cookie_name: "sample_sid"
+  assets_path: "examples/web_stack_sample/public"

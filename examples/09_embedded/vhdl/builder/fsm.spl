@@ -1,0 +1,102 @@
+# VHDL Example: Finite State Machine (Traffic Light Controller)
+#
+# Demonstrates:
+# - Package with enum type
+# - Clocked process for state register
+# - Combinational process for next-state logic
+# - Record type for outputs
+# - Component instantiation pattern
+#
+# Expected VHDL output: examples/09_embedded/vhdl/builder/golden/fsm.vhd
+# Run: bin/simple run examples/09_embedded/vhdl/builder/fsm.spl
+
+use compiler.backend.vhdl_type_mapper.VhdlTypeMapper
+use compiler.backend.vhdl.vhdl_builder.VhdlBuilder
+
+fn main():
+    val mapper = VhdlTypeMapper__create()
+    var builder = VhdlBuilder__create("traffic_light")
+
+    builder.emit_library_header()
+
+    # Package with state enum and output record
+    builder.emit_package_begin("traffic_light")
+    builder.emit_type_decl("state_t", mapper.map_enum_type(["S_RED", "S_GREEN", "S_YELLOW"]))
+    val output_fields = [("red", mapper.bit_type()), ("yellow", mapper.bit_type()), ("green", mapper.bit_type())]
+    builder.emit_type_decl("light_t", mapper.map_record(output_fields))
+    builder.emit_constant_decl("MAX_COUNT", "integer", "50000000")
+    builder.emit_package_end("traffic_light")
+
+    # Entity
+    builder.emit_use_package("work", "traffic_light_pkg")
+    builder.emit_entity_begin("traffic_light")
+    builder.emit_port_begin()
+    builder.emit_port("clk", "in", mapper.bit_type(), false)
+    builder.emit_port("rst", "in", mapper.bit_type(), false)
+    builder.emit_port("red", "out", mapper.bit_type(), false)
+    builder.emit_port("yellow", "out", mapper.bit_type(), false)
+    builder.emit_port("green", "out", mapper.bit_type(), true)
+    builder.emit_port_end()
+    builder.emit_entity_end("traffic_light")
+
+    # Architecture
+    builder.emit_use_package("work", "traffic_light_pkg")
+    builder.emit_architecture_begin("traffic_light", "rtl")
+    builder.emit_signal_decl("current_state", "state_t", Some("S_RED"))
+    builder.emit_signal_decl("next_state", "state_t", nil)
+    builder.emit_signal_decl("timer", "integer range 0 to MAX_COUNT", Some("0"))
+    builder.emit_signal_decl("timer_done", mapper.bit_type(), Some("'0'"))
+    builder.emit_architecture_body_begin()
+
+    # State register (clocked)
+    builder.emit_clocked_process_begin(Some("state_reg"), "clk", Some("rst"))
+    builder.emit_process_body_begin()
+    builder.emit_if_begin("rst = '1'")
+    builder.emit_signal_assign("current_state", "S_RED")
+    builder.emit_signal_assign("timer", "0")
+    builder.emit_elsif("rising_edge(clk)")
+    builder.emit_signal_assign("current_state", "next_state")
+    builder.emit_if_begin("timer_done = '1'")
+    builder.emit_signal_assign("timer", "0")
+    builder.emit_else()
+    builder.emit_signal_assign("timer", "timer + 1")
+    builder.emit_if_end()
+    builder.emit_if_end()
+    builder.emit_process_end(Some("state_reg"))
+
+    # Next-state logic (combinational)
+    builder.emit_process_begin(Some("next_state_logic"), ["current_state", "timer_done"])
+    builder.emit_process_body_begin()
+    builder.emit_comment("Default: stay in current state")
+    builder.emit_signal_assign("next_state", "current_state")
+    builder.emit_if_begin("timer_done = '1'")
+    builder.emit_comment("State transitions")
+    builder.emit_if_begin("current_state = S_RED")
+    builder.emit_signal_assign("next_state", "S_GREEN")
+    builder.emit_elsif("current_state = S_GREEN")
+    builder.emit_signal_assign("next_state", "S_YELLOW")
+    builder.emit_elsif("current_state = S_YELLOW")
+    builder.emit_signal_assign("next_state", "S_RED")
+    builder.emit_if_end()
+    builder.emit_if_end()
+    builder.emit_process_end(Some("next_state_logic"))
+
+    # Output logic (combinational)
+    builder.emit_process_begin(Some("output_logic"), ["current_state"])
+    builder.emit_process_body_begin()
+    builder.emit_comment("Default outputs off")
+    builder.emit_signal_assign("red", "'0'")
+    builder.emit_signal_assign("yellow", "'0'")
+    builder.emit_signal_assign("green", "'0'")
+    builder.emit_if_begin("current_state = S_RED")
+    builder.emit_signal_assign("red", "'1'")
+    builder.emit_elsif("current_state = S_GREEN")
+    builder.emit_signal_assign("green", "'1'")
+    builder.emit_elsif("current_state = S_YELLOW")
+    builder.emit_signal_assign("yellow", "'1'")
+    builder.emit_if_end()
+    builder.emit_process_end(Some("output_logic"))
+
+    builder.emit_architecture_end("rtl")
+
+    print builder.build()

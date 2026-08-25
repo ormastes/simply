@@ -1,0 +1,29 @@
+app:
+    title: "Input TextField Demo"
+    theme: glass_dark
+
+layout:
+    type: vbox
+    children:
+        form:
+            type: panel
+            title: "Text Entry"
+            children:
+                search:
+                    type: input
+                    placeholder: "Search..."
+                email:
+                    type: input
+                    placeholder: "Enter email"
+                name:
+                    type: textfield
+                    value: "John Doe"
+                    placeholder: "Full name"
+                bio:
+                    type: textfield
+                    value: ""
+                    placeholder: "Tell us about yourself"
+        status:
+            type: statusbar
+            left: "{app.mode}"
+            right: "{app.title}"

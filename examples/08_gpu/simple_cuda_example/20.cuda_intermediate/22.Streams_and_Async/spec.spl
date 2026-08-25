@@ -1,0 +1,101 @@
+# Exercise 22: Streams and Async - Tests
+#
+# Device tests for the default-stream ordering demos in main.spl. Every
+# example skips when no CUDA device is present.
+
+use self.main.{
+    PTX, make_data, scale_bits,
+    demo_single_stream, demo_two_streams, demo_pipeline, demo_stream_add, demo_event_timing
+}
+use gpu_test_helpers.{gpu_setup, gpu_teardown, gpu_load_ptx, gpu_unload, all_close, close_enough}
+
+describe "Streams and Async":
+
+    describe "host helpers":
+
+        it "make_data fills n elements":
+            val d = make_data(5, 2.5)
+            expect(d.len()).to_equal(5)
+            expect(close_enough(d[4], 2.5, 0.0001)).to_equal(true)
+
+        it "scale_bits encodes IEEE-754 single precision":
+            expect(scale_bits(1.0)).to_equal(1065353216)
+            expect(scale_bits(2.0)).to_equal(1073741824)
+            expect(scale_bits(0.0)).to_equal(0)
+
+    describe "default stream":
+
+        it "scales data correctly after one sync":
+            val ctx = gpu_setup(0)
+            if ctx == 0:
+                skip("default stream", "no CUDA device")
+            val module = gpu_load_ptx(PTX)
+            val r = demo_single_stream(module, 1024).unwrap()
+            expect(r.len()).to_equal(1024)
+            expect(all_close(r, 15.0, 0.001)).to_equal(true)
+            gpu_unload(module)
+            gpu_teardown(ctx)
+
+        it "two launches before one sync both complete":
+            val ctx = gpu_setup(0)
+            if ctx == 0:
+                skip("default stream", "no CUDA device")
+            val module = gpu_load_ptx(PTX)
+            val n = 512
+            val r = demo_two_streams(module, n).unwrap()
+            expect(r.len()).to_equal(2 * n)
+            expect(close_enough(r[0], 2.0, 0.001)).to_equal(true)
+            expect(close_enough(r[n - 1], 2.0, 0.001)).to_equal(true)
+            expect(close_enough(r[n], 4.0, 0.001)).to_equal(true)
+            expect(close_enough(r[2 * n - 1], 4.0, 0.001)).to_equal(true)
+            gpu_unload(module)
+            gpu_teardown(ctx)
+
+    describe "chunked pipeline":
+
+        it "each chunk is scaled by its own factor":
+            val ctx = gpu_setup(0)
+            if ctx == 0:
+                skip("chunked pipeline", "no CUDA device")
+            val module = gpu_load_ptx(PTX)
+            val r = demo_pipeline(module, 1024, 4).unwrap()
+            expect(close_enough(r[0], 1.0, 0.001)).to_equal(true)
+            expect(close_enough(r[255], 1.0, 0.001)).to_equal(true)
+            expect(close_enough(r[256], 2.0, 0.001)).to_equal(true)
+            expect(close_enough(r[767], 3.0, 0.001)).to_equal(true)
+            expect(close_enough(r[1023], 4.0, 0.001)).to_equal(true)
+            gpu_unload(module)
+            gpu_teardown(ctx)
+
+        it "rejects a chunk count that does not divide the total":
+            val ctx = gpu_setup(0)
+            if ctx == 0:
+                skip("chunked pipeline", "no CUDA device")
+            val module = gpu_load_ptx(PTX)
+            expect(demo_pipeline(module, 1000, 3).is_err()).to_equal(true)
+            gpu_unload(module)
+            gpu_teardown(ctx)
+
+    describe "producer / consumer ordering":
+
+        it "consumer kernel sees both producers' results":
+            val ctx = gpu_setup(0)
+            if ctx == 0:
+                skip("producer / consumer ordering", "no CUDA device")
+            val module = gpu_load_ptx(PTX)
+            val r = demo_stream_add(module, 1024).unwrap()
+            expect(all_close(r, 5.0, 0.001)).to_equal(true)
+            gpu_unload(module)
+            gpu_teardown(ctx)
+
+    describe "events":
+
+        it "event pair measures a non-negative elapsed time":
+            val ctx = gpu_setup(0)
+            if ctx == 0:
+                skip("events", "no CUDA device")
+            val module = gpu_load_ptx(PTX)
+            val ns = demo_event_timing(module, 1024).unwrap()
+            expect(ns >= 0).to_equal(true)
+            gpu_unload(module)
+            gpu_teardown(ctx)

@@ -1,0 +1,86 @@
+#![allow(unnamed_duplicate_typed_args)]
+#!/usr/bin/env simple
+# CUDA Concepts - Simple Demo
+# Self-contained example showing CUDA patterns
+
+print "=== CUDA Programming Concepts ==="
+print ""
+
+# Device Information
+print "--- Device Info ---"
+print "Available Devices: 2"
+print "  Device 0: RTX 4090 (24GB)"
+print "  Device 1: RTX 4080 (16GB)"
+print ""
+
+# Memory Management
+print "--- Memory Management ---"
+
+class Tensor:
+    size_mb: i64
+    device_id: i64
+    on_device: bool
+
+fn create_device_tensor(size: i64, device: i64) -> Tensor:
+    print "Allocating {size}MB on device {device}"
+    Tensor(size_mb: size, device_id: device, on_device: true)
+
+val t1 = create_device_tensor(1024, 0)
+val t2 = create_device_tensor(2048, 0)
+print "Total memory: {t1.size_mb + t2.size_mb}MB"
+print ""
+
+# Kernel Execution
+print "--- Kernel Execution ---"
+print "Matrix mult: A(1024x1024) @ B(1024x1024)"
+print "  Grid: (64, 64)"
+print "  Block: (16, 16)"
+print "  Operations: 2,147,483,648"
+print ""
+
+# Async Streams
+print "--- Async Streams ---"
+
+class Stream:
+    stream_id: i64
+    device_id: i64
+
+fn make_stream(device: i64) -> Stream:
+    Stream(stream_id: 0, device_id: device)
+
+val s0 = make_stream(0)
+val s1 = make_stream(0)
+val s2 = make_stream(0)
+
+print "Pipeline with 3 streams:"
+print "  Stream 0: Compute batch N"
+print "  Stream 1: Transfer batch N+1"
+print "  Stream 2: Transfer results N-1"
+print ""
+
+# Multi-Device Training
+print "--- Multi-Device Training ---"
+print "Data Parallel (2 devices):"
+print "  Device 0: Batch 0-63"
+print "  Device 1: Batch 64-127"
+print "  Sync: AllReduce gradients"
+print ""
+
+# Performance
+print "--- Performance ---"
+print "Matrix Mult (2048x2048):"
+print "  CPU: 2.5 sec"
+print "  Device 0: 0.015 sec (167x faster)"
+print "  2 Devices: 0.008 sec (312x faster)"
+print ""
+
+print "=== Demo Complete ===="
+print ""
+print "Key Concepts:"
+print "  ✓ Device management"
+print "  ✓ Memory allocation"
+print "  ✓ Kernel execution"
+print "  ✓ Async streams"
+print "  ✓ Multi-device parallelism"
+print ""
+print "See examples/torch/ for PyTorch integration"

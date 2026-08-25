@@ -1,0 +1,61 @@
+"""
+ftl_gc — garbage-collection / wear-leveling victim selection.
+
+The production GC victim is chosen by `Ftl.policy_gc_victim` (ftl.spl), which enumerates the
+CLOSED blocks and asks the sandboxed policy hook to SCORE each (default = greedy fewest-valid).
+This module holds the STATIC wear-leveling victim: the CLOSED block holding live data with the
+LOWEST erase count (the coldest block), reclaimed by `wear_level_once` so a lightly-worn block
+re-enters the write rotation and wear spreads evenly. Returns UNMAP if none qualifies.
+"""
+
+use nvme_types.*
+use ftl_band.*
+use fil.*
+
+fn gc_select_wear_victim(band: BandAlloc, fil: Fil) -> i64:
+    var best: i64 = UNMAP
+    var best_ec: i64 = 0
+    var blk: i64 = 0
+    while blk < NUM_BLOCKS:
+        if band.block_state(blk) == BLK_CLOSED:
+            if band.valid_count(blk) > 0:
+                val ec: i64 = fil.erase_count(blk)
+                if best == UNMAP or ec < best_ec:
+                    best_ec = ec
+                    best = blk
+        blk = blk + 1
+    best
+
+fn ftl_gc_selftest() -> i64:
+    var fail: i64 = 0
+    var band: BandAlloc = ftl_band_new()
+    var fil: Fil = fil_new()
+
+    # Nothing closed yet -> no wear victim.
+    fail = fail + expect_eq(gc_select_wear_victim(band, fil), UNMAP, "no wear victim when nothing closed")
+
+    # Close block 0 and block 1 (each full of valid pages); a third alloc opens block 2.
+    # Bind each alloc to a local before mark_valid — passing a method call result directly
+    # as a method argument is corrupted at the call boundary under the nested interpreter.
+    var b: i64 = 0
+    while b < 2:
+        var i: i64 = 0
+        while i < PAGES_PER_BLOCK:
+            val p: i64 = band.alloc_page()
+            band.mark_valid(p)
+            i = i + 1
+        b = b + 1
+    val p2: i64 = band.alloc_page()        # open block 2 so blocks 0 and 1 are CLOSED
+    band.mark_valid(p2)
+
+    # Make block 0 hotter than block 1 (higher erase count). Block 0 is the FIRST CLOSED block
+    # the scan reaches, so choosing the colder block 1 forces the erase-count min-search to
+    # override scan order: a degenerate "return the first CLOSED block" selector that ignored
+    # erase counts (or a flipped comparator) would wrongly return 0 and fail this assertion.
+    fil.erase(0)
+    fil.erase(0)
+
+    # The coldest CLOSED block holding live data (block 1, erase_count 0) is the wear victim,
+    # even though the hotter block 0 is scanned first.
+    fail = fail + expect_eq(gc_select_wear_victim(band, fil), 1, "coldest closed block wins over the earlier-scanned hotter block")
+    fail

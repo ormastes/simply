@@ -1,0 +1,633 @@
+"""
+nvme_admin — admin command building blocks for the NVMe controller.
+
+Holds the pieces the controller (nvme_controller.spl) composes to service the
+admin queue:
+  * AdminQueue — the qid-0 ring carrying AdminCmd + its completion ring;
+  * FeatureStore — Get/Set Features backing store;
+  * command-dword decoders (qid/qsize/cqid/cns/fid/logid bit layouts);
+  * AdminCmd builders so callers/tests read like NVMe transactions;
+  * Identify Controller/Namespace and SMART log page builders.
+
+Mutations that must persist live on structs the controller OWNS as fields
+(AdminQueue, FeatureStore) so field-mutation-through-`me` semantics apply.
+"""
+
+use nvme_types.*
+use nvme_admin_types.*
+use hil_queue.*   # bool_to_i64
+
+# ── Command-dword decoders (NVMe Create/Delete/Identify/Features layouts) ──────
+fn admin_qid(cdw10: i64) -> i64:
+    cdw10 & 0xFFFF
+
+fn admin_qsize(cdw10: i64) -> i64:
+    (cdw10 >> 16) & 0xFFFF
+
+fn admin_cqid(cdw11: i64) -> i64:
+    (cdw11 >> 16) & 0xFFFF
+
+fn admin_cns(cdw10: i64) -> i64:
+    cdw10 & 0xFF
+
+fn admin_fid(cdw10: i64) -> i64:
+    cdw10 & 0xFF
+
+fn admin_logid(cdw10: i64) -> i64:
+    cdw10 & 0xFF
+
+# ── AdminCmd builders (readable host transactions) ────────────────────────────
+fn admin_identify_cmd(cid: i64, cns: i64) -> AdminCmd:
+    admin_cmd_make(cid, ADMIN_IDENTIFY, 0, cns, 0, 0)
+
+fn admin_identify_ns_cmd(cid: i64, nsid: i64) -> AdminCmd:
+    admin_cmd_make(cid, ADMIN_IDENTIFY, nsid, CNS_NAMESPACE, 0, 0)
+
+fn admin_create_cq_cmd(cid: i64, qid: i64, size: i64) -> AdminCmd:
+    val cdw10: i64 = (size << 16) | qid
+    admin_cmd_make(cid, ADMIN_CREATE_CQ, 0, cdw10, 1, 0)   # cdw11 bit0=PC
+
+fn admin_create_sq_cmd(cid: i64, qid: i64, size: i64, cqid: i64) -> AdminCmd:
+    val cdw10: i64 = (size << 16) | qid
+    val cdw11: i64 = (cqid << 16) | 1                      # cqid + PC
+    admin_cmd_make(cid, ADMIN_CREATE_SQ, 0, cdw10, cdw11, 0)
+
+fn admin_delete_cq_cmd(cid: i64, qid: i64) -> AdminCmd:
+    admin_cmd_make(cid, ADMIN_DELETE_CQ, 0, qid, 0, 0)
+
+fn admin_delete_sq_cmd(cid: i64, qid: i64) -> AdminCmd:
+    admin_cmd_make(cid, ADMIN_DELETE_SQ, 0, qid, 0, 0)
+
+fn admin_set_feature_cmd(cid: i64, fid: i64, value: i64) -> AdminCmd:
+    admin_cmd_make(cid, ADMIN_SET_FEATURES, 0, fid, value, 0)
+
+fn admin_get_feature_cmd(cid: i64, fid: i64) -> AdminCmd:
+    admin_cmd_make(cid, ADMIN_GET_FEATURES, 0, fid, 0, 0)
+
+fn admin_get_log_cmd(cid: i64, logid: i64) -> AdminCmd:
+    admin_cmd_make(cid, ADMIN_GET_LOG, 0, logid, 0, 0)
+
+fn admin_abort_cmd(cid: i64, sqid: i64, target_cid: i64) -> AdminCmd:
+    # cdw10: SQID in low 16 bits, CID-to-abort in high 16 bits.
+    admin_cmd_make(cid, ADMIN_ABORT, 0, (target_cid << 16) | sqid, 0, 0)
+
+fn admin_async_event_cmd(cid: i64) -> AdminCmd:
+    admin_cmd_make(cid, ADMIN_ASYNC_EVENT, 0, 0, 0, 0)
+
+fn admin_format_cmd(cid: i64, nsid: i64) -> AdminCmd:
+    admin_cmd_make(cid, ADMIN_FORMAT_NVM, nsid, 0, 0, 0)
+
+fn admin_fw_download_cmd(cid: i64, numd: i64, ofst: i64) -> AdminCmd:
+    # NUMD = number of dwords to transfer (0's based on the wire; a plain count here).
+    admin_cmd_make(cid, ADMIN_FW_DOWNLOAD, 0, numd, ofst, 0)
+
+fn admin_fw_commit_cmd(cid: i64, slot: i64, action: i64) -> AdminCmd:
+    # cdw10: firmware slot in bits 0..2, commit action in bits 3..5.
+    admin_cmd_make(cid, ADMIN_FW_COMMIT, 0, (action << 3) | slot, 0, 0)
+
+# Commit-command decoders.
+fn admin_fw_slot(cdw10: i64) -> i64:
+    cdw10 & 0x7
+
+fn admin_fw_action(cdw10: i64) -> i64:
+    (cdw10 >> 3) & 0x7
+
+# Valid firmware Commit slots for this 3-slot device (slot 0 is reserved/invalid).
+fn admin_fw_slot_valid(slot: i64) -> bool:
+    slot >= 1 and slot <= 3
+
+# Abort-command decoder: the CID-to-abort is packed in cdw10 bits 16..31 (the target SQID is
+# the low 16 bits, decoded by admin_qid). Inverts admin_abort_cmd's packing.
+fn admin_abort_cid(cdw10: i64) -> i64:
+    (cdw10 >> 16) & 0xFFFF
+
+# ── Identify / SMART builders ─────────────────────────────────────────────────
+fn build_identify_controller() -> IdentifyData:
+    IdentifyData(kind: CNS_CONTROLLER, vid: 0x1B36, num_ns: 1, max_queues: MAX_IO_QUEUES, mdts: MDTS_BLOCKS, target_id: 0, channels: 0, ways_per_channel: 0, nvme_blocks_per_slice: 0, cpu_cores: 0, nsid: 0, ns_size: 0, ns_cap: 0, lba_bytes: 0)
+
+fn build_identify_namespace(nsid: i64) -> IdentifyData:
+    IdentifyData(kind: CNS_NAMESPACE, vid: 0, num_ns: 0, max_queues: 0, mdts: 0, target_id: 0, channels: 0, ways_per_channel: 0, nvme_blocks_per_slice: 0, cpu_cores: 0, nsid: nsid, ns_size: LBA_COUNT, ns_cap: LBA_COUNT, lba_bytes: 4096)
+
+fn identify_lbas_safe(lbas: i64) -> i64:
+    if lbas < 0:
+        return 0
+    lbas
+
+fn identify_lba_bytes_safe(lba_bytes: i64) -> i64:
+    if lba_bytes <= 0:
+        return 4096
+    lba_bytes
+
+fn build_identify_namespace_for_target(nsid: i64, lbas: i64, lba_bytes: i64) -> IdentifyData:
+    val safe_lbas: i64 = identify_lbas_safe(lbas)
+    IdentifyData(kind: CNS_NAMESPACE, vid: 0, num_ns: 0, max_queues: 0, mdts: 0, target_id: 0, channels: 0, ways_per_channel: 0, nvme_blocks_per_slice: 0, cpu_cores: 0, nsid: nsid, ns_size: safe_lbas, ns_cap: safe_lbas, lba_bytes: identify_lba_bytes_safe(lba_bytes))
+
+# Endurance used (percent), from the most-worn block against the rated PE cycles.
+fn smart_percent_used(max_erase: i64) -> i64:
+    if max_erase < 0:
+        return 0
+    if max_erase >= RATED_PE_CYCLES:
+        return 100
+    var pu: i64 = (max_erase * 100) / RATED_PE_CYCLES
+    if pu > 100:
+        pu = 100
+    pu
+
+# Available spare (percent), from the bad-block count against the spare pool.
+fn smart_avail_spare(bad_blocks: i64) -> i64:
+    if bad_blocks < 0:
+        return 100
+    if bad_blocks >= SPARE_BLOCKS:
+        return 0
+    var used: i64 = (bad_blocks * 100) / SPARE_BLOCKS
+    if used > 100:
+        used = 100
+    100 - used
+
+fn smart_nonnegative(v: i64) -> i64:
+    if v < 0:
+        return 0
+    v
+
+fn smart_counter_next(v: i64) -> i64:
+    if v < 0:
+        return 1
+    if v >= 1000000000000000000:
+        return 1000000000000000000
+    v + 1
+
+fn smart_percent(v: i64) -> i64:
+    if v < 0:
+        return 0
+    if v > 100:
+        return 100
+    v
+
+fn build_smart_log(reads: i64, writes: i64, power_cycles: i64, unsafe_sd: i64, media_err: i64, percent_used: i64, avail_spare: i64, temperature: i64, thermal_crit: i64) -> SmartLog:
+    # Critical warning when the spare pool is low (<10%), media errors have occurred,
+    # or the device is thermally critical (composite temperature over the threshold).
+    val safe_spare: i64 = smart_percent(avail_spare)
+    val safe_media_err: i64 = smart_nonnegative(media_err)
+    var crit: i64 = 0
+    if safe_media_err > 0:
+        crit = 1
+    if safe_spare < 10:
+        crit = 1
+    if thermal_crit > 0:
+        crit = 1
+    SmartLog(crit_warning: crit, temperature: smart_nonnegative(temperature), avail_spare: safe_spare, percent_used: smart_percent(percent_used), data_units_read: smart_nonnegative(reads), data_units_written: smart_nonnegative(writes), power_cycles: smart_nonnegative(power_cycles), unsafe_shutdowns: smart_nonnegative(unsafe_sd), media_errors: safe_media_err)
+
+fn admin_cpl_status_valid(status: i64) -> bool:
+    cpl_status_valid(status) or status == SC_CQ_INVALID or status == SC_INVALID_QID or status == SC_INVALID_QSIZE or status == SC_QUEUE_BUSY
+
+# ── FeatureStore — Get/Set Features backing store ─────────────────────────────
+struct FeatureStore:
+    vals: [i64]
+
+fn feature_num_queues_default() -> i64:
+    ((MAX_IO_QUEUES - 1) << 16) | (MAX_IO_QUEUES - 1)
+
+fn feature_value_safe(fid: i64, value: i64) -> i64:
+    if fid == FEAT_VOLATILE_WC:
+        if value == 0 or value == 1:
+            return value
+        return 0
+    if fid == FEAT_NUM_QUEUES:
+        val ncqr: i64 = value & 0xFFFF
+        val nsqr: i64 = (value >> 16) & 0xFFFF
+        if value == ((nsqr << 16) | ncqr) and ncqr >= 0 and nsqr >= 0 and ncqr < MAX_IO_QUEUES and nsqr < MAX_IO_QUEUES:
+            return value
+        return feature_num_queues_default()
+    value
+
+fn feature_store_new() -> FeatureStore:
+    var vals: [i64] = []
+    var i: i64 = 0
+    while i < FEAT_MAX:
+        vals.push(0)
+        i = i + 1
+    var fs: FeatureStore = FeatureStore(vals: vals)
+    # default: report (MAX-1) IO queues available, 0's-based per NVMe (NCQR/NSQR)
+    fs.set(FEAT_NUM_QUEUES, feature_num_queues_default())
+    fs.set(FEAT_VOLATILE_WC, 1)
+    fs
+
+impl FeatureStore:
+    me set(fid: i64, value: i64) -> bool:
+        if fid < 0 or fid >= FEAT_MAX:
+            return false
+        if fid >= me.vals.len():
+            return false
+        me.vals[fid] = value
+        true
+
+    me get(fid: i64) -> i64:
+        if fid < 0 or fid >= FEAT_MAX:
+            return 0
+        if fid >= me.vals.len():
+            return feature_value_safe(fid, 0)
+        feature_value_safe(fid, me.vals[fid])
+
+# ── AdminQueue — qid-0 submission + completion rings ──────────────────────────
+struct AdminQueue:
+    sq_cid:   [i64]
+    sq_op:    [i64]
+    sq_nsid:  [i64]
+    sq_cdw10: [i64]
+    sq_cdw11: [i64]
+    sq_cdw12: [i64]
+    sq_head:  i64
+    sq_tail:  i64
+    sq_len:   i64
+    cq_cid:    [i64]
+    cq_status: [i64]
+    cq_data:   [i64]
+    cq_head:  i64
+    cq_tail:  i64
+    cq_len:   i64
+    depth:    i64
+
+fn admin_queue_new() -> AdminQueue:
+    val cap: i64 = MAX_QUEUE_SIZE
+    var sq_cid:   [i64] = []
+    var sq_op:    [i64] = []
+    var sq_nsid:  [i64] = []
+    var sq_cdw10: [i64] = []
+    var sq_cdw11: [i64] = []
+    var sq_cdw12: [i64] = []
+    var cq_cid:    [i64] = []
+    var cq_status: [i64] = []
+    var cq_data:   [i64] = []
+    var i: i64 = 0
+    while i < cap:
+        sq_cid.push(0)
+        sq_op.push(0)
+        sq_nsid.push(0)
+        sq_cdw10.push(0)
+        sq_cdw11.push(0)
+        sq_cdw12.push(0)
+        cq_cid.push(0)
+        cq_status.push(0)
+        cq_data.push(0)
+        i = i + 1
+    AdminQueue(sq_cid: sq_cid, sq_op: sq_op, sq_nsid: sq_nsid, sq_cdw10: sq_cdw10, sq_cdw11: sq_cdw11, sq_cdw12: sq_cdw12, sq_head: 0, sq_tail: 0, sq_len: 0, cq_cid: cq_cid, cq_status: cq_status, cq_data: cq_data, cq_head: 0, cq_tail: 0, cq_len: 0, depth: cap)
+
+impl AdminQueue:
+    me effective_depth() -> i64:
+        var d: i64 = me.depth
+        if d < 0:
+            return 0
+        if d > MAX_QUEUE_SIZE:
+            d = MAX_QUEUE_SIZE
+        if d > me.sq_cid.len():
+            d = me.sq_cid.len()
+        if d > me.sq_op.len():
+            d = me.sq_op.len()
+        if d > me.sq_nsid.len():
+            d = me.sq_nsid.len()
+        if d > me.sq_cdw10.len():
+            d = me.sq_cdw10.len()
+        if d > me.sq_cdw11.len():
+            d = me.sq_cdw11.len()
+        if d > me.sq_cdw12.len():
+            d = me.sq_cdw12.len()
+        if d > me.cq_cid.len():
+            d = me.cq_cid.len()
+        if d > me.cq_status.len():
+            d = me.cq_status.len()
+        if d > me.cq_data.len():
+            d = me.cq_data.len()
+        d
+
+    me submit(c: AdminCmd) -> bool:
+        if not cid_valid(c.cid):
+            return false
+        val depth: i64 = me.effective_depth()
+        if depth <= 0:
+            return false
+        if me.sq_len < 0 or me.sq_len >= depth:
+            return false
+        val t: i64 = me.sq_tail
+        if t < 0 or t >= depth:
+            return false
+        me.sq_cid[t]   = c.cid
+        me.sq_op[t]    = c.opcode
+        me.sq_nsid[t]  = c.nsid
+        me.sq_cdw10[t] = c.cdw10
+        me.sq_cdw11[t] = c.cdw11
+        me.sq_cdw12[t] = c.cdw12
+        me.sq_tail = (me.sq_tail + 1) % depth
+        me.sq_len = me.sq_len + 1
+        true
+
+    me pending() -> i64:
+        val depth: i64 = me.effective_depth()
+        if me.sq_len < 0:
+            return 0
+        if me.sq_len > depth:
+            return depth
+        me.sq_len
+
+    me sq_can_fetch() -> bool:
+        val depth: i64 = me.effective_depth()
+        if depth <= 0:
+            return false
+        if me.sq_len <= 0 or me.sq_len > depth:
+            return false
+        if me.sq_head < 0 or me.sq_head >= depth:
+            return false
+        if not cid_valid(me.sq_cid[me.sq_head]):
+            return false
+        true
+
+    me fetch() -> AdminCmd:
+        if me.sq_len <= 0:
+            return admin_cmd_make(0, SC_INVALID_OPCODE, 0, 0, 0, 0)
+        val depth: i64 = me.effective_depth()
+        if depth <= 0:
+            return admin_cmd_make(0, SC_INVALID_OPCODE, 0, 0, 0, 0)
+        val h: i64 = me.sq_head
+        if h < 0 or h >= depth:
+            return admin_cmd_make(0, SC_INVALID_OPCODE, 0, 0, 0, 0)
+        val cid:   i64 = me.sq_cid[h]
+        if not cid_valid(cid):
+            return admin_cmd_make(0, SC_INVALID_OPCODE, 0, 0, 0, 0)
+        val op:    i64 = me.sq_op[h]
+        val nsid:  i64 = me.sq_nsid[h]
+        val cdw10: i64 = me.sq_cdw10[h]
+        val cdw11: i64 = me.sq_cdw11[h]
+        val cdw12: i64 = me.sq_cdw12[h]
+        me.sq_head = (me.sq_head + 1) % depth
+        me.sq_len = me.sq_len - 1
+        admin_cmd_make(cid, op, nsid, cdw10, cdw11, cdw12)
+
+    me cq_post(p: NvmeCpl) -> bool:
+        if not cid_valid(p.cid):
+            return false
+        if not admin_cpl_status_valid(p.status):
+            return false
+        val depth: i64 = me.effective_depth()
+        if depth <= 0:
+            return false
+        if me.cq_len < 0 or me.cq_len >= depth:
+            return false
+        val t: i64 = me.cq_tail
+        if t < 0 or t >= depth:
+            return false
+        me.cq_cid[t]    = p.cid
+        me.cq_status[t] = p.status
+        me.cq_data[t]   = p.data
+        me.cq_tail = (me.cq_tail + 1) % depth
+        me.cq_len = me.cq_len + 1
+        true
+
+    me cq_pending() -> i64:
+        val depth: i64 = me.effective_depth()
+        if me.cq_len < 0:
+            return 0
+        if me.cq_len > depth:
+            return depth
+        me.cq_len
+
+    me cq_is_full() -> bool:
+        val depth: i64 = me.effective_depth()
+        if depth <= 0:
+            return true
+        if me.cq_len < 0 or me.cq_len > depth:
+            return true
+        if me.cq_head < 0 or me.cq_head >= depth:
+            return true
+        if me.cq_tail < 0 or me.cq_tail >= depth:
+            return true
+        if me.cq_len > 0:
+            if not cid_valid(me.cq_cid[me.cq_head]):
+                return true
+            if not admin_cpl_status_valid(me.cq_status[me.cq_head]):
+                return true
+        me.cq_len >= depth
+
+    me cq_reap() -> NvmeCpl:
+        if me.cq_len <= 0:
+            return cpl_make(0, SC_INVALID_FIELD, 0)
+        val depth: i64 = me.effective_depth()
+        if depth <= 0:
+            return cpl_make(0, SC_INVALID_FIELD, 0)
+        val h: i64 = me.cq_head
+        if h < 0 or h >= depth:
+            return cpl_make(0, SC_INVALID_FIELD, 0)
+        val cid:    i64 = me.cq_cid[h]
+        if not cid_valid(cid):
+            return cpl_make(0, SC_INVALID_FIELD, 0)
+        val status: i64 = me.cq_status[h]
+        if not admin_cpl_status_valid(status):
+            return cpl_make(0, SC_INVALID_FIELD, 0)
+        val data:   i64 = me.cq_data[h]
+        me.cq_head = (me.cq_head + 1) % depth
+        me.cq_len = me.cq_len - 1
+        cpl_make(cid, status, data)
+
+# ── Self-test ─────────────────────────────────────────────────────────────────
+fn nvme_admin_selftest() -> i64:
+    var fail: i64 = 0
+
+    # decoders invert the builders' bit packing
+    val ccq: AdminCmd = admin_create_cq_cmd(11, 3, 64)
+    fail = fail + expect_eq(admin_qid(ccq.cdw10), 3, "create-cq decodes qid")
+    fail = fail + expect_eq(admin_qsize(ccq.cdw10), 64, "create-cq decodes qsize")
+    val csq: AdminCmd = admin_create_sq_cmd(12, 3, 64, 2)
+    fail = fail + expect_eq(admin_qid(csq.cdw10), 3, "create-sq decodes qid")
+    fail = fail + expect_eq(admin_cqid(csq.cdw11), 2, "create-sq decodes bound cqid")
+    val idc: AdminCmd = admin_identify_cmd(13, CNS_CONTROLLER)
+    fail = fail + expect_eq(admin_cns(idc.cdw10), CNS_CONTROLLER, "identify decodes cns")
+
+    # abort decode inverts the builder packing (SQID low 16, target CID high 16)
+    val abt: AdminCmd = admin_abort_cmd(14, 2, 0x55)
+    fail = fail + expect_eq(admin_qid(abt.cdw10), 2, "abort decodes target sqid")
+    fail = fail + expect_eq(admin_abort_cid(abt.cdw10), 0x55, "abort decodes target cid")
+
+    # firmware-commit decode: slot (bits 0..2) + action (bits 3..5), plus slot validity
+    val fwc: AdminCmd = admin_fw_commit_cmd(15, 2, 3)
+    fail = fail + expect_eq(admin_fw_slot(fwc.cdw10), 2, "fw commit decodes slot")
+    fail = fail + expect_eq(admin_fw_action(fwc.cdw10), 3, "fw commit decodes action")
+    fail = fail + expect_eq(bool_to_i64(admin_fw_slot_valid(2)), 1, "fw slot 2 is valid")
+    fail = fail + expect_eq(bool_to_i64(admin_fw_slot_valid(0)), 0, "fw slot 0 is invalid")
+
+    # FeatureStore round-trip (value is the 2nd param -> x8-bug guard)
+    var fs: FeatureStore = feature_store_new()
+    fs.set(FEAT_TEMP_THRESH, 358)
+    fail = fail + expect_eq(fs.get(FEAT_TEMP_THRESH), 358, "feature set/get round-trips (x8 guard)")
+    fail = fail + expect_eq(fs.get(FEAT_VOLATILE_WC), 1, "volatile write cache default on")
+    fs.vals[FEAT_NUM_QUEUES] = 999999
+    fail = fail + expect_eq(fs.get(FEAT_NUM_QUEUES), feature_num_queues_default(), "corrupted queue count feature returns advertised max")
+    fs.vals = []
+    fail = fail + expect_eq(bool_to_i64(fs.set(FEAT_TEMP_THRESH, 359)), 0, "truncated feature store rejects set")
+    fail = fail + expect_eq(fs.get(FEAT_TEMP_THRESH), 0, "truncated feature store get fails closed")
+
+    # AdminQueue submit/fetch preserves cid + all dwords
+    var aq: AdminQueue = admin_queue_new()
+    aq.submit(admin_set_feature_cmd(21, FEAT_TEMP_THRESH, 311))
+    fail = fail + expect_eq(aq.pending(), 1, "admin SQ pending == 1")
+    val af: AdminCmd = aq.fetch()
+    fail = fail + expect_eq(af.cid, 21, "admin fetch cid round-trips")
+    fail = fail + expect_eq(af.opcode, ADMIN_SET_FEATURES, "admin fetch opcode")
+    fail = fail + expect_eq(admin_fid(af.cdw10), FEAT_TEMP_THRESH, "admin fetch fid")
+    fail = fail + expect_eq(af.cdw11, 311, "admin fetch value dword")
+    val empty_af: AdminCmd = aq.fetch()
+    fail = fail + expect_eq(empty_af.opcode, SC_INVALID_OPCODE, "empty admin fetch returns invalid opcode")
+    fail = fail + expect_eq(aq.pending(), 0, "empty admin fetch leaves pending count unchanged")
+    aq.sq_len = 1
+    aq.sq_head = MAX_QUEUE_SIZE
+    val bad_head_af: AdminCmd = aq.fetch()
+    fail = fail + expect_eq(bad_head_af.opcode, SC_INVALID_OPCODE, "invalid admin SQ head fetch fails closed")
+    fail = fail + expect_eq(aq.pending(), 1, "invalid admin SQ head preserves pending count")
+    aq.sq_len = 0
+    aq.sq_head = 0
+    aq.sq_tail = MAX_QUEUE_SIZE
+    fail = fail + expect_eq(bool_to_i64(aq.submit(admin_set_feature_cmd(22, FEAT_TEMP_THRESH, 312))), 0, "invalid admin SQ tail submit fails closed")
+    fail = fail + expect_eq(aq.pending(), 0, "invalid admin SQ tail submit leaves pending count unchanged")
+    aq.sq_tail = 0
+    aq.sq_len = -3
+    fail = fail + expect_eq(aq.pending(), 0, "negative admin SQ length pending clamps to zero")
+    fail = fail + expect_eq(bool_to_i64(aq.submit(admin_set_feature_cmd(23, FEAT_TEMP_THRESH, 313))), 0, "negative admin SQ length submit fails closed")
+    val neg_af: AdminCmd = aq.fetch()
+    fail = fail + expect_eq(neg_af.opcode, SC_INVALID_OPCODE, "negative admin SQ length fetch fails closed")
+    aq.sq_len = aq.depth + 3
+    fail = fail + expect_eq(aq.pending(), aq.depth, "oversized admin SQ length pending clamps to depth")
+    fail = fail + expect_eq(bool_to_i64(aq.sq_can_fetch()), 0, "oversized admin SQ length blocks dispatch")
+    fail = fail + expect_eq(bool_to_i64(aq.submit(admin_set_feature_cmd(24, FEAT_TEMP_THRESH, 314))), 0, "oversized admin SQ length submit fails closed")
+    aq.sq_len = 0
+    aq.depth = MAX_QUEUE_SIZE + 5
+    fail = fail + expect_eq(aq.effective_depth(), MAX_QUEUE_SIZE, "oversized admin queue depth clamps to backing rings")
+    fail = fail + expect_eq(aq.pending(), 0, "oversized admin queue depth keeps SQ pending safe")
+    aq.depth = -1
+    fail = fail + expect_eq(aq.effective_depth(), 0, "negative admin queue depth clamps to zero")
+    fail = fail + expect_eq(bool_to_i64(aq.submit(admin_set_feature_cmd(25, FEAT_TEMP_THRESH, 315))), 0, "negative admin queue depth blocks submit")
+    val bad_depth_af: AdminCmd = aq.fetch()
+    fail = fail + expect_eq(bad_depth_af.opcode, SC_INVALID_OPCODE, "negative admin queue depth fetch fails closed")
+    aq.depth = MAX_QUEUE_SIZE
+    aq.sq_len = 0
+    aq.sq_head = 0
+    aq.sq_tail = 0
+    aq.submit(admin_set_feature_cmd(26, FEAT_TEMP_THRESH, 316))
+    val bad_admin_cid_slot: i64 = aq.sq_head
+    val saved_admin_cid: i64 = aq.sq_cid[bad_admin_cid_slot]
+    aq.sq_cid[bad_admin_cid_slot] = 70000
+    fail = fail + expect_eq(bool_to_i64(aq.sq_can_fetch()), 0, "invalid admin SQ head cid blocks dispatch")
+    fail = fail + expect_eq(aq.pending(), 1, "invalid admin SQ head cid preserves pending command")
+    val bad_admin_cid_fetch: AdminCmd = aq.fetch()
+    fail = fail + expect_eq(bad_admin_cid_fetch.opcode, SC_INVALID_OPCODE, "invalid admin SQ head cid fetch fails closed")
+    fail = fail + expect_eq(aq.pending(), 1, "invalid admin SQ head cid fetch preserves pending command")
+    aq.sq_cid[bad_admin_cid_slot] = saved_admin_cid
+    fail = fail + expect_eq(bool_to_i64(aq.sq_can_fetch()), 1, "repaired admin SQ head cid re-enables dispatch")
+    val cid_repaired_af: AdminCmd = aq.fetch()
+    fail = fail + expect_eq(cid_repaired_af.cid, 26, "repaired admin SQ head cid command remains fetchable")
+    aq.cq_post(cpl_make(21, SC_SUCCESS, 0))
+    fail = fail + expect_eq(aq.cq_pending(), 1, "admin CQ pending == 1")
+    val ar: NvmeCpl = aq.cq_reap()
+    fail = fail + expect_eq(ar.cid, 21, "admin completion cid round-trips")
+    val empty_ar: NvmeCpl = aq.cq_reap()
+    fail = fail + expect_eq(empty_ar.status, SC_INVALID_FIELD, "empty admin completion reap fails closed")
+    fail = fail + expect_eq(aq.cq_pending(), 0, "empty admin completion reap leaves pending count unchanged")
+    aq.cq_len = 1
+    aq.cq_head = MAX_QUEUE_SIZE
+    val bad_head_ar: NvmeCpl = aq.cq_reap()
+    fail = fail + expect_eq(bad_head_ar.status, SC_INVALID_FIELD, "invalid admin CQ head reap fails closed")
+    fail = fail + expect_eq(aq.cq_pending(), 1, "invalid admin CQ head preserves pending count")
+    fail = fail + expect_eq(bool_to_i64(aq.cq_is_full()), 1, "invalid admin CQ head blocks admin dispatch")
+    aq.cq_len = 0
+    aq.cq_head = 0
+    aq.cq_tail = MAX_QUEUE_SIZE
+    fail = fail + expect_eq(bool_to_i64(aq.cq_is_full()), 1, "invalid admin CQ tail blocks admin dispatch")
+    fail = fail + expect_eq(bool_to_i64(aq.cq_post(cpl_make(22, SC_SUCCESS, 0))), 0, "invalid admin CQ tail post fails closed")
+    fail = fail + expect_eq(aq.cq_pending(), 0, "invalid admin CQ tail post leaves pending count unchanged")
+    aq.cq_tail = 0
+    aq.cq_len = -4
+    fail = fail + expect_eq(aq.cq_pending(), 0, "negative admin CQ length pending clamps to zero")
+    fail = fail + expect_eq(bool_to_i64(aq.cq_is_full()), 1, "negative admin CQ length blocks admin dispatch")
+    fail = fail + expect_eq(bool_to_i64(aq.cq_post(cpl_make(23, SC_SUCCESS, 0))), 0, "negative admin CQ length post fails closed")
+    val neg_ar: NvmeCpl = aq.cq_reap()
+    fail = fail + expect_eq(neg_ar.status, SC_INVALID_FIELD, "negative admin CQ length reap fails closed")
+    aq.cq_len = aq.depth + 4
+    fail = fail + expect_eq(aq.cq_pending(), aq.depth, "oversized admin CQ length pending clamps to depth")
+    fail = fail + expect_eq(bool_to_i64(aq.cq_post(cpl_make(24, SC_SUCCESS, 0))), 0, "oversized admin CQ length post fails closed")
+    aq.cq_len = 0
+    aq.depth = MAX_QUEUE_SIZE + 6
+    fail = fail + expect_eq(aq.effective_depth(), MAX_QUEUE_SIZE, "oversized admin CQ depth clamps to backing rings")
+    fail = fail + expect_eq(aq.cq_pending(), 0, "oversized admin CQ depth keeps pending safe")
+    aq.depth = -1
+    fail = fail + expect_eq(aq.effective_depth(), 0, "negative admin CQ depth clamps to zero")
+    fail = fail + expect_eq(bool_to_i64(aq.cq_post(cpl_make(25, SC_SUCCESS, 0))), 0, "negative admin queue depth blocks completion post")
+    val bad_depth_ar: NvmeCpl = aq.cq_reap()
+    fail = fail + expect_eq(bad_depth_ar.status, SC_INVALID_FIELD, "negative admin queue depth reap fails closed")
+    aq.depth = MAX_QUEUE_SIZE
+    aq.cq_len = 0
+    aq.cq_head = 0
+    aq.cq_tail = 0
+    aq.cq_post(cpl_make(26, SC_SUCCESS, 0x26))
+    val bad_admin_cq_cid_slot: i64 = aq.cq_head
+    val saved_admin_cq_cid: i64 = aq.cq_cid[bad_admin_cq_cid_slot]
+    aq.cq_cid[bad_admin_cq_cid_slot] = 70000
+    val bad_admin_cq_cid: NvmeCpl = aq.cq_reap()
+    fail = fail + expect_eq(bad_admin_cq_cid.status, SC_INVALID_FIELD, "invalid admin CQ head cid reap fails closed")
+    fail = fail + expect_eq(aq.cq_pending(), 1, "invalid admin CQ head cid preserves pending completion")
+    aq.cq_cid[bad_admin_cq_cid_slot] = saved_admin_cq_cid
+    val repaired_admin_cq_cid: NvmeCpl = aq.cq_reap()
+    fail = fail + expect_eq(repaired_admin_cq_cid.cid, 26, "repaired admin CQ head cid completion remains reapable")
+    aq.cq_post(cpl_make(27, SC_SUCCESS, 0x27))
+    val bad_admin_cq_status_slot: i64 = aq.cq_head
+    val saved_admin_cq_status: i64 = aq.cq_status[bad_admin_cq_status_slot]
+    aq.cq_status[bad_admin_cq_status_slot] = 70000
+    val bad_admin_cq_status: NvmeCpl = aq.cq_reap()
+    fail = fail + expect_eq(bad_admin_cq_status.status, SC_INVALID_FIELD, "invalid admin CQ head status reap fails closed")
+    fail = fail + expect_eq(aq.cq_pending(), 1, "invalid admin CQ head status preserves pending completion")
+    fail = fail + expect_eq(bool_to_i64(aq.cq_is_full()), 1, "invalid admin CQ head status blocks admin dispatch")
+    aq.cq_status[bad_admin_cq_status_slot] = saved_admin_cq_status
+    val repaired_admin_cq_status: NvmeCpl = aq.cq_reap()
+    fail = fail + expect_eq(repaired_admin_cq_status.status, SC_SUCCESS, "repaired admin CQ head status completion remains reapable")
+    fail = fail + expect_eq(bool_to_i64(aq.cq_post(cpl_make(70000, SC_SUCCESS, 0))), 0, "admin rejects oversized completion id")
+    fail = fail + expect_eq(bool_to_i64(aq.cq_post(cpl_make(-1, SC_SUCCESS, 0))), 0, "admin rejects negative completion id")
+    fail = fail + expect_eq(bool_to_i64(aq.cq_post(cpl_make(28, 70000, 0))), 0, "admin rejects invalid completion status")
+    fail = fail + expect_eq(bool_to_i64(aq.submit(admin_set_feature_cmd(70000, FEAT_TEMP_THRESH, 1))), 0, "admin rejects oversized cid")
+    fail = fail + expect_eq(bool_to_i64(aq.submit(admin_set_feature_cmd(-1, FEAT_TEMP_THRESH, 1))), 0, "admin rejects negative cid")
+    var aqt: AdminQueue = admin_queue_new()
+    aqt.sq_op = []
+    fail = fail + expect_eq(aqt.effective_depth(), 0, "truncated admin SQ sibling ring clamps depth to zero")
+    fail = fail + expect_eq(bool_to_i64(aqt.submit(admin_set_feature_cmd(29, FEAT_TEMP_THRESH, 317))), 0, "truncated admin SQ sibling ring rejects submit")
+    aqt.sq_len = 1
+    fail = fail + expect_eq(bool_to_i64(aqt.sq_can_fetch()), 0, "truncated admin SQ sibling ring blocks dispatch")
+    fail = fail + expect_eq(aqt.fetch().opcode, SC_INVALID_OPCODE, "truncated admin SQ sibling ring fetch fails closed")
+    var aqc: AdminQueue = admin_queue_new()
+    aqc.cq_status = []
+    fail = fail + expect_eq(aqc.effective_depth(), 0, "truncated admin CQ sibling ring clamps depth to zero")
+    fail = fail + expect_eq(bool_to_i64(aqc.cq_post(cpl_make(30, SC_SUCCESS, 0))), 0, "truncated admin CQ sibling ring rejects post")
+    aqc.cq_len = 1
+    fail = fail + expect_eq(bool_to_i64(aqc.cq_is_full()), 1, "truncated admin CQ sibling ring blocks dispatch")
+    fail = fail + expect_eq(aqc.cq_reap().status, SC_INVALID_FIELD, "truncated admin CQ sibling ring reap fails closed")
+
+    # Identify builders surface the device geometry
+    val ictrl: IdentifyData = build_identify_controller()
+    fail = fail + expect_eq(ictrl.max_queues, MAX_IO_QUEUES, "identify-controller reports max queues")
+    val ins: IdentifyData = build_identify_namespace(1)
+    fail = fail + expect_eq(ins.ns_size, LBA_COUNT, "identify-namespace reports LBA count")
+    fail = fail + expect_eq(ins.lba_bytes, 4096, "identify-namespace block size 4096")
+
+    # SMART derived metrics: endurance used (from max erase) and available spare (from bad blocks).
+    fail = fail + expect_eq(smart_percent_used(50), 50, "percent_used from max erase count")
+    fail = fail + expect_eq(smart_percent_used(250), 100, "percent_used clamps at 100")
+    fail = fail + expect_eq(smart_percent_used(FW_OVERFLOW_TEST_SIZE), 100, "percent_used saturates before large multiply")
+    fail = fail + expect_eq(smart_percent_used(-1), 0, "percent_used clamps negative wear")
+    fail = fail + expect_eq(smart_avail_spare(0), 100, "avail_spare full with no bad blocks")
+    fail = fail + expect_eq(smart_avail_spare(1), 88, "avail_spare drops with a retired block")
+    fail = fail + expect_eq(smart_avail_spare(FW_OVERFLOW_TEST_SIZE), 0, "avail_spare saturates before large multiply")
+    fail = fail + expect_eq(smart_avail_spare(-1), 100, "avail_spare clamps negative bad-block count")
+    val sm_bad: SmartLog = build_smart_log(-1, -2, -3, -4, -5, -6, 150, -7, 0)
+    fail = fail + expect_eq(sm_bad.data_units_read, 0, "SMART clamps negative reads")
+    fail = fail + expect_eq(sm_bad.data_units_written, 0, "SMART clamps negative writes")
+    fail = fail + expect_eq(sm_bad.power_cycles, 0, "SMART clamps negative power cycles")
+    fail = fail + expect_eq(sm_bad.unsafe_shutdowns, 0, "SMART clamps negative unsafe shutdowns")
+    fail = fail + expect_eq(sm_bad.media_errors, 0, "SMART clamps negative media errors")
+    fail = fail + expect_eq(sm_bad.percent_used, 0, "SMART clamps negative percent used")
+    fail = fail + expect_eq(sm_bad.avail_spare, 100, "SMART clamps oversized available spare")
+    fail = fail + expect_eq(sm_bad.temperature, 0, "SMART clamps negative temperature")
+
+    fail

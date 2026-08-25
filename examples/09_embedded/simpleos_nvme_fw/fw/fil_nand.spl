@@ -1,0 +1,259 @@
+"""
+fil_nand — simulated NAND flash array (lowest-level FIL layer).
+Depends only on nvme_types and the ECC utility used for OOB parity.
+"""
+
+use nvme_types.*
+use fil_ecc.*
+
+fn nand_erase_counter_next(v: i64) -> i64:
+    if v < 0:
+        return 1
+    if v >= FW_SAFE_I64_LIMIT:
+        return FW_SAFE_I64_LIMIT
+    v + 1
+
+# ── NandRead: result returned by read_page ────────────────────────────────────
+struct NandRead:
+    data: i64
+    lba:  i64
+    seq:  i64
+    ecc:  i64
+    err:  i64
+
+# ── Nand: the full simulated NAND device ──────────────────────────────────────
+struct Nand:
+    data:       [i64]   # length NUM_PAGES, page payload byte
+    oob_lba:    [i64]   # length NUM_PAGES, OOB logical addr (UNMAP if unwritten)
+    oob_seq:    [i64]   # length NUM_PAGES, OOB write sequence number
+    oob_ecc:    [i64]   # length NUM_PAGES, stored ECC from program time
+    page_err:   [i64]   # length NUM_PAGES, injected bit-flip count (0 normally)
+    blk_state:  [i64]   # length NUM_BLOCKS, BLK_FREE/OPEN/CLOSED/BAD
+    blk_erase:  [i64]   # length NUM_BLOCKS, cumulative erase count
+    blk_wp:     [i64]   # length NUM_BLOCKS, write pointer (0..PAGES_PER_BLOCK)
+    prog_fail:  [i64]   # length NUM_BLOCKS, 1 = next program to this block fails
+    erase_fail: [i64]   # length NUM_BLOCKS, 1 = next erase of this block fails
+
+fn nand_new() -> Nand:
+    var data:       [i64] = []
+    var oob_lba:    [i64] = []
+    var oob_seq:    [i64] = []
+    var oob_ecc:    [i64] = []
+    var page_err:   [i64] = []
+    var blk_state:  [i64] = []
+    var blk_erase:  [i64] = []
+    var blk_wp:     [i64] = []
+    var prog_fail:  [i64] = []
+    var erase_fail: [i64] = []
+
+    var i: i64 = 0
+    while i < NUM_PAGES:
+        data.push(0)
+        oob_lba.push(UNMAP)
+        oob_seq.push(0)
+        oob_ecc.push(0)
+        page_err.push(0)
+        i = i + 1
+
+    i = 0
+    while i < NUM_BLOCKS:
+        blk_state.push(BLK_FREE)
+        blk_erase.push(0)
+        blk_wp.push(0)
+        prog_fail.push(0)
+        erase_fail.push(0)
+        i = i + 1
+
+    Nand(data: data, oob_lba: oob_lba, oob_seq: oob_seq, oob_ecc: oob_ecc, page_err: page_err, blk_state: blk_state, blk_erase: blk_erase, blk_wp: blk_wp, prog_fail: prog_fail, erase_fail: erase_fail)
+
+impl Nand:
+    me page_ready(ppn: i64) -> bool:
+        ppn_in_range(ppn) and ppn < me.data.len() and ppn < me.oob_lba.len() and ppn < me.oob_seq.len() and ppn < me.oob_ecc.len() and ppn < me.page_err.len()
+
+    me block_ready(blk: i64) -> bool:
+        block_in_range(blk) and blk < me.blk_state.len() and blk < me.blk_erase.len() and blk < me.blk_wp.len() and blk < me.prog_fail.len() and blk < me.erase_fail.len()
+
+    me block_pages_ready(blk: i64) -> bool:
+        me.block_ready(blk) and block_first_ppn(blk) + PAGES_PER_BLOCK <= me.data.len() and block_first_ppn(blk) + PAGES_PER_BLOCK <= me.oob_lba.len() and block_first_ppn(blk) + PAGES_PER_BLOCK <= me.oob_seq.len() and block_first_ppn(blk) + PAGES_PER_BLOCK <= me.oob_ecc.len() and block_first_ppn(blk) + PAGES_PER_BLOCK <= me.page_err.len()
+
+    me program(ppn: i64, lba: i64, seq: i64, data: i64) -> i64:
+        if not me.page_ready(ppn):
+            return NAND_BAD_BLOCK
+        val blk: i64 = ppn_block(ppn)
+        if not me.block_ready(blk):
+            return NAND_BAD_BLOCK
+        if me.blk_state[blk] == BLK_BAD:
+            return NAND_BAD_BLOCK
+        if me.prog_fail[blk] != 0:
+            me.prog_fail[blk] = 0
+            return NAND_PROG_FAIL
+        if me.oob_lba[ppn] != UNMAP:
+            return NAND_PROG_FAIL
+        me.data[ppn] = data
+        me.oob_lba[ppn] = lba
+        me.oob_seq[ppn] = seq
+        me.oob_ecc[ppn] = ecc_compute(data, lba, seq)
+        me.blk_state[blk] = BLK_OPEN
+        NAND_OK
+
+    me read_page(ppn: i64) -> NandRead:
+        if not me.page_ready(ppn):
+            return NandRead(data: 0, lba: UNMAP, seq: 0, ecc: 0, err: 2)
+        var err: i64 = me.page_err[ppn]
+        if err < 0:
+            err = 0
+        NandRead(data: me.data[ppn], lba: me.oob_lba[ppn], seq: me.oob_seq[ppn], ecc: me.oob_ecc[ppn], err: err)
+
+    me erase_block(blk: i64) -> i64:
+        if not me.block_pages_ready(blk):
+            return NAND_BAD_BLOCK
+        if me.blk_state[blk] == BLK_BAD:
+            return NAND_BAD_BLOCK
+        if me.erase_fail[blk] != 0:
+            me.erase_fail[blk] = 0
+            return NAND_ERASE_FAIL
+        val first: i64 = block_first_ppn(blk)
+        var pg: i64 = 0
+        while pg < PAGES_PER_BLOCK:
+            var ppn: i64 = first + pg
+            me.data[ppn] = 0
+            me.oob_lba[ppn] = UNMAP
+            me.oob_seq[ppn] = 0
+            me.oob_ecc[ppn] = 0
+            me.page_err[ppn] = 0
+            pg = pg + 1
+        me.blk_erase[blk] = nand_erase_counter_next(me.blk_erase[blk])
+        me.blk_wp[blk] = 0
+        me.blk_state[blk] = BLK_FREE
+        NAND_OK
+
+    me erase_count(blk: i64) -> i64:
+        if not me.block_ready(blk):
+            return 0
+        if me.blk_erase[blk] < 0:
+            return 0
+        if me.blk_erase[blk] > FW_SAFE_I64_LIMIT:
+            return FW_SAFE_I64_LIMIT
+        me.blk_erase[blk]
+
+    me inject_prog_fail(blk: i64):
+        if not me.block_ready(blk):
+            return
+        me.prog_fail[blk] = 1
+
+    me inject_erase_fail(blk: i64):
+        if not me.block_ready(blk):
+            return
+        me.erase_fail[blk] = 1
+
+    me inject_read_bitflip(ppn: i64, n: i64):
+        if not me.page_ready(ppn):
+            return
+        if n < 0:
+            me.page_err[ppn] = 0
+            return
+        me.page_err[ppn] = n
+
+    me corrupt_page_data(ppn: i64, data: i64):
+        if not me.page_ready(ppn):
+            return
+        me.data[ppn] = data
+
+    me set_bad(blk: i64):
+        if not me.block_ready(blk):
+            return
+        me.blk_state[blk] = BLK_BAD
+
+# ── Self-test ─────────────────────────────────────────────────────────────────
+fn nand_selftest() -> i64:
+    var failures: i64 = 0
+    var nand = nand_new()
+
+    # program page at block_first_ppn(1)+0, then read it back
+    val ppn0: i64 = block_first_ppn(1)
+    var rc: i64 = nand.program(ppn0, 10, 5, 0xAB)
+    failures = failures + expect_eq(rc, NAND_OK, "program returns NAND_OK")
+
+    var r0: NandRead = nand.read_page(ppn0)
+    failures = failures + expect_eq(r0.data, 0xAB, "read data==0xAB")
+    failures = failures + expect_eq(r0.lba, 10, "read lba==10")
+    failures = failures + expect_eq(r0.seq, 5, "read seq==5")
+    failures = failures + expect_eq(r0.ecc, ecc_compute(0xAB, 10, 5), "read stored ecc")
+    failures = failures + expect_eq(r0.err, 0, "read err==0")
+    rc = nand.program(ppn0, 11, 6, 0xBC)
+    failures = failures + expect_eq(rc, NAND_PROG_FAIL, "no-overwrite fails closed")
+    failures = failures + expect_eq(nand.read_page(ppn0).data, 0xAB, "no-overwrite preserves data")
+
+    # block 0 was never erased
+    var ec0: i64 = nand.erase_count(0)
+    failures = failures + expect_eq(ec0, 0, "erase_count(0)==0")
+
+    # erase block 1
+    rc = nand.erase_block(1)
+    failures = failures + expect_eq(rc, NAND_OK, "erase_block returns NAND_OK")
+
+    var r1: NandRead = nand.read_page(ppn0)
+    failures = failures + expect_eq(r1.lba, UNMAP, "post-erase oob_lba==UNMAP")
+    failures = failures + expect_eq(r1.ecc, 0, "post-erase ecc cleared")
+
+    var ec1: i64 = nand.erase_count(1)
+    failures = failures + expect_eq(ec1, 1, "erase_count(1)==1")
+
+    # inject_prog_fail -> next program to block 1 returns NAND_PROG_FAIL
+    nand.inject_prog_fail(1)
+    rc = nand.program(ppn0, 99, 1, 0xFF)
+    failures = failures + expect_eq(rc, NAND_PROG_FAIL, "prog_fail hook")
+    nand.prog_fail[4] = 7
+    val ppn4: i64 = block_first_ppn(4)
+    failures = failures + expect_eq(nand.program(ppn4, 44, 4, 0x44), NAND_PROG_FAIL, "corrupted nonzero program fault fails once")
+    failures = failures + expect_eq(nand.program(ppn4, 44, 4, 0x44), NAND_OK, "corrupted program fault clears after one failure")
+    nand.erase_fail[5] = 7
+    failures = failures + expect_eq(nand.erase_block(5), NAND_ERASE_FAIL, "corrupted nonzero erase fault fails once")
+    failures = failures + expect_eq(nand.erase_block(5), NAND_OK, "corrupted erase fault clears after one failure")
+
+    # set_bad(2) -> program into block 2 returns NAND_BAD_BLOCK
+    nand.set_bad(2)
+    val ppn2: i64 = block_first_ppn(2)
+    rc = nand.program(ppn2, 42, 3, 0xCD)
+    failures = failures + expect_eq(rc, NAND_BAD_BLOCK, "bad block hook")
+
+    # inject_read_bitflip -> err field == injected count
+    nand.inject_read_bitflip(0, 3)
+    var r2: NandRead = nand.read_page(0)
+    failures = failures + expect_eq(r2.err, 3, "bitflip err==3")
+    nand.inject_read_bitflip(0, -1)
+    failures = failures + expect_eq(nand.read_page(0).err, 0, "negative bitflip injection clamps to zero")
+    nand.page_err[0] = -7
+    failures = failures + expect_eq(nand.read_page(0).err, 0, "corrupted negative read error clamps to zero")
+    nand.blk_erase[1] = -5
+    failures = failures + expect_eq(nand.erase_count(1), 0, "corrupted negative erase count clamps to zero")
+    failures = failures + expect_eq(nand.erase_block(1), NAND_OK, "erase recovers corrupted negative erase count")
+    failures = failures + expect_eq(nand.erase_count(1), 1, "erase count recovers from corrupted negative value")
+    nand.blk_erase[1] = FW_OVERFLOW_TEST_SIZE + 1
+    failures = failures + expect_eq(nand.erase_count(1), FW_SAFE_I64_LIMIT, "corrupted oversized erase count saturates")
+    failures = failures + expect_eq(nand.erase_block(1), NAND_OK, "erase still succeeds with saturated erase count")
+    failures = failures + expect_eq(nand.erase_count(1), FW_SAFE_I64_LIMIT, "erase count remains saturated after oversized value")
+
+    val ppn3: i64 = block_first_ppn(3)
+    rc = nand.program(ppn3, 42, 3, 0xCD)
+    failures = failures + expect_eq(rc, NAND_OK, "program corruption-test page")
+    nand.corrupt_page_data(ppn3, 0xCE)
+    val r3: NandRead = nand.read_page(ppn3)
+    failures = failures + expect_eq(r3.data, 0xCE, "corrupt_page_data changes payload")
+    failures = failures + expect_eq(r3.ecc, ecc_compute(0xCD, 42, 3), "corrupt_page_data preserves stored ecc")
+    failures = failures + expect_eq(nand.program(NUM_PAGES, 1, 1, 1), NAND_BAD_BLOCK, "out-of-range program fails closed")
+    failures = failures + expect_eq(nand.read_page(NUM_PAGES).err, 2, "out-of-range read reports uncorrectable")
+    failures = failures + expect_eq(nand.erase_block(NUM_BLOCKS), NAND_BAD_BLOCK, "out-of-range erase fails closed")
+    failures = failures + expect_eq(nand.erase_count(NUM_BLOCKS), 0, "out-of-range erase count is inert")
+    var nt = nand_new()
+    nt.data = []
+    failures = failures + expect_eq(nt.program(0, 1, 1, 1), NAND_BAD_BLOCK, "truncated NAND data program fails closed")
+    failures = failures + expect_eq(nt.read_page(0).err, 2, "truncated NAND data read reports uncorrectable")
+    failures = failures + expect_eq(nt.erase_block(0), NAND_BAD_BLOCK, "truncated NAND data erase fails closed")
+    nt = nand_new()
+    nt.blk_state = []
+    failures = failures + expect_eq(nt.program(0, 1, 1, 1), NAND_BAD_BLOCK, "truncated NAND block metadata program fails closed")
+    failures = failures + expect_eq(nt.erase_count(0), 0, "truncated NAND block metadata erase count is inert")
+    failures = failures + expect_eq(nt.erase_block(0), NAND_BAD_BLOCK, "truncated NAND block metadata erase fails closed")
+
+    failures

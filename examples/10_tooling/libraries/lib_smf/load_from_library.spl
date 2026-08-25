@@ -1,0 +1,98 @@
+#!/usr/bin/env simple
+# Example: Load modules from a library archive
+#
+# This example shows how to use ModuleLoaderWithLibs to load SMF modules
+# from a library archive.
+# Note: This must be run in compiled mode, not interpreter mode.
+
+use compiler.loader.module_loader_lib_support.{ModuleLoaderWithLibs, ModuleLoaderLibConfig, create_loader_with_stdlib}
+use app.io.{file_exists}
+
+fn main():
+    print "========================================="
+    print "Loading Modules from Library"
+    print "========================================="
+    print ""
+
+    # Check if library exists
+    val lib_path = "libmath.lsm"
+    if not file_exists(lib_path):
+        print "Error: Library not found: {lib_path}"
+        print ""
+        print "Please run create_sample_library.spl first to create the library."
+        exit(1)
+
+    # Create loader with custom configuration
+    var config = ModuleLoaderLibConfig.default()
+    config.verbose = true
+    config.enable_libraries = true
+
+    var loader = ModuleLoaderWithLibs.new(config)
+
+    print "Created module loader"
+    print ""
+
+    # Add the library
+    print "Adding library: {lib_path}"
+    val add_result = loader.add_library(lib_path)
+    if add_result.is_err():
+        print "Error adding library: {add_result.unwrap_err()}"
+        exit(1)
+
+    print ""
+
+    # List available modules
+    print "Available modules:"
+    val modules = loader.list_available_modules()
+    for module_name in modules:
+        print "  - {module_name}"
+
+    print ""
+
+    # Check if specific module exists
+    val test_module = "math/add"
+    print "Checking for module: {test_module}"
+    if loader.has_module(test_module):
+        print "  ✓ Module found!"
+
+        # Get source information
+        val source_result = loader.get_module_source(test_module)
+        if source_result.is_ok():
+            print "  Source: {source_result.unwrap()}"
+    else:
+        print "  ✗ Module not found"
+
+    print ""
+
+    # Try to load a module
+    print "Attempting to load module: {test_module}"
+    val load_result = loader.load_module(test_module)
+
+    if load_result.is_err():
+        val error_msg = load_result.unwrap_err()
+        print "  ✗ Error loading module: {error_msg}"
+    else:
+        print "  ✓ Module loaded successfully!"
+
+        val reader = load_result.unwrap()
+        val header = reader.get_header()
+        val (major, minor) = header.version
+
+        print ""
+        print "Module Details:"
+        print "  Version: {major}.{minor}"
+        print "  Symbol count: {header.symbol_count}"
+        print "  Entry point: 0x{header.entry_point}"
+        print "  Data size: {reader.data_size()} bytes"
+
+        # List exported symbols
+        val exported = reader.exported_symbols()
+        if exported.len() > 0:
+            print "  Exported symbols: {exported.len()}"
+            for sym in exported:
+                print "    - {sym.name}"
+
+    print ""
+    print "========================================="
+    print "Library Loading Demo Complete"
+    print "========================================="

@@ -1,0 +1,443 @@
+#![allow(unnamed_duplicate_typed_args)]
+# LLM Caret - Provider Dispatch
+#
+# Routes requests to the correct backend based on provider name.
+# Uses if/elif routing (no dynamic dispatch).
+
+extern fn rt_process_run(cmd: text, args: [text]) -> (text, text, i64)
+extern fn rt_http_request(method: text, url: text, headers: text, body: text) -> (i64, text, text)
+
+use common.text.{escape_json}
+use std.nogc_async_mut.mcp.helpers.{Q, LB, RB}
+use std.nogc_async_mut.llm.json_helpers.{_unwrap_idx, extract_json_string, extract_json_value, extract_json_int, extract_json_bool}
+
+# ============================================================================
+# Unified response struct
+# ============================================================================
+
+struct LLMResponse:
+    content: text
+    model: text
+    provider: text
+    session_id: text
+    stop_reason: text
+    input_tokens: i64
+    output_tokens: i64
+    error: text
+    is_error: bool
+    raw: text
+
+fn new_llm_error(provider: text, error_msg: text) -> LLMResponse:
+    LLMResponse(
+        content: "",
+        model: "",
+        provider: provider,
+        session_id: "",
+        stop_reason: "error",
+        input_tokens: 0,
+        output_tokens: 0,
+        error: error_msg,
+        is_error: true,
+        raw: ""
+    )
+
+# ============================================================================
+# Provider list
+# ============================================================================
+
+fn list_providers() -> [text]:
+    ["claude_cli", "claude_api", "openai", "openai_compat", "local_torch", "codex_cli", "gemini_cli"]
+
+fn is_valid_provider(provider: text) -> bool:
+    if provider == "claude_cli":
+        return true
+    if provider == "claude_api":
+        return true
+    if provider == "openai":
+        return true
+    if provider == "openai_compat":
+        return true
+    if provider == "local_torch":
+        return true
+    if provider == "codex_cli":
+        return true
+    if provider == "gemini_cli":
+        return true
+    false
+
+# ============================================================================
+# Dispatch (calls inline implementations)
+# ============================================================================
+
+fn dispatch_send(provider: text, prompt: text, model: text, api_key: text, base_url: text, cli_path: text, system_prompt: text, session_id: text, max_turns: i64, max_tokens: i64, messages_json: text) -> LLMResponse:
+    if not is_valid_provider(provider):
+        return new_llm_error(provider, "unknown provider: " + provider)
+
+    if provider == "claude_cli":
+        return _dispatch_claude_cli(cli_path, prompt, model, system_prompt, session_id, max_turns, max_tokens)
+    elif provider == "claude_api":
+        return _dispatch_claude_api(api_key, base_url, model, messages_json, system_prompt, max_tokens)
+    elif provider == "openai":
+        return _dispatch_openai(api_key, base_url, model, messages_json, max_tokens)
+    elif provider == "openai_compat":
+        return _dispatch_compat(base_url, api_key, model, messages_json, max_tokens)
+    elif provider == "codex_cli":
+        return _dispatch_codex_cli(cli_path, prompt, model, system_prompt)
+    elif provider == "gemini_cli":
+        return _dispatch_gemini_cli(cli_path, prompt, model, session_id)
+    else:
+        return new_llm_error(provider, "provider not implemented: " + provider)
+
+# ============================================================================
+# Claude CLI dispatch
+# ============================================================================
+
+fn _build_cli_args(prompt: text, model: text, system_prompt: text, session_id: text, max_turns: i64, max_tokens: i64) -> [text]:
+    var args: [text] = []
+    args.push("--dangerously-skip-permissions")
+    args.push("-p")
+    args.push(prompt)
+    args.push("--output-format")
+    args.push("json")
+    if model != "":
+        args.push("--model")
+        args.push(model)
+    if system_prompt != "":
+        args.push("--system-prompt")
+        args.push(system_prompt)
+    if session_id != "":
+        args.push("--resume")
+        args.push(session_id)
+    if max_turns > 0:
+        args.push("--max-turns")
+        args.push(max_turns.to_text())
+    if max_tokens > 0:
+        args.push("--max-tokens")
+        args.push(max_tokens.to_text())
+    args
+
+fn _dispatch_claude_cli(cli_path: text, prompt: text, model: text, system_prompt: text, session_id: text, max_turns: i64, max_tokens: i64) -> LLMResponse:
+    var path = cli_path
+    if path == "":
+        path = "claude"
+    val args = _build_cli_args(prompt, model, system_prompt, session_id, max_turns, max_tokens)
+    val result = rt_process_run(path, args)
+    val stdout = result.0 ?? ""
+    val stderr = result.1 ?? ""
+    val exit_code = result.2
+    if exit_code != 0:
+        var err_msg = "claude CLI exited with code " + exit_code.to_text()
+        if stderr != "":
+            err_msg = err_msg + ": " + stderr
+        return new_llm_error("claude_cli", err_msg)
+    # Parse JSON response
+    val content = extract_json_string(stdout, "result")
+    val resp_model = extract_json_string(stdout, "model")
+    val sess = extract_json_string(stdout, "session_id")
+    val is_err = extract_json_bool(stdout, "is_error")
+    val in_tok = extract_json_int(stdout, "input_tokens")
+    val out_tok = extract_json_int(stdout, "output_tokens")
+    if is_err:
+        return LLMResponse(
+            content: "",
+            model: resp_model,
+            provider: "claude_cli",
+            session_id: sess,
+            stop_reason: "error",
+            input_tokens: in_tok,
+            output_tokens: out_tok,
+            error: content,
+            is_error: true,
+            raw: stdout
+        )
+    LLMResponse(
+        content: content,
+        model: resp_model,
+        provider: "claude_cli",
+        session_id: sess,
+        stop_reason: "end_turn",
+        input_tokens: in_tok,
+        output_tokens: out_tok,
+        error: "",
+        is_error: false,
+        raw: stdout
+    )
+
+# ============================================================================
+# Claude API dispatch
+# ============================================================================
+
+fn _dispatch_claude_api(api_key: text, base_url: text, model: text, messages_json: text, system_prompt: text, max_tokens: i64) -> LLMResponse:
+    if api_key == "":
+        return new_llm_error("claude_api", "ANTHROPIC_API_KEY not set")
+    var url = base_url
+    if url == "":
+        url = "https://api.anthropic.com"
+    url = url + "/v1/messages"
+    var tokens = max_tokens
+    if tokens <= 0:
+        tokens = 4096
+    # Build body
+    var parts: [text] = []
+    var model_val = model
+    if model_val == "":
+        model_val = "claude-sonnet-4-20250514"
+    parts.push(Q() + "model" + Q() + ":" + Q() + model_val + Q())
+    parts.push(Q() + "max_tokens" + Q() + ":" + tokens.to_text())
+    if system_prompt != "":
+        parts.push(Q() + "system" + Q() + ":" + Q() + escape_json(system_prompt) + Q())
+    parts.push(Q() + "messages" + Q() + ":" + messages_json)
+    var body_parts = []
+    body_parts.append(LB())
+    var i = 0
+    for part in parts:
+        if i > 0:
+            body_parts.append(",")
+        body_parts.append(part)
+        i = i + 1
+    body_parts.append(RB())
+    val body = body_parts.join("")
+    # Build headers
+    var hdr_parts = []
+    hdr_parts.append("x-api-key: " + api_key)
+    hdr_parts.append("anthropic-version: 2023-06-01")
+    hdr_parts.append("content-type: application/json")
+    val headers = hdr_parts.join("\n")
+    val result = rt_http_request("POST", url, headers, body)
+    val resp_body = result.1 ?? ""
+    val http_error = result.2 ?? ""
+    if http_error != "":
+        return new_llm_error("claude_api", "HTTP error: " + http_error)
+    val content = extract_json_string(resp_body, "text")
+    val resp_model = extract_json_string(resp_body, "model")
+    val in_tok = extract_json_int(resp_body, "input_tokens")
+    val out_tok = extract_json_int(resp_body, "output_tokens")
+    LLMResponse(
+        content: content,
+        model: resp_model,
+        provider: "claude_api",
+        session_id: "",
+        stop_reason: "end_turn",
+        input_tokens: in_tok,
+        output_tokens: out_tok,
+        error: "",
+        is_error: false,
+        raw: resp_body
+    )
+
+# ============================================================================
+# OpenAI dispatch
+# ============================================================================
+
+fn _dispatch_openai(api_key: text, base_url: text, model: text, messages_json: text, max_tokens: i64) -> LLMResponse:
+    if api_key == "":
+        return new_llm_error("openai", "OPENAI_API_KEY not set")
+    var url = base_url
+    if url == "":
+        url = "https://api.openai.com"
+    url = url + "/v1/chat/completions"
+    # Build body
+    var parts: [text] = []
+    var model_val = model
+    if model_val == "":
+        model_val = "gpt-4o"
+    parts.push(Q() + "model" + Q() + ":" + Q() + model_val + Q())
+    parts.push(Q() + "messages" + Q() + ":" + messages_json)
+    if max_tokens > 0:
+        parts.push(Q() + "max_tokens" + Q() + ":" + max_tokens.to_text())
+    var body_parts = []
+    body_parts.append(LB())
+    var i = 0
+    for part in parts:
+        if i > 0:
+            body_parts.append(",")
+        body_parts.append(part)
+        i = i + 1
+    body_parts.append(RB())
+    val body = body_parts.join("")
+    var hdr_parts = []
+    hdr_parts.append("Authorization: Bearer " + api_key)
+    hdr_parts.append("Content-Type: application/json")
+    val headers = hdr_parts.join("\n")
+    val result = rt_http_request("POST", url, headers, body)
+    val resp_body = result.1 ?? ""
+    val http_error = result.2 ?? ""
+    if http_error != "":
+        return new_llm_error("openai", "HTTP error: " + http_error)
+    val content = extract_json_string(resp_body, "content")
+    val resp_model = extract_json_string(resp_body, "model")
+    LLMResponse(
+        content: content,
+        model: resp_model,
+        provider: "openai",
+        session_id: "",
+        stop_reason: "stop",
+        input_tokens: 0,
+        output_tokens: 0,
+        error: "",
+        is_error: false,
+        raw: resp_body
+    )
+
+# ============================================================================
+# OpenAI-Compatible dispatch
+# ============================================================================
+
+# ============================================================================
+# Codex CLI dispatch
+# ============================================================================
+
+fn _dispatch_codex_cli(cli_path: text, prompt: text, model: text, instructions: text) -> LLMResponse:
+    var path = cli_path
+    if path == "":
+        path = "codex"
+    var args: [text] = []
+    args.push("exec")
+    args.push("--json")
+    args.push("--full-auto")
+    args.push("--sandbox")
+    args.push("off")
+    if model != "":
+        args.push("--model")
+        args.push(model)
+    if instructions != "":
+        args.push("--instructions")
+        args.push(instructions)
+    args.push(prompt)
+    val result = rt_process_run(path, args)
+    val stdout = result.0 ?? ""
+    val stderr = result.1 ?? ""
+    val exit_code = result.2
+    if exit_code != 0:
+        var err_msg = "codex CLI exited with code " + exit_code.to_text()
+        if stderr != "":
+            err_msg = err_msg + ": " + stderr
+        return new_llm_error("codex_cli", err_msg)
+    # Parse JSONL — find last assistant message with output_text
+    var content = ""
+    var resp_model = ""
+    val lines = stdout.split("\n")
+    for line in lines:
+        val trimmed = line.trim()
+        if trimmed == "":
+            continue
+        val role = extract_json_string(trimmed, "role")
+        if role == "assistant":
+            val text_val = extract_json_string(trimmed, "text")
+            if text_val != "":
+                content = text_val
+        val etype = extract_json_string(trimmed, "type")
+        if etype == "error":
+            val err_msg = extract_json_string(trimmed, "message")
+            return new_llm_error("codex_cli", err_msg)
+        val mdl = extract_json_string(trimmed, "model")
+        if mdl != "":
+            resp_model = mdl
+    LLMResponse(
+        content: content,
+        model: resp_model,
+        provider: "codex_cli",
+        session_id: "",
+        stop_reason: "end_turn",
+        input_tokens: 0,
+        output_tokens: 0,
+        error: "",
+        is_error: false,
+        raw: stdout
+    )
+
+# ============================================================================
+# Gemini CLI dispatch
+# ============================================================================
+
+fn _dispatch_gemini_cli(cli_path: text, prompt: text, model: text, session_id: text) -> LLMResponse:
+    var path = cli_path
+    if path == "":
+        path = "gemini"
+    var args: [text] = []
+    args.push("--sandbox")
+    args.push("off")
+    args.push("-p")
+    args.push(prompt)
+    args.push("--output-format")
+    args.push("json")
+    if model != "":
+        args.push("--model")
+        args.push(model)
+    if session_id != "":
+        args.push("--resume")
+        args.push(session_id)
+    val result = rt_process_run(path, args)
+    val stdout = result.0 ?? ""
+    val stderr = result.1 ?? ""
+    val exit_code = result.2
+    if exit_code != 0:
+        var err_msg = "gemini CLI exited with code " + exit_code.to_text()
+        if stderr != "":
+            err_msg = err_msg + ": " + stderr
+        return new_llm_error("gemini_cli", err_msg)
+    # Parse JSON — Gemini uses "response" field, not "result"
+    val content = extract_json_string(stdout, "response")
+    val resp_model = extract_json_string(stdout, "model")
+    val in_tok = extract_json_int(stdout, "input_tokens")
+    val out_tok = extract_json_int(stdout, "output_tokens")
+    val error_val = extract_json_string(stdout, "error")
+    if error_val != "":
+        return new_llm_error("gemini_cli", error_val)
+    LLMResponse(
+        content: content,
+        model: resp_model,
+        provider: "gemini_cli",
+        session_id: "",
+        stop_reason: "end_turn",
+        input_tokens: in_tok,
+        output_tokens: out_tok,
+        error: "",
+        is_error: false,
+        raw: stdout
+    )
+
+fn _dispatch_compat(base_url: text, api_key: text, model: text, messages_json: text, max_tokens: i64) -> LLMResponse:
+    var url = base_url
+    if url == "":
+        url = "http://localhost:11434"
+    url = url + "/v1/chat/completions"
+    var parts: [text] = []
+    parts.push(Q() + "model" + Q() + ":" + Q() + model + Q())
+    parts.push(Q() + "messages" + Q() + ":" + messages_json)
+    if max_tokens > 0:
+        parts.push(Q() + "max_tokens" + Q() + ":" + max_tokens.to_text())
+    var body_parts = []
+    body_parts.append(LB())
+    var i = 0
+    for part in parts:
+        if i > 0:
+            body_parts.append(",")
+        body_parts.append(part)
+        i = i + 1
+    body_parts.append(RB())
+    val body = body_parts.join("")
+    var hdr_parts = []
+    if api_key != "":
+        hdr_parts.append("Authorization: Bearer " + api_key)
+    hdr_parts.append("Content-Type: application/json")
+    val headers = hdr_parts.join("\n")
+    val result = rt_http_request("POST", url, headers, body)
+    val resp_body = result.1 ?? ""
+    val http_error = result.2 ?? ""
+    if http_error != "":
+        return new_llm_error("openai_compat", "HTTP error: " + http_error)
+    val content = extract_json_string(resp_body, "content")
+    val resp_model = extract_json_string(resp_body, "model")
+    LLMResponse(
+        content: content,
+        model: resp_model,
+        provider: "openai_compat",
+        session_id: "",
+        stop_reason: "stop",
+        input_tokens: 0,
+        output_tokens: 0,
+        error: "",
+        is_error: false,
+        raw: resp_body
+    )

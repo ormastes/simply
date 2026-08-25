@@ -1,0 +1,351 @@
+# Async Runtime Demo - Complete Examples
+#
+# This file demonstrates both embedded and host async runtimes.
+# Run with: simple examples/async_demo.spl
+
+use std.async_core.*
+use std.async_embedded.*
+use std.async_host.*
+
+# ============================================================================
+# Embedded Runtime Examples (No Heap, Fixed Capacity)
+# ============================================================================
+
+fn demo_embedded_basic():
+    """Basic embedded scheduler usage."""
+    print "\n=== Embedded Runtime: Basic ==="
+
+    var sched = EmbeddedScheduler.new()
+
+    # Schedule tasks with different priorities
+    sched.schedule(Priority.High, \:
+        print "  [HIGH] Critical task executing"
+        Poll.Ready(())
+    )
+
+    sched.schedule(Priority.Normal, \:
+        print "  [NORMAL] Regular task executing"
+        Poll.Ready(())
+    )
+
+    sched.schedule(Priority.Low, \:
+        print "  [LOW] Background task executing"
+        Poll.Ready(())
+    )
+
+    # Run until all tasks complete
+    sched.run()
+    print "  All tasks completed"
+
+fn demo_embedded_joinset():
+    """JoinSet: spawn tasks and await results."""
+    print "\n=== Embedded Runtime: JoinSet ==="
+
+    var set = EmbeddedJoinSet.new()
+
+    # Add multiple tasks
+    var task1 = set.add_task(1)
+    var task2 = set.add_task(2)
+    var task3 = set.add_task(3)
+
+    print "  Spawned 3 tasks: {task1}, {task2}, {task3}"
+
+    # Simulate task completion
+    set.mark_completed(0, 100)
+    set.mark_completed(1, 200)
+    set.mark_completed(2, 300)
+
+    # Collect results as they complete
+    var sum: i64 = 0
+    while val Some((id, result)) = set.try_join_next():
+        print "  Task {id} completed with result: {result}"
+        sum = sum + result
+
+    print "  Total: {sum}"
+
+fn demo_embedded_futures_unordered():
+    """FuturesUnordered: poll multiple futures."""
+    print "\n=== Embedded Runtime: FuturesUnordered ==="
+
+    var futs = EmbeddedFuturesUnordered.new()
+
+    # Add ready futures
+    futs.push(EmbeddedFuture.ready(10))
+    futs.push(EmbeddedFuture.ready(20))
+    futs.push(EmbeddedFuture.ready(30))
+
+    print "  Added 3 ready futures"
+
+    # Collect results in completion order
+    var results: [i64] = []
+    while val Some(value) = futs.try_next():
+        print "  Got value: {value}"
+        results = results.push(value)
+
+    print "  All values: {results}"
+
+fn demo_embedded_capacity():
+    """Capacity management in embedded runtime."""
+    print "\n=== Embedded Runtime: Capacity Limits ==="
+
+    var set = EmbeddedJoinSet.new()
+
+    print "  Capacity: {set.capacity()}"
+    print "  Empty: {set.is_empty()}"
+    print "  Full: {set.is_full()}"
+
+    # Add tasks up to capacity
+    for i in 0..5:
+        val task_id = set.add_task(i)
+        print "  Added task {i} -> ID {task_id}"
+
+    print "  Length: {set.len()}"
+    print "  Pending: {set.pending_count()}"
+
+# ============================================================================
+# Host Runtime Examples (Heap, Dynamic, Work-Stealing)
+# ============================================================================
+
+fn demo_host_basic():
+    """Basic host runtime usage."""
+    print "\n=== Host Runtime: Basic ==="
+
+    var runtime = HostRuntime.new()
+
+    # Create a simple future
+    val future = HostFuture.ready(42)
+    print "  Created future"
+
+    # Block until ready
+    val result = runtime.block_on(future)
+    print "  Result: {result}"
+
+fn demo_host_joinset():
+    """JoinSet with dynamic capacity."""
+    print "\n=== Host Runtime: JoinSet ==="
+
+    var set = HostJoinSet.new()
+
+    # Spawn many tasks (no capacity limit)
+    for i in 0..10:
+        val id = set.add_task(\: compute(i))
+        print "  Spawned task {i} with ID {id}"
+
+    print "  Total tasks: {set.len()}"
+    print "  Pending: {set.pending_count()}"
+
+    # Note: In real usage, tasks would complete asynchronously
+    # For demo, we're just showing the API
+
+fn compute(x: i64) -> i64:
+    x * x
+
+fn demo_host_futures_unordered():
+    """FuturesUnordered with dynamic growth."""
+    print "\n=== Host Runtime: FuturesUnordered ==="
+
+    var futs = HostFuturesUnordered.new()
+
+    # Add many futures (grows dynamically)
+    for i in 0..20:
+        futs.push(HostFuture.ready(i))
+
+    print "  Added {futs.len()} futures"
+
+    # Consume first few
+    var count = 0
+    while count < 5:
+        match futs.try_next():
+            case Some(value):
+                print "  Got: {value}"
+                count = count + 1
+            case None:
+                break
+
+    print "  Remaining: {futs.len()}"
+
+fn demo_host_scheduler():
+    """Work-stealing scheduler."""
+    print "\n=== Host Runtime: Scheduler ==="
+
+    var sched = HostScheduler.new(4)  # 4 workers
+
+    # Schedule tasks with priorities
+    val id1 = sched.schedule(Priority.Critical, \:
+        print "  [CRITICAL] Must run first"
+        Poll.Ready(())
+    )
+
+    val id2 = sched.schedule(Priority.Normal, \:
+        print "  [NORMAL] Regular task"
+        Poll.Ready(())
+    )
+
+    val id3 = sched.schedule(Priority.Idle, \:
+        print "  [IDLE] Only when idle"
+        Poll.Ready(())
+    )
+
+    print "  Scheduled tasks: {id1}, {id2}, {id3}"
+    print "  Has runnable: {sched.has_runnable()}"
+
+    # Run one task
+    val did_work = sched.run_one()
+    print "  Ran one task: {did_work}"
+
+fn demo_host_combinators():
+    """Future combinators."""
+    print "\n=== Host Runtime: Combinators ==="
+
+    val futures = [
+        HostFuture.ready(1),
+        HostFuture.ready(2),
+        HostFuture.ready(3)
+    ]
+
+    # join_all: wait for all futures
+    val all = join_all(futures)
+    print "  join_all created (would wait for all)"
+
+    # select: return first ready with index
+    val futures2 = [
+        HostFuture.ready(10),
+        HostFuture.ready(20)
+    ]
+    val first = select(futures2)
+    print "  select created (would return first ready)"
+
+    # race: return first ready value
+    val winner = race(futures2)
+    print "  race created (would return first value)"
+
+# ============================================================================
+# Comparison Demo
+# ============================================================================
+
+fn demo_comparison():
+    """Side-by-side comparison of embedded vs host."""
+    print "\n=== Embedded vs Host Comparison ==="
+
+    print "\n  Embedded Runtime:"
+    print "    - Fixed capacity: 16 tasks, 32 futures (configurable)"
+    print "    - No heap allocation"
+    print "    - Polling-based (no wakers)"
+    print "    - Cooperative scheduling"
+    print "    - Use case: Microcontrollers, RTOS"
+
+    print "\n  Host Runtime:"
+    print "    - Dynamic capacity (grows as needed)"
+    print "    - Heap-allocated"
+    print "    - Waker-based notification"
+    print "    - Work-stealing scheduler"
+    print "    - Use case: Desktop, server, full OS"
+
+    print "\n  Shared Interface:"
+    print "    - Poll<T>, TaskState, Priority"
+    print "    - JoinSet<T>, FuturesUnordered<T>"
+    print "    - TaskHandle.is_finished(), try_join()"
+    print "    - Duck typing (no explicit traits)"
+
+# ============================================================================
+# Priority Demo
+# ============================================================================
+
+fn demo_priorities():
+    """Priority scheduling demonstration."""
+    print "\n=== Priority Scheduling ==="
+
+    var sched = EmbeddedScheduler.new()
+
+    # Schedule tasks in random order
+    sched.schedule(Priority.Low, \:
+        print "  [3/5] Low priority"
+        Poll.Ready(())
+    )
+
+    sched.schedule(Priority.Critical, \:
+        print "  [1/5] Critical - runs first!"
+        Poll.Ready(())
+    )
+
+    sched.schedule(Priority.Normal, \:
+        print "  [2/5] Normal priority"
+        Poll.Ready(())
+    )
+
+    sched.schedule(Priority.Idle, \:
+        print "  [5/5] Idle - runs last"
+        Poll.Ready(())
+    )
+
+    sched.schedule(Priority.High, \:
+        print "  [2/5] High priority"
+        Poll.Ready(())
+    )
+
+    print "  Running tasks in priority order:"
+    sched.run()
+
+# ============================================================================
+# Error Handling Demo
+# ============================================================================
+
+fn demo_errors():
+    """Error handling patterns."""
+    print "\n=== Error Handling ==="
+
+    var set = EmbeddedJoinSet.new()
+
+    # Try to exceed capacity
+    print "  Capacity: {set.capacity()}"
+
+    for i in 0..35:  # Capacity is 32
+        match set.add_task(i):
+            case Ok(id):
+                if i < 5 or i >= 30:
+                    print "  Task {i} -> ID {id}"
+            case Err(AsyncError.CapacityExceeded):
+                print "  Task {i} -> CAPACITY EXCEEDED"
+                break
+            case Err(e):
+                print "  Task {i} -> ERROR: {e.message()}"
+
+    print "  Final count: {set.len()}/{set.capacity()}"
+
+# ============================================================================
+# Main Demo Runner
+# ============================================================================
+
+fn main():
+    print "=========================================="
+    print "Simple Async Runtime - Complete Demo"
+    print "=========================================="
+
+    # Embedded runtime demos
+    demo_embedded_basic()
+    demo_embedded_joinset()
+    demo_embedded_futures_unordered()
+    demo_embedded_capacity()
+
+    # Host runtime demos
+    demo_host_basic()
+    demo_host_joinset()
+    demo_host_futures_unordered()
+    demo_host_scheduler()
+    demo_host_combinators()
+
+    # Comparison
+    demo_comparison()
+
+    # Priority scheduling
+    demo_priorities()
+
+    # Error handling
+    demo_errors()
+
+    print "\n=========================================="
+    print "Demo Complete!"
+    print "=========================================="
+
+# Run the demo
+main()

@@ -1,0 +1,271 @@
+#!/usr/bin/env simple
+# Rodio Audio Demo
+#
+# Demonstrates cross-platform audio playback using Rodio.
+# Shows sound effects, music, spatial audio, and effects.
+
+use app.io.audio_ffi.{
+    Vec3,
+    AudioEngine, audio_init, audio_shutdown,
+    audio_set_master_volume, audio_get_master_volume,
+    AudioSource, audio_load_from_file, audio_source_free,
+    audio_source_duration, audio_source_sample_rate, audio_source_channels,
+    audio_play_sound, audio_play_sound_with_volume, audio_play_sound_looped,
+    audio_play_music_looped, audio_stop_music,
+    audio_playback_set_volume, audio_playback_set_speed,
+    audio_playback_pause, audio_playback_resume, audio_playback_stop,
+    audio_playback_is_playing,
+    audio_play_sound_spatial, audio_playback_set_position,
+    audio_set_listener_position,
+    audio_playback_fade_in, audio_playback_fade_out,
+    ReverbSettings, audio_playback_set_reverb,
+    audio_get_supported_formats
+}
+use app.io.{print}
+
+fn main():
+    print "=== Rodio Audio Demo ==="
+    print ""
+
+    # Initialize audio engine
+    val engine = audio_init()
+
+    if not engine.is_valid:
+        print "ERROR: Failed to initialize audio engine"
+        print "  (This is expected in demo - no audio files loaded)"
+        return
+
+    print "✓ Audio engine initialized"
+    print ""
+
+    demo_master_volume(engine)
+    print ""
+    demo_sound_info(engine)
+    print ""
+    demo_playback_control(engine)
+    print ""
+    demo_spatial_audio(engine)
+    print ""
+    demo_audio_effects(engine)
+    print ""
+    demo_supported_formats()
+    print ""
+
+    # Cleanup
+    audio_shutdown(engine)
+    print "✓ Audio engine shut down"
+    print ""
+    print "=== Demo Complete ==="
+
+fn demo_master_volume(engine: AudioEngine):
+    """
+    Demonstrates master volume control.
+    """
+    print "--- Master Volume Control ---"
+
+    # Set master volume to 50%
+    audio_set_master_volume(engine, 0.5)
+    val volume = audio_get_master_volume(engine)
+
+    print "✓ Master volume set to {volume:0.2f}"
+
+    # Set to 100%
+    audio_set_master_volume(engine, 1.0)
+    print "✓ Master volume restored to 1.00"
+
+fn demo_sound_info(engine: AudioEngine):
+    """
+    Demonstrates loading audio and getting info.
+    Note: This will fail without actual audio files.
+    """
+    print "--- Audio Source Info ---"
+
+    # Try to load a sound file (will fail in demo)
+    val sound = audio_load_from_file(engine, "sound_effect.wav")
+
+    if not sound.is_valid:
+        print "ℹ  No audio file loaded (expected in demo)"
+        print "   In a real app, you would:"
+        print "   1. Load: audio_load_from_file(engine, \"sound.wav\")"
+        print "   2. Get duration: {audio_source_duration(sound)} seconds"
+        print "   3. Get sample rate: {audio_source_sample_rate(sound)} Hz"
+        print "   4. Get channels: {audio_source_channels(sound)}"
+        return
+
+    val duration = audio_source_duration(sound)
+    val sample_rate = audio_source_sample_rate(sound)
+    val channels = audio_source_channels(sound)
+
+    print "✓ Audio loaded:"
+    print "  Duration: {duration:0.2f} seconds"
+    print "  Sample Rate: {sample_rate} Hz"
+    print "  Channels: {channels}"
+
+    audio_source_free(sound)
+
+fn demo_playback_control(engine: AudioEngine):
+    """
+    Demonstrates playback control (play, pause, stop, volume, speed).
+    """
+    print "--- Playback Control ---"
+
+    print "Sound playback features:"
+    print "  ✓ audio_play_sound(engine, source)"
+    print "  ✓ audio_play_sound_with_volume(engine, source, 0.5)"
+    print "  ✓ audio_play_sound_looped(engine, source)"
+    print ""
+    print "Music playback features:"
+    print "  ✓ audio_play_music_looped(engine, \"music.mp3\")"
+    print "  ✓ audio_stop_music(music_handle)"
+    print ""
+    print "Control features:"
+    print "  ✓ audio_playback_pause(handle)"
+    print "  ✓ audio_playback_resume(handle)"
+    print "  ✓ audio_playback_stop(handle)"
+    print "  ✓ audio_playback_set_volume(handle, 0.75)"
+    print "  ✓ audio_playback_set_speed(handle, 1.5)  # 1.5x speed"
+    print "  ✓ audio_playback_is_playing(handle)"
+
+fn demo_spatial_audio(engine: AudioEngine):
+    """
+    Demonstrates 3D spatial audio positioning.
+    """
+    print "--- Spatial Audio (3D) ---"
+
+    # Set listener position (player/camera)
+    val listener_pos = Vec3(x: 0.0, y: 0.0, z: 0.0)
+    audio_set_listener_position(engine, listener_pos)
+    print "✓ Listener at origin (0, 0, 0)"
+
+    # Play sound at a position in 3D space
+    val sound_pos = Vec3(x: 10.0, y: 0.0, z: 5.0)
+    print "✓ Can play sound at position ({sound_pos.x}, {sound_pos.y}, {sound_pos.z})"
+
+    # Calculate distance for volume falloff
+    val distance = listener_pos.distance_to(sound_pos)
+    print "  Distance from listener: {distance:0.2f} units"
+
+    # Example: Moving sound source
+    print ""
+    print "Moving sound example:"
+    for i in 0..10:
+        val t = i / 10.0
+        val moving_pos = Vec3(x: t * 20.0, y: 0.0, z: 0.0)
+        print "  Frame {i}: Sound at x={moving_pos.x:0.1f}"
+
+fn demo_audio_effects(engine: AudioEngine):
+    """
+    Demonstrates audio effects (reverb, delay, fade).
+    """
+    print "--- Audio Effects ---"
+
+    print "Fade effects:"
+    print "  ✓ audio_playback_fade_in(handle, 1000)   # 1 second"
+    print "  ✓ audio_playback_fade_out(handle, 500)   # 0.5 seconds"
+    print ""
+
+    print "Reverb effect:"
+    val reverb = ReverbSettings(room_size: 0.8, damping: 0.5)
+    print "  ✓ Room size: {reverb.room_size}"
+    print "  ✓ Damping: {reverb.damping}"
+    print "  ✓ audio_playback_set_reverb(handle, reverb)"
+    print ""
+
+    print "Delay effect (echo):"
+    print "  ✓ Delay: 250ms"
+    print "  ✓ Decay: 0.6 (60% feedback)"
+
+fn demo_supported_formats():
+    """
+    Demonstrates querying supported audio formats.
+    """
+    print "--- Supported Audio Formats ---"
+
+    val formats = audio_get_supported_formats()
+
+    if formats.len() > 0:
+        print "Supported formats:"
+        for format in formats:
+            print "  - {format}"
+    else:
+        print "Common supported formats:"
+        print "  - WAV (uncompressed)"
+        print "  - MP3 (compressed)"
+        print "  - OGG Vorbis (compressed)"
+        print "  - FLAC (lossless)"
+
+# Example of a complete game audio system (for reference)
+fn game_audio_system_example():
+    """
+    This shows how you would use audio in a real game.
+    Not executed in this demo.
+    """
+    # Initialize
+    val engine = audio_init()
+
+    # Load sounds
+    val jump_sound = audio_load_from_file(engine, "sounds/jump.wav")
+    val coin_sound = audio_load_from_file(engine, "sounds/coin.wav")
+    val explosion_sound = audio_load_from_file(engine, "sounds/explosion.wav")
+
+    # Load music
+    val music = audio_play_music_looped(engine, "music/background.mp3")
+    audio_playback_set_volume(music, 0.3)  # Music quieter than SFX
+
+    # Game loop
+    var running = true
+    while running:
+        # Play sound effects on events
+        # if player.jumped:
+        #     audio_play_sound(engine, jump_sound)
+        #
+        # if player.collected_coin:
+        #     audio_play_sound_with_volume(engine, coin_sound, 0.8)
+        #
+        # if enemy.exploded:
+        #     val explosion_pos = Vec3(x: enemy.x, y: enemy.y, z: 0.0)
+        #     val explosion = audio_play_sound_spatial(engine, explosion_sound, explosion_pos)
+        #     audio_playback_set_volume(explosion, 1.0)
+
+        # Update listener position (camera/player)
+        # val listener = Vec3(x: player.x, y: player.y, z: 0.0)
+        # audio_set_listener_position(engine, listener)
+
+        pass
+
+    # Cleanup
+    audio_stop_music(music)
+    audio_source_free(jump_sound)
+    audio_source_free(coin_sound)
+    audio_source_free(explosion_sound)
+    audio_shutdown(engine)
+
+# Example of audio categories/mixing
+fn audio_mixing_example():
+    """
+    Shows how to use mixers for audio categories (SFX, Music, Voice).
+    Not executed in this demo.
+    """
+    val engine = audio_init()
+
+    # Create mixer for sound effects
+    val sfx_mixer = audio_mixer_create(engine)
+    audio_mixer_set_volume(sfx_mixer, 0.8)  # 80% volume
+
+    # Create mixer for music
+    val music_mixer = audio_mixer_create(engine)
+    audio_mixer_set_volume(music_mixer, 0.5)  # 50% volume
+
+    # Add sources to mixers
+    # val sound1 = audio_load_from_file(engine, "sfx1.wav")
+    # val sound2 = audio_load_from_file(engine, "sfx2.wav")
+    # audio_mixer_add_source(sfx_mixer, sound1)
+    # audio_mixer_add_source(sfx_mixer, sound2)
+
+    # Play entire mixer
+    # val sfx_playback = audio_mixer_play(sfx_mixer)
+
+    # Cleanup
+    audio_mixer_free(sfx_mixer)
+    audio_mixer_free(music_mixer)
+    audio_shutdown(engine)

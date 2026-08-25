@@ -1,0 +1,157 @@
+# @cover src/path/to/covered_module.spl 80%
+"""
+# Feature Name Specification
+
+**Feature IDs:** #XXX-XXX
+**Category:** Choose: Infrastructure | Language | Syntax | Stdlib | Runtime | Testing | Tooling
+**Difficulty:** 1-5/5 (1=trivial, 5=complex)
+**Status:** Draft | In Progress | Implemented | Complete
+**Requirements:** doc/02_requirements/feature/xxx.md
+**Plan:** doc/03_plan/xxx.md
+**Design:** doc/05_design/xxx.md
+**Research:** doc/01_research/xxx.md
+**Artifacts:** build/test-artifacts/<spec-relative-path>/summary.txt
+**Screenshots:** doc/spec/image/<spec-relative-path>/after.png
+**TUI Captures:** build/test-artifacts/<spec-relative-path>/capture.ansi
+**Logs:** build/test-artifacts/<spec-relative-path>/run.log
+(replace paths with actual doc paths, or use N/A to suppress validation warnings)
+(artifact fields are optional; use `;` or `,` to list multiple items)
+
+## Overview
+
+High-level description of the feature and its purpose.
+Explain what problem it solves and why it matters.
+
+## Syntax
+
+```simple
+# Example code showing the feature syntax
+val example = feature_example()
+```
+
+## Key Concepts
+
+| Concept | Description |
+|---------|-------------|
+| Term1   | Explanation of key term |
+| Term2   | Explanation of another term |
+
+## Behavior
+
+Describe how the feature works:
+- Key behavior 1
+- Key behavior 2
+- Edge cases and special conditions
+
+## Related Specifications
+
+- [Related Spec 1](spec1.md) - Brief description
+- [Related Spec 2](spec2.md) - Brief description
+
+## Implementation Notes
+
+Any important implementation details, performance considerations,
+or technical constraints.
+
+## Examples
+
+```simple
+use std.spipe.*
+
+describe "FeatureName":
+    it "demonstrates basic usage":
+        val result = use_feature()
+        expect(result).to_equal(expected)
+```
+"""
+
+use std.spipe.*
+
+
+# ============================================================================
+# Test Group 1: Basic Functionality
+# ============================================================================
+
+describe "FeatureName Basic Functionality":
+    """
+    ## Basic Usage
+
+    Describe what this test group validates.
+    Include expected behavior and key scenarios.
+    """
+
+    context "when condition X":
+        """
+        ### Scenario: Condition X Description
+
+        Explain this specific scenario and what it tests.
+        """
+
+        it "does expected behavior":
+            # Arrange
+            val input = setup_input()
+
+            # Act
+            val result = perform_action(input)
+
+            # Assert
+            expect(result).to_equal(expected)
+
+    context "when condition Y":
+        """
+        ### Scenario: Condition Y Description
+
+        Explain this scenario.
+        """
+
+        it "handles edge case":
+            val result = perform_edge_case()
+            expect(result).to_equal(expected_edge_case)
+
+
+# ============================================================================
+# Test Group 2: Advanced Features
+# ============================================================================
+
+describe "FeatureName Advanced Features":
+    """
+    ## Advanced Usage
+
+    Cover complex scenarios, error handling, integration with other features.
+    """
+
+    before_each:
+        # Setup code that runs before each test
+        @fixture = setup_fixture()
+
+    after_each:
+        # Cleanup code
+        cleanup(@fixture)
+
+    it "integrates with other features":
+        val result = integrate_feature()
+        expect(result).to_equal(expected_integration)
+
+    it "returns an error result for invalid input":
+        val result = risky_operation()
+        expect(result.error?).to_equal(true)
+
+
+# ============================================================================
+# Helper Code (if needed)
+# ============================================================================
+
+# Helper functions, test fixtures, mock objects, etc.
+# Place at the end of the file
+
+fn setup_input() -> InputType:
+    # Helper implementation
+    return InputType.default()
+
+fn setup_fixture() -> FixtureType:
+    # Fixture setup
+    return FixtureType.default()
+
+fn cleanup(fixture: FixtureType):
+    # Cleanup implementation
+    nil

@@ -1,0 +1,17 @@
+use logic_journal_count_core.*
+use logic_journal_record_core.*
+
+pub fn _rv32_journal_record_lba(ridx: i64, wal_count: i64, cap: i64, lba0: i64, lba1: i64, lba2: i64) -> i64:
+    _rv32_journal_record_lba_impl(ridx, wal_count, cap, lba0, lba1, lba2)
+
+pub fn _rv32_journal_record_seq(ridx: i64, wal_count: i64, cap: i64, seq0: i64, seq1: i64, seq2: i64) -> i64:
+    _rv32_journal_record_seq_impl(ridx, wal_count, cap, seq0, seq1, seq2)
+
+pub fn _rv32_journal_checkpoint_valid(seq: i64) -> i32:
+    _rv32_journal_checkpoint_valid_impl(seq)
+
+pub fn _rv32_journal_checkpoint_ptr(seq: i64) -> i64:
+    _rv32_journal_checkpoint_ptr_impl(seq)
+
+pub fn _rv32_journal_truncate_count(ckpt_seq: i64, seq0: i64, seq1: i64, seq2: i64) -> i64:
+    _rv32_journal_truncate_count_impl(ckpt_seq, seq0, seq1, seq2)

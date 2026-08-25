@@ -1,0 +1,466 @@
+# codex-impl
+# Canonical ARM64 production desktop entry for QEMU virt ramfb.
+
+use std.nogc_sync_mut.ptr.raw.{raw_alloc}
+use os.kernel.arch.arm64.ramfb.{
+    ARM64_RAMFB_HEIGHT,
+    ARM64_RAMFB_SCRATCH_BYTES,
+    ARM64_RAMFB_WIDTH,
+    arm64_ramfb_framebuffer_bytes,
+    arm64_ramfb_scanout_checksum,
+    arm64_ramfb_setup
+}
+use os.kernel.arch.arm64.console.{uart_data_ready, uart_init, uart_read_char, uart_writeln}
+use os.gui.input_event.{WmAction}
+use os.gui.shortcut.{uart_char_to_action}
+use os.kernel.arch.arm64.virtio_input.{
+    arm64_virtio_input_init
+}
+use os.kernel.arch.arm64.simd_receipt.{arm64_engine2d_simd_scalar_parity}
+use os.drivers.input.ps2_keyboard.{Key, KeyEvent}
+use os.drivers.virtio.virtio_input_ops.{
+    BTN_LEFT,
+    BTN_MIDDLE,
+    BTN_RIGHT,
+    EV_KEY,
+    EV_REL,
+    KEY_LEFTALT,
+    KEY_LEFTCTRL,
+    KEY_RIGHTALT,
+    KEY_RIGHTCTRL,
+    REL_X,
+    REL_Y,
+    REL_WHEEL
+}
+use os.drivers.framebuffer.fb_driver.{FramebufferDriver}
+use os.compositor.compositor.{Compositor}
+use os.compositor.arm64_virtio_input_backend.{Arm64VirtioInputBackend}
+use os.compositor.compositor_engine2d.{Engine2dCompositorBackend}
+use os.compositor.engine2d_display.{create_fb_engine_sized}
+use os.compositor.engine2d_baremetal_core.{
+    baremetal_simd_fill_enabled,
+    baremetal_simd_fill_hits,
+    baremetal_simd_fill_chunks,
+    baremetal_simd_fill_tail_pixels
+}
+use os.compositor.engine2d_wm_frame_executor.{Engine2dWmFrameExecutor}
+use os.compositor.simpleos_wm_theme_bootstrap.{install_generated_simpleos_wm_theme, apply_simpleos_css_theme_override}
+use os.desktop.shell.{DesktopShell}
+use os.desktop.font_bootstrap.{simpleos_desktop_register_selected_fonts_from_vfs}
+use os.services.vfs.vfs_init.{vfs_boot_init_virtio_fat32, g_vfs_read_file_text}
+use os.kernel.ipc.host_gpu_ivshmem_map.{
+    map_qemu_host_gpu_ivshmem_bar2,
+    qemu_host_gpu_ivshmem_window_base
+}
+use os.kernel.boot.monotonic_hardware.{boot_monotonic_now_us, boot_monotonic_prepare}
+use common.gpu.simpleos_host_gpu_protocol.{
+    SIMPLEOS_HOST_GPU_BACKEND_METAL,
+    SIMPLEOS_HOST_GPU_BACKEND_VULKAN,
+    SIMPLEOS_HOST_GPU_ISA_AARCH64
+}
+
+fn arm64_wm_action_from_virtio_key(event: KeyEvent) -> WmAction:
+    """Map shared evdev-translated key presses onto existing WM actions.
+
+    Releases remain observable device receipts but never mutate WM state.
+    This intentionally shares the existing WmAction model used by UART/PS2.
+    """
+    match event:
+        KeyEvent.Release(_key): WmAction.None
+        KeyEvent.Press(key):
+            match key:
+                Key.Tab: WmAction.CycleFocus
+                Key.Num1: WmAction.FocusWindow(idx: 0u64)
+                Key.Num2: WmAction.FocusWindow(idx: 1u64)
+                Key.Num3: WmAction.FocusWindow(idx: 2u64)
+                Key.Num4: WmAction.FocusWindow(idx: 3u64)
+                Key.Num5: WmAction.FocusWindow(idx: 4u64)
+                Key.Num6: WmAction.FocusWindow(idx: 5u64)
+                Key.Num7: WmAction.FocusWindow(idx: 6u64)
+                Key.Num8: WmAction.FocusWindow(idx: 7u64)
+                Key.Num9: WmAction.FocusWindow(idx: 8u64)
+                Key.Q: WmAction.Quit
+                Key.M: WmAction.Minimize
+                Key.W: WmAction.Close
+                Key.R: WmAction.Restore
+                Key.T: WmAction.ToggleTheme
+                _: WmAction.None
+
+fn arm64_emit_ramfb_visual_commit(
+    input_sequence: i64,
+    framebuffer_address: u64,
+    rendered_revision: i64,
+    frame_id: i64
+) -> bool:
+    """Emit guest-owned evidence only after the canonical frame presenter returns."""
+    if rendered_revision <= 0 or frame_id <= 0:
+        uart_writeln(
+            "[ramfb-visual-commit] input_seq={input_sequence} status=failed reason=invalid-render-provenance"
+        )
+        return false
+    val checksum_started_us = boot_monotonic_now_us()
+    val checksum = arm64_ramfb_scanout_checksum(
+        framebuffer_address,
+        ARM64_RAMFB_WIDTH,
+        ARM64_RAMFB_HEIGHT,
+        ARM64_RAMFB_WIDTH * 4u32
+    )
+    val checksum_finished_us = boot_monotonic_now_us()
+    if checksum_finished_us <= checksum_started_us:
+        uart_writeln(
+            "[ramfb-visual-commit] input_seq={input_sequence} status=failed reason=scanout-checksum-timer"
+        )
+        return false
+    val checksum_us = checksum_finished_us - checksum_started_us
+    if checksum <= 0:
+        uart_writeln(
+            "[ramfb-visual-commit] input_seq={input_sequence} status=failed reason=scanout-checksum"
+        )
+        return false
+    # Engine2D recomposes and presents the complete scene for this lane, so the
+    # truthful committed region is the full RAMFB surface.
+    uart_writeln(
+        "[ramfb-visual-commit] input_seq={input_sequence} address={framebuffer_address} width={ARM64_RAMFB_WIDTH} height={ARM64_RAMFB_HEIGHT} stride={ARM64_RAMFB_WIDTH * 4u32} format=bgra8888 rendered_revision={rendered_revision} frame_id={frame_id} checksum={checksum:x} checksum_us={checksum_us} damage_kind=conservative-full-frame damage_bound_x=0 damage_bound_y=0 damage_bound_width={ARM64_RAMFB_WIDTH} damage_bound_height={ARM64_RAMFB_HEIGHT} status=success"
+    )
+    true
+
+pub fn gui_entry_desktop_start(file_backed_ram_tail_base: u64, preferred_backend_code: i64 = SIMPLEOS_HOST_GPU_BACKEND_METAL, backend_required: bool = false):
+    uart_init()
+    val screen_width = ARM64_RAMFB_WIDTH.to_i32()
+    val screen_height = ARM64_RAMFB_HEIGHT.to_i32()
+    val framebuffer_size = arm64_ramfb_framebuffer_bytes(ARM64_RAMFB_WIDTH, ARM64_RAMFB_HEIGHT)
+    val FRAMEBUFFER_SIZE = framebuffer_size + ARM64_RAMFB_SCRATCH_BYTES
+
+    uart_writeln("[desktop-gui-arm64] boot")
+    val theme_snapshot = install_generated_simpleos_wm_theme()
+    uart_writeln("[theme-evidence] id={theme_snapshot.id} source_manifest_sha256={theme_snapshot.source_manifest_sha256} material_sha256={theme_snapshot.material_sha256} backdrop_filter=unavailable fallback=solid-material")
+    val framebuffer_address = raw_alloc(FRAMEBUFFER_SIZE.to_i64())
+    if framebuffer_address == 0:
+        uart_writeln("[desktop-gui-arm64] fatal reason=framebuffer-allocation")
+        return
+
+    val ramfb_scratch = (framebuffer_address + framebuffer_size).to_u64()
+    if not arm64_ramfb_setup(
+        framebuffer_address.to_u64(),
+        ARM64_RAMFB_WIDTH,
+        ARM64_RAMFB_HEIGHT,
+        ramfb_scratch
+    ):
+        uart_writeln("[desktop-gui-arm64] ramfb unavailable; rendering remains local")
+
+    var framebuffer = FramebufferDriver.from_scanout_raw(
+        framebuffer_address.to_u64(),
+        screen_width.to_u32(),
+        screen_height.to_u32(),
+        (screen_width * 4).to_u32(),
+        32u32
+    )
+    val vfs_mounted = vfs_boot_init_virtio_fat32()
+    val theme_css = if vfs_mounted:
+        g_vfs_read_file_text("/THEME.CSS")
+    else:
+        ""
+    val theme_override_applied = if vfs_mounted:
+        apply_simpleos_css_theme_override(theme_css)
+    else:
+        false
+    uart_writeln("[theme-override] path=/THEME.CSS mount={vfs_mounted} bytes={theme_css.len()} applied={theme_override_applied}")
+    val font_loaded = simpleos_desktop_register_selected_fonts_from_vfs()
+    if font_loaded:
+        uart_writeln("[desktop-gui-arm64] font registered source=virtio-fat32")
+    else:
+        uart_writeln("[desktop-gui-arm64] font unavailable fallback=bitmap")
+    var engine = create_fb_engine_sized(framebuffer, screen_width, screen_height)
+    val compositor_backend = Engine2dCompositorBackend.create(engine)
+    var input_backend = Arm64VirtioInputBackend.create(
+        screen_width.to_i64(),
+        screen_height.to_i64()
+    )
+    # The C MMIO owner has already discovered both producer devices before
+    # this backend is handed to the canonical compositor ingress.  A failed
+    # producer remains unavailable rather than masquerading as an idle queue.
+    val virtio_input_mask = arm64_virtio_input_init()
+    val virtio_input_enabled = input_backend.admit_producer(virtio_input_mask)
+    var compositor = Compositor.with_backends(
+        compositor_backend,
+        input_backend,
+        screen_width,
+        screen_height
+    )
+
+    val terminal_id = compositor.compositor_materialize_process_surface_scalar(
+        "Terminal", 60, 60, 420, 260, 0, "terminal",
+        "<pre>simple$ uname -m\naarch64\nsimple$ simple check\nAll checks passed\nsimple$</pre>"
+    )
+    val editor_id = compositor.compositor_materialize_process_surface_scalar(
+        "Editor", 300, 160, 480, 300, 0, "editor",
+        "<pre>fn main():\n    val x = 42\n    print x\n\n# Comment\nfn square(n):\n    n * n</pre>"
+    )
+    val finder_id = compositor.compositor_materialize_process_surface_scalar(
+        "Finder", 540, 300, 360, 240, 0, "finder",
+        "<h2>Favorites</h2><p>Desktop</p><p>Documents</p><p>Downloads</p><h3>Project</h3><p>Photos</p>"
+    )
+    if terminal_id <= 0 or editor_id <= 0 or finder_id <= 0:
+        uart_writeln("[desktop-gui-arm64] fatal reason=surface-materialization")
+        return
+    compositor.focus_window(editor_id.to_i32())
+
+    var shell = DesktopShell.new(compositor)
+    shell.init_baremetal()
+
+    boot_monotonic_prepare()
+    val mapped_slot = map_qemu_host_gpu_ivshmem_bar2()
+    # macOS/HVF lacks ivshmem. Its wrapper reserves the final 8 MiB of a
+    # file-backed 512 MiB RAM region; ordinary ivshmem keeps priority.
+    # A dedicated macOS-QEMU entry supplies the reserved RAM-tail address.
+    # The ordinary entry passes zero, preserving real-board and ivshmem-only
+    # behavior. A mapped ivshmem BAR always keeps priority.
+    val host_gpu_base = if mapped_slot > 0: qemu_host_gpu_ivshmem_window_base(mapped_slot) else: file_backed_ram_tail_base
+    val negotiation_started_us = boot_monotonic_now_us()
+    var wm_frame_executor = Engine2dWmFrameExecutor.create(engine, framebuffer, 0, 0, baremetal_simd_fill_enabled())
+    if host_gpu_base != 0u64 or backend_required:
+        wm_frame_executor = Engine2dWmFrameExecutor.create_host_gpu(
+            engine, framebuffer, host_gpu_base,
+            SIMPLEOS_HOST_GPU_ISA_AARCH64,
+            preferred_backend_code,
+            0, 0, negotiation_started_us, baremetal_simd_fill_enabled(),
+            backend_required
+        )
+
+    val first_revision = shell.render_baremetal_first_frame(wm_frame_executor)
+    if first_revision <= 0:
+        uart_writeln("[desktop-gui-arm64] fatal reason=first-frame")
+        return
+    var ramfb_frame_id: i64 = 1
+    if not arm64_emit_ramfb_visual_commit(
+        0,
+        framebuffer_address.to_u64(),
+        first_revision,
+        ramfb_frame_id
+    ):
+        uart_writeln("[desktop-gui-arm64] fatal reason=first-frame-ramfb-receipt")
+        return
+    val simd_enabled = baremetal_simd_fill_enabled()
+    val simd_hits = baremetal_simd_fill_hits()
+    val simd_chunks = baremetal_simd_fill_chunks()
+    val simd_tail_pixels = baremetal_simd_fill_tail_pixels()
+    val simd_scalar_parity = arm64_engine2d_simd_scalar_parity()
+    if not simd_enabled or simd_hits == 0 or simd_chunks == 0 or not simd_scalar_parity:
+        uart_writeln("[engine2d-simd] fatal arch=aarch64 isa=neon reason=invalid-runtime-receipt")
+        return
+    uart_writeln("[engine2d-simd] arch=aarch64 isa=neon enabled=1 fill_hits={simd_hits} fill_chunks={simd_chunks} fill_tail_pixels={simd_tail_pixels} scalar_parity=bit-exact")
+    var backend2d_event_step: i64 = 0
+    if virtio_input_enabled:
+        uart_writeln("[backend2d-event-blocker] backend=simpleos-qemu-arm64 event_backend=virtio-mmio keyboard=transport-ready pointer=transport-ready owner=InputBackend reason=live-qmp-evidence-pending")
+        uart_writeln("[backend2d-event] backend=simpleos-qemu-arm64 event_backend=virtio-mmio producer_mask={virtio_input_mask} delivered=true")
+    else:
+        uart_writeln("[backend2d-event-blocker] backend=simpleos-qemu-arm64 event_backend=virtio-mmio required=keyboard,pointer ready_mask={virtio_input_mask} uart=fallback-only")
+    uart_writeln("[desktop-gui] first-frame-rendered")
+    uart_writeln("[desktop-gui-arm64] desktop-ready revision={first_revision}")
+    uart_writeln("[desktop-gui-arm64] controls Tab=cycle 1/2/3=focus m=minimize w=close r=restore q=quit")
+
+    var running = true
+    var event_count = 0
+    var observed_key_sequence: i64 = 0
+    var observed_pointer_sequence: i64 = 0
+    var showcase_animation_tick: i64 = 0
+    var showcase_animation_next_us = boot_monotonic_now_us() + 16667
+    while running:
+        var input_compositor = shell.compositor
+        var action = WmAction.None
+        var changed = false
+        var pointer_event_pending = false
+        var pointer_sequence: i64 = 0
+        var pointer_x: i32 = 0
+        var pointer_y: i32 = 0
+        var pointer_button_code: i32 = 0
+        var pointer_kind_code: i32 = 0
+        var key_event_pending = false
+        var key_sequence: i64 = 0
+        var key_code: u16 = 0u16
+        var key_value: u32 = 0u32
+        var animation_event_pending = false
+
+        if virtio_input_enabled:
+            input_compositor.handle_input()
+            if input_backend.delivered_key_sequence > observed_key_sequence:
+                observed_key_sequence = input_backend.delivered_key_sequence
+                key_event_pending = true
+                key_sequence = observed_key_sequence
+                key_code = input_backend.delivered_key_code
+                key_value = input_backend.delivered_key_value
+                input_compositor.input_sequence = key_sequence
+                uart_writeln("[virtio-input-device] input_seq={key_sequence} device=keyboard type=1 code={key_code} value={key_value}")
+                if key_code == KEY_LEFTCTRL and key_value != 0u32 and backend2d_event_step == 5:
+                    uart_writeln("[backend2d-event] backend=simpleos-qemu-arm64 event_backend=virtio-mmio seq=6 name=left_ctrl_down delivered=true")
+                    backend2d_event_step = 6
+                elif key_code == KEY_LEFTCTRL and key_value == 0u32 and backend2d_event_step == 6:
+                    uart_writeln("[backend2d-event] backend=simpleos-qemu-arm64 event_backend=virtio-mmio seq=7 name=left_ctrl_up delivered=true")
+                    backend2d_event_step = 7
+                elif key_code == KEY_RIGHTCTRL and key_value != 0u32 and backend2d_event_step == 7:
+                    uart_writeln("[backend2d-event] backend=simpleos-qemu-arm64 event_backend=virtio-mmio seq=8 name=right_ctrl_down delivered=true")
+                    backend2d_event_step = 8
+                elif key_code == KEY_RIGHTCTRL and key_value == 0u32 and backend2d_event_step == 8:
+                    uart_writeln("[backend2d-event] backend=simpleos-qemu-arm64 event_backend=virtio-mmio seq=9 name=right_ctrl_up delivered=true")
+                    backend2d_event_step = 9
+                elif key_code == KEY_LEFTALT and key_value != 0u32 and backend2d_event_step == 9:
+                    uart_writeln("[backend2d-event] backend=simpleos-qemu-arm64 event_backend=virtio-mmio seq=10 name=left_alt_down delivered=true")
+                    backend2d_event_step = 10
+                elif key_code == KEY_LEFTALT and key_value == 0u32 and backend2d_event_step == 10:
+                    uart_writeln("[backend2d-event] backend=simpleos-qemu-arm64 event_backend=virtio-mmio seq=11 name=left_alt_up delivered=true")
+                    backend2d_event_step = 11
+                elif key_code == KEY_RIGHTALT and key_value != 0u32 and backend2d_event_step == 11:
+                    uart_writeln("[backend2d-event] backend=simpleos-qemu-arm64 event_backend=virtio-mmio seq=12 name=right_alt_down delivered=true")
+                    backend2d_event_step = 12
+                elif key_code == KEY_RIGHTALT and key_value == 0u32 and backend2d_event_step == 12:
+                    uart_writeln("[backend2d-event] backend=simpleos-qemu-arm64 event_backend=virtio-mmio seq=13 name=right_alt_up delivered=true")
+                    backend2d_event_step = 13
+                elif backend2d_event_step > 0 and backend2d_event_step < 13:
+                    uart_writeln("[backend2d-event-blocker] backend=simpleos-qemu-arm64 event_backend=virtio-mmio reason=unexpected-key-order step={backend2d_event_step} value={key_value}")
+                    backend2d_event_step = -1
+                if val key_event = input_backend.delivered_key:
+                    action = arm64_wm_action_from_virtio_key(key_event)
+            if input_backend.delivered_mouse_sequence > observed_pointer_sequence:
+                observed_pointer_sequence = input_backend.delivered_mouse_sequence
+                pointer_event_pending = input_compositor.pending_wm_pointer_valid
+                pointer_sequence = observed_pointer_sequence
+                pointer_x = input_compositor.pending_wm_pointer_x
+                pointer_y = input_compositor.pending_wm_pointer_y
+                pointer_button_code = input_compositor.pending_wm_pointer_button_code
+                pointer_kind_code = input_compositor.pending_wm_pointer_kind_code
+                if pointer_kind_code == 3 and not input_backend.delivered_pointer_wheel_seen and backend2d_event_step == 0:
+                    uart_writeln("[backend2d-event] backend=simpleos-qemu-arm64 event_backend=virtio-mmio seq=1 name=pointer_move delivered=true")
+                    backend2d_event_step = 1
+                elif pointer_kind_code == 1 and backend2d_event_step == 1:
+                    uart_writeln("[backend2d-event] backend=simpleos-qemu-arm64 event_backend=virtio-mmio seq=2 name=pointer_down delivered=true")
+                    backend2d_event_step = 2
+                elif pointer_kind_code == 4 and backend2d_event_step == 2:
+                    uart_writeln("[backend2d-event] backend=simpleos-qemu-arm64 event_backend=virtio-mmio seq=3 name=pointer_drag delivered=true")
+                    backend2d_event_step = 3
+                elif pointer_kind_code == 2 and backend2d_event_step == 3:
+                    uart_writeln("[backend2d-event] backend=simpleos-qemu-arm64 event_backend=virtio-mmio seq=4 name=pointer_up delivered=true")
+                    backend2d_event_step = 4
+                elif pointer_kind_code == 3 and input_backend.delivered_pointer_wheel_seen and backend2d_event_step == 4:
+                    uart_writeln("[backend2d-event] backend=simpleos-qemu-arm64 event_backend=virtio-mmio seq=5 name=pointer_wheel delivered=true")
+                    backend2d_event_step = 5
+                elif backend2d_event_step > 0:
+                    uart_writeln("[backend2d-event-blocker] backend=simpleos-qemu-arm64 event_backend=virtio-mmio reason=unexpected-pointer-order step={backend2d_event_step} kind={pointer_kind_code}")
+                    backend2d_event_step = -1
+                if pointer_sequence > input_compositor.input_sequence:
+                    input_compositor.input_sequence = pointer_sequence
+                if input_backend.delivered_pointer_rel_x_seen:
+                    uart_writeln("[virtio-input-device] input_seq={pointer_sequence} device=pointer type={EV_REL} code={REL_X} value={input_backend.delivered_pointer_rel_x} frame=raw-summary")
+                if input_backend.delivered_pointer_rel_y_seen:
+                    uart_writeln("[virtio-input-device] input_seq={pointer_sequence} device=pointer type={EV_REL} code={REL_Y} value={input_backend.delivered_pointer_rel_y} frame=raw-summary")
+                if input_backend.delivered_pointer_wheel_seen:
+                    uart_writeln("[virtio-input-device] input_seq={pointer_sequence} device=pointer type={EV_REL} code={REL_WHEEL} value={input_backend.delivered_pointer_wheel} frame=raw-summary")
+                if input_backend.delivered_pointer_left_edge:
+                    uart_writeln("[virtio-input-device] input_seq={pointer_sequence} device=pointer type={EV_KEY} code={BTN_LEFT} value={input_backend.delivered_pointer_left_value} frame=raw-edge")
+                if input_backend.delivered_pointer_right_edge:
+                    uart_writeln("[virtio-input-device] input_seq={pointer_sequence} device=pointer type={EV_KEY} code={BTN_RIGHT} value={input_backend.delivered_pointer_right_value} frame=raw-edge")
+                if input_backend.delivered_pointer_middle_edge:
+                    uart_writeln("[virtio-input-device] input_seq={pointer_sequence} device=pointer type={EV_KEY} code={BTN_MIDDLE} value={input_backend.delivered_pointer_middle_value} frame=raw-edge")
+                uart_writeln("[virtio-input-device] input_seq={pointer_sequence} device=pointer type={input_backend.delivered_pointer_type} code={input_backend.delivered_pointer_code} value={input_backend.delivered_pointer_value} frame=syn-report")
+        elif uart_data_ready() == 1:
+            action = uart_char_to_action(uart_read_char())
+
+        match action:
+            case WmAction.CycleFocus:
+                input_compositor.cycle_focus()
+                changed = true
+            case WmAction.FocusWindow(idx: surface_index):
+                if surface_index < input_compositor.surfaces.len().to_u64():
+                    input_compositor.focus_window(
+                        input_compositor.surfaces[surface_index.to_i64()].id.to_i32()
+                    )
+                    changed = true
+            case WmAction.Quit:
+                running = false
+            case WmAction.Minimize:
+                val focused = input_compositor.focused_idx
+                if focused >= 0 and focused < input_compositor.surfaces.len():
+                    input_compositor.minimize_window(input_compositor.surfaces[focused].id.to_u64())
+                    changed = true
+            case WmAction.Close:
+                val focused = input_compositor.focused_idx
+                if focused >= 0 and focused < input_compositor.surfaces.len():
+                    input_compositor.destroy_window(input_compositor.surfaces[focused].id)
+                    changed = true
+            case WmAction.Restore:
+                var surface_index = 0
+                while surface_index < input_compositor.surfaces.len():
+                    input_compositor.restore_window(input_compositor.surfaces[surface_index].id.to_u64())
+                    surface_index = surface_index + 1
+                changed = true
+            case WmAction.ToggleTheme:
+                uart_writeln("[theme-switch-blocker] backend=simpleos-qemu-arm64 reason=snapshot-notification-transport-unavailable")
+            case WmAction.None:
+                pass
+
+        # The showcase animation is guest-owned scene state. It advances a
+        # real compositor surface on the boot monotonic clock and therefore
+        # traverses the canonical Shell -> DrawIR -> required Vulkan path.
+        # Input always wins an iteration so attribution remains one-to-one.
+        val animation_now_us = boot_monotonic_now_us()
+        if backend_required and preferred_backend_code == SIMPLEOS_HOST_GPU_BACKEND_VULKAN and showcase_animation_tick < 20 and not pointer_event_pending and not key_event_pending and animation_now_us >= showcase_animation_next_us:
+            showcase_animation_tick = showcase_animation_tick + 1
+            showcase_animation_next_us = animation_now_us + 16667
+            input_compositor.move_window(editor_id.to_i32(), (300 + showcase_animation_tick).to_i32(), 160)
+            changed = true
+            animation_event_pending = true
+
+        if changed or pointer_event_pending or key_event_pending:
+            if pointer_event_pending or key_event_pending:
+                event_count = event_count + 1
+            shell.compositor = input_compositor
+            if pointer_event_pending:
+                uart_writeln("[wm-pointer-poll] source=poll input_seq={pointer_sequence} x={pointer_x} y={pointer_y} button_code={pointer_button_code} kind_code={pointer_kind_code}")
+                shell.handle_pending_wm_pointer_step()
+                uart_writeln("[wm-pointer-state] input_seq={pointer_sequence} focused_idx={shell.compositor.focused_idx}")
+            if key_event_pending:
+                val key_edge = if key_value == 0u32: "release" else: "press"
+                val key_changed = if changed: "true" else: "false"
+                uart_writeln("[wm-key-poll] source=poll input_seq={key_sequence} edge={key_edge} code={key_code}")
+                uart_writeln("[wm-key-state] input_seq={key_sequence} edge={key_edge} changed={key_changed} focused_idx={shell.compositor.focused_idx}")
+                uart_writeln("[wm-key-modifiers] input_seq={key_sequence} ctrl={input_backend.ctrl_held()} alt={input_backend.alt_held()}")
+            if virtio_input_enabled:
+                uart_writeln("[backend2d-event-receipt] backend=simpleos-qemu-arm64 event_backend=virtio-mmio event_count={event_count}")
+                if backend2d_event_step == 13:
+                    uart_writeln("[backend2d-event-receipt] backend=simpleos-qemu-arm64 event_backend=virtio-mmio event_count={event_count} sequence=pointer_move,pointer_down,pointer_drag,pointer_up,pointer_wheel,left_ctrl_down,left_ctrl_up,right_ctrl_down,right_ctrl_up,left_alt_down,left_alt_up,right_alt_down,right_alt_up delivered=true")
+                    backend2d_event_step = 14
+            else:
+                uart_writeln("[backend2d-event-receipt] backend=simpleos-qemu-arm64 event_backend=pl011-uart event_count={event_count}")
+            var rendered_revision: i64 = 0
+            if pointer_event_pending and key_event_pending:
+                uart_writeln("[desktop-gui-arm64] fatal reason=multi-input-frame-attribution")
+                running = false
+            else:
+                rendered_revision = shell.render_baremetal_frame(wm_frame_executor)
+            if rendered_revision > 0:
+                ramfb_frame_id = ramfb_frame_id + 1
+                val frame_input_sequence = if key_event_pending:
+                    key_sequence
+                else:
+                    pointer_sequence
+                if not arm64_emit_ramfb_visual_commit(
+                    frame_input_sequence,
+                    framebuffer_address.to_u64(),
+                    rendered_revision,
+                    ramfb_frame_id
+                ):
+                    uart_writeln("[desktop-gui-arm64] fatal reason=changed-frame-ramfb-receipt")
+                    running = false
+            if rendered_revision > 0 and pointer_event_pending:
+                uart_writeln("[wm-pointer-frame] input_seq={pointer_sequence} rendered_revision={rendered_revision} frame_id={ramfb_frame_id}")
+            if rendered_revision > 0 and key_event_pending:
+                uart_writeln("[wm-key-frame] input_seq={key_sequence} rendered_revision={rendered_revision} frame_id={ramfb_frame_id}")
+            if rendered_revision > 0 and animation_event_pending:
+                uart_writeln("[showcase-animation-frame] source=guest-monotonic tick={showcase_animation_tick} scene_revision={rendered_revision} frame_id={ramfb_frame_id} editor_x={300 + showcase_animation_tick}")
+            if rendered_revision <= 0:
+                uart_writeln("[desktop-gui-arm64] fatal reason=changed-frame")
+                running = false
+
+    uart_writeln("[desktop-gui-arm64] shutdown")
+
+fn spl_start():
+    gui_entry_desktop_start(0u64)

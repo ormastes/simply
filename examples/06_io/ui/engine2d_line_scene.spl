@@ -1,0 +1,49 @@
+use std.gpu.engine2d.backend.{RenderBackend}
+
+pub val W: i32 = 64
+pub val H: i32 = 48
+val BG: u32 = 0xFF101820u32
+val BLUE: u32 = 0xFF33A1FDu32
+val GREEN: u32 = 0xFF4ADE80u32
+val PINK: u32 = 0xFFF472B6u32
+
+fn _px(pixels: [u32], x: i32, y: i32) -> u32:
+    pixels[y * W + x]
+
+fn _count_color(pixels: [u32], color: u32) -> i32:
+    var n: i32 = 0
+    var i = 0
+    while i < pixels.len():
+        if pixels[i] == color:
+            n = n + 1
+        i = i + 1
+    n
+
+pub fn run_engine2d_line_scene(engine: RenderBackend, active_name: text, line_gpu_native: bool) -> bool:
+    print "    status: Initialized (active: {active_name})"
+    if line_gpu_native:
+        print "    mode: line primitive is GPU-native for this backend"
+    else:
+        print "    mode: line primitive uses the Engine2D CPU/mirror path"
+    engine.clear(BG)
+    engine.draw_line(4, 8, 60, 40, BLUE, 3)
+    engine.draw_line(4, 40, 60, 8, GREEN, 3)
+    engine.draw_line(8, 24, 56, 24, PINK, 2)
+    engine.present()
+    val pixels = engine.read_pixels()
+    if pixels.len() < W * H:
+        print "    -> readback unavailable (got {pixels.len()} px, need {W * H})"
+        engine.shutdown()
+        return false
+    val blue_count = _count_color(pixels, BLUE)
+    val green_count = _count_color(pixels, GREEN)
+    val pink_count = _count_color(pixels, PINK)
+    val center_ok = _px(pixels, 32, 24) == PINK
+    print "    pixels: blue={blue_count} green={green_count} pink={pink_count}"
+    engine.shutdown()
+    val ok = blue_count > 0 and green_count > 0 and pink_count > 0 and center_ok
+    if ok:
+        print "    result: PASS"
+    else:
+        print "    result: FAIL"
+    ok

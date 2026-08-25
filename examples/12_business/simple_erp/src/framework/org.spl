@@ -1,0 +1,93 @@
+# Business Framework — Org Model as Data
+#
+# Organizational complexity (roles, approval chains) is registered DATA, the
+# same way a business lane is (framework/registry.spl): a RoleDef states what
+# a role may do, an ApprovalChain states who must sign off, in order. Adding a
+# role or a chain is a data registration, not a framework edit.
+
+use framework.registry.{LaneDef, is_registered_write}
+
+# A role's write policy. `writes_lanes` grants every REGISTERED lane write
+# action (mirrors the "operator" semantics in framework/guarded.spl);
+# `extra_actions` grants a closed set of non-lane actions (reads, closes, ...)
+# regardless of `writes_lanes`.
+struct RoleDef:
+    val name: text
+    val all_actions: bool
+    val writes_lanes: bool
+    val extra_actions: [text]
+
+fn role_def(name: text, writes_lanes: bool) -> RoleDef:
+    var extra: [text] = []
+    return RoleDef { name: name, all_actions: false, writes_lanes: writes_lanes, extra_actions: extra }
+
+fn role_def_with(name: text, writes_lanes: bool, extra_actions: [text]) -> RoleDef:
+    return RoleDef { name: name, all_actions: false, writes_lanes: writes_lanes, extra_actions: extra_actions }
+
+# A superuser role: every action allowed (the guarded.spl "admin" semantics).
+fn role_def_all(name: text) -> RoleDef:
+    var extra: [text] = []
+    return RoleDef { name: name, all_actions: true, writes_lanes: true, extra_actions: extra }
+
+# The stock roles. THE single source of role policy: framework/guarded.spl's
+# role_can_for delegates here, so these definitions ARE the gate's RBAC.
+fn default_roles() -> [RoleDef]:
+    var roles: [RoleDef] = []
+    roles.push(role_def_all("admin"))
+    roles.push(role_def("operator", true))
+    var auditor_extra: [text] = []
+    auditor_extra.push("audit.read")
+    auditor_extra.push("report.read")
+    roles.push(role_def_with("auditor", false, auditor_extra))
+    return roles
+
+# First match wins — register each role name once.
+fn find_role(roles: [RoleDef], role: text) -> RoleDef:
+    for role_entry in roles:
+        if role_entry.name == role:
+            return role_entry
+    var none: [text] = []
+    return RoleDef { name: "", all_actions: false, writes_lanes: false, extra_actions: none }
+
+fn action_in(actions: [text], action: text) -> bool:
+    for a in actions:
+        if a == action:
+            return true
+    return false
+
+# Can `role` perform `action`? Unknown roles are fail-closed (false). A known
+# role may act when either its lane-write grant covers a registered lane
+# write, or the action is one of its explicit extra actions.
+fn org_role_can(roles: [RoleDef], lanes: [LaneDef], role: text, action: text) -> bool:
+    val role_entry = find_role(roles, role)
+    if role_entry.name == "":
+        return false
+    if role_entry.all_actions:
+        return true
+    if role_entry.writes_lanes and is_registered_write(lanes, action):
+        return true
+    return action_in(role_entry.extra_actions, action)
+
+# An ordered sign-off policy: `required_roles[0]` must approve before
+# `required_roles[1]`, and so on.
+struct ApprovalChain:
+    val required_roles: [text]
+
+# Is the chain fully and correctly satisfied? `approvals` must match
+# `required_roles` exactly, element for element, in order.
+fn chain_satisfied(chain: ApprovalChain, approvals: [text]) -> bool:
+    if chain.required_roles.length() != approvals.length():
+        return false
+    var i = 0
+    while i < chain.required_roles.length():
+        if chain.required_roles[i] != approvals[i]:
+            return false
+        i = i + 1
+    return true
+
+# The next role required to approve, or "" once the chain is satisfied or
+# overrun (more approvals given than required roles).
+fn chain_next(chain: ApprovalChain, approvals: [text]) -> text:
+    if approvals.length() >= chain.required_roles.length():
+        return ""
+    return chain.required_roles[approvals.length()]

@@ -1,0 +1,354 @@
+# Exercise 24: Memory Coalescing
+#
+# Access-pattern demos on a real CUDA device (row-major rows x cols matrix):
+#
+#   column_sum_coalesced  thread j walks column j: at each step the warp reads
+#                         32 consecutive floats of one row -> coalesced
+#   row_sum_strided       thread i walks row i: at each step the warp reads
+#                         addresses `cols` apart -> strided, uncoalesced
+#   transpose_kernel      2D grid, out[c][r] = in[r][c]
+#                         (coalesced read, strided write -- the naive version)
+#   scale_coalesced       out[i] = in[i] * scale, the ideal contiguous pattern
+#
+# Kernels are hand-written PTX launched through `std.cuda` (see
+# lib/gpu_test_helpers.spl for why). CPU references are scalar: the upstream
+# version imported `std.simd.{Vec4f, Vec8f, simd_add, simd_mul}`, which this
+# stdlib does not provide (use-warning on load).
+
+use ..gpu_test_helpers.{
+    gpu_setup, gpu_teardown,
+    gpu_upload_f32s, gpu_download_f32s, gpu_alloc_zeroed_words, gpu_free_ptr,
+    gpu_load_ptx, gpu_unload, gpu_run_1d, gpu_run_3d, grid_for, f32_bits
+}
+
+val BLOCK_SIZE = 256
+val TILE = 16
+
+val PTX = """
+.version 7.0
+.target sm_75
+.address_size 64
+
+// thread j (< cols): result[j] = sum_r data[r * cols + j]
+.visible .entry column_sum_coalesced(.param .u64 data, .param .u64 result, .param .u64 rows, .param .u64 cols)
+{
+    .reg .pred %p<4>;
+    .reg .b32 %r<8>;
+    .reg .f32 %f<4>;
+    .reg .b64 %rd<16>;
+    ld.param.u64 %rd1, [data];
+    ld.param.u64 %rd2, [result];
+    ld.param.u64 %rd3, [rows];
+    ld.param.u64 %rd4, [cols];
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r4, %r1, %r2, %r3;
+    cvt.u64.u32 %rd5, %r4;
+    setp.ge.u64 %p1, %rd5, %rd4;
+    @%p1 bra DONE;
+    mov.f32 %f1, 0f00000000;
+    mov.u64 %rd6, 0;
+LOOP:
+    setp.ge.u64 %p2, %rd6, %rd3;
+    @%p2 bra STORE;
+    mad.lo.u64 %rd7, %rd6, %rd4, %rd5;
+    shl.b64 %rd8, %rd7, 2;
+    add.u64 %rd9, %rd1, %rd8;
+    ld.global.f32 %f2, [%rd9];
+    add.f32 %f1, %f1, %f2;
+    add.u64 %rd6, %rd6, 1;
+    bra LOOP;
+STORE:
+    shl.b64 %rd10, %rd5, 2;
+    add.u64 %rd11, %rd2, %rd10;
+    st.global.f32 [%rd11], %f1;
+DONE:
+    ret;
+}
+
+// thread i (< rows): result[i] = sum_c data[i * cols + c]
+.visible .entry row_sum_strided(.param .u64 data, .param .u64 result, .param .u64 rows, .param .u64 cols)
+{
+    .reg .pred %p<4>;
+    .reg .b32 %r<8>;
+    .reg .f32 %f<4>;
+    .reg .b64 %rd<16>;
+    ld.param.u64 %rd1, [data];
+    ld.param.u64 %rd2, [result];
+    ld.param.u64 %rd3, [rows];
+    ld.param.u64 %rd4, [cols];
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r4, %r1, %r2, %r3;
+    cvt.u64.u32 %rd5, %r4;
+    setp.ge.u64 %p1, %rd5, %rd3;
+    @%p1 bra DONE;
+    mov.f32 %f1, 0f00000000;
+    mov.u64 %rd6, 0;
+    mul.lo.u64 %rd12, %rd5, %rd4;
+LOOP:
+    setp.ge.u64 %p2, %rd6, %rd4;
+    @%p2 bra STORE;
+    add.u64 %rd7, %rd12, %rd6;
+    shl.b64 %rd8, %rd7, 2;
+    add.u64 %rd9, %rd1, %rd8;
+    ld.global.f32 %f2, [%rd9];
+    add.f32 %f1, %f1, %f2;
+    add.u64 %rd6, %rd6, 1;
+    bra LOOP;
+STORE:
+    shl.b64 %rd10, %rd5, 2;
+    add.u64 %rd11, %rd2, %rd10;
+    st.global.f32 [%rd11], %f1;
+DONE:
+    ret;
+}
+
+// 2D grid: c = blockIdx.x*blockDim.x + threadIdx.x, r = blockIdx.y*blockDim.y + threadIdx.y
+// output[c * rows + r] = input[r * cols + c]
+.visible .entry transpose_kernel(.param .u64 input, .param .u64 output, .param .u64 rows, .param .u64 cols)
+{
+    .reg .pred %p<4>;
+    .reg .b32 %r<12>;
+    .reg .f32 %f<4>;
+    .reg .b64 %rd<20>;
+    ld.param.u64 %rd1, [input];
+    ld.param.u64 %rd2, [output];
+    ld.param.u64 %rd3, [rows];
+    ld.param.u64 %rd4, [cols];
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r4, %r1, %r2, %r3;
+    mov.u32 %r5, %ctaid.y;
+    mov.u32 %r6, %ntid.y;
+    mov.u32 %r7, %tid.y;
+    mad.lo.u32 %r8, %r5, %r6, %r7;
+    cvt.u64.u32 %rd5, %r4;
+    cvt.u64.u32 %rd6, %r8;
+    setp.ge.u64 %p1, %rd5, %rd4;
+    @%p1 bra DONE;
+    setp.ge.u64 %p2, %rd6, %rd3;
+    @%p2 bra DONE;
+    mad.lo.u64 %rd7, %rd6, %rd4, %rd5;
+    shl.b64 %rd8, %rd7, 2;
+    add.u64 %rd9, %rd1, %rd8;
+    ld.global.f32 %f1, [%rd9];
+    mad.lo.u64 %rd10, %rd5, %rd3, %rd6;
+    shl.b64 %rd11, %rd10, 2;
+    add.u64 %rd12, %rd2, %rd11;
+    st.global.f32 [%rd12], %f1;
+DONE:
+    ret;
+}
+
+// result[i] = data[i] * scale   (scale passed as f32 bits in a .u64 slot)
+.visible .entry scale_coalesced(.param .u64 data, .param .u64 result, .param .u64 scale_bits, .param .u64 n)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<8>;
+    .reg .f32 %f<4>;
+    .reg .b64 %rd<12>;
+    ld.param.u64 %rd1, [data];
+    ld.param.u64 %rd2, [result];
+    ld.param.u64 %rd3, [scale_bits];
+    ld.param.u64 %rd4, [n];
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r4, %r1, %r2, %r3;
+    cvt.u64.u32 %rd5, %r4;
+    setp.ge.u64 %p1, %rd5, %rd4;
+    @%p1 bra DONE;
+    cvt.u32.u64 %r5, %rd3;
+    mov.b32 %f1, %r5;
+    shl.b64 %rd6, %rd5, 2;
+    add.u64 %rd7, %rd1, %rd6;
+    add.u64 %rd8, %rd2, %rd6;
+    ld.global.f32 %f2, [%rd7];
+    mul.f32 %f3, %f2, %f1;
+    st.global.f32 [%rd8], %f3;
+DONE:
+    ret;
+}
+"""
+
+# ----------------------------------------------------------------------------
+# Host data
+# ----------------------------------------------------------------------------
+
+fn make_matrix(rows: i64, cols: i64, fill: f32) -> [f32]:
+    var out: [f32] = []
+    for i in 0..(rows * cols):
+        out.push(fill)
+    out
+
+fn make_sequential_matrix(rows: i64, cols: i64) -> [f32]:
+    var out: [f32] = []
+    for i in 0..(rows * cols):
+        out.push(i as f32)
+    out
+
+fn to_column_major(data: [f32], rows: i64, cols: i64) -> [f32]:
+    var out: [f32] = []
+    for c in 0..cols:
+        for r in 0..rows:
+            out.push(data[r * cols + c])
+    out
+
+# ----------------------------------------------------------------------------
+# CPU references
+# ----------------------------------------------------------------------------
+
+fn cpu_column_sum(data: [f32], rows: i64, cols: i64) -> [f32]:
+    var out: [f32] = []
+    for c in 0..cols:
+        var s: f32 = 0.0
+        for r in 0..rows:
+            s = s + data[r * cols + c]
+        out.push(s)
+    out
+
+fn cpu_row_sum(data: [f32], rows: i64, cols: i64) -> [f32]:
+    var out: [f32] = []
+    for r in 0..rows:
+        var s: f32 = 0.0
+        for c in 0..cols:
+            s = s + data[r * cols + c]
+        out.push(s)
+    out
+
+fn cpu_scale_scalar(data: [f32], scale: f32) -> [f32]:
+    var out: [f32] = []
+    for x in data:
+        out.push(x * scale)
+    out
+
+fn cpu_transpose(data: [f32], rows: i64, cols: i64) -> [f32]:
+    to_column_major(data, rows, cols)
+
+# ----------------------------------------------------------------------------
+# Device runs
+# ----------------------------------------------------------------------------
+
+fn run_column_sum_coalesced(module: i64, data: [f32], rows: i64, cols: i64) -> Result<[f32], text>:
+    val dev = gpu_upload_f32s(data)
+    val res = gpu_alloc_zeroed_words(cols)
+    if dev == 0 or res == 0:
+        return Err("alloc failed")
+    val ok = gpu_run_1d(module, "column_sum_coalesced", grid_for(cols, BLOCK_SIZE), BLOCK_SIZE, [dev, res, rows, cols])
+    val out = gpu_download_f32s(res, cols)
+    gpu_free_ptr(dev)
+    gpu_free_ptr(res)
+    if not ok or out.len() != cols:
+        return Err("column_sum launch failed")
+    Ok(out)
+
+fn run_row_sum_strided(module: i64, data: [f32], rows: i64, cols: i64) -> Result<[f32], text>:
+    val dev = gpu_upload_f32s(data)
+    val res = gpu_alloc_zeroed_words(rows)
+    if dev == 0 or res == 0:
+        return Err("alloc failed")
+    val ok = gpu_run_1d(module, "row_sum_strided", grid_for(rows, BLOCK_SIZE), BLOCK_SIZE, [dev, res, rows, cols])
+    val out = gpu_download_f32s(res, rows)
+    gpu_free_ptr(dev)
+    gpu_free_ptr(res)
+    if not ok or out.len() != rows:
+        return Err("row_sum launch failed")
+    Ok(out)
+
+fn run_transpose(module: i64, data: [f32], rows: i64, cols: i64) -> Result<[f32], text>:
+    val dev = gpu_upload_f32s(data)
+    val res = gpu_alloc_zeroed_words(rows * cols)
+    if dev == 0 or res == 0:
+        return Err("alloc failed")
+    val ok = gpu_run_3d(module, "transpose_kernel",
+                        grid_for(cols, TILE), grid_for(rows, TILE), 1,
+                        TILE, TILE, 1,
+                        [dev, res, rows, cols])
+    val out = gpu_download_f32s(res, rows * cols)
+    gpu_free_ptr(dev)
+    gpu_free_ptr(res)
+    if not ok or out.len() != rows * cols:
+        return Err("transpose launch failed")
+    Ok(out)
+
+fn run_gpu_scale(module: i64, data: [f32], scale: f32) -> Result<[f32], text>:
+    val n = data.len()
+    val dev = gpu_upload_f32s(data)
+    val res = gpu_alloc_zeroed_words(n)
+    if dev == 0 or res == 0:
+        return Err("alloc failed")
+    val ok = gpu_run_1d(module, "scale_coalesced", grid_for(n, BLOCK_SIZE), BLOCK_SIZE, [dev, res, f32_bits(scale), n])
+    val out = gpu_download_f32s(res, n)
+    gpu_free_ptr(dev)
+    gpu_free_ptr(res)
+    if not ok or out.len() != n:
+        return Err("scale launch failed")
+    Ok(out)
+
+fn max_abs_diff(a: [f32], b: [f32]) -> f32:
+    var m: f32 = 0.0
+    if a.len() != b.len():
+        return 1.0e30
+    for i in 0..a.len():
+        var d = a[i] - b[i]
+        if d < 0.0:
+            d = 0.0 - d
+        if d > m:
+            m = d
+    m
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+
+fn main():
+    val ctx = gpu_setup(0)
+    if ctx == 0:
+        print "No CUDA device available; nothing to run."
+        return
+    val module = gpu_load_ptx(PTX)
+    if module == 0:
+        print "PTX module failed to load; nothing to run."
+        gpu_teardown(ctx)
+        return
+
+    val rows = 64
+    val cols = 128
+    val data = make_sequential_matrix(rows, cols)
+    print "Matrix {rows} x {cols} (row-major, sequential values)"
+
+    print "=== Column sum (coalesced: warp reads one row segment per step) ==="
+    match run_column_sum_coalesced(module, data, rows, cols):
+        case Ok(r):
+            print "  max |gpu - cpu| = {max_abs_diff(r, cpu_column_sum(data, rows, cols))}"
+        case Err(e):
+            print "  error: {e}"
+
+    print "=== Row sum (strided: warp reads addresses {cols} floats apart) ==="
+    match run_row_sum_strided(module, data, rows, cols):
+        case Ok(r):
+            print "  max |gpu - cpu| = {max_abs_diff(r, cpu_row_sum(data, rows, cols))}"
+        case Err(e):
+            print "  error: {e}"
+
+    print "=== Transpose (2D grid of {TILE}x{TILE} blocks) ==="
+    match run_transpose(module, data, rows, cols):
+        case Ok(r):
+            print "  max |gpu - cpu| = {max_abs_diff(r, cpu_transpose(data, rows, cols))}, out[1] = {r[1]} (expected {cols}.0)"
+        case Err(e):
+            print "  error: {e}"
+
+    print "=== Scale by 0.5 (ideal contiguous access) ==="
+    match run_gpu_scale(module, data, 0.5):
+        case Ok(r):
+            print "  max |gpu - cpu| = {max_abs_diff(r, cpu_scale_scalar(data, 0.5))}"
+        case Err(e):
+            print "  error: {e}"
+
+    gpu_unload(module)
+    gpu_teardown(ctx)
+    print "All memory coalescing demos complete."

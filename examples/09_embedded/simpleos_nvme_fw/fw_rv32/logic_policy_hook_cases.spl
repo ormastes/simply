@@ -1,0 +1,35 @@
+use logic_policy_target_core.*
+
+fn rv32_policy_hook_cases_selftest() -> i32:
+    if _rv32_policy_hook_allowed(0) != 1:
+        return 1
+    if _rv32_policy_hook_allowed(3) != 1:
+        return 1
+    if _rv32_policy_hook_allowed(100) != 0:
+        return 1
+    if _rv32_policy_hook_allowed(102) != 0:
+        return 1
+    if _rv32_policy_hook_allowed(105) != 0:
+        return 1
+    if _rv32_policy_rejected_after(100, 0) != 1:
+        return 1
+    if _rv32_policy_rejected_after(0, 1) != 1:
+        return 1
+    if _rv32_policy_rejected_after(100, -2) != 1:
+        return 1
+    if _rv32_policy_rejected_after(0, -2) != 0:
+        return 1
+    val cap: i64 = _rv32_policy_counter_cap()
+    if _rv32_policy_rejected_after(100, cap) != cap:
+        return 1
+    if _rv32_policy_rejected_after(0, cap + 1) != cap:
+        return 1
+    if _rv32_policy_clamp_priority(-5) != 0:
+        return 1
+    if _rv32_policy_clamp_priority(99) != 3:
+        return 1
+    if _rv32_policy_clamp_bool(42) != 1:
+        return 1
+    if _rv32_policy_clamp_bool(-1) != 0:
+        return 1
+    0

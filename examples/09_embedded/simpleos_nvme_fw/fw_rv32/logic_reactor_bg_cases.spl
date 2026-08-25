@@ -1,0 +1,18 @@
+use logic_reactor_bg_core.*
+
+fn rv32_reactor_bg_cases_selftest() -> i32:
+    if _rv32_reactor_bg_needed_impl(3) != 1:
+        return 1
+    if _rv32_reactor_bg_needed_impl(4) != 0:
+        return 1
+    if _rv32_reactor_gc_sweep_impl(0) != 0:
+        return 1
+    if _rv32_reactor_gc_sweep_impl(2) != 2:
+        return 1
+    if _rv32_reactor_gc_sweep_impl(9) != 3:
+        return 1
+    if _rv32_reactor_power_cycle_read_impl(66, 0) != 66:
+        return 1
+    if _rv32_reactor_power_cycle_read_impl(66, 1) != 66:
+        return 1
+    0

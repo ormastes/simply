@@ -1,0 +1,6 @@
+use logic_ecc_compute_payload.*
+
+fn _rv32_ecc_compute_impl(data: i64, lba: i64, seq: i64) -> i64:
+    val payload: i64 = _rv32_ecc_hamming_payload(data)
+    val meta: i64 = (lba ^ (seq << 4) ^ (lba >> 3) ^ (seq >> 5)) & 2047
+    payload | (meta << 6)

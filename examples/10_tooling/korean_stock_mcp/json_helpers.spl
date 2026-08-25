@@ -1,0 +1,191 @@
+#![allow(unnamed_duplicate_typed_args)]
+# Korean Stock MCP - JSON helpers
+# Reuses same patterns from src/app/mcp/main_lazy_json.spl
+
+# --- Safe string helpers (workaround for interpreter-mode .substring() mutation bug) ---
+
+fn mcp_substr(s: text, start: i64, end_pos: i64) -> text:
+    var buf: [text] = []
+    var idx = 0
+    for ch in s:
+        if idx >= start and idx < end_pos:
+            buf.push(ch)
+        idx = idx + 1
+    buf.join("")
+
+fn mcp_char_at(s: text, index: i64) -> text:
+    var idx = 0
+    for ch in s:
+        if idx == index:
+            return ch
+        idx = idx + 1
+    ""
+
+# --- JSON helpers ---
+
+fn Q() -> text:
+    "\""
+
+fn LB() -> text:
+    "{"
+
+fn RB() -> text:
+    "}"
+
+fn SB_L() -> text:
+    "["
+
+fn SB_R() -> text:
+    "]"
+
+fn escape_json(s: text) -> text:
+    var result = s
+    result = result.replace(r"\", r"\\")
+    result = result.replace(Q(), r"\" + Q())
+    result = result.replace("\n", r"\n")
+    result = result.replace("\r", r"\r")
+    result = result.replace("\t", r"\t")
+    result
+
+fn js(s: text) -> text:
+    Q() + escape_json(s) + Q()
+
+fn jp(key: text, value: text) -> text:
+    Q() + key + Q() + ":" + value
+
+fn jo1(p1: text) -> text:
+    LB() + p1 + RB()
+
+fn jo2(p1: text, p2: text) -> text:
+    LB() + p1 + "," + p2 + RB()
+
+fn jo3(p1: text, p2: text, p3: text) -> text:
+    LB() + p1 + "," + p2 + "," + p3 + RB()
+
+fn jo4(p1: text, p2: text, p3: text, p4: text) -> text:
+    LB() + p1 + "," + p2 + "," + p3 + "," + p4 + RB()
+
+fn jo5(p1: text, p2: text, p3: text, p4: text, p5: text) -> text:
+    LB() + p1 + "," + p2 + "," + p3 + "," + p4 + "," + p5 + RB()
+
+fn extract_field(json: text, key: text) -> text:
+    val quoted1 = json.split(Q() + key + Q() + ":" + Q())
+    if quoted1.len() >= 2:
+        return quoted1[1].split(Q())[0]
+    val quoted2 = json.split(Q() + key + Q() + ": " + Q())
+    if quoted2.len() >= 2:
+        return quoted2[1].split(Q())[0]
+    val raw = extract_field_raw(json, key)
+    if raw == "null":
+        return ""
+    if raw.starts_with(Q()) and raw.ends_with(Q()) and raw.len() >= 2:
+        return mcp_substr(raw, 1, raw.len() - 1)
+    raw
+
+fn extract_field_raw(json: text, key: text) -> text:
+    val quoted1 = json.split(Q() + key + Q() + ":" + Q())
+    if quoted1.len() >= 2:
+        return Q() + quoted1[1].split(Q())[0] + Q()
+    val quoted2 = json.split(Q() + key + Q() + ": " + Q())
+    if quoted2.len() >= 2:
+        return Q() + quoted2[1].split(Q())[0] + Q()
+    val parts1 = json.split(Q() + key + Q() + ":")
+    if parts1.len() < 2:
+        return "null"
+    var rest = parts1[1].trim()
+    var parts: [text] = []
+    for ch in rest:
+        if ch == "," or ch == RB() or ch == SB_R() or ch == " " or ch == "\n" or ch == "\r":
+            break
+        parts.push(ch)
+    val raw = parts.join("")
+    if raw == "":
+        return "null"
+    raw
+
+fn extract_id(json: text) -> text:
+    extract_field_raw(json, "id")
+
+fn extract_nested(json: text, key: text) -> text:
+    val params_parts = json.split(Q() + "params" + Q() + ":")
+    if params_parts.len() >= 2:
+        val from_params = extract_field(params_parts[1], key)
+        if from_params != "":
+            return from_params
+    extract_field(json, key)
+
+fn extract_arguments_field(json: text, key: text) -> text:
+    val args_parts = json.split(Q() + "arguments" + Q() + ":")
+    if args_parts.len() >= 2:
+        val from_args = extract_field(args_parts[1], key)
+        if from_args != "":
+            return from_args
+    extract_field(json, key)
+
+fn make_json_result(id: text, result: text) -> text:
+    LB() + Q() + "jsonrpc" + Q() + ":" + js("2.0") + "," + Q() + "id" + Q() + ":" + id + "," + Q() + "result" + Q() + ":" + result + RB()
+
+fn make_error(id: text, code: i64, message: text) -> text:
+    val err = LB() + Q() + "code" + Q() + ":" + str(code) + "," + Q() + "message" + Q() + ":" + js(message) + RB()
+    LB() + Q() + "jsonrpc" + Q() + ":" + js("2.0") + "," + Q() + "id" + Q() + ":" + id + "," + Q() + "error" + Q() + ":" + err + RB()
+
+# --- MCP Tool Result helpers ---
+
+fn make_tool_result(id: text, output: text) -> text:
+    val escaped = escape_json(output)
+    val quoted = Q() + escaped + Q()
+    val content = SB_L() + jo2(jp("type", js("text")), jp("text", quoted)) + SB_R()
+    val result = jo1(jp("content", content))
+    make_json_result(id, result)
+
+fn make_tool_error(id: text, code: i64, msg: text) -> text:
+    val content = SB_L() + jo2(jp("type", js("text")), jp("text", js("ERROR " + str(code) + ": " + msg))) + SB_R()
+    var err_result = LB() + jp("content", content) + "," + jp("isError", "true") + RB()
+    make_json_result(id, err_result)
+
+fn text_byte_len(s: text) -> i64:
+    s.len()
+
+# --- JSON array extraction helper ---
+
+fn extract_json_array_items(json_array: text) -> [text]:
+    var items: [text] = []
+    var trimmed = json_array.trim()
+    if not trimmed.starts_with("["):
+        return items
+    # Remove outer brackets
+    trimmed = mcp_substr(trimmed, 1, trimmed.len() - 1)
+    var depth = 0
+    var in_string = false
+    var escaped = false
+    var current: [text] = []
+    for ch in trimmed:
+        if in_string:
+            current.push(ch)
+            if escaped:
+                escaped = false
+            elif ch == "\\":
+                escaped = true
+            elif ch == Q():
+                in_string = false
+            continue
+        if ch == Q():
+            in_string = true
+            current.push(ch)
+        elif ch == "[" or ch == "{":
+            depth = depth + 1
+            current.push(ch)
+        elif ch == "]" or ch == "}":
+            depth = depth - 1
+            current.push(ch)
+        elif ch == "," and depth == 0:
+            val item = current.join("").trim()
+            if item != "":
+                items.push(item)
+            current = []
+        else:
+            current.push(ch)
+    val last = current.join("").trim()
+    if last != "":
+        items.push(last)
+    items

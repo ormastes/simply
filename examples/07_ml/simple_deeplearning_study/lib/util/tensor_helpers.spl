@@ -1,0 +1,58 @@
+# Tensor convenience helpers for the deep learning study project
+# Wraps PureTensor operations with study-friendly names
+
+use std.pure.tensor.{PureTensor, tensor_from_data, tensor_zeros, tensor_ones, tensor_randn}
+use std.pure.tensor_ops.{add, sub, mul, div, mul_scalar, add_scalar, matmul, transpose}
+use std.pure.tensor_ops.{sum, mean}
+
+# Create a 2D tensor from nested data (row-major)
+fn tensor_2d(data: [f64], rows: i64, cols: i64) -> PureTensor<f64>:
+    tensor_from_data(data, [rows, cols])
+
+# Create a 1D tensor from data
+fn tensor_1d(data: [f64]) -> PureTensor<f64>:
+    tensor_from_data(data, [data.len()])
+
+# Create a 3D tensor
+fn tensor_3d(data: [f64], d0: i64, d1: i64, d2: i64) -> PureTensor<f64>:
+    tensor_from_data(data, [d0, d1, d2])
+
+# Get shape as readable string
+fn shape_str(t: PureTensor<f64>) -> text:
+    var s = "["
+    var i = 0
+    while i < t.shape.len():
+        if i > 0:
+            s = s + ", "
+        s = s + "{t.shape[i]}"
+        i = i + 1
+    s + "]"
+
+# Print tensor shape for debugging
+fn print_shape(name: text, t: PureTensor<f64>):
+    print "{name}: shape={shape_str(t)}, numel={t.numel()}"
+
+# Sum along last dimension (for softmax, etc.)
+fn sum_last_dim(t: PureTensor<f64>) -> PureTensor<f64>:
+    # For 2D: sum each row
+    if t.shape.len() == 2:
+        val rows = t.shape[0]
+        val cols = t.shape[1]
+        var result: [f64] = []
+        var r = 0
+        while r < rows:
+            var s = 0.0
+            var c = 0
+            while c < cols:
+                s = s + t.get([r, c])
+                c = c + 1
+            result.push(s)
+            r = r + 1
+        return tensor_from_data(result, [rows])
+    # For 1D: just sum
+    val s = sum(t)
+    tensor_from_data([s], [1])
+
+export tensor_2d, tensor_1d, tensor_3d
+export shape_str, print_shape
+export sum_last_dim

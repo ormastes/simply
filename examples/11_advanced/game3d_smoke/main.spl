@@ -1,0 +1,98 @@
+# 3D Offscreen Smoke — depth-correct software render proof (no window).
+#
+# Renders two unlit triangles with the CPU 3D backend at 160x120:
+#   1. NEAR green triangle (z = +1, 2 units from camera) drawn FIRST
+#   2. FAR red triangle (z = -1, 4 units from camera, larger) drawn SECOND
+# If the depth buffer works, the center pixel stays green even though red
+# was drawn last (painter's order would make it red). Dumps a P3 PPM.
+#
+# Run: SIMPLE_TIMEOUT_SECONDS=60 bin/simple run examples/11_advanced/game3d_smoke/main.spl
+
+use std.gpu.engine3d.engine.{Engine3D}
+use std.gpu.engine3d.types3d.{
+    vertex3d_pos_normal, material_unlit,
+    mat4_identity, mat4_perspective, mat4_look_at,
+    CULL_NONE, color3d_r, color3d_g, color3d_b
+}
+use std.io_runtime.{write_file}
+
+val W: i32 = 160
+val H: i32 = 120
+val BG: u32 = 0xFF202020
+val GREEN: u32 = 0xFF00CC00
+val RED: u32 = 0xFFCC0000
+val OUT: text = "build/game3d_smoke.ppm"
+
+fn check(label: text, pixels: [u32], x: i32, y: i32, expected: u32) -> bool:
+    val got = pixels[y * W + x]
+    val ok = got == expected
+    val status = if ok: "PASS" else: "FAIL"
+    print "{status} {label} ({x},{y}) r={color3d_r(got)} g={color3d_g(got)} b={color3d_b(got)}"
+    ok
+
+fn main():
+    var engine = Engine3D.create(W, H)
+    print "backend: {engine.backend_name()}"
+
+    val view = mat4_look_at(0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0)
+    val proj = mat4_perspective(1.0472, (W as f32) / (H as f32), 0.1, 100.0)
+    engine.set_camera(view, proj)
+    engine.set_cull_mode(CULL_NONE)
+
+    engine.begin_frame()
+    engine.clear(BG)
+    engine.clear_depth()
+
+    val model = mat4_identity()
+
+    # Near green triangle drawn FIRST — depth test must protect it.
+    engine.submit_triangle(
+        vertex3d_pos_normal(-0.5, -0.5, 1.0, 0.0, 0.0, 1.0),
+        vertex3d_pos_normal(0.5, -0.5, 1.0, 0.0, 0.0, 1.0),
+        vertex3d_pos_normal(0.0, 0.5, 1.0, 0.0, 0.0, 1.0),
+        material_unlit(GREEN), model)
+
+    # Far red triangle drawn SECOND, larger so it shows around the green one.
+    engine.submit_triangle(
+        vertex3d_pos_normal(-2.0, -2.0, -1.0, 0.0, 0.0, 1.0),
+        vertex3d_pos_normal(2.0, -2.0, -1.0, 0.0, 0.0, 1.0),
+        vertex3d_pos_normal(0.0, 2.5, -1.0, 0.0, 0.0, 1.0),
+        material_unlit(RED), model)
+
+    engine.end_frame()
+    val pixels = engine.read_pixels()
+
+    var ok = true
+    # Center: near green must occlude far red drawn after it.
+    if not check("center=near-green", pixels, W / 2, H / 2, GREEN):
+        ok = false
+    # Right of green triangle, still inside red: far object visible.
+    if not check("side=far-red", pixels, 100, H / 2, RED):
+        ok = false
+    # Corner: untouched background.
+    if not check("corner=background", pixels, 2, 2, BG):
+        ok = false
+
+    # Dump PPM for eyeballing.
+    var body = ""
+    var y = 0
+    while y < H:
+        var row = ""
+        var x = 0
+        while x < W:
+            val p = pixels[y * W + x]
+            row = row + "{color3d_r(p)} {color3d_g(p)} {color3d_b(p)}\n"
+            x = x + 1
+        body = body + row
+        y = y + 1
+    val ppm = "P3\n{W} {H}\n255\n" + body
+    if write_file(OUT, ppm):
+        print "wrote {OUT}"
+    else:
+        print "FAIL could not write {OUT}"
+        ok = false
+
+    if ok:
+        print "GAME3D_SMOKE PASS"
+    else:
+        print "GAME3D_SMOKE FAIL"

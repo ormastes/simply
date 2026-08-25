@@ -1,0 +1,55 @@
+use std.database.{DbCodec, DbValue, DbRow, TableSchema, Column, ColumnType, Database}
+use std.web_framework.model.{Repository}
+
+class AdditionalMenu:
+    id: i64
+    parent_item_id: i64
+    name: text
+    description: text
+    price: i64
+    created_at: text
+
+class AdditionalMenuCodec:
+    fn table_name() -> text:
+        "additional_menus"
+
+    fn columns() -> List<text>:
+        ["parent_item_id", "name", "description", "price", "created_at"]
+
+    fn encode(a: AdditionalMenu) -> List<DbValue>:
+        [
+            DbValue.integer(a.parent_item_id),
+            DbValue.text(a.name),
+            DbValue.text(a.description),
+            DbValue.integer(a.price),
+            DbValue.text(a.created_at)
+        ]
+
+    fn decode(row: DbRow) -> AdditionalMenu:
+        AdditionalMenu(
+            id: row.get_i64("id"),
+            parent_item_id: row.get_i64("parent_item_id"),
+            name: row.get_text("name"),
+            description: row.get_text("description"),
+            price: row.get_i64("price"),
+            created_at: row.get_text("created_at")
+        )
+
+    fn schema() -> TableSchema:
+        TableSchema(
+            name: "additional_menus",
+            columns: [
+                Column(name: "id", col_type: ColumnType.integer, primary_key: true, auto_increment: true),
+                Column(name: "parent_item_id", col_type: ColumnType.integer, nullable: false),
+                Column(name: "name", col_type: ColumnType.text, nullable: false),
+                Column(name: "description", col_type: ColumnType.text, nullable: false),
+                Column(name: "price", col_type: ColumnType.integer, nullable: false),
+                Column(name: "created_at", col_type: ColumnType.text, nullable: false)
+            ]
+        )
+
+fn create_additional_repository(db: Database) -> Repository<AdditionalMenu>:
+    Repository<AdditionalMenu>(db: db, codec: AdditionalMenuCodec())
+
+fn find_additional_for_item(repo: Repository<AdditionalMenu>, parent_id: i64) -> List<AdditionalMenu>:
+    repo.find_where("parent_item_id = ?", [DbValue.integer(parent_id)])

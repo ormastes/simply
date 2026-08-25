@@ -1,0 +1,44 @@
+{{#layout "application"}}
+
+<h1>Deliveries</h1>
+
+<table class="table">
+    <thead>
+        <tr>
+            <th>#</th>
+            <th>Order</th>
+            <th>Customer</th>
+            <th>Address</th>
+            <th>Status</th>
+            <th>ETA</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+        {{#each deliveries}}
+        <tr>
+            <td>{{id}}</td>
+            <td>#{{order_id}}</td>
+            <td>{{customer_name}} ({{customer_phone}})</td>
+            <td>{{address}}</td>
+            <td><span class="badge badge-{{status}}">{{status}}</span></td>
+            <td>{{estimated_time}}</td>
+            <td>
+                <form method="POST" action="/admin/deliveries/{{id}}/update" class="form-inline">
+                    <input type="hidden" name="csrf_token" value="{{../csrf_token}}">
+                    <select name="status">
+                        <option value="dispatched">Dispatched</option>
+                        <option value="in_transit">In Transit</option>
+                        <option value="delivered">Delivered</option>
+                        <option value="cancelled">Cancelled</option>
+                    </select>
+                    <input type="text" name="estimated_time" placeholder="ETA" size="10">
+                    <button type="submit" class="btn btn-sm btn-primary">Update</button>
+                </form>
+            </td>
+        </tr>
+        {{/each}}
+    </tbody>
+</table>
+
+{{/layout}}

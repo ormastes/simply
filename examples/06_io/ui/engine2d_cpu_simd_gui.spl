@@ -1,0 +1,68 @@
+# CPU SIMD Engine2D window smoke.
+#
+# Launch:
+#   SIMPLE_GUI_RUN_SKIP_NUDGE=1 scripts/macos-gui-run.shs examples/ui/engine2d_cpu_simd_gui.spl
+
+use std.gpu.engine2d.backend_cpu.{CpuBackend}
+use std.io.window_winit.{WinitLoop, WinitWindow, winit_loop_new, winit_loop_free, winit_window_new, winit_window_free, winit_present_rgba, winit_poll_close_requested}
+
+use std.io_runtime.{env_get}
+
+val W: i32 = 96
+val H: i32 = 72
+
+fn pack(src: [u32]) -> [i64]:
+    var out: [i64] = [0; src.len()]
+    var i = 0
+    while i < src.len():
+        out[i] = src[i].to_i64() & 0xFFFFFF
+        i = i + 1
+    out
+
+fn build_frame() -> [u32]:
+    var backend = CpuBackend.create()
+    if not backend.init(W, H):
+        print "CPU SIMD Engine2D backend failed to initialize"
+        return []
+    backend.clear(0xFF101820u32)
+    backend.draw_text(6, 4, "CPU SIMD", 0xFFFFFFFFu32, 6)
+    backend.draw_rect_filled(8, 8, 22, 18, 0xFFE53935u32)
+    backend.draw_circle_filled(72, 18, 12, 0xFF43A047u32)
+    backend.draw_line(8, 38, 88, 38, 0xFF33A1FDu32, 4)
+    backend.draw_gradient_rect(8, 50, 34, 14, 0xFFFFB300u32, 0xFF6A1B9Au32)
+    backend.draw_rounded_rect(56, 50, 32, 14, 4, 0xFF00ACC1u32)
+    backend.present()
+    val pixels = backend.read_pixels()
+    backend.shutdown()
+    pixels
+
+fn main() -> i64:
+    print "CPU SIMD Engine2D GUI — render {W}x{H}"
+    val pixels = build_frame()
+    if pixels.len() < W * H:
+        return 1
+
+    if (env_get("SIMPLE_GUI") ?? "") != "1":
+        print "No GUI requested (use scripts/macos-gui-run.shs to open a window); headless only."
+        return 0
+
+    val lp = winit_loop_new()
+    if not lp.is_valid:
+        print "No GUI runtime available."
+        return 1
+    val win = winit_window_new(lp, W.to_i64(), H.to_i64(), "CPU SIMD Engine2D")
+    if not win.is_valid:
+        winit_loop_free(lp)
+        return 1
+
+    val packed = pack(pixels)
+    var running = true
+    var iters = 0
+    while running and iters < 2000000:
+        winit_present_rgba(win, W.to_i64(), H.to_i64(), packed)
+        if winit_poll_close_requested(lp):
+            running = false
+        iters = iters + 1
+    winit_window_free(win)
+    winit_loop_free(lp)
+    return 0

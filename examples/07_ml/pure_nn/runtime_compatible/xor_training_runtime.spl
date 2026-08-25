@@ -1,0 +1,202 @@
+#![allow(unnamed_duplicate_typed_args)]
+#!/usr/bin/env simple
+# XOR Training with Pure Simple (Runtime Compatible)
+# Demonstrates complete training loop with backpropagation simulation
+# Self-contained implementation without generics
+
+class SimpleTensor:
+    data: [f64]
+    shape: [i64]
+
+fn create_tensor(data: [f64], shape: [i64]) -> SimpleTensor:
+    SimpleTensor(data: data, shape: shape)
+
+fn tensor_zeros(shape: [i64]) -> SimpleTensor:
+    var numel = 1
+    for dim in shape:
+        numel = numel * dim
+    var data: [f64] = []
+    var i = 0
+    while i < numel:
+        data.push(0.0)
+        i = i + 1
+    SimpleTensor(data: data, shape: shape)
+
+fn tensor_matmul(a: SimpleTensor, b: SimpleTensor) -> SimpleTensor:
+    val M = a.shape[0]
+    val K = a.shape[1]
+    val N = b.shape[1]
+    var result: [f64] = []
+    var i = 0
+    while i < M:
+        var j = 0
+        while j < N:
+            var sum = 0.0
+            var k = 0
+            while k < K:
+                sum = sum + a.data[i * K + k] * b.data[k * N + j]
+                k = k + 1
+            result.push(sum)
+            j = j + 1
+        i = i + 1
+    SimpleTensor(data: result, shape: [M, N])
+
+fn tensor_add(a: SimpleTensor, b: SimpleTensor) -> SimpleTensor:
+    var result: [f64] = []
+    var i = 0
+    # Broadcasting
+    if b.data.len() < a.data.len():
+        while i < a.data.len():
+            val b_idx = i % b.data.len()
+            result.push(a.data[i] + b.data[b_idx])
+            i = i + 1
+    else:
+        while i < a.data.len():
+            result.push(a.data[i] + b.data[i])
+            i = i + 1
+    SimpleTensor(data: result, shape: a.shape)
+
+fn tensor_sigmoid(t: SimpleTensor) -> SimpleTensor:
+    var result: [f64] = []
+    for v in t.data:
+        # Fast approximation of sigmoid
+        val clamped = if v > 6.0: 6.0 else: (if v < -6.0: -6.0 else: v)
+        val exp_neg = 2.718281828459045
+        var exp_v = 1.0
+        var term = 1.0
+        var n = 1
+        while n < 10:
+            term = term * (-clamped) / n
+            exp_v = exp_v + term
+            n = n + 1
+        result.push(1.0 / (1.0 + exp_v))
+    SimpleTensor(data: result, shape: t.shape)
+
+fn compute_mse_loss(pred: SimpleTensor, target: SimpleTensor) -> f64:
+    var loss = 0.0
+    var i = 0
+    while i < pred.data.len():
+        val diff = pred.data[i] - target.data[i]
+        loss = loss + (diff * diff)
+        i = i + 1
+    loss / pred.data.len()
+
+class Network:
+    # Simple 2 → 4 → 1 network
+    w1: SimpleTensor
+    b1: SimpleTensor
+    w2: SimpleTensor
+    b2: SimpleTensor
+
+fn create_network() -> Network:
+    # Initialize with random-ish values
+    val w1 = create_tensor([
+        0.5, 0.3, -0.2, 0.7,
+        0.1, -0.4, 0.6, 0.2
+    ], [2, 4])
+    val b1 = tensor_zeros([1, 4])
+    val w2 = create_tensor([0.3, -0.5, 0.4, 0.2], [4, 1])
+    val b2 = tensor_zeros([1, 1])
+    Network(w1: w1, b1: b1, w2: w2, b2: b2)
+
+fn forward(net: Network, x: SimpleTensor) -> SimpleTensor:
+    # Layer 1: sigmoid(x @ w1 + b1)
+    val z1 = tensor_matmul(x, net.w1)
+    val z1_bias = tensor_add(z1, net.b1)
+    val h1 = tensor_sigmoid(z1_bias)
+    # Layer 2: sigmoid(h1 @ w2 + b2)
+    val z2 = tensor_matmul(h1, net.w2)
+    val z2_bias = tensor_add(z2, net.b2)
+    val output = tensor_sigmoid(z2_bias)
+    output
+
+fn update_weights(net: Network, learning_rate: f64):
+    # Simplified weight update (gradient descent approximation)
+    # In real training, we'd compute gradients via backprop
+    var i = 0
+    while i < net.w1.data.len():
+        val noise = ((i * 123456789) % 1000) / 1000.0 - 0.5
+        net.w1.data[i] = net.w1.data[i] + (learning_rate * noise * 0.1)
+        i = i + 1
+
+    i = 0
+    while i < net.w2.data.len():
+        val noise = ((i * 987654321) % 1000) / 1000.0 - 0.5
+        net.w2.data[i] = net.w2.data[i] + (learning_rate * noise * 0.1)
+        i = i + 1
+
+fn print_predictions(pred: SimpleTensor, label: text):
+    print "  {label}:"
+    var i = 0
+    while i < pred.data.len():
+        val rounded = if pred.data[i] > 0.5: 1.0 else: 0.0
+        print "    [{i}] = {pred.data[i]} (rounded: {rounded})"
+        i = i + 1
+
+fn main():
+    print "═══════════════════════════════════════════════════════════"
+    print "    XOR Training with Pure Simple (Runtime Compatible)"
+    print "═══════════════════════════════════════════════════════════"
+    print ""
+
+    # XOR dataset
+    val X = create_tensor([
+        0.0, 0.0,
+        0.0, 1.0,
+        1.0, 0.0,
+        1.0, 1.0
+    ], [4, 2])
+
+    val Y = create_tensor([0.0, 1.0, 1.0, 0.0], [4, 1])
+
+    print "XOR Problem:"
+    print "  [0, 0] → 0"
+    print "  [0, 1] → 1"
+    print "  [1, 0] → 1"
+    print "  [1, 1] → 0"
+    print ""
+
+    # Create network
+    val net = create_network()
+    print "Network: 2 → 4 → 1 (sigmoid activations)"
+    print ""
+
+    # Training loop
+    print "Training..."
+    val epochs = 5
+    var epoch = 0
+    while epoch < epochs:
+        # Forward pass
+        val pred = forward(net, X)
+        val loss = compute_mse_loss(pred, Y)
+
+        print "  Epoch {epoch + 1}/{epochs}: loss = {loss}"
+
+        # Backward pass (simplified - not real backprop)
+        update_weights(net, 0.1)
+
+        epoch = epoch + 1
+
+    print ""
+    print "Training complete!"
+    print ""
+
+    # Final predictions
+    val final_pred = forward(net, X)
+    print "Final Predictions:"
+    print_predictions(final_pred, "Output")
+    print ""
+
+    print "Expected:"
+    print "  [0] = 0.0"
+    print "  [1] = 1.0"
+    print "  [2] = 1.0"
+    print "  [3] = 0.0"
+    print ""
+
+    print "═══════════════════════════════════════════════════════════"
+    print "Note: This is a simplified demonstration."
+    print "For real backpropagation, use std.pure.autograd in compiled mode."
+    print "═══════════════════════════════════════════════════════════"
+
+main()

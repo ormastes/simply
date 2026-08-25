@@ -1,0 +1,138 @@
+# x86_64 GENERAL-spawn ring-3 verification entry.
+#
+# The rung above ring3_smoke_entry.spl. ring3_smoke mapped a raw embedded machine-
+# code buffer to prove the bare ring-3 handoff. This entry proves the SAME handoff
+# for bytes that flow through the REAL general spawn image builder — sourced off
+# the FAT32/NVMe disk (the byte path proven by the FS-exec smoke and #22), NOT an
+# embedded kernel blob:
+#
+#   1. Bring up the C-backed NVMe controller (simpleos_nvme_init) and read
+#      /FSEXEC.ELF off the FAT32 image into the kernel's static path-read buffer
+#      (simpleos_fat32_stream_open/read_at -> simpleos_fat32_path_read_buffer_addr),
+#      then materialise it into a Simple [u8]. This is the exact byte source the
+#      FS-exec smoke maps + runs today; it replaces the old .rodata blob accessor
+#      that hit the freestanding symbol-load anomaly.
+#   2. Feed the [u8] to build_user_process_image_unchecked — the GENERAL spawn image
+#      builder used by fs_exec_prepare_spawn_from_bytes — producing a real
+#      UserProcessImage (its file_bytes is a pass-through copy of the raw ELF; the
+#      module-val-bound structured fields are unreliable under freestanding, so the
+#      handoff re-parses file_bytes).
+#   3. Hand the image to x86_64_fs_exec_enter_image_ring3 — the control-transfer
+#      handoff — which maps it into a fresh user AS and iretq's to CPL3.
+#
+# The payload writes "FDR\n" via `out` (only possible when CPL <= IOPL, i.e.
+# genuinely ring 3) then "FSEXEC_OK rc=42\n" via syscall 60, then exits QEMU via
+# `out 0xf4`. "FDR" on serial alone is definitive ring-3 proof.
+#
+# Freestanding discipline (module-level `val` initializers do not run under
+# native-build): all constants function-local, explicit parens on zero-arg calls.
+
+extern fn serial_println(msg: text)
+extern fn rt_debug_exit_success()
+extern fn rt_x86_tss_init() -> i64
+
+# C-backed NVMe + FAT32 boot reader (boot/baremetal_stubs.c) — the proven byte
+# source (same externs the FS-exec smoke uses).
+extern fn simpleos_nvme_init() -> i64
+extern fn simpleos_fat32_path_read_buffer_addr() -> u64
+extern fn simpleos_fat32_stream_open(path: text) -> i64
+extern fn simpleos_fat32_stream_read_at(file_off: u64, dst: u64, len: u64) -> i64
+
+# Materialise a raw identity-mapped buffer into a Simple [u8] via the C runtime
+# (rt_extras.c/baremetal_stubs.c). This AVOIDS the freestanding growable-[u8]
+# hazard: `var out:[u8]=[]` + per-byte `.push()` starts at cap=16 and grows the
+# backing store via ~9 realloc-copies, and the freestanding bump allocator's
+# grow-copy corrupts the element bytes (length survives, data does not — the ELF
+# arrived with magic=248,3,0,0 / phnum=0). rt_bytes_from_raw calls rt_array_new(n)
+# which PRE-SIZES capacity to n, so no realloc ever runs. Same helper the
+# freestanding VFS/sandbox boot paths use (vfs_boot_init, sandbox_boot_apply).
+extern fn rt_bytes_from_raw(ptr: i64, len: i64) -> [u8]
+
+use os.kernel.arch.x86_64.arch_init.{arch_x86_64_early_init}
+use os.kernel.memory.pmm.{pmm_init_identity_range, g_pmm}
+use os.kernel.memory.vmm.{vmm_init}
+use os.kernel.arch.arch_context.{Architecture}
+use os.kernel.loader.process_image.{build_user_process_image_unchecked}
+use os.kernel.loader.x86_64_fs_exec_ring3.{x86_64_fs_exec_enter_image_ring3}
+
+fn _read_fsexec_bytes() -> [u8]:
+    """Stream /FSEXEC.ELF off the FAT32/NVMe disk into the static path-read buffer
+    and materialise it into a Simple [u8]. Same read path the FS-exec smoke uses;
+    the C DMA target is the static FAT buffer (disjoint from kernel rodata / the
+    VMM bump-allocator arena), so no clobber hazard."""
+    val fsize = simpleos_fat32_stream_open("/FSEXEC.ELF")
+    if fsize <= 0:
+        serial_println("[gen] FAIL fat32 stream open /FSEXEC.ELF rc={fsize}")
+        return []
+    val buf = simpleos_fat32_path_read_buffer_addr()
+    val n = simpleos_fat32_stream_read_at(0, buf, fsize.to_u64())
+    if n <= 0:
+        serial_println("[gen] FAIL fat32 stream read rc={n}")
+        return []
+    serial_println("[gen] /FSEXEC.ELF read size={fsize} buf=0x{buf}")
+    # Pre-sized C-side materialisation (no growable-[u8] realloc — see the
+    # rt_bytes_from_raw extern comment above). buf is an identity-mapped physical
+    # address; the C helper reads the raw bytes directly.
+    rt_bytes_from_raw(buf as i64, fsize)
+
+fn spl_start():
+    serial_println("")
+    serial_println("=== SimpleOS x86_64 general-spawn ring-3 ===")
+
+    arch_x86_64_early_init()
+    serial_println("[gen] arch-init + syscall MSRs done")
+    rt_x86_tss_init()
+
+    # 1. NVMe online, then read + materialise /FSEXEC.ELF BEFORE pmm/vmm init —
+    #    the FAT read + [u8] copy run against the C static heap; keeping them ahead
+    #    of the VMM bump allocator matches the FS-exec smoke ordering.
+    if simpleos_nvme_init() != 0:
+        serial_println("[gen] FAIL nvme init")
+        serial_println("TEST FAILED")
+        rt_debug_exit_success()
+        return
+    serial_println("[gen] nvme online")
+
+    val bytes = _read_fsexec_bytes()
+    var b0: i64 = 0
+    var b1: i64 = 0
+    var b2: i64 = 0
+    var b3: i64 = 0
+    if bytes.len() >= 4:
+        b0 = bytes[0].to_i64()
+        b1 = bytes[1].to_i64()
+        b2 = bytes[2].to_i64()
+        b3 = bytes[3].to_i64()
+    serial_println("[gen] blob materialized len={bytes.len()} magic={b0},{b1},{b2},{b3}")
+    if bytes.len() < 64:
+        serial_println("[gen] FAIL short ELF")
+        serial_println("TEST FAILED")
+        rt_debug_exit_success()
+        return
+
+    # 2. PMM + VMM online (after NVMe/FAT — the C NVMe DMA uses the static C heap
+    #    in low .bss, disjoint from this identity range at 0x80000000+).
+    #    Kernel end = 0x18000000 (384 MiB bound for 128 MB base + ~118 MB RW extent).
+    if not pmm_init_identity_range(0x80000000, 0x100000, 0x18000000):
+        serial_println("[gen] FAIL pmm_init")
+        serial_println("TEST FAILED")
+        rt_debug_exit_success()
+        return
+    vmm_init(g_pmm, 0)
+    serial_println("[gen] pmm+vmm online")
+
+    # THE GENERAL SPAWN IMAGE BUILDER (same one fs_exec_prepare_spawn_from_bytes
+    # calls). Not the hardcoded smoke blob path.
+    val image = build_user_process_image_unchecked(
+        "/sys/apps/fsexec_hello.elf", bytes, Architecture.X86_64, [], []
+    )
+    serial_println("[gen] general image built")
+
+    # THE HANDOFF: map + enter ring 3. Does not return on success. Pass the raw
+    # identity-mapped FAT read buffer (still holds the full ELF, disjoint from the
+    # pmm/vmm arenas) so the handoff parses the ELF via mmio, not the boxed-[u8]
+    # image.file_bytes channel.
+    val rc = x86_64_fs_exec_enter_image_ring3(image, simpleos_fat32_path_read_buffer_addr(), [], [])
+    serial_println("[gen] handoff returned rc={rc} (unexpected)")
+    serial_println("TEST FAILED")
+    rt_debug_exit_success()

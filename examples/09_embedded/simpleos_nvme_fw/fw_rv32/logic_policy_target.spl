@@ -1,0 +1,4 @@
+use logic_policy_target_cases.*
+
+fn rv32_policy_target_selftest() -> i32:
+    rv32_policy_target_cases_selftest()

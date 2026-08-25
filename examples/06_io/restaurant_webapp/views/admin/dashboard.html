@@ -1,0 +1,22 @@
+{{#layout "application"}}
+
+<h1>Admin Dashboard</h1>
+<p>Welcome, {{admin_name}}!</p>
+
+<div class="dashboard-cards">
+    <div class="card">
+        <h2>Templates</h2>
+        <p>{{template_count}} template(s)</p>
+        <a href="/admin/templates" class="btn">Manage Templates</a>
+    </div>
+    <div class="card">
+        <h2>Orders</h2>
+        <a href="/admin/orders" class="btn">View Orders</a>
+    </div>
+</div>
+
+<form method="POST" action="/admin/logout" style="margin-top: 2rem;">
+    <button type="submit" class="btn btn-danger">Logout</button>
+</form>
+
+{{/layout}}

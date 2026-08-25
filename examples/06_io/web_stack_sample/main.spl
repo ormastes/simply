@@ -1,0 +1,5 @@
+use app.web_stack_sample.{open_web_stack_sample}
+
+fn main():
+    open_web_stack_sample("simpledb", "var/lib/web_stack_sample/sample.sdn")?
+    print "[web-stack-sample] verification data ready"

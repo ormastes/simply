@@ -1,0 +1,45 @@
+#!/bin/sh
+# smux launcher — detects platform and runs with appropriate backend
+# Usage: sh examples/smux/run.shs [--gui] [--backend=tui|tauri]
+#   or:  cd examples/smux && sh run.shs
+set -e
+
+# Resolve project root and smux directory
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SMUX_DIR="$SCRIPT_DIR"
+
+# Find the simple binary (check relative to script, then PATH)
+SIMPLE=""
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+if [ -x "$PROJECT_ROOT/bin/simple" ]; then
+    SIMPLE="$PROJECT_ROOT/bin/simple"
+elif [ -x "$PROJECT_ROOT/bin/simple" ]; then
+    SIMPLE="$PROJECT_ROOT/bin/simple"
+elif command -v simple >/dev/null 2>&1; then
+    SIMPLE="simple"
+else
+    echo "Error: simple binary not found." >&2
+    echo "  Expected at: $PROJECT_ROOT/bin/simple" >&2
+    echo "  Or install simple to PATH." >&2
+    exit 1
+fi
+
+# Detect platform for helpful messages
+PLATFORM="unknown"
+if [ -n "$ANDROID_ROOT" ] || echo "$PREFIX" | grep -q "com.termux" 2>/dev/null; then
+    PLATFORM="android"
+elif [ -d "/var/mobile" ] || [ -n "$ISHELL" ]; then
+    PLATFORM="ios"
+elif [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+    PLATFORM="macos"
+elif [ "$(uname -s 2>/dev/null)" = "Linux" ]; then
+    PLATFORM="linux"
+elif [ -n "$WINDIR" ] || [ "$OS" = "Windows_NT" ]; then
+    PLATFORM="windows"
+fi
+
+echo "smux: platform=$PLATFORM, binary=$SIMPLE"
+
+# Run from smux directory so relative imports resolve correctly
+cd "$SMUX_DIR"
+exec "$SIMPLE" run main.spl "$@"

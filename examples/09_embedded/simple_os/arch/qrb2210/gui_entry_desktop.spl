@@ -1,0 +1,47 @@
+# codex-impl
+# Canonical UNO Q QRB2210 desktop entry admission boundary.
+#
+# This target must never borrow the ARM QEMU RAMFB, virtio-input, ivshmem, or
+# virtio-snd adapters.  A physical QRB2210 port may enter the shared
+# WM -> DrawIrComposition -> Engine2D -> Qualcomm Vulkan pipeline only after
+# the canonical board contract admits display, window-event, and audio owners.
+# Until those physical drivers exist, startup fails before creating a renderer
+# or emitting any device/capture receipt. Live input, audio, font, animation,
+# Vulkan submit/fence/readback, and frame-capture receipts belong to the future
+# physical composition root; this entry never fabricates them.
+
+use os.port.qrb2210_native_2d_composition_root.{
+    qrb2210_native_2d_factory_admission
+}
+
+class Qrb2210DesktopEntryAdmission:
+    admitted: bool
+    capability: text
+    reason: text
+
+fn qrb2210_desktop_entry_admission() -> Qrb2210DesktopEntryAdmission:
+    """Require every physical owner before the shared desktop may start.
+
+    This function consumes only canonical port status.  It never accepts
+    caller-supplied receipts, vendor-OS readiness, or synthetic hardware.
+    """
+    val admission = qrb2210_native_2d_factory_admission()
+    Qrb2210DesktopEntryAdmission(
+        admitted: admission.admitted,
+        capability: admission.missing_owner,
+        reason: admission.reason
+    )
+
+fn spl_start():
+    val admission = qrb2210_desktop_entry_admission()
+    if not admission.admitted:
+        panic(
+            "UNO_Q_QRB2210_DESKTOP_BLOCKED capability={admission.capability} " +
+            "reason={admission.reason}"
+        )
+    # The physical boot loop must call qrb2210_native_2d_assemble_root with
+    # typed DRM, evdev, PCM, and Adreno owners. This entry remains fail-closed
+    # until those kernel owners exist; no owner is accessed by this probe.
+    panic("UNO_Q_QRB2210_DESKTOP_BLOCKED reason=physical-composition-root-not-bound")
+
+export Qrb2210DesktopEntryAdmission, qrb2210_desktop_entry_admission

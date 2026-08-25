@@ -1,0 +1,86 @@
+# Pure Simple Libraries Demo
+# Showcasing 100% Simple implementations
+
+use std.text (trim, replace_all, reverse_string, starts_with, pad_left)
+use std.path (basename, dirname, normalize_path, get_extension)
+use std.pure.collections (range, chunk, unique, zip, find)
+
+fn main():
+    print "═══════════════════════════════════════"
+    print "  Pure Simple Libraries Demo"
+    print "  100% Simple - No Rust Dependencies"
+    print "═══════════════════════════════════════"
+    print ""
+
+    demo_strings()
+    demo_paths()
+    demo_collections()
+
+    print ""
+    print "═══════════════════════════════════════"
+    print "  All demos completed successfully!"
+    print "  Total: 800+ lines of pure Simple code"
+    print "═══════════════════════════════════════"
+
+fn demo_strings():
+    print "📝 String Utilities Demo"
+    print "------------------------"
+
+    val text = "  Hello, World!  "
+    print "Original: '{text}'"
+    print "Trimmed: '{trim(text)}'"
+
+    val message = "Simple is awesome!"
+    print "Message: {message}"
+    print "Reversed: {reverse_string(message)}"
+    print "Replaced: {replace_all(message, 'Simple', 'Pure Simple')}"
+
+    val name = "Simple"
+    print "Padded: '{pad_left(name, 15, '*')}'"
+
+    print ""
+
+fn demo_paths():
+    print "📁 Path Utilities Demo"
+    print "----------------------"
+
+    val path = "/usr/local/bin/simple.spl"
+    print "Path: {path}"
+    print "Basename: {basename(path)}"
+    print "Dirname: {dirname(path)}"
+    print "Extension: {get_extension(path)}"
+
+    val messy_path = "./foo/../bar/./baz"
+    print "Messy: {messy_path}"
+    print "Normalized: {normalize_path(messy_path)}"
+
+    print ""
+
+fn demo_collections():
+    print "📦 Collection Utilities Demo"
+    print "----------------------------"
+
+    val numbers = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    print "Numbers: {numbers}"
+
+    val chunks = chunk(numbers, 3)
+    print "Chunked by 3: {chunks}"
+
+    val duplicates = [1, 2, 2, 3, 3, 3, 4]
+    print "With duplicates: {duplicates}"
+    print "Unique: {unique(duplicates)}"
+
+    val letters = ["a", "b", "c"]
+    val nums = [1, 2, 3]
+    print "Zipped: {zip(letters, nums)}"
+
+    val found = find(numbers, _ > 5)
+    match found:
+        case Some(n): print "First > 5: {n}"
+        case None: print "Not found"
+
+    print ""
+
+
+# Run the demo
+main()

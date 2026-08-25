@@ -1,0 +1,98 @@
+use common.ui.widget.{WidgetNode, UITree, WidgetProp, WidgetKind}
+use compiler.frontend.parser.partial.{PartialNode, PartialNodeKind}
+
+struct FlatNode:
+    id: text
+    props: Dict<text, text>
+    children: [text]
+
+struct UiFlatNode:
+    id: text
+    kind: text
+    props: [WidgetProp]
+    children: [text]
+    layout: text
+    visible: bool
+    focused: bool
+
+struct EnumFlatNode:
+    id: text
+    kind: text
+    layout: text
+    visible: bool
+    focused: bool
+
+fn main() -> i64:
+    print "probe:start"
+
+    val flat = FlatNode(
+        id: "flat",
+        props: {},
+        children: []
+    )
+    print "probe:flat:{flat.id}"
+
+    val prop = WidgetProp(node_id: "ui_flat", key: "content", value: "ok")
+    print "probe:prop:{prop.key}"
+
+    val enum_flat = EnumFlatNode(
+        id: "enum_flat",
+        kind: "text",
+        layout: "vbox",
+        visible: true,
+        focused: false
+    )
+    print "probe:enumflat:{enum_flat.id}"
+
+    val ui_flat = UiFlatNode(
+        id: "ui_flat",
+        kind: "text",
+        props: [prop],
+        children: [],
+        layout: "vbox",
+        visible: true,
+        focused: false
+    )
+    print "probe:uiflat:{ui_flat.id}"
+
+    val partial = PartialNode(
+        kind: PartialNodeKind.Module,
+        name: nil,
+        start_line: 0,
+        start_column: 0,
+        end_line: 0,
+        end_column: 0,
+        children: [],
+        error_message: nil,
+        type_hint: nil
+    )
+    print "probe:partial:{partial.start_line}"
+
+    val empty = WidgetNode(id: "empty")
+    print "probe:empty:{empty.id}"
+
+    val node = WidgetNode.new("node", WidgetKind.Text.to_wire())
+    print "probe:new:{node.id}"
+
+    val node2 = node.set_prop("content", "hello")
+    print "probe:prop:{node2.get_prop(\"content\")}"
+
+    val base_parent = WidgetNode.new("parent", WidgetKind.Panel.to_wire())
+    print "probe:base_parent_id:{base_parent.id}"
+    val laid_out_parent = base_parent.set_layout("vbox")
+    print "probe:laid_out_parent_layout:{laid_out_parent.layout_name()}"
+    val parent = laid_out_parent.add_child(node2)
+    print "probe:parent_id:{parent.id}"
+    print "probe:parent_layout:{parent.layout_name()}"
+    print "probe:parent_children_blob:{parent.get_prop(\"ui_children\")}"
+    val first_child = parent.child_at(0)
+    if first_child != nil:
+        print "probe:first_child:{first_child.id}"
+    else:
+        print "probe:first_child:nil"
+
+    val tree = UITree.new(node2)
+    print "probe:tree_root:{tree.root_id}"
+    print "probe:tree_title:{tree.title_text()}"
+
+    return 0

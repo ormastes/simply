@@ -1,0 +1,18 @@
+description = "Full feature development via SPipe/SStack: intake, research, design, specs, implementation, refactor, verify, and ship."
+prompt = """
+Run the full SPipe/SStack feature-development pipeline for the given request.
+
+This command is equivalent to /sp_dev and /sstack.
+
+Pipeline:
+1. dev: refine the task into a clear goal and acceptance criteria
+2. research: local and domain research, with Codex cooperative research when available
+3. arch: architecture and UI design, with Gemini/Codex cooperative design when available
+4. spec: SPipe BDD tests with built-in matchers only
+5. implement: code changes following Simple language rules
+6. refactor: duplication, size, coupling, and performance cleanup
+7. verify: production readiness and SPipe quality gates
+8. ship: VCS sync or release handoff when requested
+
+Follow `.claude/skills/sstack.md` as the canonical procedure.
+"""

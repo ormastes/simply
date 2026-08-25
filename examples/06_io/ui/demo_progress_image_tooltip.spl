@@ -1,0 +1,170 @@
+# Demo — Progress, Image, Tooltip Widget Rendering
+#
+# Non-interactive demo that builds a widget tree with progress bars at
+# various percentages, an image placeholder, and a tooltip.  Computes
+# layout for an 80x24 screen, renders to a Screen buffer, and runs
+# PASS/FAIL verification checks on the output.
+
+use common.ui.builder.{column, panel, progress, image, tooltip, build_tree_with_title}
+use common.ui.widget.{UIState}
+use common.ui.layout.{compute_layout}
+use common.ui.state.{init_state}
+use app.ui.tui.screen.{Screen}
+use app.ui.render.widgets.{render_tui_tree, render_html_tree}
+
+fn build_display_tree() -> UIState:
+    """Build a widget tree with progress, image, and tooltip widgets."""
+    val prog1 = progress("prog1", 25)
+    val prog2 = progress("prog2", 50)
+    val prog3 = progress("prog3", 75)
+    val prog4 = progress("prog4", 100)
+    val logo = image("logo", "logo.png", "Company Logo")
+    val help_tip = tooltip("help_tip", "Click for help", "help_btn")
+
+    val display = panel("display", "Display Widgets", [
+        prog1, prog2, prog3, prog4, logo, help_tip
+    ])
+
+    val root = column("root", [display])
+    val tree = build_tree_with_title(root, "Progress Image Tooltip Demo", "dark")
+    return init_state(tree)
+
+fn main() -> i64:
+    var failures = 0
+    val width = 80
+    val height = 24
+
+    # -- Build --
+    val state = build_display_tree()
+
+    val ids = state.tree.all_widget_ids()
+    if ids.len() > 0:
+        print "PASS: tree built with {ids.len()} widgets"
+    else:
+        print "FAIL: tree has no widgets"
+        failures = failures + 1
+
+    # -- Layout --
+    val rects = compute_layout(state.tree.root, 0, 0, width, height - 1)
+
+    if rects.len() > 0:
+        print "PASS: layout computed with {rects.len()} rects"
+    else:
+        print "FAIL: layout produced no rects"
+        failures = failures + 1
+
+    # -- TUI Render --
+    var screen = Screen.new(width, height - 1)
+    screen = render_tui_tree(screen, state.tree.root, rects, state)
+    val output = screen.render()
+
+    if output.len() > 0:
+        print "PASS: TUI render produced output ({output.len()} chars)"
+    else:
+        print "FAIL: TUI render produced empty output"
+        failures = failures + 1
+
+    # -- Panel title --
+    if output.contains("Display Widgets"):
+        print "PASS: output contains panel title 'Display Widgets'"
+    else:
+        print "FAIL: output missing panel title 'Display Widgets'"
+        failures = failures + 1
+
+    # -- Progress bars --
+    # render_progress_bar produces "[===...] NN%" — check the bracket pattern
+    if output.contains("["):
+        print "PASS: output contains progress bar bracket"
+    else:
+        print "FAIL: output missing progress bar bracket"
+        failures = failures + 1
+
+    if output.contains("25%"):
+        print "PASS: output contains 25% progress value"
+    else:
+        print "FAIL: output missing 25% progress value"
+        failures = failures + 1
+
+    if output.contains("100%"):
+        print "PASS: output contains 100% progress value"
+    else:
+        print "FAIL: output missing 100% progress value"
+        failures = failures + 1
+
+    # -- Image alt text --
+    if output.contains("[IMG: Company Logo]"):
+        print "PASS: output contains image alt text '[IMG: Company Logo]'"
+    else:
+        print "FAIL: output missing image alt text '[IMG: Company Logo]'"
+        failures = failures + 1
+
+    # -- HTML backend verification --
+    val html = render_html_tree(state.tree.root, state)
+
+    if html.len() > 0:
+        print "PASS: HTML render produced output ({html.len()} chars)"
+    else:
+        print "FAIL: HTML render produced empty output"
+        failures = failures + 1
+
+    if html.contains("widget-progress"):
+        print "PASS: HTML contains progress widget class"
+    else:
+        print "FAIL: HTML missing progress widget class"
+        failures = failures + 1
+
+    if html.contains("width: 25%"):
+        print "PASS: HTML contains progress 25% width style"
+    else:
+        print "FAIL: HTML missing progress 25% width style"
+        failures = failures + 1
+
+    if html.contains("width: 100%"):
+        print "PASS: HTML contains progress 100% width style"
+    else:
+        print "FAIL: HTML missing progress 100% width style"
+        failures = failures + 1
+
+    if html.contains("widget-image"):
+        print "PASS: HTML contains image widget class"
+    else:
+        print "FAIL: HTML missing image widget class"
+        failures = failures + 1
+
+    if html.contains("logo.png"):
+        print "PASS: HTML contains image src 'logo.png'"
+    else:
+        print "FAIL: HTML missing image src 'logo.png'"
+        failures = failures + 1
+
+    if html.contains("Company Logo"):
+        print "PASS: HTML contains image alt 'Company Logo'"
+    else:
+        print "FAIL: HTML missing image alt 'Company Logo'"
+        failures = failures + 1
+
+    if html.contains("widget-tooltip"):
+        print "PASS: HTML contains tooltip widget class"
+    else:
+        print "FAIL: HTML missing tooltip widget class"
+        failures = failures + 1
+
+    if html.contains("Click for help"):
+        print "PASS: HTML contains tooltip content 'Click for help'"
+    else:
+        print "FAIL: HTML missing tooltip content 'Click for help'"
+        failures = failures + 1
+
+    if html.contains("help_btn"):
+        print "PASS: HTML contains tooltip target 'help_btn'"
+    else:
+        print "FAIL: HTML missing tooltip target 'help_btn'"
+        failures = failures + 1
+
+    # -- Summary --
+    if failures == 0:
+        print "All tests passed."
+        return 0
+    else:
+        print "{failures} test(s) failed."
+        return 1

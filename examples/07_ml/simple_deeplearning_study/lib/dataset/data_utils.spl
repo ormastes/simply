@@ -1,0 +1,49 @@
+# Data Utilities — from scratch
+# Chapter 2-5: "Build a Large Language Model From Scratch" (Rasbt)
+#
+# Train/val splitting, batch creation, data loading helpers.
+
+use examples.simple_deeplearning_study.lib.dataset.text_dataset.{TextSample, TextDataset}
+
+class DataSplit:
+    train_ids: [i64]
+    val_ids: [i64]
+
+# Split token IDs into train and validation sets
+# split_ratio: fraction for training (e.g., 0.9)
+fn train_val_split(token_ids: [i64], split_ratio: f64) -> DataSplit:
+    val split_idx = ((token_ids.len() as f64) * split_ratio) as i64
+    var train: [i64] = []
+    var val_set: [i64] = []
+    var i = 0
+    while i < token_ids.len():
+        if i < split_idx:
+            train.push(token_ids[i])
+        else:
+            val_set.push(token_ids[i])
+        i = i + 1
+    DataSplit(train_ids: train, val_ids: val_set)
+
+class Batch:
+    inputs: [[i64]]     # [batch_size][ctx_len]
+    targets: [[i64]]    # [batch_size][ctx_len]
+
+# Create batches from dataset
+fn create_batches(dataset: TextDataset, batch_size: i64) -> [Batch]:
+    var batches: [Batch] = []
+    var start = 0
+    while start + batch_size <= dataset.len():
+        var inputs: [[i64]] = []
+        var targets: [[i64]] = []
+        var i = 0
+        while i < batch_size:
+            val sample = dataset.get(start + i)
+            inputs.push(sample.input)
+            targets.push(sample.target)
+            i = i + 1
+        batches.push(Batch(inputs: inputs, targets: targets))
+        start = start + batch_size
+    batches
+
+export DataSplit, train_val_split
+export Batch, create_batches

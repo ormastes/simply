@@ -1,0 +1,13 @@
+# Admitted proof debt example
+# Demonstrates: sorry/admitted state, visible in reports
+#
+# When a @verify function has no proof (or uses sorry), the verification
+# state is Admitted. This appears prominently in verification reports
+# and never collapses into Verified.
+
+@verify
+fn complex_algorithm(data: List<i64>) -> i64:
+    in: data.len() > 0
+    out(ret): ret >= 0
+    # Complex logic - proof admitted for now
+    pass_todo

@@ -1,0 +1,52 @@
+# Render the mobile_hello .ui.sdn to a full standalone HTML page and write it
+# to a file. Render-once (no event loop) so it exits cleanly. Used to preview
+# the Simple GUI lib output inside the real Tauri webview window.
+
+use nogc_sync_mut.ui.parse.sdn_tree.{parse_ui_to_tree}
+use common.ui.state.{init_state}
+use app.ui.render.html_widgets.{render_html_tree}
+use app.ui.web.html.{generate_css}
+use common.ui.web_render_api.{WEB_RENDER_TARGET_TAURI, WebRenderRequest, web_render_to_artifact}
+use std.sffi.cli.{cli_get_args}
+
+use std.io_runtime.{write_file}
+
+fn render_full_page(sdn_path: text) -> Result<text, text>:
+    val tree_result = parse_ui_to_tree(sdn_path)
+    match tree_result:
+        Err(e):
+            return Err(e)
+        Ok(tree):
+            val state = init_state(tree)
+            val css = generate_css(state.tree.theme_name())
+            val body_html = render_html_tree(state.tree.root_node(), state)
+            # Client-side interaction must be authored in Simple and compiled to
+            # WebAssembly (no hand-written JS) — blocked on the CLI wasm-emit gap,
+            # see doc/08_tracking/bug/wasm_cli_emit_*. Until then the page is a
+            # static render; native <input> text entry still works in the webview.
+            val req = WebRenderRequest.html(WEB_RENDER_TARGET_TAURI, "", body_html, css, "", 430, 900).with_surface("main")
+            return Ok(web_render_to_artifact(req).html)
+
+fn main() -> i64:
+    val args = cli_get_args()
+    var sdn = "examples/ui/mobile_hello.ui.sdn"
+    var out = "tools/tauri-shell/dist/index.html"
+    var i = 0
+    while i < args.len():
+        if args[i].ends_with(".ui.sdn"):
+            sdn = args[i]
+        elif args[i].ends_with(".html"):
+            out = args[i]
+        i = i + 1
+
+    val page = render_full_page(sdn)
+    match page:
+        Err(e):
+            print "Error: {e}"
+            return 1
+        Ok(html):
+            if write_file(out, html):
+                print "Wrote {html.len()} bytes to {out}"
+                return 0
+            print "Error: failed to write {out}"
+            return 1

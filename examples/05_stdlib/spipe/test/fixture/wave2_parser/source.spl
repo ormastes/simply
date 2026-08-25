@@ -1,0 +1,9 @@
+// spipe:symbol uid=SY-00000000000000000000000000000001 key=search.index.add
+// @cover REQ-SPKC-011
+pub fn add_document(doc: SearchDocument):
+    return doc
+
+// @implements REQ-SPKC-012
+fn rank_document(query: text, doc: SearchDocument):
+    return doc
+

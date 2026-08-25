@@ -1,0 +1,22 @@
+app:
+    title: "Minimal"
+    theme: glass_dark
+
+layout:
+    type: vbox
+    children:
+        main:
+            type: panel
+            id: main
+            title: Hello
+            flex: 1
+            children:
+                greeting:
+                    type: text
+                    id: greeting
+                    content: "Hello from Simple UI!"
+        status:
+            type: statusbar
+            id: status
+            left: "NORMAL MODE"
+            right: "Minimal"

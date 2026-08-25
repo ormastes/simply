@@ -1,0 +1,211 @@
+# 16. Error Handling - Result<T, GpuError> Patterns
+#
+# Demonstrates error handling for GPU operations in Simple.
+# All GPU API calls return Result<T, GpuError>.
+# The ? operator propagates errors to the caller.
+#
+# C/CUDA equivalent:
+#   cudaError_t err = cudaMalloc(&d_a, size);
+#   if (err != cudaSuccess) { ... handle error ... }
+#
+# Simple equivalent:
+#   val d_a = gpu_alloc(size)?   // ? propagates on Err
+
+use std.gpu.*
+
+# ============================================================================
+# Pattern 1: Basic error propagation with ?
+# ============================================================================
+
+fn allocate_and_fill(n: i64, value: f32) -> Result<GpuPtr, GpuError>:
+    # Each call can fail -- ? propagates immediately on error
+    val ptr = gpu_alloc(n * 4)?
+    val data = make_constant(n, value)
+    gpu_upload_f32(ptr, data)?
+    Ok(ptr)
+
+fn make_constant(n: i64, value: f32) -> [f32]:
+    var data: [f32] = []
+    for i in 0..n:
+        data = data + [value]
+    data
+
+# ============================================================================
+# Pattern 2: Explicit match for recovery
+# ============================================================================
+
+fn try_allocate_with_fallback(preferred_size: i64, fallback_size: i64) -> Result<GpuPtr, GpuError>:
+    # Try the preferred size first
+    val result = gpu_alloc(preferred_size)
+    match result:
+        case Ok(ptr):
+            print "  Allocated preferred size: {preferred_size} bytes"
+            Ok(ptr)
+        case Err(e):
+            print "  Preferred size failed ({e.message}), trying fallback..."
+            val fallback = gpu_alloc(fallback_size)?
+            print "  Allocated fallback size: {fallback_size} bytes"
+            Ok(fallback)
+
+# ============================================================================
+# Pattern 3: Cleanup on error (manual RAII)
+# ============================================================================
+
+fn safe_vector_add(host_a: [f32], host_b: [f32]) -> Result<[f32], GpuError>:
+    val n = host_a.len()
+    val bytes = n * 4
+
+    # Allocate all three buffers
+    val d_a = gpu_alloc(bytes)?
+    val d_b = gpu_alloc(bytes)?
+    val d_c = gpu_alloc(bytes)?
+
+    # Upload data
+    gpu_upload_f32(d_a, host_a)?
+    gpu_upload_f32(d_b, host_b)?
+
+    # Launch kernel (1D for simplicity)
+    val block_size = 256
+    val grid_size = (n + block_size - 1) / block_size
+    vector_add_1d<<<grid: (grid_size, 1, 1), block: (block_size, 1, 1)>>>(d_a, d_b, d_c, n)
+
+    # Synchronise and download
+    gpu_sync()?
+    val result = gpu_download_f32(d_c, n)?
+
+    # Free device memory
+    gpu_free(d_a)?
+    gpu_free(d_b)?
+    gpu_free(d_c)?
+
+    Ok(result)
+
+@gpu_kernel
+fn vector_add_1d(a: GpuPtr, b: GpuPtr, c: GpuPtr, n: i64):
+    val i = gpu_block_id_x() * gpu_block_dim_x() + gpu_local_id_x()
+    if i < n:
+        val va = gpu_load_f32(a, i)
+        val vb = gpu_load_f32(b, i)
+        gpu_store_f32(c, i, va + vb)
+
+# ============================================================================
+# Pattern 4: Wrapping raw error codes
+# ============================================================================
+
+fn check_device_available() -> Result<i64, GpuError>:
+    val count = gpu_device_count()
+    if count <= 0:
+        return Err(GpuError(code: -1, message: "No GPU devices found"))
+    Ok(count)
+
+# ============================================================================
+# Pattern 5: Composing multiple fallible operations
+# ============================================================================
+
+fn full_pipeline(data: [f32]) -> Result<f32, GpuError>:
+    # Chain of operations, any of which can fail
+    val device_count = check_device_available()?
+    print "  Devices available: {device_count}"
+
+    gpu_init()?
+    gpu_set_device(0)?
+
+    val d_input = allocate_and_fill(data.len(), 0.0)?
+    gpu_upload_f32(d_input, data)?
+
+    # Compute sum on CPU as demo (real code would launch a reduction kernel)
+    var total: f32 = 0.0
+    for i in 0..data.len():
+        total = total + data[i]
+
+    gpu_free(d_input)?
+    Ok(total)
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn bring_up_device() -> Result<(), GpuError>:
+    # cuInit + cuCtxCreate. Everything below needs a live context, and every
+    # step of that bring-up is itself fallible.
+    gpu_init()?
+    gpu_set_device(0)?
+    Ok(())
+
+fn main():
+    print "=== Error Handling Patterns (Simple GPU) ==="
+    print ""
+
+    # --- Pattern 0: bring the device up, report (not crash) if it is absent ---
+    print "Pattern 0: driver bring-up"
+    match bring_up_device():
+        case Ok(_):
+            print "  Device 0 ready ({gpu_device_count()} device(s) visible)"
+        case Err(e):
+            print "  No usable device: {e.message} - later patterns will report errors"
+    print ""
+
+    # --- Pattern 1: basic ? propagation ---
+    print "Pattern 1: basic ? propagation"
+    val r1 = allocate_and_fill(1024, 3.14)
+    match r1:
+        case Ok(ptr):
+            print "  Success: allocated and filled 1024 f32s"
+            val freed = gpu_free(ptr)
+            match freed:
+                case Ok(_): pass_dn
+                case Err(e): print "  Warning: free failed: {e.message}"
+        case Err(e):
+            print "  Error: {e.message}"
+    print ""
+
+    # --- Pattern 2: fallback allocation ---
+    print "Pattern 2: fallback allocation"
+    val huge = 1024 * 1024 * 1024 * 16   # 16 GB
+    val small = 1024 * 1024               # 1 MB
+    val r2 = try_allocate_with_fallback(huge, small)
+    match r2:
+        case Ok(ptr):
+            print "  Success."
+            val freed = gpu_free(ptr)
+            match freed:
+                case Ok(_): pass_dn
+                case Err(e): print "  Warning: free failed: {e.message}"
+        case Err(e):
+            print "  Both allocations failed: {e.message}"
+    print ""
+
+    # --- Pattern 3: safe vector add ---
+    print "Pattern 3: safe vector add with cleanup"
+    val a = [1.0, 2.0, 3.0, 4.0]
+    val b = [10.0, 20.0, 30.0, 40.0]
+    val r3 = safe_vector_add(a, b)
+    match r3:
+        case Ok(c):
+            print "  Result: {c}"
+        case Err(e):
+            print "  GPU error: {e.message}"
+    print ""
+
+    # --- Pattern 4: custom error ---
+    print "Pattern 4: custom error wrapping"
+    val r4 = check_device_available()
+    match r4:
+        case Ok(count):
+            print "  Found {count} device(s)."
+        case Err(e):
+            print "  Error: {e.message}"
+    print ""
+
+    # --- Pattern 5: pipeline composition ---
+    print "Pattern 5: composing fallible operations"
+    val data = [1.0, 2.0, 3.0, 4.0, 5.0]
+    val r5 = full_pipeline(data)
+    match r5:
+        case Ok(total):
+            print "  Pipeline result: {total}"
+        case Err(e):
+            print "  Pipeline failed: {e.message}"
+    print ""
+
+    print "=== Done ==="

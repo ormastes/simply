@@ -1,0 +1,114 @@
+# @cover src/lanes/market.spl 80%
+"""
+# Market Lane
+
+Marketplace listings and orders flow through the ONE shared gate: session ->
+rbac -> validation -> idempotency. This spec pins the accepted path plus each
+fail-closed reason, and the lane's own domain operations (commission,
+stock depletion, payout).
+"""
+
+use std.spec
+use lanes.market.{Listing, MarketOrder, validate_listing, can_fill, fill_order, commission, seller_payout, submit_listing_write}
+use framework.guarded.{Tenant, Actor, Session}
+use std.nogc_sync_mut.enterprise_store.store.{EnterpriseStore, store_open}
+use std.io_runtime.{file_exists, file_delete, dir_create_all}
+
+# Each scenario opens its own durable store: the interpreter backend caches
+# open databases per path in-process, so every it-block gets a fresh path.
+fn fresh_store(name: text) -> EnterpriseStore:
+    dir_create_all("build/test-artifacts")
+    val db = "build/test-artifacts/erp_market_lane_" + name + ".db"
+    if file_exists(db):
+        file_delete(db)
+    store_open(db)
+
+describe "Market lane — guarded writes":
+    it "accepts a valid write through the gate":
+        val tenant = Tenant { id: "t1", name: "Demo" }
+        val user = Actor { id: 1, name: "Mina", role: "operator" }
+        val session = Session { token: "sess-1", user_id: 1, tenant_id: "t1", active: true }
+        val listing = Listing { id: 1, seller_id: 1, sku: "sku-1", title: "Widget", price: 500, stock: 10, status: "active" }
+        val store = fresh_store("s1")
+        val r = submit_listing_write(session, tenant, user, listing, "market-1", store)
+        expect(r.ok).to_equal(true)
+        expect(r.reason).to_equal("accepted")
+        expect(r.ledger_key).to_equal("market-1")
+
+    it "denies an inactive session":
+        val tenant = Tenant { id: "t1", name: "Demo" }
+        val user = Actor { id: 1, name: "Mina", role: "operator" }
+        val session = Session { token: "sess-1", user_id: 1, tenant_id: "t1", active: false }
+        val listing = Listing { id: 1, seller_id: 1, sku: "sku-1", title: "Widget", price: 500, stock: 10, status: "active" }
+        val store = fresh_store("s2")
+        val r = submit_listing_write(session, tenant, user, listing, "market-1", store)
+        assert_false(r.ok)
+        expect(r.reason).to_equal("invalid-session")
+
+    it "forbids an auditor from writing":
+        val tenant = Tenant { id: "t1", name: "Demo" }
+        val user = Actor { id: 3, name: "Jae", role: "auditor" }
+        val session = Session { token: "sess-3", user_id: 3, tenant_id: "t1", active: true }
+        val listing = Listing { id: 1, seller_id: 1, sku: "sku-1", title: "Widget", price: 500, stock: 10, status: "active" }
+        val store = fresh_store("s3")
+        val r = submit_listing_write(session, tenant, user, listing, "market-1", store)
+        assert_false(r.ok)
+        expect(r.reason).to_equal("forbidden")
+
+    it "rejects an invalid record":
+        val tenant = Tenant { id: "t1", name: "Demo" }
+        val user = Actor { id: 1, name: "Mina", role: "operator" }
+        val session = Session { token: "sess-1", user_id: 1, tenant_id: "t1", active: true }
+        val listing = Listing { id: 0, seller_id: 0, sku: "", title: "", price: -5, stock: -1, status: "active" }
+        val store = fresh_store("s4")
+        val r = submit_listing_write(session, tenant, user, listing, "market-1", store)
+        assert_false(r.ok)
+        expect(r.reason).to_equal("invalid-record")
+
+    it "rejects a duplicate idempotency key":
+        val tenant = Tenant { id: "t1", name: "Demo" }
+        val user = Actor { id: 1, name: "Mina", role: "operator" }
+        val session = Session { token: "sess-1", user_id: 1, tenant_id: "t1", active: true }
+        val listing = Listing { id: 1, seller_id: 1, sku: "sku-1", title: "Widget", price: 500, stock: 10, status: "active" }
+        val store = fresh_store("s5")
+        submit_listing_write(session, tenant, user, listing, "market-1", store)
+        val r = submit_listing_write(session, tenant, user, listing, "market-1", store)
+        assert_false(r.ok)
+        expect(r.reason).to_equal("duplicate-key")
+
+describe "Market lane — domain operations":
+    it "validates a well-formed listing":
+        val listing = Listing { id: 2, seller_id: 2, sku: "sku-2", title: "Gadget", price: 900, stock: 5, status: "active" }
+        assert_true(validate_listing(listing))
+
+    it "rejects a malformed listing":
+        val listing = Listing { id: 0, seller_id: 1, sku: "sku-2", title: "Gadget", price: 900, stock: 5, status: "active" }
+        assert_false(validate_listing(listing))
+
+    it "computes commission from price, qty and basis points":
+        expect(commission(1000, 2, 500)).to_equal(100)
+
+    it "computes seller payout net of commission":
+        expect(seller_payout(1000, 2, 500)).to_equal(1900)
+
+    it "fills an order and depletes stock without closing when stock remains":
+        val listing = Listing { id: 1, seller_id: 1, sku: "sku-1", title: "Widget", price: 500, stock: 10, status: "active" }
+        val order = MarketOrder { id: 1, listing_id: 1, buyer_id: 9, qty: 4, paid: true }
+        assert_true(can_fill(listing, order))
+        val filled = fill_order(listing, order)
+        expect(filled.stock).to_equal(6)
+        expect(filled.status).to_equal("active")
+
+    it "closes the listing once stock hits zero":
+        val listing = Listing { id: 1, seller_id: 1, sku: "sku-1", title: "Widget", price: 500, stock: 4, status: "active" }
+        val order = MarketOrder { id: 1, listing_id: 1, buyer_id: 9, qty: 4, paid: true }
+        val filled = fill_order(listing, order)
+        expect(filled.stock).to_equal(0)
+        expect(filled.status).to_equal("closed")
+
+    it "refuses to fill an order exceeding stock or an unpaid order":
+        val listing = Listing { id: 1, seller_id: 1, sku: "sku-1", title: "Widget", price: 500, stock: 3, status: "active" }
+        val too_big = MarketOrder { id: 1, listing_id: 1, buyer_id: 9, qty: 4, paid: true }
+        assert_false(can_fill(listing, too_big))
+        val unpaid = MarketOrder { id: 2, listing_id: 1, buyer_id: 9, qty: 2, paid: false }
+        assert_false(can_fill(listing, unpaid))

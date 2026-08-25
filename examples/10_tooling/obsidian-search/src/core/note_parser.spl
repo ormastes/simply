@@ -1,0 +1,328 @@
+# Note parser — parses Obsidian markdown files
+#
+# Extracts frontmatter, wikilinks, tags, tasks, and heading-based chunks
+# from Obsidian-flavored markdown files.
+
+use src.util.json_helpers.{safe_substr}
+
+# --- Data structures ---
+
+struct NoteMeta:
+    path: text
+    title: text
+    aliases: [text]
+    tags: [text]
+    frontmatter_raw: text
+
+struct WikiLink:
+    target: text
+    alias: text
+
+struct Task:
+    status: text
+    text_content: text
+    line_num: i64
+
+struct Chunk:
+    chunk_type: text
+    heading_path: text
+    text_content: text
+
+# --- Frontmatter parsing ---
+
+/**
+Parse YAML frontmatter from Obsidian markdown content.
+Extracts title, aliases, and tags from the `---` fenced block.
+Falls back to first heading if no title in frontmatter.
+
+```sdoctest
+>>> val md = "---\ntitle: My Note\ntags: [a, b]\naliases: [mn]\n---\n# Body"
+>>> val meta = parse_frontmatter(md)
+>>> meta.title
+My Note
+>>> meta.tags
+[a, b]
+>>> meta.aliases
+[mn]
+```
+*/
+fn parse_frontmatter(content: text) -> NoteMeta:
+    var title = ""
+    var aliases: [text] = []
+    var tags: [text] = []
+    var fm_lines: [text] = []
+    var in_fm = false
+    var fm_started = false
+    var line_num = 0
+
+    val lines = content.split("\n")
+    for line in lines:
+        val trimmed = line.trim()
+        if line_num == 0 and trimmed == "---":
+            in_fm = true
+            fm_started = true
+            line_num = line_num + 1
+            continue
+        if in_fm and trimmed == "---":
+            in_fm = false
+            line_num = line_num + 1
+            continue
+        if in_fm:
+            fm_lines.push(trimmed)
+            if trimmed.starts_with("title:"):
+                title = extract_fm_value(trimmed, "title:")
+            elif trimmed.starts_with("aliases:"):
+                val val_str = extract_fm_value(trimmed, "aliases:")
+                aliases = parse_fm_list(val_str)
+            elif trimmed.starts_with("tags:"):
+                val val_str = extract_fm_value(trimmed, "tags:")
+                tags = parse_fm_list(val_str)
+        line_num = line_num + 1
+
+    # If no title from frontmatter, extract from first heading
+    if title == "":
+        title = extract_first_heading(content)
+
+    NoteMeta(
+        path: "",
+        title: title,
+        aliases: aliases,
+        tags: tags,
+        frontmatter_raw: fm_lines.join("\n")
+    )
+
+fn extract_fm_value(line: text, prefix: text) -> text:
+    val after = safe_substr(line, prefix.len(), line.len())
+    var result = after.trim()
+    # Remove surrounding quotes
+    if result.starts_with("\"") and result.ends_with("\""):
+        result = safe_substr(result, 1, result.len() - 1)
+    result
+
+fn parse_fm_list(value: text) -> [text]:
+    var result: [text] = []
+    var clean = value.trim()
+    # Handle [item1, item2] format
+    if clean.starts_with("[") and clean.ends_with("]"):
+        clean = safe_substr(clean, 1, clean.len() - 1)
+    val parts = clean.split(",")
+    for part in parts:
+        var trimmed = part.trim()
+        # Remove surrounding quotes
+        if trimmed.starts_with("\"") and trimmed.ends_with("\""):
+            trimmed = safe_substr(trimmed, 1, trimmed.len() - 1)
+        if trimmed != "":
+            result.push(trimmed)
+    result
+
+fn extract_first_heading(content: text) -> text:
+    val lines = content.split("\n")
+    for line in lines:
+        val trimmed = line.trim()
+        if trimmed.starts_with("# "):
+            return safe_substr(trimmed, 2, trimmed.len())
+    ""
+
+# --- Wikilink extraction ---
+
+/**
+Extract all `[[target]]` and `[[target|alias]]` wikilinks from content.
+
+```sdoctest
+>>> val links = extract_wikilinks("See [[api-design]] and [[meeting|Mon standup]]")
+>>> links.len()
+2
+>>> links[0].target
+api-design
+>>> links[1].alias
+Mon standup
+```
+*/
+fn extract_wikilinks(content: text) -> [WikiLink]:
+    var links: [WikiLink] = []
+    var i = 0
+    val content_len = content.len()
+
+    while i < content_len - 1:
+        val ch = safe_substr(content, i, i + 1)
+        val next_ch = safe_substr(content, i + 1, i + 2)
+        if ch == "[" and next_ch == "[":
+            # Found opening [[
+            val link_start = i + 2
+            var link_end = -1
+            var j = link_start
+            while j < content_len - 1:
+                val c1 = safe_substr(content, j, j + 1)
+                val c2 = safe_substr(content, j + 1, j + 2)
+                if c1 == "]" and c2 == "]":
+                    link_end = j
+                    break
+                j = j + 1
+            if link_end > link_start:
+                val link_text = safe_substr(content, link_start, link_end)
+                val link = parse_wikilink_text(link_text)
+                links.push(link)
+                i = link_end + 2
+            else:
+                i = i + 1
+        else:
+            i = i + 1
+    links
+
+fn parse_wikilink_text(link_text: text) -> WikiLink:
+    val pipe_idx_result = link_text.index_of("|")
+    var pipe_idx = -1
+    match pipe_idx_result:
+        Some(i): pipe_idx = i
+        nil: pipe_idx = -1
+    if pipe_idx >= 0:
+        val target = safe_substr(link_text, 0, pipe_idx)
+        val alias = safe_substr(link_text, pipe_idx + 1, link_text.len())
+        WikiLink(target: target, alias: alias)
+    else:
+        WikiLink(target: link_text, alias: "")
+
+# --- Tag extraction ---
+
+/**
+Extract inline `#tag` patterns from content.
+Ignores heading markers (`# `, `## `) — only captures tags preceded by whitespace or SOL.
+
+```sdoctest
+>>> val tags = extract_tags("# Heading\nSome text #meeting #project")
+>>> tags.len()
+2
+>>> tags[0]
+meeting
+>>> tags[1]
+project
+```
+*/
+fn extract_tags(content: text) -> [text]:
+    var tags: [text] = []
+    var i = 0
+    val content_len = content.len()
+    var prev_ch = " "
+
+    while i < content_len:
+        val ch = safe_substr(content, i, i + 1)
+        if ch == "#" and (prev_ch == " " or prev_ch == "\n" or i == 0):
+            # Check it's not a heading
+            val next_i = i + 1
+            if next_i < content_len:
+                val next_ch = safe_substr(content, next_i, next_i + 1)
+                if next_ch != " " and next_ch != "#":
+                    # Extract tag
+                    var tag_chars: [text] = []
+                    var k = next_i
+                    while k < content_len:
+                        val tc = safe_substr(content, k, k + 1)
+                        if tc == " " or tc == "\n" or tc == "\r" or tc == "," or tc == "]":
+                            break
+                        tag_chars.push(tc)
+                        k = k + 1
+                    val tag = tag_chars.join("")
+                    if tag != "":
+                        tags.push(tag)
+                    i = k
+                    prev_ch = " "
+                    continue
+        prev_ch = ch
+        i = i + 1
+    tags
+
+# --- Task extraction ---
+
+/**
+Extract checkbox tasks (`- [ ]` open, `- [x]` done) from content.
+
+```sdoctest
+>>> val tasks = extract_tasks("- [ ] Buy milk\n- [x] Write docs")
+>>> tasks.len()
+2
+>>> tasks[0].status
+open
+>>> tasks[0].text_content
+Buy milk
+>>> tasks[1].status
+done
+```
+*/
+fn extract_tasks(content: text) -> [Task]:
+    var tasks: [Task] = []
+    val lines = content.split("\n")
+    var line_num = 0
+    for line in lines:
+        val trimmed = line.trim()
+        if trimmed.starts_with("- [ ] "):
+            val task_text = safe_substr(trimmed, 6, trimmed.len())
+            tasks.push(Task(status: "open", text_content: task_text, line_num: line_num))
+        elif trimmed.starts_with("- [x] "):
+            val task_text = safe_substr(trimmed, 6, trimmed.len())
+            tasks.push(Task(status: "done", text_content: task_text, line_num: line_num))
+        line_num = line_num + 1
+    tasks
+
+# --- Chunk by heading ---
+
+fn chunk_by_heading(content: text) -> [Chunk]:
+    var chunks: [Chunk] = []
+    val lines = content.split("\n")
+    var current_heading = ""
+    var current_lines: [text] = []
+    var heading_stack: [text] = []
+
+    for line in lines:
+        val trimmed = line.trim()
+        var heading_level = detect_heading_level(trimmed)
+        if heading_level > 0:
+            # Flush current chunk
+            if current_lines.len() > 0:
+                val chunk_text = current_lines.join("\n")
+                if chunk_text.trim() != "":
+                    val chunk_type = if current_heading == "": "title" else: "heading"
+                    chunks.push(Chunk(
+                        chunk_type: chunk_type,
+                        heading_path: current_heading,
+                        text_content: chunk_text
+                    ))
+                current_lines = []
+
+            # Update heading path
+            val heading_text = safe_substr(trimmed, heading_level + 1, trimmed.len())
+            # Trim heading stack to current level
+            while heading_stack.len() >= heading_level:
+                heading_stack.pop()
+            heading_stack.push(heading_text)
+            current_heading = heading_stack.join(" > ")
+            current_lines.push(line)
+        else:
+            current_lines.push(line)
+
+    # Flush last chunk
+    if current_lines.len() > 0:
+        val chunk_text = current_lines.join("\n")
+        if chunk_text.trim() != "":
+            val chunk_type = if current_heading == "": "title" else: "heading"
+            chunks.push(Chunk(
+                chunk_type: chunk_type,
+                heading_path: current_heading,
+                text_content: chunk_text
+            ))
+
+    chunks
+
+fn detect_heading_level(line: text) -> i64:
+    if line.starts_with("# "):
+        return 1
+    if line.starts_with("## "):
+        return 2
+    if line.starts_with("### "):
+        return 3
+    if line.starts_with("#### "):
+        return 4
+    if line.starts_with("##### "):
+        return 5
+    if line.starts_with("###### "):
+        return 6
+    0

@@ -1,0 +1,44 @@
+app:
+    title: "Menu Tooltip Demo"
+    theme: glass_dark
+
+layout:
+    type: vbox
+    children:
+        menu:
+            type: menubar
+            items:
+                0:
+                    label: "File"
+                1:
+                    type: separator
+                2:
+                    label: "Edit"
+                    children:
+                        0:
+                            label: "Cut"
+                            action: "cut"
+                        1:
+                            label: "Copy"
+                            action: "copy"
+                        2:
+                            label: "Paste"
+                            action: "paste"
+                3:
+                    type: separator
+                4:
+                    label: "View"
+                5:
+                    label: "Help"
+        content:
+            type: panel
+            title: "Main"
+            children:
+                submit_btn:
+                    type: button
+                    label: "Submit"
+                    action: "submit"
+                submit_tip:
+                    type: tooltip
+                    content: "Click to submit"
+                    target: "submit_btn"

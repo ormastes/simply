@@ -1,0 +1,24 @@
+use logic_target_core.*
+
+fn rv32_target_profile_cases_selftest() -> i32:
+    if _rv32_target_valid_profile(1, 2, 8, 1, 4) != 0:
+        return 1
+    if _rv32_target_valid_profile(2, 8, 8, 1, 4) != 0:
+        return 1
+    if _rv32_target_valid_profile(1, 8, 8, 1, 4) == 0:
+        return 1
+    if _rv32_target_valid_profile(2, 1, 1, 1, 4) == 0:
+        return 1
+    if _rv32_target_valid_profile(2, 8, 8, 1, 1) == 0:
+        return 1
+    if _rv32_target_valid_profile(99, 8, 8, 1, 4) == 0:
+        return 1
+    if _rv32_target_valid_pcie_vendor(1, 0x10EE) != 0:
+        return 1
+    if _rv32_target_valid_pcie_vendor(2, 0x10EE) != 0:
+        return 1
+    if _rv32_target_valid_pcie_vendor(2, 0x1B36) == 0:
+        return 1
+    if _rv32_target_valid_pcie_vendor(99, 0x10EE) == 0:
+        return 1
+    0

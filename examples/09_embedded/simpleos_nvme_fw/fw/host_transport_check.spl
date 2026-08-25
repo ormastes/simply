@@ -1,0 +1,33 @@
+"""
+host_transport_check — segmented PRP host transport floor (gap-closure P4).
+
+Run: bin/simple run examples/09_embedded/simpleos_nvme_fw/fw/host_transport_check.spl
+"""
+
+use nvme_types.*
+use hil.*
+use hil_command.*
+
+fn main():
+    var fail: i64 = 0
+    var h: Hil = hil_new()
+
+    h.submit(cmd_make(1, OP_WRITE, 70, 4, prp_pack(0x30, 0xC0)))
+    h.run()
+    val w: NvmeCpl = h.reap()
+    fail = fail + expect_eq(w.status, SC_SUCCESS, "segmented PRP write completes")
+
+    h.submit(cmd_make(2, OP_READ, 70, 1, 0))
+    h.submit(cmd_make(3, OP_READ, 71, 1, 0))
+    h.submit(cmd_make(4, OP_READ, 72, 1, 0))
+    h.submit(cmd_make(5, OP_READ, 73, 1, 0))
+    h.run()
+    fail = fail + expect_eq(h.reap().data, 0x30, "first PRP segment byte 0")
+    fail = fail + expect_eq(h.reap().data, 0x31, "first PRP segment byte 1")
+    fail = fail + expect_eq(h.reap().data, 0xC0, "second PRP segment byte 0")
+    fail = fail + expect_eq(h.reap().data, 0xC1, "second PRP segment byte 1")
+
+    if fail == 0:
+        print "HOST TRANSPORT OK"
+    else:
+        print "HOST TRANSPORT FAIL ({fail})"

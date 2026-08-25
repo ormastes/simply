@@ -1,0 +1,531 @@
+#![allow(unnamed_duplicate_typed_args)]
+# Korean Stock MCP - KRX Data Source
+#
+# Direct HTTP calls to KRX (Korea Exchange) data API.
+# Same endpoints that pykrx uses internally.
+#
+# Base URL: http://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd
+# Method: POST with form-encoded params
+# Response: JSON
+
+val KRX_API_URL = "http://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
+
+# --- Ticker list cache ---
+var TICKER_CACHE_KOSPI: [text] = []
+var TICKER_CACHE_KOSDAQ: [text] = []
+var TICKER_CACHE_LOADED = false
+
+# --- Helper: Build KRX form body ---
+
+fn krx_form_body(bld: text, extra_params: text) -> text:
+    var body = "bld=" + bld
+    if extra_params != "":
+        body = body + "&" + extra_params
+    body
+
+fn krx_post(bld: text, params: text) -> text:
+    val body = krx_form_body(bld, params)
+    val headers: [text] = [
+        "Content-Type: application/x-www-form-urlencoded",
+        "User-Agent: Mozilla/5.0",
+        "Referer: http://data.krx.co.kr/contents/MDC/MDI/mdiStat/tabs/MDC_STAT_STD.cmd"
+    ]
+    var status: i64 = 0
+    var resp_body = ""
+    var error = ""
+    (status, resp_body, error) = rt_http_request("POST", KRX_API_URL, headers, body)
+    if status < 200 or status >= 300:
+        if error != "":
+            return "ERROR: KRX API request failed: " + error
+        return "ERROR: KRX API returned status " + str(status)
+    resp_body
+
+# --- Get today's date in YYYYMMDD format ---
+
+fn get_today_yyyymmdd() -> text:
+    var out = ""
+    var err = ""
+    var rc: i64 = 0
+    (out, err, rc) = rt_process_run("/bin/sh", ["-c", "date +%Y%m%d"])
+    out.trim()
+
+fn get_days_ago_yyyymmdd(n: i64) -> text:
+    var out = ""
+    var err = ""
+    var rc: i64 = 0
+    (out, err, rc) = rt_process_run("/bin/sh", ["-c", "date -d '" + str(n) + " days ago' +%Y%m%d"])
+    out.trim()
+
+fn get_current_year() -> text:
+    var out = ""
+    var err = ""
+    var rc: i64 = 0
+    (out, err, rc) = rt_process_run("/bin/sh", ["-c", "date +%Y"])
+    out.trim()
+
+# ============================================================================
+# Stock Price
+# ============================================================================
+
+fn krx_get_stock_price(ticker: text) -> text:
+    val today = get_today_yyyymmdd()
+    val params = "trdDd=" + today + "&mktId=ALL&isuCd=&isuCdS=&isuCdD=&strtDd=" + today + "&endDd=" + today + "&adjStkPrc_check=Y"
+    val resp = krx_post("dbms/MDC/STAT/standard/MDCSTAT01501", params)
+    if resp.starts_with("ERROR"):
+        return resp
+
+    # Parse response - look for the ticker in OutBlock_1
+    val block = extract_field(resp, "OutBlock_1")
+    if block == "":
+        # Try to find ticker data in the response directly
+        val isu_search = Q() + "ISU_SRT_CD" + Q() + ":" + Q() + ticker + Q()
+        val found_result = resp.index_of(isu_search)
+        var found = false
+        match found_result:
+            Some(i): found = true
+            nil: found = false
+        if not found:
+            return "No data found for ticker: " + ticker
+
+    # Extract fields for this ticker from the JSON response
+    val price = find_ticker_field(resp, ticker, "TDD_CLSPRC")
+    val change = find_ticker_field(resp, ticker, "CMPPREVDD_PRC")
+    val change_pct = find_ticker_field(resp, ticker, "FLUC_RT")
+    val volume = find_ticker_field(resp, ticker, "ACC_TRDVOL")
+    val name = find_ticker_field(resp, ticker, "ISU_ABBRV")
+    val open_price = find_ticker_field(resp, ticker, "TDD_OPNPRC")
+    val high = find_ticker_field(resp, ticker, "TDD_HGPRC")
+    val low = find_ticker_field(resp, ticker, "TDD_LWPRC")
+
+    if price == "":
+        return "No price data found for ticker: " + ticker
+
+    var output: [text] = []
+    output.push("Stock: " + name + " (" + ticker + ")")
+    output.push("Price: " + format_krw(price) + " KRW")
+    output.push("Change: " + change + " (" + change_pct + "%)")
+    output.push("Open: " + format_krw(open_price))
+    output.push("High: " + format_krw(high))
+    output.push("Low: " + format_krw(low))
+    output.push("Volume: " + format_volume(volume))
+    output.push("Date: " + today)
+    output.join("\n")
+
+# Helper: find a field value for a specific ticker in KRX JSON response
+fn find_ticker_field(json: text, ticker: text, field_name: text) -> text:
+    # KRX returns array of objects in OutBlock_1
+    # Find the object containing this ticker, then extract the field
+    val ticker_search = Q() + "ISU_SRT_CD" + Q() + ":" + Q() + ticker + Q()
+    val idx_result = json.index_of(ticker_search)
+    var idx = -1
+    match idx_result:
+        Some(i): idx = i
+        nil: return ""
+    if idx < 0:
+        return ""
+
+    # Find the start of this object (look backwards for {)
+    var obj_start = idx
+    while obj_start > 0:
+        val ch = mcp_char_at(json, obj_start)
+        if ch == "{":
+            break
+        obj_start = obj_start - 1
+
+    # Find the end of this object (look forwards for })
+    var obj_end = idx
+    var depth = 0
+    while obj_end < json.len():
+        val ch = mcp_char_at(json, obj_end)
+        if ch == "{":
+            depth = depth + 1
+        elif ch == "}":
+            depth = depth - 1
+            if depth == 0:
+                obj_end = obj_end + 1
+                break
+        obj_end = obj_end + 1
+
+    val obj_str = mcp_substr(json, obj_start, obj_end)
+    extract_field(obj_str, field_name)
+
+# ============================================================================
+# OHLCV History
+# ============================================================================
+
+fn krx_get_ohlcv(ticker: text, days: i64, market: text) -> text:
+    val end_date = get_today_yyyymmdd()
+    val start_date = get_days_ago_yyyymmdd(days)
+    var mkt_id = "STK"
+    if market == "KOSDAQ":
+        mkt_id = "KSQ"
+    val params = "trdDd=" + end_date + "&mktId=" + mkt_id + "&strtDd=" + start_date + "&endDd=" + end_date + "&isuCd=&isuCdS=&adjStkPrc_check=Y"
+    val resp = krx_post("dbms/MDC/STAT/standard/MDCSTAT01501", params)
+    if resp.starts_with("ERROR"):
+        return resp
+
+    # Parse the response for this ticker's OHLCV data
+    var output: [text] = []
+    output.push("OHLCV History for " + ticker + " (last " + str(days) + " days)")
+    output.push("Date | Open | High | Low | Close | Volume")
+    output.push("-----|------|------|-----|-------|-------")
+
+    # Find all entries for this ticker
+    var search_pos = 0
+    val ticker_pattern = Q() + "ISU_SRT_CD" + Q() + ":" + Q() + ticker + Q()
+    var entry_count = 0
+    while search_pos < resp.len() and entry_count < days:
+        val remaining = mcp_substr(resp, search_pos, resp.len())
+        val found_result = remaining.index_of(ticker_pattern)
+        var found_idx = -1
+        match found_result:
+            Some(i): found_idx = i
+            nil: break
+        if found_idx < 0:
+            break
+
+        val abs_pos = search_pos + found_idx
+
+        # Extract object around this position
+        var obj_start = abs_pos
+        while obj_start > 0:
+            if mcp_char_at(resp, obj_start) == "{":
+                break
+            obj_start = obj_start - 1
+        var obj_end = abs_pos
+        var depth = 0
+        while obj_end < resp.len():
+            val ch = mcp_char_at(resp, obj_end)
+            if ch == "{":
+                depth = depth + 1
+            elif ch == "}":
+                depth = depth - 1
+                if depth == 0:
+                    obj_end = obj_end + 1
+                    break
+            obj_end = obj_end + 1
+
+        val obj = mcp_substr(resp, obj_start, obj_end)
+        val date = extract_field(obj, "TRD_DD")
+        val open_p = extract_field(obj, "TDD_OPNPRC")
+        val high_p = extract_field(obj, "TDD_HGPRC")
+        val low_p = extract_field(obj, "TDD_LWPRC")
+        val close_p = extract_field(obj, "TDD_CLSPRC")
+        val vol = extract_field(obj, "ACC_TRDVOL")
+
+        if date != "":
+            output.push(date + " | " + open_p + " | " + high_p + " | " + low_p + " | " + close_p + " | " + vol)
+            entry_count = entry_count + 1
+
+        search_pos = obj_end
+
+    if entry_count == 0:
+        output.push("(No data found for ticker " + ticker + ")")
+
+    output.join("\n")
+
+# ============================================================================
+# Stock Search
+# ============================================================================
+
+fn krx_search_stock(query: text) -> text:
+    # Use the ticker list endpoint to get all stocks, then filter
+    val today = get_today_yyyymmdd()
+    val params = "trdDd=" + today + "&mktId=ALL"
+    val resp = krx_post("dbms/MDC/STAT/standard/MDCSTAT01901", params)
+    if resp.starts_with("ERROR"):
+        return resp
+
+    val query_lower = query.to_lower()
+    var results: [text] = []
+    results.push("Search results for: " + query)
+    results.push("Ticker | Name | Market")
+    results.push("-------|------|-------")
+
+    # Search through the response for matching tickers or names
+    var search_pos = 0
+    var count = 0
+    val name_key = Q() + "ISU_ABBRV" + Q()
+    while search_pos < resp.len() and count < 50:
+        val remaining = mcp_substr(resp, search_pos, resp.len())
+        val found_result = remaining.index_of(name_key)
+        var found_idx = -1
+        match found_result:
+            Some(i): found_idx = i
+            nil: break
+        if found_idx < 0:
+            break
+
+        val abs_pos = search_pos + found_idx
+        var obj_start = abs_pos
+        while obj_start > 0:
+            if mcp_char_at(resp, obj_start) == "{":
+                break
+            obj_start = obj_start - 1
+        var obj_end = abs_pos
+        var depth = 0
+        while obj_end < resp.len():
+            val ch = mcp_char_at(resp, obj_end)
+            if ch == "{":
+                depth = depth + 1
+            elif ch == "}":
+                depth = depth - 1
+                if depth == 0:
+                    obj_end = obj_end + 1
+                    break
+            obj_end = obj_end + 1
+
+        val obj = mcp_substr(resp, obj_start, obj_end)
+        val name = extract_field(obj, "ISU_ABBRV")
+        val ticker = extract_field(obj, "ISU_SRT_CD")
+        val mkt = extract_field(obj, "MKT_TP_NM")
+
+        val name_lower = name.to_lower()
+        val ticker_lower = ticker.to_lower()
+        if (name_lower.contains(query_lower) or ticker_lower.contains(query_lower)):
+            results.push(ticker + " | " + name + " | " + mkt)
+            count = count + 1
+
+        search_pos = obj_end
+
+    if count == 0:
+        results.push("(No matching stocks found)")
+    else:
+        results.push("Found " + str(count) + " result(s)")
+
+    results.join("\n")
+
+# ============================================================================
+# Stock List
+# ============================================================================
+
+fn krx_get_stock_list(market: text) -> text:
+    val today = get_today_yyyymmdd()
+    var mkt_param = "ALL"
+    if market == "KOSPI":
+        mkt_param = "STK"
+    elif market == "KOSDAQ":
+        mkt_param = "KSQ"
+    val params = "trdDd=" + today + "&mktId=" + mkt_param
+    val resp = krx_post("dbms/MDC/STAT/standard/MDCSTAT01901", params)
+    if resp.starts_with("ERROR"):
+        return resp
+
+    var results: [text] = []
+    results.push("Stock List (" + market + ")")
+    results.push("Ticker | Name | Market | Sector")
+    results.push("-------|------|--------|-------")
+
+    var search_pos = 0
+    var count = 0
+    val name_key = Q() + "ISU_ABBRV" + Q()
+    while search_pos < resp.len() and count < 200:
+        val remaining = mcp_substr(resp, search_pos, resp.len())
+        val found_result = remaining.index_of(name_key)
+        var found_idx = -1
+        match found_result:
+            Some(i): found_idx = i
+            nil: break
+        if found_idx < 0:
+            break
+
+        val abs_pos = search_pos + found_idx
+        var obj_start = abs_pos
+        while obj_start > 0:
+            if mcp_char_at(resp, obj_start) == "{":
+                break
+            obj_start = obj_start - 1
+        var obj_end = abs_pos
+        var depth = 0
+        while obj_end < resp.len():
+            val ch = mcp_char_at(resp, obj_end)
+            if ch == "{":
+                depth = depth + 1
+            elif ch == "}":
+                depth = depth - 1
+                if depth == 0:
+                    obj_end = obj_end + 1
+                    break
+            obj_end = obj_end + 1
+
+        val obj = mcp_substr(resp, obj_start, obj_end)
+        val name = extract_field(obj, "ISU_ABBRV")
+        val ticker = extract_field(obj, "ISU_SRT_CD")
+        val mkt = extract_field(obj, "MKT_TP_NM")
+        val sector = extract_field(obj, "IDX_IND_NM")
+
+        results.push(ticker + " | " + name + " | " + mkt + " | " + sector)
+        count = count + 1
+
+        search_pos = obj_end
+
+    results.push("Total: " + str(count) + " stocks")
+    results.join("\n")
+
+# ============================================================================
+# Market Index
+# ============================================================================
+
+fn krx_get_market_index(index_name: text) -> text:
+    val today = get_today_yyyymmdd()
+    var idx_cd = "1001"  # KOSPI
+    if index_name == "KOSDAQ":
+        idx_cd = "2001"
+    elif index_name == "KPI200":
+        idx_cd = "1028"
+    val params = "trdDd=" + today + "&idxIndMidclssCd=" + idx_cd
+    val resp = krx_post("dbms/MDC/STAT/standard/MDCSTAT00301", params)
+    if resp.starts_with("ERROR"):
+        return resp
+
+    var results: [text] = []
+    results.push("Market Index: " + index_name)
+
+    val clsprc = find_first_field(resp, "CLSPRC_IDX")
+    val change = find_first_field(resp, "CMPPREVDD_IDX")
+    val change_rt = find_first_field(resp, "FLUC_RT")
+    val trd_vol = find_first_field(resp, "ACC_TRDVOL")
+    val trd_val = find_first_field(resp, "ACC_TRDVAL")
+
+    results.push("Index: " + clsprc)
+    results.push("Change: " + change + " (" + change_rt + "%)")
+    results.push("Volume: " + format_volume(trd_vol))
+    results.push("Value: " + trd_val)
+    results.push("Date: " + today)
+    results.join("\n")
+
+# Helper: find first occurrence of a field in JSON
+fn find_first_field(json: text, field_name: text) -> text:
+    extract_field(json, field_name)
+
+# ============================================================================
+# Market Cap
+# ============================================================================
+
+fn krx_get_market_cap(market: text, top_n: i64) -> text:
+    val today = get_today_yyyymmdd()
+    var mkt_id = "STK"
+    if market == "KOSDAQ":
+        mkt_id = "KSQ"
+    val params = "trdDd=" + today + "&mktId=" + mkt_id
+    val resp = krx_post("dbms/MDC/STAT/standard/MDCSTAT01501", params)
+    if resp.starts_with("ERROR"):
+        return resp
+
+    var results: [text] = []
+    results.push("Market Cap Ranking (" + market + ", Top " + str(top_n) + ")")
+    results.push("Rank | Ticker | Name | Market Cap | Price")
+    results.push("-----|--------|------|-----------|------")
+
+    # Extract all entries and build list
+    var search_pos = 0
+    var count = 0
+    val name_key = Q() + "ISU_ABBRV" + Q()
+    while search_pos < resp.len() and count < top_n:
+        val remaining = mcp_substr(resp, search_pos, resp.len())
+        val found_result = remaining.index_of(name_key)
+        var found_idx = -1
+        match found_result:
+            Some(i): found_idx = i
+            nil: break
+        if found_idx < 0:
+            break
+
+        val abs_pos = search_pos + found_idx
+        var obj_start = abs_pos
+        while obj_start > 0:
+            if mcp_char_at(resp, obj_start) == "{":
+                break
+            obj_start = obj_start - 1
+        var obj_end = abs_pos
+        var depth = 0
+        while obj_end < resp.len():
+            val ch = mcp_char_at(resp, obj_end)
+            if ch == "{":
+                depth = depth + 1
+            elif ch == "}":
+                depth = depth - 1
+                if depth == 0:
+                    obj_end = obj_end + 1
+                    break
+            obj_end = obj_end + 1
+
+        val obj = mcp_substr(resp, obj_start, obj_end)
+        val name = extract_field(obj, "ISU_ABBRV")
+        val ticker = extract_field(obj, "ISU_SRT_CD")
+        val mktcap = extract_field(obj, "MKTCAP")
+        val price = extract_field(obj, "TDD_CLSPRC")
+
+        count = count + 1
+        results.push(str(count) + " | " + ticker + " | " + name + " | " + format_krw(mktcap) + " | " + format_krw(price))
+
+        search_pos = obj_end
+
+    results.join("\n")
+
+# ============================================================================
+# Sector Performance
+# ============================================================================
+
+fn krx_get_sector_performance(market: text) -> text:
+    val today = get_today_yyyymmdd()
+    var mkt_id = "STK"
+    if market == "KOSDAQ":
+        mkt_id = "KSQ"
+    val params = "trdDd=" + today + "&mktId=" + mkt_id
+    val resp = krx_post("dbms/MDC/STAT/standard/MDCSTAT03901", params)
+    if resp.starts_with("ERROR"):
+        return resp
+
+    var results: [text] = []
+    results.push("Sector Performance (" + market + ")")
+    results.push("Sector | Index | Change | Change%")
+    results.push("-------|-------|--------|--------")
+
+    var search_pos = 0
+    var count = 0
+    val name_key = Q() + "IDX_IND_NM" + Q()
+    while search_pos < resp.len() and count < 50:
+        val remaining = mcp_substr(resp, search_pos, resp.len())
+        val found_result = remaining.index_of(name_key)
+        var found_idx = -1
+        match found_result:
+            Some(i): found_idx = i
+            nil: break
+        if found_idx < 0:
+            break
+
+        val abs_pos = search_pos + found_idx
+        var obj_start = abs_pos
+        while obj_start > 0:
+            if mcp_char_at(resp, obj_start) == "{":
+                break
+            obj_start = obj_start - 1
+        var obj_end = abs_pos
+        var depth = 0
+        while obj_end < resp.len():
+            val ch = mcp_char_at(resp, obj_end)
+            if ch == "{":
+                depth = depth + 1
+            elif ch == "}":
+                depth = depth - 1
+                if depth == 0:
+                    obj_end = obj_end + 1
+                    break
+            obj_end = obj_end + 1
+
+        val obj = mcp_substr(resp, obj_start, obj_end)
+        val sector_name = extract_field(obj, "IDX_IND_NM")
+        val idx_val = extract_field(obj, "CLSPRC_IDX")
+        val change = extract_field(obj, "CMPPREVDD_IDX")
+        val change_rt = extract_field(obj, "FLUC_RT")
+
+        results.push(sector_name + " | " + idx_val + " | " + change + " | " + change_rt + "%")
+        count = count + 1
+
+        search_pos = obj_end
+
+    if count == 0:
+        results.push("(No sector data available)")
+
+    results.join("\n")

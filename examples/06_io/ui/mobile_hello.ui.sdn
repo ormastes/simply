@@ -1,0 +1,113 @@
+app:
+    title: "Simple Mobile"
+    theme: glass_dark
+
+layout:
+    type: vbox
+    id: root
+    children:
+        nav:
+            type: navigation_bar
+            id: nav
+            title: "Simple Mobile Hello"
+        body:
+            type: scroll
+            id: body
+            max_height: 18
+            scroll_offset: 0
+            flex: 1
+            children:
+                greeting:
+                    type: heading
+                    id: greeting
+                    content: "Hello from Simple GUI + Tauri"
+                intro:
+                    type: text
+                    id: intro
+                    content: "One layout, native window on desktop / iOS / Android."
+
+                form_panel:
+                    type: panel
+                    id: form_panel
+                    title: "Text input"
+                    children:
+                        name_field:
+                            type: textfield
+                            id: name_field
+                            label: "Name"
+                            value: ""
+                            placeholder: "Type your name"
+                        search_box:
+                            type: input
+                            id: search_box
+                            value: ""
+                            placeholder: "Search..."
+
+                choices_panel:
+                    type: panel
+                    id: choices_panel
+                    title: "Checkbox & Radio"
+                    children:
+                        terms_cb:
+                            type: checkbox
+                            id: terms_cb
+                            label: "Accept terms"
+                            checked: true
+                        news_cb:
+                            type: checkbox
+                            id: news_cb
+                            label: "Subscribe to newsletter"
+                            checked: false
+                        plan_radio:
+                            type: radio
+                            id: plan_radio
+                            selected_index: "0"
+                            children:
+                                0:
+                                    label: "Free plan"
+                                1:
+                                    label: "Pro plan"
+                                2:
+                                    label: "Team plan"
+
+                list_panel:
+                    type: panel
+                    id: list_panel
+                    title: "List"
+                    children:
+                        fruits:
+                            type: list
+                            id: fruits
+                            selected_index: "1"
+                            items:
+                                0:
+                                    label: "Apple"
+                                1:
+                                    label: "Banana"
+                                2:
+                                    label: "Cherry"
+                                3:
+                                    label: "Date"
+                                4:
+                                    label: "Elderberry"
+
+                actions_panel:
+                    type: panel
+                    id: actions_panel
+                    title: "Buttons"
+                    children:
+                        submit_btn:
+                            type: button
+                            id: submit_btn
+                            label: "Submit"
+                            action: "submit_form"
+                        reset_btn:
+                            type: button
+                            id: reset_btn
+                            label: "Reset"
+                            action: "reset_form"
+        status:
+            type: statusbar
+            id: status
+            left: "{app.mode}"
+            right: "{app.title}"

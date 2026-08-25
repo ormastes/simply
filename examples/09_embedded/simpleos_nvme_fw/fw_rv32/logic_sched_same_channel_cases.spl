@@ -1,0 +1,8 @@
+use logic_sched_core.*
+
+fn rv32_sched_same_channel_cases_selftest() -> i32:
+    if _rv32_sched_same_channel_steps(8) != 8:
+        return 1
+    if _rv32_sched_same_channel_steps(-1) != 0:
+        return 1
+    0

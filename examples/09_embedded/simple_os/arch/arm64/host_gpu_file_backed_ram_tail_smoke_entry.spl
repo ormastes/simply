@@ -1,0 +1,6 @@
+use arch.common.host_gpu_ivshmem_probe_entry.{host_gpu_file_backed_ram_tail_probe_main}
+
+fn spl_start():
+    # The linker owns only 0x40000000..0x50000000; the wrapper reserves the
+    # final 8 MiB of its 512 MiB RAM file at 0x5f800000 for this protocol.
+    host_gpu_file_backed_ram_tail_probe_main()

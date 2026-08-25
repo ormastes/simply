@@ -1,0 +1,111 @@
+# x86_64 combined servers entry — sshd (22) + http (8080) + dbd (5433)
+#
+# Single-core cooperative round-robin: sshd is brought to "ready to accept"
+# via SshDaemon.bind_and_ready() (its own listener, on the proven
+# rt_boot_tcp_* single-global-slot convenience layer — unchanged from the
+# ssh-only entries), http and dbd bind their OWN independent listener
+# sockets via the true per-fd rt_net_* primitives (see
+# src/os/kernel/boot/http_baremetal.spl and src/os/apps/dbd/dbd.spl for
+# why: rt_boot_tcp_* cannot host a second listener on a different port).
+# The boot loop then round-robins each service's one-shot
+# accept_and_handle_once()-style helper so no threads are needed.
+#
+# QEMU forwards host ports 42222/48080/45433 to guest 22/8080/5433 for the
+# one-boot gate: scripts/check/check-simpleos-servers-qemu.shs.
+
+use build.os.generated.ssh_live_build_marker.{ssh_live_build_marker}
+use os.apps.sshd.sshd.{SshDaemon}
+use os.kernel.boot.http_baremetal.{http_bind_baremetal, http_accept_and_handle_once}
+use os.apps.dbd.dbd.{DbdServer, DBD_PORT, dbd_bind, dbd_accept_and_handle_once}
+use os.services.vfs.vfs_boot_init.{vfs_boot_init_production, g_root_fat32, g_adapter}
+use os.services.fat32.shared_fat32_driver.{SharedFat32Driver as Fat32Core}
+
+extern fn serial_println(msg: text)
+extern fn rt_net_init() -> i64
+extern fn rt_net_stats() -> i64
+extern fn rt_embedded_host_rsa_pkcs8() -> [u8]
+extern fn rt_embedded_host_rsa_public_blob() -> [u8]
+
+fn _servers_ensure_generic_root_fat32():
+    """Mount a generic (arbitrary-filename-capable) FAT32 driver onto the
+    VFS read/write hub's g_root_fat32 slot when the pure-Simple boot
+    storage path left it nil (that path favors a fixed-registry scalar
+    reader for known app/manifest files instead — see vfs_boot_init.spl's
+    _vfs_boot_init_pure_nvme_fat32). Mirrors vfs_boot_init_virtio_fat32's
+    approach (used on ARM), reusing the x86_64 NVMe adapter that
+    vfs_boot_init_production() already brought up. Best-effort: on failure,
+    g_vfs_read_file_bytes/g_vfs_write_file_bytes simply keep falling back to
+    whatever the boot path already offers (http/dbd file routes then
+    degrade to clean 404/ERR rather than crashing).
+    """
+    if g_root_fat32 != nil:
+        return
+    var root = Fat32Core.new(g_adapter)
+    val mount_result = root.mount("", "")
+    if mount_result.is_err():
+        serial_println("[boot] generic FAT32 VFS mount failed: {mount_result.unwrap_err()}")
+        return
+    g_root_fat32 = Some(root)
+    serial_println("[boot] generic FAT32 VFS mount ok (arbitrary paths via g_vfs_read/write_file_bytes)")
+
+fn _start():
+    serial_println("")
+    serial_println("=== SimpleOS Combined Servers Boot (sshd+http+dbd) ===")
+    serial_println("[boot] Build marker:")
+    serial_println(ssh_live_build_marker())
+    serial_println("")
+
+    serial_println("[boot] Initializing storage stack (VFS/NVMe/FAT32)")
+    val storage_ok = vfs_boot_init_production()
+    serial_println("[boot] vfs_boot_init_production ok={storage_ok}")
+    if storage_ok:
+        _servers_ensure_generic_root_fat32()
+    else:
+        serial_println("[boot] storage unavailable; dbd/http file routes degrade to ERR/404")
+
+    serial_println("[boot] Initializing C-backed network runtime")
+    val net_init = rt_net_init()
+    serial_println("[boot] rt_net_init rc={net_init}")
+    if net_init < 0:
+        serial_println("[FATAL] network init failed")
+        return
+    val _net_stats = rt_net_stats()
+
+    var daemon = SshDaemon.new(22)
+    val rsa_pkcs8 = rt_embedded_host_rsa_pkcs8()
+    val rsa_public_blob = rt_embedded_host_rsa_public_blob()
+    if rsa_pkcs8.len() > 0 and rsa_public_blob.len() > 0:
+        serial_println("[boot] Live host key policy: Ed25519 enabled; RSA staged")
+    else:
+        serial_println("[boot] Live host key policy: Ed25519 only")
+
+    serial_println("[boot] Starting production SSH daemon on port 22")
+    serial_println("[ssh-live] production-daemon-starting port=22 hostfwd=42222")
+    match daemon.bind_and_ready():
+        Ok(_): pass
+        Err(err):
+            serial_println("[FATAL] SSH daemon bind failed: {err}")
+            return
+    serial_println("[sshd] accept loop start")
+
+    val http_listener = http_bind_baremetal()
+    if http_listener < 0:
+        serial_println("[FATAL] http bind failed rc={http_listener}")
+    else:
+        serial_println("[http] serving on 0.0.0.0:8080")
+
+    var dbd_server = DbdServer.new()
+    dbd_server.replay_log()
+    val dbd_listener = dbd_bind(DBD_PORT)
+    if dbd_listener < 0:
+        serial_println("[FATAL] dbd bind failed rc={dbd_listener}")
+    else:
+        serial_println("[dbd] serving on 0.0.0.0:5433")
+
+    serial_println("[servers] round-robin loop start")
+    while true:
+        daemon.accept_and_handle_once()
+        if http_listener >= 0:
+            http_accept_and_handle_once(http_listener)
+        if dbd_listener >= 0:
+            dbd_accept_and_handle_once(dbd_listener, dbd_server)

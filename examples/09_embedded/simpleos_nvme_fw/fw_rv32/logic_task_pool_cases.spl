@@ -1,0 +1,20 @@
+use logic_task_pool_core.*
+
+fn rv32_task_pool_cases_selftest() -> i32:
+    if _rv32_task_pool_write_status(0, 0, 0, 0, 1) != 130:
+        return 1
+    if _rv32_task_pool_write_status(0, 1, 1, 0, 1) != 130:
+        return 1
+    if _rv32_task_pool_write_status(0, 1, 0, 0, -1) != 130:
+        return 1
+    if _rv32_task_pool_write_status(2, 1, 0, 0, 1) != 2:
+        return 1
+    val ok_status: i64 = _rv32_task_pool_write_status(0, 1, 0, 0, 1)
+    if ok_status != 0:
+        return 1
+    if _rv32_task_pool_write_data(17, 34, ok_status) != 34:
+        return 1
+    val closed_status: i64 = _rv32_task_pool_write_status(0, 0, 0, 0, 1)
+    if _rv32_task_pool_write_data(17, 34, closed_status) != 17:
+        return 1
+    0

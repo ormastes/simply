@@ -1,0 +1,12 @@
+use std.gpu.engine2d.backend_cpu.{CpuBackend}
+use examples.ui.engine2d_backend_scene.{W, H, run_engine2d_scene_backend}
+
+fn main() -> i64:
+    print "  backend 'cpu_simd':"
+    var backend = CpuBackend.create()
+    if not backend.init(W, H):
+        print "    -> CPU SIMD backend failed to initialize"
+        return 1
+    if run_engine2d_scene_backend(backend, "cpu_simd", true):
+        return 0
+    1

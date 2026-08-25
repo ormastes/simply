@@ -1,0 +1,17 @@
+# UBS Dimension — Location / Jurisdiction
+#
+# Owns tax, compliance and localization. Rule content (rates, classes) is
+# data-driven and keyed to this dimension, so the same logic serves every
+# jurisdiction without per-module branching.
+
+struct Jurisdiction:
+    val code: text
+    val tax_class: text
+    val rate_bps: i64        # tax rate in basis points (1% == 100 bps)
+
+fn jurisdiction(code: text, tax_class: text, rate_bps: i64) -> Jurisdiction:
+    return Jurisdiction { code: code, tax_class: tax_class, rate_bps: rate_bps }
+
+# Tax on a minor-unit amount, rounded down. Rate as data, never as code.
+fn tax_on(j: Jurisdiction, minor: i64) -> i64:
+    return (minor * j.rate_bps) / 10000

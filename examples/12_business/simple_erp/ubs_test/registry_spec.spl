@@ -1,0 +1,73 @@
+# @cover src/framework/registry.spl 80%
+"""
+# Lane Registry — the framework extension point
+
+RBAC, routing, and gating derive from registered LaneDefs, so a new business
+is one registration, not a framework edit. This spec pins that derivation and
+the fail-closed default: unregistered actions are forbidden.
+"""
+
+use std.spec
+use framework.registry.{LaneDef, lane_def, default_lanes, is_registered_write, find_lane}
+use framework.guarded.{Tenant, Actor, Session, role_can_for, gate_write_for}
+use web.routes.{routes_for, find_route_in}
+use std.nogc_sync_mut.enterprise_store.store.{EnterpriseStore, store_open}
+use std.io_runtime.{file_exists, file_delete, dir_create_all}
+
+# Each scenario opens its own durable store: the interpreter backend caches
+# open databases per path in-process, so every it-block gets a fresh path.
+fn fresh_store(name: text) -> EnterpriseStore:
+    dir_create_all("build/test-artifacts")
+    val db = "build/test-artifacts/erp_registry_" + name + ".db"
+    if file_exists(db):
+        file_delete(db)
+    store_open(db)
+
+describe "Registry — registration drives RBAC":
+    it "registers the five stock lanes with derived write actions":
+        val lanes = default_lanes()
+        expect(lanes.length()).to_equal(5)
+        assert_true(is_registered_write(lanes, "sale.write"))
+        assert_false(is_registered_write(lanes, "clinic.write"))
+        expect(find_lane(lanes, "market").write_path).to_equal("/api/market/listings")
+        expect(find_lane(lanes, "nope").name).to_equal("")
+
+    it "allows an operator exactly the registered write actions":
+        var lanes = default_lanes()
+        assert_true(role_can_for(lanes, "operator", "crm.write"))
+        assert_false(role_can_for(lanes, "operator", "clinic.write"))
+        lanes.push(lane_def("clinic", "/api/clinic/appointments", 200000, "admin"))
+        assert_true(role_can_for(lanes, "operator", "clinic.write"))
+
+    it "keeps auditor and unknown roles unchanged by registration":
+        var lanes = default_lanes()
+        lanes.push(lane_def("clinic", "/api/clinic/appointments", 200000, "admin"))
+        assert_true(role_can_for(lanes, "auditor", "audit.read"))
+        assert_false(role_can_for(lanes, "auditor", "clinic.write"))
+        assert_false(role_can_for(lanes, "guest", "clinic.write"))
+
+describe "Registry — registration drives routing and gating":
+    it "derives one write route per registered lane":
+        var lanes = default_lanes()
+        val before = routes_for(lanes)
+        expect(before.length()).to_equal(7)
+        lanes.push(lane_def("clinic", "/api/clinic/appointments", 200000, "admin"))
+        val after = routes_for(lanes)
+        expect(after.length()).to_equal(8)
+        val clinic = find_route_in(after, "POST", "/api/clinic/appointments")
+        expect(clinic.action).to_equal("clinic.write")
+        val miss = find_route_in(before, "POST", "/api/clinic/appointments")
+        expect(miss.action).to_equal("")
+
+    it "gates a registered lane write and forbids an unregistered one":
+        var lanes = default_lanes()
+        lanes.push(lane_def("clinic", "/api/clinic/appointments", 200000, "admin"))
+        val tenant = Tenant { id: "t1", name: "Demo" }
+        val operator = Actor { id: 1, name: "Mina", role: "operator" }
+        val session = Session { token: "sess-1", user_id: 1, tenant_id: "t1", active: true }
+        val store = fresh_store("s1")
+        val ok = gate_write_for(lanes, store, session, tenant, operator, "clinic.write", true, "c-1")
+        assert_true(ok.ok)
+        val no = gate_write_for(default_lanes(), store, session, tenant, operator, "clinic.write", true, "c-2")
+        assert_false(no.ok)
+        expect(no.reason).to_equal("forbidden")

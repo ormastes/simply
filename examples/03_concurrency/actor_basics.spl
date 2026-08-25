@@ -1,0 +1,195 @@
+#!/usr/bin/env simple
+# Actor Model Basics Example
+#
+# Demonstrates actor-based concurrency with message passing.
+# Actors register named method handlers at spawn time. The runtime
+# dispatches messages by looking up method names in the handler table.
+
+use std.actors.actor.{
+    ActorRef, spawn_actor, spawn_pool,
+    broadcast, round_robin, get_actor_runtime,
+    make_handlers
+}
+
+# ================================================================
+# Simple Counter Actor
+# ================================================================
+
+fn make_counter_handlers() -> HandlerTable:
+    """Create handlers for a counter actor.
+
+    State is captured via a mutable variable outside the handler
+    closures (closures can READ outer vars in Simple).
+    Because closure modification is broken, we use a list as
+    a mutable container: counter_state[0] holds the current value.
+    """
+    var counter_state = [0]
+
+    var h = make_handlers()
+    h.register("increment", \args:
+        val current = counter_state[0]
+        val next_val = current + 1
+        # Cannot modify outer var directly; use list mutation
+        counter_state[0] = next_val
+        print "Counter: {next_val}"
+        "{next_val}"
+    )
+    h.register("get", \args:
+        val current = counter_state[0]
+        "{current}"
+    )
+    h
+
+fn example_simple_actor():
+    """Example: Basic actor spawning and messaging."""
+    print "=== Simple Actor ==="
+
+    # Spawn actor with handler table
+    val counter = spawn_actor(make_counter_handlers())
+
+    # Send messages
+    counter.send("increment", [])
+    counter.send("increment", [])
+    counter.send("increment", [])
+
+    # Process all messages
+    get_actor_runtime().run()
+
+    print "Actor completed\n"
+
+# ================================================================
+# Worker Pool Example
+# ================================================================
+
+fn make_worker_handlers(worker_id: i64) -> HandlerTable:
+    """Create handlers for a worker actor."""
+    var task_count = [0]
+
+    var h = make_handlers()
+    h.register("process", \args:
+        val task = args[0]
+        val current = task_count[0]
+        val next_count = current + 1
+        task_count[0] = next_count
+        print "Worker {worker_id} processed task: {task} (total: {next_count})"
+        "done"
+    )
+    h
+
+fn example_worker_pool():
+    """Example: Pool of worker actors."""
+    print "=== Worker Pool ==="
+
+    # Spawn 3 workers with unique IDs
+    var workers: [ActorRef] = []
+    for i in 0..3:
+        val h = make_worker_handlers(i)
+        val ref = spawn_actor(h)
+        workers.push(ref)
+
+    # Distribute tasks via round-robin
+    val tasks = ["task_a", "task_b", "task_c", "task_d", "task_e"]
+    round_robin(workers, tasks)
+
+    # Process all messages
+    get_actor_runtime().run()
+
+    print "All tasks completed\n"
+
+# ================================================================
+# Broadcast Logger Example
+# ================================================================
+
+fn make_logger_handlers(name: text) -> HandlerTable:
+    """Create handlers for a logger actor."""
+    var h = make_handlers()
+    h.register("log", \args:
+        val message = args[0]
+        print "[{name}] {message}"
+        "logged"
+    )
+    h
+
+fn example_broadcast():
+    """Example: Broadcasting to multiple actors."""
+    print "=== Broadcast ==="
+
+    # Spawn loggers
+    var loggers: [ActorRef] = []
+    val l1 = spawn_actor(make_logger_handlers("Logger1"))
+    loggers.push(l1)
+    val l2 = spawn_actor(make_logger_handlers("Logger2"))
+    loggers.push(l2)
+    val l3 = spawn_actor(make_logger_handlers("Logger3"))
+    loggers.push(l3)
+
+    # Broadcast message to all
+    broadcast(loggers, "log", ["System starting"])
+    broadcast(loggers, "log", ["All systems operational"])
+
+    # Process messages
+    get_actor_runtime().run()
+
+    print "Broadcast complete\n"
+
+# ================================================================
+# Ask/Reply Example
+# ================================================================
+
+fn make_calculator_handlers() -> HandlerTable:
+    """Create handlers for a calculator that supports ask-style calls."""
+    var h = make_handlers()
+    h.register("add", \args:
+        val a = int(args[0])
+        val b = int(args[1])
+        val result = a + b
+        "{result}"
+    )
+    h.register("multiply", \args:
+        val a = int(args[0])
+        val b = int(args[1])
+        val result = a * b
+        "{result}"
+    )
+    h
+
+fn example_ask_reply():
+    """Example: Ask-style request/response messaging."""
+    print "=== Ask/Reply ==="
+
+    val calc = spawn_actor(make_calculator_handlers())
+
+    # Send an ask-style message
+    val reply_id = calc.ask("add", ["10", "32"])
+
+    # Process messages so the handler runs
+    get_actor_runtime().run()
+
+    # Check for the reply
+    val runtime = get_actor_runtime()
+    val result = runtime.get_reply(reply_id)
+    if result.?:
+        print "Add result: {result}"
+    else:
+        print "No reply yet"
+
+    print "Ask/Reply complete\n"
+
+# ================================================================
+# Main
+# ================================================================
+
+fn main():
+    print "Actor Model Examples"
+    print "====================\n"
+
+    example_simple_actor()
+    example_worker_pool()
+    example_broadcast()
+    example_ask_reply()
+
+    print "=== Complete ==="
+    print "Actors use handler tables for method dispatch."
+    print "Each handler is a fn([text]) -> text registered by name."
+
+main()

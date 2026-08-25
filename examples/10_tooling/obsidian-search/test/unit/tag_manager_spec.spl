@@ -1,0 +1,84 @@
+# @cover src/core/tag_manager.spl 80%
+# Unit tests for tag_manager module
+#
+# NOTE: add_tag_to_note, remove_tag_from_note, rename_tag_in_vault,
+# and list_all_tags require filesystem access. These tests validate
+# the parse_tag_list helper via frontmatter_manager integration and
+# document expected behavior for compiled-mode execution.
+
+use src.core.frontmatter_manager.{get_frontmatter_field, set_frontmatter_field}
+use src.core.tag_manager.{add_tag_to_note, remove_tag_from_note, rename_tag_in_vault, list_all_tags}
+
+describe "TagManager":
+    """Tests for tag operations across vault notes"""
+
+    context "tag parsing via frontmatter integration":
+        """Verifying tag round-trip through frontmatter operations"""
+
+        it "can read tags from frontmatter":
+            val content = "---\ntags: [project, active, review]\n---\nBody"
+            val tags_str = get_frontmatter_field(content, "tags")
+            expect(tags_str).to_contain("project")
+            expect(tags_str).to_contain("active")
+            expect(tags_str).to_contain("review")
+
+        it "can set tags in frontmatter":
+            val content = "---\ntitle: Note\n---\nBody"
+            val updated = set_frontmatter_field(content, "tags", "[new-tag, another]")
+            val tags_str = get_frontmatter_field(updated, "tags")
+            expect(tags_str).to_contain("new-tag")
+            expect(tags_str).to_contain("another")
+
+        it "can add tag by reading and rewriting tags field":
+            val content = "---\ntags: [existing]\n---\nBody"
+            val current = get_frontmatter_field(content, "tags")
+            expect(current).to_contain("existing")
+            val updated = set_frontmatter_field(content, "tags", "[existing, added]")
+            val new_tags = get_frontmatter_field(updated, "tags")
+            expect(new_tags).to_contain("existing")
+            expect(new_tags).to_contain("added")
+
+        it "can remove tag by reading and rewriting tags field":
+            val content = "---\ntags: [keep, remove-me, also-keep]\n---\nBody"
+            val updated = set_frontmatter_field(content, "tags", "[keep, also-keep]")
+            val new_tags = get_frontmatter_field(updated, "tags")
+            expect(new_tags).to_contain("keep")
+            expect(new_tags).to_contain("also-keep")
+            val has_removed = new_tags.contains("remove-me")
+            expect(has_removed).to_equal(false)
+
+        it "handles empty tags array":
+            val content = "---\ntags: []\n---\nBody"
+            val tags_str = get_frontmatter_field(content, "tags")
+            expect(tags_str).to_equal("[]")
+
+        it "preserves other fields when modifying tags":
+            val content = "---\ntitle: Important Note\ntags: [old]\ndate: 2024-01-15\n---\nBody"
+            val updated = set_frontmatter_field(content, "tags", "[new-tag]")
+            expect(updated).to_contain("title: Important Note")
+            expect(updated).to_contain("date: 2024-01-15")
+            expect(updated).to_contain("tags: [new-tag]")
+
+    context "inline tag replacement":
+        """Verifying inline #tag rename behavior"""
+
+        it "replaces inline tag in text":
+            val content = "Some text #old-tag and more #other"
+            val replaced = content.replace("#old-tag", "#new-tag")
+            expect(replaced).to_contain("#new-tag")
+            expect(replaced).to_contain("#other")
+            val has_old = replaced.contains("#old-tag")
+            expect(has_old).to_equal(false)
+
+        it "replaces multiple occurrences of inline tag":
+            val content = "First #project then #project again"
+            val replaced = content.replace("#project", "#work")
+            val count_check = replaced.contains("#project")
+            expect(count_check).to_equal(false)
+            expect(replaced).to_contain("#work")
+
+        it "does not affect similar tags":
+            val content = "Has #tag and #tagging"
+            val replaced = content.replace("#tag ", "#newtag ")
+            expect(replaced).to_contain("#newtag ")
+            expect(replaced).to_contain("#tagging")

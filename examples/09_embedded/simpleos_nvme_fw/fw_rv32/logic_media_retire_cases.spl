@@ -1,0 +1,9 @@
+use logic_media_block_cases.*
+use logic_media_result_cases.*
+
+fn rv32_media_retire_cases_selftest() -> i32:
+    if rv32_media_block_cases_selftest() != 0:
+        return 1
+    if rv32_media_result_cases_selftest() != 0:
+        return 1
+    0

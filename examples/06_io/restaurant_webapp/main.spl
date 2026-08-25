@@ -1,0 +1,11 @@
+use std.web_framework.app.{WebApp}
+
+fn main():
+    val app = WebApp.create("app.sdn")?
+
+    app.mount_routes("routes.sdn")?
+
+    print "[RestaurantApp] Starting at http://localhost:3001"
+
+    app.start()?
+    app.wait()

@@ -1,0 +1,45 @@
+# UBS Kernel — Indexed Idempotency Keys
+#
+# Idempotency keys must be checked on every write to reject duplicates. A flat
+# list scan is O(n) per write and O(n^2) over a run. This is a 16-bucket hash
+# index: each key lands in one bucket by a cheap char-code hash, so membership is
+# O(bucket) instead of O(n). Buckets are a nested array [[text]].
+# ponytail: fixed 16 buckets + linear per-bucket scan is a placeholder — swap the
+# whole thing for a real hash map (std Dict) once Dict is stable at volume.
+
+struct KeyIndex:
+    val buckets: [[text]]
+
+fn key_index_new() -> KeyIndex:
+    var bs: [[text]] = []
+    var i = 0
+    while i < 16:
+        var empty: [text] = []
+        bs.push(empty)
+        i = i + 1
+    return KeyIndex { buckets: bs }
+
+fn key_hash(key: text) -> i64:
+    var total = 0
+    var i = 0
+    while i < key.len():
+        total = total + key.char_code_at(i)
+        i = i + 1
+    return total % 16
+
+fn key_index_has(idx: KeyIndex, key: text) -> bool:
+    val h = key_hash(key)
+    val bucket = idx.buckets[h]
+    for k in bucket:
+        if k == key:
+            return true
+    return false
+
+# Returns a new KeyIndex value; a no-op (same-value return) if key is present.
+fn key_index_add(idx: KeyIndex, key: text) -> KeyIndex:
+    if key_index_has(idx, key):
+        return idx
+    val h = key_hash(key)
+    var bs = idx.buckets
+    bs[h].push(key)
+    return KeyIndex { buckets: bs }

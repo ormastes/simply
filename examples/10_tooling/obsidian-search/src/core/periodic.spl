@@ -1,0 +1,541 @@
+# Periodic notes & templates — daily, weekly, monthly, quarterly, yearly
+#
+# Reads/creates periodic notes in standard Obsidian folder layouts.
+# Supports daily notes config from .obsidian/daily-notes.json and
+# variable-substitution templates from the vault's templates/ folder.
+
+extern fn rt_time_now() -> i64
+extern fn rt_time_format(ts: i64, fmt: text) -> text
+extern fn rt_dir_walk(path: text) -> [text]
+use std.io_runtime.{read_file, write_file, file_exists, process_run}
+
+use src.util.json_helpers.{safe_substr}
+
+# --- Path helpers (local) ---
+
+fn join_path(base: text, rel: text) -> text:
+    var b = base
+    if b != "" and not b.ends_with("/"):
+        b = b + "/"
+    b + rel
+
+fn parent_dir(path: text) -> text:
+    val idx = path.last_index_of("/")
+    match idx:
+        Some(i):
+            return path.substring(0, i)
+        nil:
+            return ""
+    ""
+
+fn ensure_parent_dirs(full_path: text) -> bool:
+    val dir = parent_dir(full_path)
+    if dir == "":
+        return true
+    var stdout = ""
+    var stderr = ""
+    var rc: i64 = 0
+    (stdout, stderr, rc) = process_run("mkdir", ["-p", dir])
+    rc == 0
+
+# --- Date helpers ---
+
+/**
+Get today's date as YYYY-MM-DD string.
+Uses rt_time_format if available, falls back to shell date command.
+*/
+fn get_today_date() -> text:
+    val ts = rt_time_now()
+    val formatted = rt_time_format(ts, "%Y-%m-%d")
+    if formatted != "":
+        return formatted
+    # Fallback: shell date command
+    var stdout = ""
+    var stderr = ""
+    var rc: i64 = 0
+    (stdout, stderr, rc) = process_run("date", ["+%Y-%m-%d"])
+    if rc == 0:
+        return stdout.trim()
+    "1970-01-01"
+
+fn extract_year(date: text) -> text:
+    # date is YYYY-MM-DD
+    if date.len() >= 4:
+        return safe_substr(date, 0, 4)
+    "0000"
+
+fn extract_month(date: text) -> text:
+    # date is YYYY-MM-DD
+    if date.len() >= 7:
+        return safe_substr(date, 5, 7)
+    "01"
+
+fn extract_month_num(date: text) -> i64:
+    val m = extract_month(date)
+    if m == "01": return 1
+    if m == "02": return 2
+    if m == "03": return 3
+    if m == "04": return 4
+    if m == "05": return 5
+    if m == "06": return 6
+    if m == "07": return 7
+    if m == "08": return 8
+    if m == "09": return 9
+    if m == "10": return 10
+    if m == "11": return 11
+    if m == "12": return 12
+    1
+
+fn extract_day_num(date: text) -> i64:
+    if date.len() >= 10:
+        val d = safe_substr(date, 8, 10)
+        if d == "01": return 1
+        if d == "02": return 2
+        if d == "03": return 3
+        if d == "04": return 4
+        if d == "05": return 5
+        if d == "06": return 6
+        if d == "07": return 7
+        if d == "08": return 8
+        if d == "09": return 9
+        if d == "10": return 10
+        if d == "11": return 11
+        if d == "12": return 12
+        if d == "13": return 13
+        if d == "14": return 14
+        if d == "15": return 15
+        if d == "16": return 16
+        if d == "17": return 17
+        if d == "18": return 18
+        if d == "19": return 19
+        if d == "20": return 20
+        if d == "21": return 21
+        if d == "22": return 22
+        if d == "23": return 23
+        if d == "24": return 24
+        if d == "25": return 25
+        if d == "26": return 26
+        if d == "27": return 27
+        if d == "28": return 28
+        if d == "29": return 29
+        if d == "30": return 30
+        if d == "31": return 31
+    1
+
+fn compute_quarter(date: text) -> i64:
+    val m = extract_month_num(date)
+    if m <= 3: return 1
+    if m <= 6: return 2
+    if m <= 9: return 3
+    4
+
+fn is_leap_year(year: i64) -> bool:
+    if year % 400 == 0: return true
+    if year % 100 == 0: return false
+    if year % 4 == 0: return true
+    false
+
+fn days_in_month(year: i64, month: i64) -> i64:
+    if month == 1: return 31
+    if month == 2:
+        if is_leap_year(year): return 29
+        return 28
+    if month == 3: return 31
+    if month == 4: return 30
+    if month == 5: return 31
+    if month == 6: return 30
+    if month == 7: return 31
+    if month == 8: return 31
+    if month == 9: return 30
+    if month == 10: return 31
+    if month == 11: return 30
+    31
+
+fn day_of_year(year: i64, month: i64, day: i64) -> i64:
+    var total = 0
+    var m = 1
+    while m < month:
+        total = total + days_in_month(year, m)
+        m = m + 1
+    total + day
+
+fn compute_iso_week(date: text) -> i64:
+    # Approximate ISO week number from date
+    # Uses day-of-year / 7 + 1 as a reasonable approximation
+    val year_str = extract_year(date)
+    var year: i64 = 2024
+    # Parse year manually
+    var stdout = ""
+    var stderr = ""
+    var rc: i64 = 0
+    (stdout, stderr, rc) = process_run("date", ["-d", date, "+%V"])
+    if rc == 0 and stdout.trim() != "":
+        val week_str = stdout.trim()
+        # Parse the two-digit week string
+        if week_str.len() == 2:
+            val tens_ch = safe_substr(week_str, 0, 1)
+            val ones_ch = safe_substr(week_str, 1, 2)
+            val tens = char_to_digit(tens_ch)
+            val ones = char_to_digit(ones_ch)
+            return tens * 10 + ones
+        elif week_str.len() == 1:
+            return char_to_digit(week_str)
+    # Fallback: approximate
+    val month = extract_month_num(date)
+    val day = extract_day_num(date)
+    val doy = day_of_year(2024, month, day)
+    (doy - 1) / 7 + 1
+
+fn char_to_digit(ch: text) -> i64:
+    if ch == "0": return 0
+    if ch == "1": return 1
+    if ch == "2": return 2
+    if ch == "3": return 3
+    if ch == "4": return 4
+    if ch == "5": return 5
+    if ch == "6": return 6
+    if ch == "7": return 7
+    if ch == "8": return 8
+    if ch == "9": return 9
+    0
+
+fn pad_two(n: i64) -> text:
+    if n < 10:
+        return "0" + str(n)
+    str(n)
+
+# --- Daily notes config ---
+
+fn read_daily_config_folder(vault_path: text) -> text:
+    val config_path = join_path(vault_path, ".obsidian/daily-notes.json")
+    if not file_exists(config_path):
+        return "daily"
+    val content = read_file(config_path) ?? ""
+    if content == "":
+        return "daily"
+    # Parse simple JSON for "folder" field
+    val folder = extract_json_string(content, "folder")
+    if folder != "":
+        return folder
+    "daily"
+
+fn read_daily_config_format(vault_path: text) -> text:
+    val config_path = join_path(vault_path, ".obsidian/daily-notes.json")
+    if not file_exists(config_path):
+        return "YYYY-MM-DD"
+    val content = read_file(config_path) ?? ""
+    if content == "":
+        return "YYYY-MM-DD"
+    val fmt = extract_json_string(content, "format")
+    if fmt != "":
+        return fmt
+    "YYYY-MM-DD"
+
+fn extract_json_string(json: text, key: text) -> text:
+    # Simple extraction of "key": "value" from JSON
+    val search = "\"" + key + "\""
+    val idx_result = json.index_of(search)
+    var idx = -1
+    match idx_result:
+        Some(i): idx = i
+        nil: return ""
+    # Find the colon after the key
+    var pos = idx + search.len()
+    val json_len = json.len()
+    # Skip whitespace and colon
+    while pos < json_len:
+        val ch = safe_substr(json, pos, pos + 1)
+        if ch == ":":
+            pos = pos + 1
+            break
+        elif ch == " " or ch == "\t":
+            pos = pos + 1
+        else:
+            return ""
+    # Skip whitespace after colon
+    while pos < json_len:
+        val ch = safe_substr(json, pos, pos + 1)
+        if ch == " " or ch == "\t":
+            pos = pos + 1
+        else:
+            break
+    # Expect opening quote
+    if pos >= json_len:
+        return ""
+    val open_ch = safe_substr(json, pos, pos + 1)
+    if open_ch != "\"":
+        return ""
+    pos = pos + 1
+    # Read until closing quote
+    var chars: [text] = []
+    while pos < json_len:
+        val ch = safe_substr(json, pos, pos + 1)
+        if ch == "\"":
+            return chars.join("")
+        chars.push(ch)
+        pos = pos + 1
+    ""
+
+fn format_daily_filename(date: text, fmt: text) -> text:
+    # Replace YYYY, MM, DD in format string
+    val year = extract_year(date)
+    val month = extract_month(date)
+    val day = if date.len() >= 10: safe_substr(date, 8, 10) else: "01"
+    var result = fmt
+    result = result.replace("YYYY", year)
+    result = result.replace("MM", month)
+    result = result.replace("DD", day)
+    result
+
+# --- Daily note functions ---
+
+/**
+Determine the full path for a daily note.
+Checks .obsidian/daily-notes.json for custom folder and format.
+Default: daily/YYYY-MM-DD.md
+*/
+fn get_daily_note_path(vault_path: text, date: text) -> text:
+    val folder = read_daily_config_folder(vault_path)
+    val fmt = read_daily_config_format(vault_path)
+    val filename = format_daily_filename(date, fmt)
+    join_path(vault_path, join_path(folder, filename + ".md"))
+
+/**
+Read a daily note's content. Returns "" if the note does not exist.
+*/
+fn read_daily_note(vault_path: text, date: text) -> text:
+    val path = get_daily_note_path(vault_path, date)
+    if not file_exists(path):
+        return ""
+    read_file(path) ?? ""
+
+/**
+Create a daily note. If content is empty, uses a default template.
+Ensures parent directories exist. Returns true on success.
+*/
+fn create_daily_note(vault_path: text, date: text, content: text) -> bool:
+    val path = get_daily_note_path(vault_path, date)
+    if not ensure_parent_dirs(path):
+        return false
+    var body = content
+    if body == "":
+        body = "# " + date + "\n\n## Tasks\n\n- [ ] \n\n## Notes\n\n"
+    write_file(path, body)
+
+# --- Periodic note functions ---
+
+/**
+Determine path for a periodic note based on period type.
+- "weekly"    -> weekly/YYYY-Www.md
+- "monthly"   -> monthly/YYYY-MM.md
+- "quarterly" -> quarterly/YYYY-Qq.md
+- "yearly"    -> yearly/YYYY.md
+*/
+fn get_periodic_note_path(vault_path: text, period: text, date: text) -> text:
+    val year = extract_year(date)
+
+    if period == "weekly":
+        val week = compute_iso_week(date)
+        val filename = year + "-W" + pad_two(week)
+        return join_path(vault_path, join_path("weekly", filename + ".md"))
+
+    if period == "monthly":
+        val month = extract_month(date)
+        val filename = year + "-" + month
+        return join_path(vault_path, join_path("monthly", filename + ".md"))
+
+    if period == "quarterly":
+        val q = compute_quarter(date)
+        val filename = year + "-Q" + str(q)
+        return join_path(vault_path, join_path("quarterly", filename + ".md"))
+
+    if period == "yearly":
+        return join_path(vault_path, join_path("yearly", year + ".md"))
+
+    # Unknown period, fallback
+    join_path(vault_path, join_path(period, date + ".md"))
+
+/**
+Read a periodic note's content. Returns "" if not found.
+*/
+fn read_periodic_note(vault_path: text, period: text, date: text) -> text:
+    val path = get_periodic_note_path(vault_path, period, date)
+    if not file_exists(path):
+        return ""
+    read_file(path) ?? ""
+
+/**
+Create a periodic note with given content. Uses default template if content is empty.
+*/
+fn create_periodic_note(vault_path: text, period: text, date: text, content: text) -> bool:
+    val path = get_periodic_note_path(vault_path, period, date)
+    if not ensure_parent_dirs(path):
+        return false
+    var body = content
+    if body == "":
+        val year = extract_year(date)
+        if period == "weekly":
+            val week = compute_iso_week(date)
+            body = "# Week " + str(week) + ", " + year + "\n\n## Goals\n\n- [ ] \n\n## Review\n\n"
+        elif period == "monthly":
+            val month = extract_month(date)
+            body = "# " + year + "-" + month + "\n\n## Goals\n\n- [ ] \n\n## Review\n\n"
+        elif period == "quarterly":
+            val q = compute_quarter(date)
+            body = "# Q" + str(q) + " " + year + "\n\n## Objectives\n\n- [ ] \n\n## Review\n\n"
+        elif period == "yearly":
+            body = "# " + year + "\n\n## Goals\n\n- [ ] \n\n## Review\n\n"
+        else:
+            body = "# " + period + " - " + date + "\n\n"
+    write_file(path, body)
+
+/**
+List recent periodic notes of a given type, sorted by filename descending (most recent first).
+Returns relative paths from the vault root.
+*/
+fn list_recent_periodic_notes(vault_path: text, period: text, limit: i64) -> [text]:
+    val folder = join_path(vault_path, period)
+    if not file_exists(folder):
+        return []
+    val all_files = rt_dir_walk(folder) ?? []
+    var md_files: [text] = []
+    for f in all_files:
+        if f.ends_with(".md"):
+            # Get relative path from vault
+            var rel = f
+            if rel.starts_with(vault_path):
+                rel = rel.substring(vault_path.len(), rel.len())
+                if rel.starts_with("/"):
+                    rel = rel.substring(1, rel.len())
+            md_files.push(rel)
+
+    # Sort by name descending (reverse alphabetical = most recent first for date-based names)
+    md_files = sort_descending(md_files)
+
+    # Apply limit
+    var actual_limit = limit
+    if actual_limit <= 0:
+        actual_limit = 10
+    var result: [text] = []
+    var count: i64 = 0
+    for f in md_files:
+        if count >= actual_limit:
+            break
+        result.push(f)
+        count = count + 1
+    result
+
+fn sort_descending(items: [text]) -> [text]:
+    # Simple insertion sort descending
+    var sorted: [text] = []
+    for item in items:
+        sorted.push(item)
+    var i: i64 = 1
+    while i < sorted.len():
+        var j = i
+        while j > 0 and sorted[j] > sorted[j - 1]:
+            val tmp = sorted[j]
+            sorted[j] = sorted[j - 1]
+            sorted[j - 1] = tmp
+            j = j - 1
+        i = i + 1
+    sorted
+
+# --- Template functions ---
+
+/**
+List template files in the vault's templates/ folder.
+Returns relative paths from vault root.
+*/
+fn list_templates(vault_path: text) -> [text]:
+    val templates_dir = join_path(vault_path, "templates")
+    if not file_exists(templates_dir):
+        return []
+    val all_files = rt_dir_walk(templates_dir) ?? []
+    var result: [text] = []
+    for f in all_files:
+        if f.ends_with(".md"):
+            var rel = f
+            if rel.starts_with(vault_path):
+                rel = rel.substring(vault_path.len(), rel.len())
+                if rel.starts_with("/"):
+                    rel = rel.substring(1, rel.len())
+            result.push(rel)
+    result
+
+/**
+Apply a template to create a new note with variable substitution.
+Reads the template, replaces {{variable}} placeholders with values
+from a comma-separated key=value string, and writes to the target path.
+
+Built-in variables (auto-populated if not overridden):
+  {{date}}  - today's date (YYYY-MM-DD)
+  {{title}} - filename without extension from target_path
+*/
+fn apply_template(vault_path: text, template_path: text, target_path: text, variables: text) -> bool:
+    val tmpl_full = join_path(vault_path, template_path)
+    if not file_exists(tmpl_full):
+        return false
+    val tmpl_content = read_file(tmpl_full) ?? ""
+    if tmpl_content == "":
+        return false
+
+    # Parse variables string: "key1=val1,key2=val2"
+    var var_keys: [text] = []
+    var var_vals: [text] = []
+    if variables != "":
+        val pairs = variables.split(",")
+        for pair in pairs:
+            val trimmed = pair.trim()
+            val eq_idx_result = trimmed.index_of("=")
+            match eq_idx_result:
+                Some(i):
+                    val key = trimmed.substring(0, i).trim()
+                    val value = trimmed.substring(i + 1, trimmed.len()).trim()
+                    var_keys.push(key)
+                    var_vals.push(value)
+                nil: pass_dn
+
+    # Add built-in variables if not already present
+    if not list_contains(var_keys, "date"):
+        var_keys.push("date")
+        var_vals.push(get_today_date())
+    if not list_contains(var_keys, "title"):
+        var_keys.push("title")
+        var_vals.push(filename_stem(target_path))
+
+    # Perform substitutions
+    var result = tmpl_content
+    var idx: i64 = 0
+    while idx < var_keys.len():
+        val placeholder = "{{" + var_keys[idx] + "}}"
+        result = result.replace(placeholder, var_vals[idx])
+        idx = idx + 1
+
+    # Write to target
+    val target_full = join_path(vault_path, target_path)
+    if not ensure_parent_dirs(target_full):
+        return false
+    write_file(target_full, result)
+
+fn list_contains(items: [text], target: text) -> bool:
+    for item in items:
+        if item == target:
+            return true
+    false
+
+fn filename_stem(path: text) -> text:
+    # Extract filename without extension from a path
+    var name = path
+    val slash_idx = path.last_index_of("/")
+    match slash_idx:
+        Some(i):
+            name = path.substring(i + 1, path.len())
+        nil: pass_dn
+    val dot_idx = name.last_index_of(".")
+    match dot_idx:
+        Some(i):
+            return name.substring(0, i)
+        nil:
+            return name
+    name

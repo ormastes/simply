@@ -1,0 +1,99 @@
+# 00. Demo - Hello GPU
+#
+# Detect the GPU, print device info, and launch a trivial kernel.
+# This is the simplest possible CUDA program translated to Simple.
+#
+# C/CUDA equivalent:
+#   __global__ void hello_kernel() { /* no-op */ }
+#   int main() {
+#       int count;
+#       cudaGetDeviceCount(&count);
+#       printf("Devices: %d\n", count);
+#       hello_kernel<<<1, 1>>>();
+#       cudaDeviceSynchronize();
+#   }
+#
+# Notes for Simple:
+#   - `gpu_init()` must run BEFORE any device query (like cuInit in the
+#     driver API); `gpu_device_count()` reports 0 until the driver is up.
+#   - `main` does not return a Result: a GPU error is matched and printed,
+#     so the demo exits cleanly on a machine without a GPU.
+
+use std.gpu.*
+
+# ============================================================================
+# Kernel: trivial "hello" kernel that does nothing
+# ============================================================================
+
+@gpu_kernel
+fn hello_kernel():
+    # Every thread just returns immediately.
+    # In C/CUDA this is: __global__ void hello_kernel() {}
+    pass_dn
+
+# ============================================================================
+# Device helper: print info about a single GPU
+# ============================================================================
+
+fn print_device_info(device_id: i64):
+    val name = gpu_device_name(device_id)
+    val cap = gpu_device_compute_capability(device_id)
+    print "  Device {device_id}: {name}"
+    print "    Compute Capability: {cap.0}.{cap.1}"
+
+fn describe_error(step: text, e: GpuError):
+    print "{step} failed: {e.to_text()}"
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn main():
+    print "=== Hello GPU (Simple) ==="
+    print ""
+
+    # --- Bring the driver up (cuInit) ---
+    match gpu_init():
+        case Ok(_):
+            pass_dn
+        case Err(e):
+            describe_error("gpu_init", e)
+            print "No usable GPU driver - exiting."
+            return
+
+    # --- Detect devices ---
+    val count = gpu_device_count()
+    print "GPU devices found: {count}"
+
+    if count == 0:
+        print "No GPU detected - exiting."
+        return
+
+    # Print info for every device
+    for i in 0..count:
+        print_device_info(i)
+    print ""
+
+    # --- Create a context on device 0 (cuCtxCreate) ---
+    match gpu_set_device(0):
+        case Ok(_):
+            print "Runtime initialised on device 0."
+        case Err(e):
+            describe_error("gpu_set_device", e)
+            return
+
+    # --- Launch the trivial kernel ---
+    # 1 block, 1 thread  (the smallest possible launch)
+    print "Launching hello_kernel<<<grid: (1,1,1), block: (1,1,1)>>>..."
+    hello_kernel<<<grid: (1, 1, 1), block: (1, 1, 1)>>>()
+
+    # Wait for the GPU to finish
+    match gpu_sync():
+        case Ok(_):
+            print "Kernel completed successfully."
+        case Err(e):
+            describe_error("gpu_sync", e)
+            return
+
+    print ""
+    print "=== Demo Complete ==="

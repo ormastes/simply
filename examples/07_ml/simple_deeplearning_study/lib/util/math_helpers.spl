@@ -1,0 +1,87 @@
+# Math helpers for deep learning study
+# Pure Simple implementations of common math functions
+
+fn dl_exp(x: f64) -> f64:
+    # Taylor series approximation for e^x
+    # Clamp input to avoid overflow
+    var cx = x
+    if cx > 20.0:
+        cx = 20.0
+    if cx < -20.0:
+        cx = -20.0
+    var result = 1.0
+    var term = 1.0
+    var i = 1
+    while i <= 20:
+        term = term * cx / (i as f64)
+        result = result + term
+        i = i + 1
+    if result < 0.0:
+        result = 0.0
+    result
+
+fn dl_sqrt(x: f64) -> f64:
+    # Newton's method for square root
+    if x <= 0.0:
+        return 0.0
+    var guess = x
+    if guess > 1.0:
+        guess = guess / 2.0
+    var i = 0
+    while i < 30:
+        guess = (guess + x / guess) / 2.0
+        i = i + 1
+    guess
+
+fn dl_log(x: f64) -> f64:
+    # Natural logarithm via series expansion
+    if x <= 0.0:
+        return -999999.0
+    # Normalize to [0.5, 2.0) range
+    var normalized = x
+    var adjust = 0.0
+    while normalized > 2.0:
+        normalized = normalized / 2.718281828
+        adjust = adjust + 1.0
+    while normalized < 0.5:
+        normalized = normalized * 2.718281828
+        adjust = adjust - 1.0
+    # Series: ln(1+u) = u - u^2/2 + u^3/3 - ...
+    val u = normalized - 1.0
+    var result = 0.0
+    var term = u
+    var i = 1
+    while i <= 30:
+        result = result + term / (i as f64)
+        term = term * (0.0 - u)
+        i = i + 1
+    result + adjust
+
+fn dl_abs(x: f64) -> f64:
+    if x < 0.0:
+        return 0.0 - x
+    x
+
+fn dl_max(a: f64, b: f64) -> f64:
+    if a > b:
+        return a
+    b
+
+fn dl_min(a: f64, b: f64) -> f64:
+    if a < b:
+        return a
+    b
+
+fn dl_tanh(x: f64) -> f64:
+    val ex = dl_exp(x)
+    val emx = dl_exp(0.0 - x)
+    (ex - emx) / (ex + emx)
+
+fn dl_sigmoid(x: f64) -> f64:
+    1.0 / (1.0 + dl_exp(0.0 - x))
+
+fn dl_pi() -> f64:
+    3.14159265358979
+
+export dl_exp, dl_sqrt, dl_log, dl_abs, dl_max, dl_min
+export dl_tanh, dl_sigmoid, dl_pi

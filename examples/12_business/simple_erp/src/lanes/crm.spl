@@ -1,0 +1,47 @@
+# CRM Lane — leads on the shared guarded-write framework
+#
+# The lane owns only its domain shape (Lead) and its validation verdict. Every
+# write is funneled through framework.gate_write with action "crm.write", so the
+# session -> rbac -> validation -> idempotency order is enforced in exactly one
+# place and this lane can never hand-roll (and thus bypass) the gate.
+
+use framework.guarded.{Tenant, Actor, Session, WriteResult, gate_write}
+use std.nogc_sync_mut.enterprise_store.store.{EnterpriseStore}
+
+struct Lead:
+    val id: i64
+    val name: text
+    val account: text
+    val contact: text
+    val stage: text
+    val value: i64
+    val next_action: text
+
+# Domain validity: identity present, all names filled, non-negative value.
+fn validate_lead(lead: Lead) -> bool:
+    return (lead.id > 0 and lead.name.len() > 0 and lead.account.len() > 0 and lead.contact.len() > 0 and lead.value >= 0)
+
+# Move a lead to a new pipeline stage. Returns a fresh value (structs are copied).
+fn advance_lead(lead: Lead, stage: text, next_action: text) -> Lead:
+    return Lead { id: lead.id, name: lead.name, account: lead.account, contact: lead.contact, stage: stage, value: lead.value, next_action: next_action }
+
+# Sum of value across leads that have not yet been won.
+fn pipeline_value(leads: [Lead]) -> i64:
+    var total = 0
+    for lead in leads:
+        if lead.stage != "won":
+            total = total + lead.value
+    return total
+
+# Count of leads still open (not won).
+fn open_lead_count(leads: [Lead]) -> i64:
+    var count = 0
+    for lead in leads:
+        if lead.stage != "won":
+            count = count + 1
+    return count
+
+# The lane's single write entry point: contributes validation + action name,
+# the framework owns the rest of the gate.
+fn submit_lead_write(session: Session, tenant: Tenant, user: Actor, lead: Lead, key: text, store: EnterpriseStore) -> WriteResult:
+    return gate_write(store, session, tenant, user, "crm.write", validate_lead(lead), key)

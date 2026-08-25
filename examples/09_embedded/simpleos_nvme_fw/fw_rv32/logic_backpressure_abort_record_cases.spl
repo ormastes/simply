@@ -1,0 +1,14 @@
+use logic_backpressure_abort_core.*
+
+fn rv32_bpa_record_cases_selftest() -> i32:
+    val cdw10: u32 = (100 << 16) | 1
+    val ok_status: i64 = _rv32_abort_status(0, cdw10, 0, 0, 1)
+    if ok_status != 0:
+        return 1
+    if _rv32_abort_data(ok_status) != 1:
+        return 1
+    if _rv32_abort_recorded_sqid(-1, ok_status, cdw10) != 1:
+        return 1
+    if _rv32_abort_recorded_cid(-1, ok_status, cdw10) != 100:
+        return 1
+    0

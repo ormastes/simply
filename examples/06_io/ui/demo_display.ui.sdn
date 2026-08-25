@@ -1,0 +1,77 @@
+app:
+    title: "Display Widgets Demo"
+    theme: glass_dark
+
+layout:
+    type: vbox
+    children:
+        progress_panel:
+            type: panel
+            title: "Progress Bars"
+            children:
+                dl_label:
+                    type: text
+                    content: "Download Progress:"
+                prog_0:
+                    type: progress
+                    id: prog_0
+                    value: "0"
+                ul_label:
+                    type: text
+                    content: "Upload Progress:"
+                prog_25:
+                    type: progress
+                    id: prog_25
+                    value: "25"
+                build_label:
+                    type: text
+                    content: "Build Progress:"
+                prog_75:
+                    type: progress
+                    id: prog_75
+                    value: "75"
+                done_label:
+                    type: text
+                    content: "Complete:"
+                prog_100:
+                    type: progress
+                    id: prog_100
+                    value: "100"
+        div1:
+            type: divider
+            id: div1
+        image_panel:
+            type: panel
+            title: "Image Widget"
+            children:
+                logo:
+                    type: image
+                    id: logo
+                    src: "assets/logo.png"
+                    alt: "Company Logo"
+                img_note:
+                    type: text
+                    content: "Images display with alt text placeholder in terminal mode."
+        div2:
+            type: divider
+            id: div2
+        tooltip_panel:
+            type: panel
+            title: "Tooltip Example"
+            children:
+                help_text:
+                    type: text
+                    id: help_text
+                    content: "Hover here for help"
+                help_tip:
+                    type: tooltip
+                    id: help_tip
+                    content: "This is a helpful tooltip with extra information."
+                    target: "help_text"
+                tip_note:
+                    type: text
+                    content: "Tooltips provide additional context on hover."
+        status:
+            type: statusbar
+            left: "NORMAL MODE"
+            right: "Display Demo"

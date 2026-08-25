@@ -1,0 +1,84 @@
+# Vault scanner — walks Obsidian vault directory, filters .md files
+#
+# Scans a vault directory recursively and returns all markdown file paths,
+# excluding configured patterns like .obsidian/, .trash/, node_modules/.
+
+use std.io_runtime.{file_exists, dir_list}
+
+# --- Check if path should be excluded ---
+
+fn should_exclude(path: text, excludes: [text]) -> bool:
+    path.contains(".obsidian/") or
+        path.contains(".trash/") or
+        path.contains("node_modules/") or
+        path.contains(".git/") or
+        path.contains("/archive/")
+
+# --- Check if path is a markdown file ---
+
+fn is_markdown(path: text) -> bool:
+    path.ends_with(".md")
+
+# --- Scan vault for markdown files ---
+
+/**
+Recursively scan a vault directory for markdown files.
+Excludes `.obsidian/`, `.trash/`, `node_modules/`, `.git/` by default.
+
+```sdoctest
+>>> val files = scan_vault("/path/to/vault")
+>>> # Returns all .md files, excluding hidden/system dirs
+```
+*/
+fn scan_vault(vault_path: text) -> [text]:
+    scan_vault_with_excludes(vault_path, [])
+
+fn scan_vault_with_excludes(vault_path: text, excludes: [text]) -> [text]:
+    var result: [text] = []
+    scan_vault_dir(vault_path, excludes, result)
+    result
+
+fn join_path(base: text, name: text) -> text:
+    if base.ends_with("/"):
+        return base + name
+    base + "/" + name
+
+fn scan_vault_dir(dir: text, excludes: [text], result: [text]):
+    if should_exclude(dir, excludes):
+        return
+    val entries = dir_list(dir) ?? []
+    for entry in entries:
+        val full_path = join_path(dir, entry)
+        if not should_exclude(full_path, excludes):
+            if is_markdown(full_path):
+                result.push(full_path)
+            else:
+                val child_entries = dir_list(full_path) ?? []
+                if child_entries.len() > 0:
+                    scan_vault_dir(full_path, excludes, result)
+
+# --- Get relative path from vault root ---
+
+/**
+Strip vault root prefix from a full path to get the relative path.
+
+```sdoctest
+>>> relative_path("/vault/daily/2024-01-15.md", "/vault")
+daily/2024-01-15.md
+>>> relative_path("/other/file.md", "/vault")
+/other/file.md
+```
+*/
+fn relative_path(full_path: text, vault_path: text) -> text:
+    val vault_len = vault_path.len()
+    if full_path.starts_with(vault_path):
+        var rel = full_path.substring(vault_len, full_path.len())
+        if rel.starts_with("/"):
+            rel = rel.substring(1, rel.len())
+        return rel
+    full_path
+
+# --- Check if vault path is valid ---
+
+fn is_valid_vault(path: text) -> bool:
+    file_exists(path)

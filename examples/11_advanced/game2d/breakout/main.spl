@@ -1,0 +1,73 @@
+# Breakout — physics + game2d demo
+use std.nogc_sync_mut.game2d.app.run.{run}
+use std.nogc_sync_mut.game2d.render.canvas.{Canvas}
+use std.nogc_sync_mut.game2d.math.{DrawMode}
+use std.common.engine.ids.{NodeId}
+use std.common.engine.math2d.{Vec2}
+use std.common.engine.rect.{Rect2}
+use std.common.engine.color.{EngineColor}
+use std.nogc_sync_mut.engine.physics.config.{default_physics_config_2d}
+use std.nogc_sync_mut.engine.physics.world2d.{PhysicsWorld2D}
+
+fn node(i: i64) -> NodeId:
+    NodeId(raw: i)
+
+class Game:
+    world: PhysicsWorld2D
+
+    fn update(self, dt: f32):
+        val _ = dt
+
+    fn fixed_update(self, step: f32):
+        self.world.step(0.016)
+
+    fn draw(self, ctx: Canvas):
+        ctx.clear(EngineColor(r: 0.05, g: 0.05, b: 0.1, a: 1.0))
+        val gray = EngineColor(r: 0.4, g: 0.4, b: 0.4, a: 1.0)
+        ctx.rect(DrawMode.Fill, Rect2(x: 100.0, y: 30.0, width: 600.0, height: 10.0), gray)
+        ctx.rect(DrawMode.Fill, Rect2(x: 100.0, y: 30.0, width: 10.0, height: 500.0), gray)
+        ctx.rect(DrawMode.Fill, Rect2(x: 690.0, y: 30.0, width: 10.0, height: 500.0), gray)
+        var i = 0
+        while i < 15:
+            val pos = self.world.get_position(node(10 + i))
+            val sx = 400.0 + pos.x * 60.0
+            val sy = 300.0 - pos.y * 60.0
+            val r_val = (i * 17 % 100).to_f64() / 100.0
+            val color = EngineColor(r: r_val, g: 0.7, b: 0.3, a: 1.0)
+            ctx.rect(DrawMode.Fill, Rect2(x: sx - 30.0, y: sy - 10.0, width: 60.0, height: 20.0), color)
+            i = i + 1
+        val ball_pos = self.world.get_position(node(0))
+        val bx = 400.0 + ball_pos.x * 60.0
+        val by = 300.0 - ball_pos.y * 60.0
+        ctx.circle(DrawMode.Fill, Vec2(x: bx, y: by), 12.0, EngineColor(r: 1.0, g: 1.0, b: 1.0, a: 1.0))
+
+fn setup_world() -> PhysicsWorld2D:
+    var config = default_physics_config_2d()
+    config.gravity = Vec2(x: 0.0, y: 0.0)
+    config.restitution = 1.0
+    config.friction = 0.0
+    var world = PhysicsWorld2D.create(config)
+    world.add_static_body(node(100), 0.0, 4.5)
+    world.add_box_collider(node(100), 5.0, 0.3)
+    world.add_static_body(node(101), -5.0, 0.0)
+    world.add_box_collider(node(101), 0.3, 5.0)
+    world.add_static_body(node(102), 5.0, 0.0)
+    world.add_box_collider(node(102), 0.3, 5.0)
+    var row = 0
+    while row < 3:
+        var col = 0
+        while col < 5:
+            val nid = 10 + row * 5 + col
+            val bx = -3.0 + col.to_f64() * 1.5
+            val by = 3.0 + row.to_f64() * 0.6
+            world.add_static_body(node(nid), bx, by)
+            world.add_box_collider(node(nid), 0.5, 0.15)
+            col = col + 1
+        row = row + 1
+    world.add_dynamic_body(node(0), 0.0, -2.0, 1.0)
+    world.add_circle_collider(node(0), 0.2)
+    world.apply_impulse(node(0), 1.5, 4.0)
+    world
+
+fn main():
+    run(Game(world: setup_world()), "Breakout", 800, 600)

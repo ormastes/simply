@@ -1,0 +1,239 @@
+#![allow(unnamed_duplicate_typed_args)]
+#!/usr/bin/env simple
+# Training Pipeline with GPU Async Operations
+#
+# Demonstrates best practices for async data loading and GPU training.
+# This pattern is what most deep learning frameworks use internally.
+
+use std.gpu.{Context}
+use std.torch.{TorchStream, TorchTensorWrapper}
+
+# ============================================================================
+# Data Loading Utilities
+# ============================================================================
+
+fn load_training_batch(batch_idx: i64, batch_size: i64) -> [f32]:
+    """Simulate loading training data from disk (slow I/O)."""
+    var data = []
+    for i in 0..batch_size:
+        val value = ((batch_idx * batch_size + i) % 1000) as f32
+        data = data + [value / 1000.0]
+    data
+
+fn load_labels_batch(batch_idx: i64, batch_size: i64) -> [i64]:
+    """Simulate loading labels."""
+    var labels = []
+    for i in 0..batch_size:
+        val label = (batch_idx + i) % 10
+        labels = labels + [label]
+    labels
+
+# ============================================================================
+# Training Loop with Optimal Async Pattern
+# ============================================================================
+
+fn train_epoch(ctx: Context, epoch: i64, batch_size: i64, num_batches: i64):
+    """Train for one epoch with async data pipeline.
+
+    Pattern:
+    - CPU thread: Load batch N from disk
+    - Upload stream: Copy batch N-1 to GPU
+    - Compute stream: Train on batch N-2
+
+    This 3-stage pipeline hides both I/O and transfer latency.
+    """
+    val upload_stream = ctx.create_stream()
+    val compute_stream = ctx.create_stream()
+
+    print "Epoch {epoch}:"
+
+    # Stage 0: Load first batch (CPU)
+    var batch_n = load_training_batch(0, batch_size)
+    var labels_n = load_labels_batch(0, batch_size)
+
+    # Stage 1: Upload first batch to GPU
+    var gpu_batch_n1 = ctx.alloc_upload(batch_n)
+    var gpu_labels_n1 = ctx.alloc_upload(labels_n)
+    upload_stream.synchronize()
+
+    var epoch_loss = 0.0
+
+    for batch_idx in 1..num_batches:
+        # === 3-Stage Pipeline ===
+
+        # Stage 1: CPU loads batch N (parallel with GPU operations)
+        val next_batch = load_training_batch(batch_idx, batch_size)
+        val next_labels = load_labels_batch(batch_idx, batch_size)
+
+        # Stage 2: Upload batch N to GPU (async, on upload_stream)
+        val gpu_next_batch = ctx.alloc_upload(next_batch)
+        val gpu_next_labels = ctx.alloc_upload(next_labels)
+
+        # Stage 3: Train on batch N-1 (async, on compute_stream, parallel with stages 1&2)
+        # In real code: forward(), backward(), optimizer.step()
+        # Here we simulate with sync
+        compute_stream.synchronize()
+
+        # Calculate loss (small download, async)
+        val batch_loss = 1.0 - (batch_idx as f32 / num_batches as f32)
+        epoch_loss = epoch_loss + batch_loss
+
+        # Wait for upload before moving to next iteration
+        upload_stream.synchronize()
+
+        print "  Batch {batch_idx}/{num_batches}: loss = {batch_loss}"
+
+        # Shift pipeline
+        gpu_batch_n1 = gpu_next_batch
+        gpu_labels_n1 = gpu_next_labels
+
+    # Process final batch
+    compute_stream.synchronize()
+    val final_loss = 1.0 / num_batches as f32
+    epoch_loss = epoch_loss + final_loss
+    print "  Batch {num_batches}/{num_batches}: loss = {final_loss}"
+
+    val avg_loss = epoch_loss / num_batches as f32
+    print "  Average loss: {avg_loss}\n"
+
+# ============================================================================
+# Comparison: Synchronous vs Asynchronous
+# ============================================================================
+
+fn train_sync(ctx: Context, num_batches: i64, batch_size: i64):
+    """Synchronous training (baseline for comparison)."""
+    print "=== Synchronous Training (Baseline) ==="
+    print "Each operation waits for previous to complete\n"
+
+    for batch_idx in 0..num_batches:
+        # Load from disk (CPU, blocks)
+        val batch = load_training_batch(batch_idx, batch_size)
+        val labels = load_labels_batch(batch_idx, batch_size)
+
+        # Upload to GPU (blocks)
+        val gpu_batch = ctx.alloc_upload(batch)
+        val gpu_labels = ctx.alloc_upload(labels)
+        ctx.synchronize()
+
+        # Compute (blocks)
+        # forward(), backward(), optimizer.step()
+        ctx.synchronize()
+
+        # Download loss (blocks)
+        val loss = 1.0 / (batch_idx + 1) as f32
+        print "  Batch {batch_idx}: loss = {loss}"
+
+    ctx.synchronize()
+    print "✓ Synchronous training complete\n"
+
+fn train_async(ctx: Context, num_batches: i64, batch_size: i64):
+    """Asynchronous training with pipeline overlap."""
+    print "=== Asynchronous Training (Optimized) ==="
+    print "3-stage pipeline: Load batch N | Upload N-1 | Compute N-2\n"
+
+    train_epoch(ctx: ctx, epoch: 0, batch_size: batch_size, num_batches: num_batches)
+
+    print "✓ Asynchronous training complete\n"
+
+# ============================================================================
+# Real-World Pattern: DataLoader Simulation
+# ============================================================================
+
+fn example_dataloader_pattern():
+    """Simulate PyTorch-style DataLoader with prefetching."""
+    print "=== DataLoader Pattern with Prefetching ==="
+
+    val ctx = Context.default()
+    val batch_size = 32
+    val num_batches = 8
+    val prefetch_batches = 2
+
+    print "Prefetching {prefetch_batches} batches ahead\n"
+
+    # Prefetch queue (in real code: circular buffer)
+    var prefetch_queue = []
+
+    # Warm up: prefetch first N batches
+    for i in 0..prefetch_batches:
+        val batch = load_training_batch(i, batch_size)
+        val gpu_batch = ctx.alloc_upload(batch)
+        prefetch_queue = prefetch_queue + [gpu_batch]
+        print "  Prefetched batch {i}"
+
+    print ""
+
+    # Training loop
+    for batch_idx in 0..num_batches:
+        # Get next batch from queue
+        val current_batch = prefetch_queue[0]
+
+        # Remove from queue (simulation)
+        var new_queue = []
+        for i in 1..prefetch_queue.len():
+            new_queue = new_queue + [prefetch_queue[i]]
+        prefetch_queue = new_queue
+
+        # Train on current batch
+        ctx.synchronize()
+        val loss = 1.0 / (batch_idx + 1) as f32
+        print "  Training batch {batch_idx}: loss = {loss}"
+
+        # Prefetch next batch (async, while training)
+        val prefetch_idx = batch_idx + prefetch_batches
+        if prefetch_idx < num_batches:
+            val next_batch = load_training_batch(prefetch_idx, batch_size)
+            val gpu_next = ctx.alloc_upload(next_batch)
+            prefetch_queue = prefetch_queue + [gpu_next]
+            print "    Prefetched batch {prefetch_idx}"
+
+    ctx.synchronize()
+    print "\n✓ DataLoader pattern complete\n"
+
+# ============================================================================
+# Performance Analysis
+# ============================================================================
+
+fn analyze_pipeline_benefits():
+    """Explain pipeline performance benefits."""
+    print "=== Pipeline Performance Analysis ===\n"
+
+    print "Synchronous (sequential) execution:"
+    print "  T_total = N * (T_load + T_upload + T_compute + T_download)"
+    print "  Example: 100 batches * (50ms + 10ms + 100ms + 5ms) = 16.5s\n"
+
+    print "Asynchronous (pipelined) execution:"
+    print "  T_total ≈ N * max(T_load, T_upload, T_compute, T_download)"
+    print "  Example: 100 batches * max(50ms, 10ms, 100ms, 5ms) = 10.0s\n"
+
+    print "Speedup: 16.5s / 10.0s = 1.65x faster!\n"
+
+    print "Key insight:"
+    print "  - Pipeline hides transfer latency behind compute"
+    print "  - Critical when T_upload + T_download ≈ T_compute"
+    print "  - Essential for small batches or fast models\n"
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn main():
+    """Demonstrate training pipeline patterns."""
+    print "Training Pipeline Examples\n"
+    print "===========================\n"
+
+    val ctx = Context.default()
+
+    print "Device: {ctx.backend_name()} (ID: {ctx.device_id()})\n"
+
+    # Comparison
+    train_sync(ctx: ctx, num_batches: 5, batch_size: 64)
+    train_async(ctx: ctx, num_batches: 5, batch_size: 64)
+
+    # Advanced patterns
+    example_dataloader_pattern()
+
+    # Analysis
+    analyze_pipeline_benefits()
+
+    print "===========================\n"
+    print "All training pipeline examples complete! ✓"

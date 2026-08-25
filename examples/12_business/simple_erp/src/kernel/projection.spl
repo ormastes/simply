@@ -1,0 +1,60 @@
+# UBS Kernel — Ledger Projection & the balanced-ledger invariant
+#
+# A journal entry is a set of signed lines (debit > 0, credit < 0). The load-
+# bearing business invariant — the one a system of record lives or dies on — is
+# that every entry BALANCES: the signed amounts sum to zero. Here it is a runtime
+# check; the design target (verify/ledger_balances.lean) is to *prove* it.
+#
+# Because the ledger is a projection of the event log, balances are derived, not
+# stored — drilling from a balance back to its source events is one chain, not a
+# reconciliation.
+
+use units.money.{Money, money, money_add, money_neg, is_zero, zero, money_eq}
+
+# A signed posting against one account. Debit positive, credit negative.
+struct JournalLine:
+    val account: i64
+    val amount: Money
+
+# A balanced set of lines, all in one currency (multi-currency entries decompose
+# into one balanced sub-entry per currency in a fuller build).
+struct JournalEntry:
+    val id: i64
+    val lines: [JournalLine]
+
+fn line(account: i64, amount: Money) -> JournalLine:
+    return JournalLine { account: account, amount: amount }
+
+# Signed sum of all lines. Same-currency by construction; mismatches surface as
+# a money_add rejection and are treated as a non-zero (i.e. non-balancing) sum.
+fn entry_sum(entry: JournalEntry) -> Money:
+    var total = zero("")
+    var started = false
+    for ln in entry.lines:
+        if !started:
+            total = ln.amount
+            started = true
+        else:
+            val r = money_add(total, ln.amount)
+            if !r.ok:
+                # currency mismatch — force a sentinel non-zero so balances() fails
+                return money(ln.amount.currency, 1)
+            total = r.value
+    return total
+
+# THE invariant: Σ debits == Σ credits  ⇔  signed sum is zero.
+fn balances(entry: JournalEntry) -> bool:
+    if entry.lines.length() == 0:
+        return true
+    return is_zero(entry_sum(entry))
+
+# Running balance for one account across a set of entries (a projection slice).
+fn account_balance(entries: [JournalEntry], account: i64, currency: text) -> Money:
+    var total = zero(currency)
+    for entry in entries:
+        for ln in entry.lines:
+            if ln.account == account and ln.amount.currency == currency:
+                val r = money_add(total, ln.amount)
+                if r.ok:
+                    total = r.value
+    return total

@@ -1,0 +1,3 @@
+[submodule "examples/06_io/restaurant_webapp"]
+	path = examples/06_io/restaurant_webapp
+	url = git@github.com:ormastes/simple-restaurant.git

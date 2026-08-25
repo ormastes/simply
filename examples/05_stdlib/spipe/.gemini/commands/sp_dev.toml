@@ -1,0 +1,9 @@
+description = "SPipe-prefixed full feature development alias for /dev and /sstack."
+prompt = """
+Run the full SPipe/SStack feature-development pipeline for the given request.
+
+This command is equivalent to /dev and /sstack, using the SPipe-prefixed
+command name for clearer namespacing.
+
+Follow `.claude/skills/sstack.md` as the canonical procedure.
+"""

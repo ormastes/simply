@@ -1,0 +1,37 @@
+# transform/dispatch/queue_view — Adapter: broker → task queue
+
+fn queue_pending_tasks() -> [text]:
+    var pending: [text] = []
+    var i = 0
+    while i < BK_TASK_COUNT:
+        if BK_TASK_STATUSES[i] == "pending":
+            pending.push(BK_TASK_IDS[i])
+        i = i + 1
+    pending
+
+fn queue_assigned_tasks() -> [text]:
+    var assigned: [text] = []
+    var i = 0
+    while i < BK_TASK_COUNT:
+        if BK_TASK_STATUSES[i] == "assigned" or BK_TASK_STATUSES[i] == "running":
+            assigned.push(BK_TASK_IDS[i])
+        i = i + 1
+    assigned
+
+fn queue_completed_count() -> i64:
+    var count = 0
+    var i = 0
+    while i < BK_TASK_COUNT:
+        if BK_TASK_STATUSES[i] == "completed":
+            count = count + 1
+        i = i + 1
+    count
+
+fn queue_failed_count() -> i64:
+    var count = 0
+    var i = 0
+    while i < BK_TASK_COUNT:
+        if BK_TASK_STATUSES[i] == "failed":
+            count = count + 1
+        i = i + 1
+    count

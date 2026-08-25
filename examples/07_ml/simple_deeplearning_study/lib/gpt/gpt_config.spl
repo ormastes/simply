@@ -1,0 +1,47 @@
+# GPT Configuration — from scratch
+# Chapter 4: "Build a Large Language Model From Scratch" (Rasbt)
+#
+# Defines model hyperparameters for different GPT-2 sizes.
+
+class GPTConfig:
+    vocab_size: i64      # Vocabulary size (GPT-2: 50257)
+    ctx_len: i64         # Maximum context length (GPT-2: 1024)
+    emb_dim: i64         # Embedding dimension (GPT-2 124M: 768)
+    num_heads: i64       # Number of attention heads (GPT-2 124M: 12)
+    num_layers: i64      # Number of transformer blocks (GPT-2 124M: 12)
+    drop_rate: f64       # Dropout rate (GPT-2: 0.1)
+
+# Tiny config for tests and demos
+fn gpt_config_tiny() -> GPTConfig:
+    GPTConfig(
+        vocab_size: 256,
+        ctx_len: 32,
+        emb_dim: 64,
+        num_heads: 4,
+        num_layers: 2,
+        drop_rate: 0.0
+    )
+
+# Small config for real experiments
+fn gpt_config_small() -> GPTConfig:
+    GPTConfig(
+        vocab_size: 50257,
+        ctx_len: 256,
+        emb_dim: 768,
+        num_heads: 12,
+        num_layers: 12,
+        drop_rate: 0.1
+    )
+
+# GPT-2 124M config
+fn gpt_config_124m() -> GPTConfig:
+    GPTConfig(
+        vocab_size: 50257,
+        ctx_len: 1024,
+        emb_dim: 768,
+        num_heads: 12,
+        num_layers: 12,
+        drop_rate: 0.1
+    )
+
+export GPTConfig, gpt_config_tiny, gpt_config_small, gpt_config_124m

@@ -1,0 +1,77 @@
+"""
+Full self-test suite for the SimpleOS NVMe firmware — every module (leaves + the
+FIL/FTL/HIL integration + the top-level reactor). The end-to-end scenario lives in
+sim_main.spl.
+Run: bin/simple run examples/09_embedded/simpleos_nvme_fw/fw/test_fw.spl
+Gate: prints "ALL FIRMWARE SELF-TESTS PASS" and exits 0.
+"""
+
+use nvme_types.*
+use fil_ecc.*
+use fil_badblock.*
+use fil_nand.*
+use fil_nand_device.*
+use fil_fmc.*
+use fil_scheduler.*
+use fil.*
+use ftl_map.*
+use ftl_band.*
+use ftl_journal.*
+use ftl_gc.*
+use ftl.*
+use rain.*
+use dram.*
+use hil_queue.*
+use hil_command.*
+use fw_pool.*
+use hil.*
+use firmware.*
+use nvme_admin_types.*
+use nvme_admin.*
+use nvme_qset.*
+use nvme_controller.*
+use power_thermal.*
+use sandbox.*
+use hooks.*
+use openssd_config.*
+
+fn main():
+    var f: i64 = 0
+    print "-- FIL (flash interface) --"
+    f = f + ecc_selftest()
+    f = f + bbt_selftest()
+    f = f + nand_selftest()
+    f = f + nand_device_selftest()
+    f = f + fil_fmc_selftest()
+    f = f + fil_scheduler_selftest()
+    f = f + fil_selftest()
+    print "-- FTL (translation) --"
+    f = f + ftl_map_selftest()
+    f = f + ftl_band_selftest()
+    f = f + ftl_journal_selftest()
+    f = f + ftl_gc_selftest()
+    f = f + ftl_selftest()
+    f = f + rain_selftest()
+    f = f + ftl_rain_selftest()
+    f = f + dram_selftest()
+    print "-- HIL (host interface) + core --"
+    f = f + hil_queue_selftest()
+    f = f + hil_command_selftest()
+    f = f + fw_pool_selftest()
+    f = f + hil_selftest()
+    f = f + firmware_selftest()
+    print "-- NVMe controller (admin + multi IO queue) --"
+    f = f + nvme_qset_selftest()
+    f = f + nvme_admin_selftest()
+    f = f + nvme_controller_selftest()
+    f = f + power_thermal_selftest()
+    print "-- Policy hooks (sandboxed dynamic policy, req 7) --"
+    f = f + sandbox_selftest()
+    f = f + hooks_selftest()
+    print "-- OpenSSD multi-target config --"
+    f = f + openssd_config_selftest()
+    print ""
+    if f == 0:
+        print "ALL FIRMWARE SELF-TESTS PASS"
+    else:
+        print "FIRMWARE TESTS FAIL ({f})"

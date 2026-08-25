@@ -1,0 +1,161 @@
+#![allow(unnamed_duplicate_typed_args)]
+# LLM Caret - Claude API (Anthropic Messages API)
+#
+# Builds HTTP requests for the Anthropic Messages API.
+# Pure functions for request/response JSON building/parsing.
+
+extern fn rt_http_request(method: text, url: text, headers: text, body: text) -> (i64, text, text)
+
+use common.text.{escape_json}
+use std.nogc_async_mut.mcp.helpers.{Q, LB, RB}
+use std.nogc_async_mut.llm.json_helpers.{_unwrap_idx, extract_json_string, extract_json_value, extract_json_int}
+
+# ============================================================================
+# Response struct
+# ============================================================================
+
+struct ApiResponse:
+    content: text
+    model: text
+    stop_reason: text
+    input_tokens: i64
+    output_tokens: i64
+    error: text
+    is_error: bool
+    raw: text
+
+# ============================================================================
+# Pure Function: build request body JSON
+# ============================================================================
+
+fn build_claude_api_body(model: text, messages_json: text, system_prompt: text, max_tokens: i64) -> text:
+    var parts: [text] = []
+    # Model
+    var model_val = model
+    if model_val == "":
+        model_val = "claude-sonnet-4-20250514"
+    parts = parts + [Q() + "model" + Q() + ":" + Q() + model_val + Q()]
+    # Max tokens
+    var tokens = max_tokens
+    if tokens <= 0:
+        tokens = 4096
+    parts = parts + [Q() + "max_tokens" + Q() + ":" + tokens.to_text()]
+    # System prompt
+    if system_prompt != "":
+        parts = parts + [Q() + "system" + Q() + ":" + Q() + escape_json(system_prompt) + Q()]
+    # Messages
+    parts = parts + [Q() + "messages" + Q() + ":" + messages_json]
+    # Join parts
+    var body_parts = []
+    body_parts.append(LB())
+    var i = 0
+    for part in parts:
+        if i > 0:
+            body_parts.append(",")
+        body_parts.append(part)
+        i = i + 1
+    body_parts.append(RB())
+    body_parts.join("")
+
+# Build headers string for Anthropic API
+fn build_claude_api_headers(api_key: text) -> text:
+    var parts = []
+    parts.append("x-api-key: " + api_key)
+    parts.append("anthropic-version: 2023-06-01")
+    parts.append("content-type: application/json")
+    parts.join("\n")
+
+# Build a messages array for a single user message
+fn build_single_message_json(role: text, content: text) -> text:
+    var parts = []
+    parts.append(LB())
+    parts.append(Q() + "role" + Q() + ":" + Q() + role + Q() + ",")
+    parts.append(Q() + "content" + Q() + ":" + Q() + escape_json(content) + Q())
+    parts.append(RB())
+    "[" + parts.join("") + "]"
+
+# ============================================================================
+# Pure Function: parse response JSON
+# ============================================================================
+
+fn parse_claude_api_response(raw: text) -> ApiResponse:
+    if raw.trim() == "":
+        return ApiResponse(
+            content: "",
+            model: "",
+            stop_reason: "",
+            input_tokens: 0,
+            output_tokens: 0,
+            error: "empty response",
+            is_error: true,
+            raw: ""
+        )
+    # Check for error response
+    val error_type = extract_json_string(raw, "type")
+    if error_type == "error":
+        val error_msg = extract_json_string(raw, "message")
+        return ApiResponse(
+            content: "",
+            model: "",
+            stop_reason: "error",
+            input_tokens: 0,
+            output_tokens: 0,
+            error: error_msg,
+            is_error: true,
+            raw: raw
+        )
+    # Extract content from content[0].text
+    val content_text = extract_json_string(raw, "text")
+    val model_val = extract_json_string(raw, "model")
+    val stop = extract_json_string(raw, "stop_reason")
+    val in_tok = extract_json_int(raw, "input_tokens")
+    val out_tok = extract_json_int(raw, "output_tokens")
+    var final_stop = stop
+    if final_stop == "":
+        final_stop = "end_turn"
+    ApiResponse(
+        content: content_text,
+        model: model_val,
+        stop_reason: final_stop,
+        input_tokens: in_tok,
+        output_tokens: out_tok,
+        error: "",
+        is_error: false,
+        raw: raw
+    )
+
+# ============================================================================
+# Impure Function: send request
+# ============================================================================
+
+fn claude_api_send(api_key: text, base_url: text, model: text, messages_json: text, system_prompt: text, max_tokens: i64) -> ApiResponse:
+    if api_key == "":
+        return ApiResponse(
+            content: "",
+            model: "",
+            stop_reason: "error",
+            input_tokens: 0,
+            output_tokens: 0,
+            error: "ANTHROPIC_API_KEY not set",
+            is_error: true,
+            raw: ""
+        )
+    val url = base_url + "/v1/messages"
+    val headers = build_claude_api_headers(api_key)
+    val body = build_claude_api_body(model, messages_json, system_prompt, max_tokens)
+    val result = rt_http_request("POST", url, headers, body)
+    val status_code = result.0
+    val resp_body = result.1 ?? ""
+    val http_error = result.2 ?? ""
+    if http_error != "":
+        return ApiResponse(
+            content: "",
+            model: "",
+            stop_reason: "error",
+            input_tokens: 0,
+            output_tokens: 0,
+            error: "HTTP error: " + http_error,
+            is_error: true,
+            raw: resp_body
+        )
+    parse_claude_api_response(resp_body)

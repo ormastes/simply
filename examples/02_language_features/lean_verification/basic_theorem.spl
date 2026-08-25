@@ -1,0 +1,13 @@
+# Basic Lean theorem generation example
+# Demonstrates: @verify attribute, deterministic Lean output
+#
+# When compiled with `bin/simple gen-lean`, this produces a Lean 4 module
+# containing a `def abs` and a `theorem abs_post_0` proving ret >= 0.
+
+@verify
+fn abs(x: i64) -> i64:
+    in: true  # no precondition
+    out(ret): ret >= 0
+    if x < 0:
+        return -x
+    x

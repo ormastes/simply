@@ -1,0 +1,59 @@
+{{#layout "application"}}
+
+<h1>Order #{{order_id}}</h1>
+<a href="/admin/orders" class="btn">&larr; Back to Orders</a>
+
+<div class="order-detail">
+    <div class="detail-row">
+        <strong>Table:</strong> {{table_number}}
+    </div>
+    <div class="detail-row">
+        <strong>Status:</strong> <span class="badge badge-{{status}}">{{status}}</span>
+    </div>
+    <div class="detail-row">
+        <strong>Items:</strong>
+        <pre>{{items_json}}</pre>
+    </div>
+    <div class="detail-row">
+        <strong>Total:</strong> ${{total_display}}
+    </div>
+    <div class="detail-row">
+        <strong>Payment:</strong> {{payment_status}}
+    </div>
+    <div class="detail-row">
+        <strong>Notes:</strong> {{notes}}
+    </div>
+</div>
+
+<div class="order-actions">
+    <form method="POST" action="/admin/orders/{{order_id}}/send-to-cook">
+        <input type="hidden" name="csrf_token" value="{{csrf_token}}">
+        <button type="submit" class="btn btn-primary">Send to Cook</button>
+    </form>
+
+    <form method="POST" action="/admin/orders/{{order_id}}/sticker">
+        <input type="hidden" name="csrf_token" value="{{csrf_token}}">
+        <button type="submit" class="btn">Print Sticker</button>
+    </form>
+
+    <form method="POST" action="/admin/orders/{{order_id}}/update" class="form">
+        <input type="hidden" name="csrf_token" value="{{csrf_token}}">
+        <div class="form-group">
+            <label for="status">Update Status</label>
+            <select name="status">
+                <option value="pending">Pending</option>
+                <option value="cooking">Cooking</option>
+                <option value="ready">Ready</option>
+                <option value="delivered">Delivered</option>
+                <option value="cancelled">Cancelled</option>
+            </select>
+        </div>
+        <div class="form-group">
+            <label for="notes">Notes</label>
+            <textarea name="notes" rows="2">{{notes}}</textarea>
+        </div>
+        <button type="submit" class="btn btn-primary">Update</button>
+    </form>
+</div>
+
+{{/layout}}

@@ -1,0 +1,30 @@
+pub fn _rv32_journal_effective_count(wal_count: i64, cap: i64) -> i64:
+    var n: i64 = wal_count
+    var c: i64 = cap
+    if n < 0:
+        return 0
+    if c < 0:
+        return 0
+    if c > 512:
+        c = 512
+    if n > c:
+        n = c
+    if n > 512:
+        n = 512
+    n
+
+pub fn _rv32_journal_is_full(wal_count: i64, cap: i64) -> i32:
+    val count: i64 = _rv32_journal_effective_count(wal_count, cap)
+    if count >= cap:
+        return 1
+    if count >= 512:
+        return 1
+    0
+
+pub fn _rv32_journal_append_count(wal_count: i64, cap: i64) -> i64:
+    val count: i64 = _rv32_journal_effective_count(wal_count, cap)
+    if count >= cap:
+        return count
+    if count >= 512:
+        return count
+    count + 1

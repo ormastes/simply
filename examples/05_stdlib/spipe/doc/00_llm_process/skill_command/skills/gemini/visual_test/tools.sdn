@@ -1,0 +1,8 @@
+# llm-process-gen: managed source=gemini_visual_test_tools source_sha256=597e07db61bbeaac71c0da6fbf123a1cc0baddd381bf528258cf3c2c573a9b75 content_sha256=7839f368db53457eefb68c6b62ec78f6db78ec374b12122615016e2d9cfbd769
+skill_tools |skill, source|
+    visual_test, gemini
+
+tools |id, type, name, purpose|
+    gemini_cli, cli, "Gemini command prompt", "Run or adapt the copied Gemini workflow prompt"
+    playwright, cli, "Playwright CLI", "Support browser research, visual testing, or UI review when requested"
+    simple_cli, cli, "bin/simple", "Run project checks referenced by the workflow"

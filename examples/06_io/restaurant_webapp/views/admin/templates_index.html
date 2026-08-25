@@ -1,0 +1,35 @@
+{{#layout "application"}}
+
+<h1>Templates</h1>
+
+<a href="/admin/templates/new" class="btn btn-primary">New Template</a>
+
+<table class="table">
+    <thead>
+        <tr>
+            <th>Name</th>
+            <th>Type</th>
+            <th>Description</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+        {{#each templates}}
+        <tr>
+            <td>{{name}}</td>
+            <td>{{template_type}}</td>
+            <td>{{description}}</td>
+            <td>
+                <a href="/admin/templates/{{id}}/edit" class="btn btn-sm">Edit</a>
+                <a href="/admin/templates/{{id}}/groups" class="btn btn-sm">Groups</a>
+                <form method="POST" action="/admin/templates/{{id}}/delete" style="display:inline;">
+                    <input type="hidden" name="csrf_token" value="{{../csrf_token}}">
+                    <button type="submit" class="btn btn-sm btn-danger">Delete</button>
+                </form>
+            </td>
+        </tr>
+        {{/each}}
+    </tbody>
+</table>
+
+{{/layout}}

@@ -1,0 +1,58 @@
+{
+  "identity_vectors": [
+    {
+      "canonical_payload": "{\"base_logical_root\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\",\"operation_id\":\"apply-1\",\"operations\":[]}",
+      "domain": "SPKC-INDEX-APPLY-PAYLOAD-V1\u0000",
+      "expected_hash": "53eac50845e9d3c9014580d3136062cb03e36c7863f947124e63bb674e38308f",
+      "payload_bytes": 136,
+      "vector": "apply_payload_without_hash"
+    },
+    {
+      "canonical_payload": "{\"base_logical_root\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\",\"operation_id\":\"delete-absence-1\",\"operations\":[{\"after\":null,\"before_hash\":null,\"before_revision\":null,\"document_id\":\"doc-missing\",\"kind\":\"delete\"}]}",
+      "domain": "SPKC-INDEX-APPLY-PAYLOAD-V1\u0000",
+      "expected_hash": "9f3366f906834cadde2ea4b02494f47f8dc80f37418729785841e7209d1d9f08",
+      "payload_bytes": 245,
+      "vector": "absence_delete_payload_without_hash"
+    },
+    {
+      "canonical_payload": "{\"action\":\"publish\",\"candidate_logical_root\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"candidate_uid\":\"cand-test\",\"expected_base_logical_root\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\",\"operation_id\":\"publish-1\"}",
+      "domain": "SPKC-INDEX-PUBLISH-PAYLOAD-V1\u0000",
+      "expected_hash": "cf61ac4db6bd270c671a5dd63e47bcc990714d2390cfe14acbfe6131e9042eee",
+      "payload_bytes": 277,
+      "vector": "publish_payload_without_hash"
+    },
+    {
+      "canonical_payload": "{\"apply_payload_hash\":\"sha256:53eac50845e9d3c9014580d3136062cb03e36c7863f947124e63bb674e38308f\",\"base_logical_root\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\",\"candidate_logical_root\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"scope_digest\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"snapshot\":\"spks1-test\",\"workspace\":\"WS-TEST\"}",
+      "domain": "SPKC-CANDIDATE-UID-V1\u0000",
+      "expected_hash": "4adcb8c9713f37d79044d0130b7117f7a4c8d1b3e57a255a9a34be40ffbdb191",
+      "expected_uid": "cand-4adcb8c9713f37d79044d0130b7117f7a4c8d1b3e57a255a9a34be40ffbdb191",
+      "payload_bytes": 424,
+      "vector": "candidate_uid_record"
+    },
+    {
+      "canonical_payload": "{\"apply_operation_id\":\"apply-1\",\"apply_receipt_id\":\"or-0000000000000000000000000000000000000000000000000000000000000000\",\"authority_generation\":7,\"authority_id\":\"candidate-authority-test\",\"base_logical_root\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\",\"candidate_expires_at_ms\":1000,\"candidate_logical_root\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"candidate_uid\":\"cand-test\",\"expired_at_ms\":1001,\"key_id\":\"ed25519:2222222222222222222222222222222222222222222222222222222222222222\",\"outcome\":\"expired\",\"policy_digest\":\"sha256:4444444444444444444444444444444444444444444444444444444444444444\",\"policy_version\":5,\"revocation_generation\":3,\"schema\":\"spipe-candidate-expiry-receipt-v1\",\"scope_digest\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"snapshot\":\"spks1-test\",\"workspace\":\"WS-TEST\"}",
+      "domain": "SPKC-CANDIDATE-EXPIRY-RECEIPT-V1\u0000",
+      "expected_hash": "5bf2e3a55ccfba6130ed059cb4c063c0db39b0f4fbf4845953cabbdf06c268cc",
+      "expected_receipt_id": "cer-5bf2e3a55ccfba6130ed059cb4c063c0db39b0f4fbf4845953cabbdf06c268cc",
+      "payload_bytes": 880,
+      "vector": "candidate_expiry_unsigned_record"
+    }
+  ],
+  "schema": "spipe-provider-protocol-vectors-v1",
+  "wire_vectors": [
+    {
+      "canonical_payload": "{\"error\":{\"code\":\"handshake_required\",\"message\":\"initialize first\",\"retryable\":false},\"ok\":false,\"operation\":\"search\",\"protocol\":{\"major\":1,\"minor\":0},\"request_id\":\"req-pre-1\"}",
+      "frame_header": "000000b0",
+      "payload_bytes": 176,
+      "sha256": "dc4f4f42bbe0ef560712e07f5fccac703c6539535b1fa5f863454b5ed55a58d3",
+      "vector": "preinit_search_handshake_required"
+    },
+    {
+      "canonical_payload": "{\"error\":{\"code\":\"cancel_target_not_found\",\"message\":\"target request never existed in this generation\",\"retryable\":false},\"ok\":false,\"operation\":\"cancel\",\"operation_receipt\":null,\"protocol\":{\"major\":1,\"minor\":0},\"provider_generation\":\"pg-00000000000000000000000000000000\",\"query_receipt\":null,\"request_id\":\"req-cancel-1\",\"scope_digest\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\",\"snapshot\":\"spks1-test\",\"workspace\":\"WS-TEST\"}",
+      "frame_header": "000001c8",
+      "payload_bytes": 456,
+      "sha256": "4c70646ba965bd9f3c4524ed322ef1d8e0cd3c1d9a74c250b0359dfa11054fc8",
+      "vector": "cancel_unknown_bound_error"
+    }
+  ]
+}

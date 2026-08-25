@@ -1,0 +1,71 @@
+use std.nogc_async_mut.concurrent.thread.{thread_sleep}
+use examples.llm_hud.src.render.{render_output, help_text}
+use examples.llm_hud.src.types.{HudOptions, HudState, ProviderSnapshot, default_options, empty_snapshot, empty_vcs}
+use std.cli.cli_util.{get_cli_args}
+use std.io.{cwd}
+
+fn parse_options() -> HudOptions:
+    val args = get_cli_args()
+    var options = default_options(cwd())
+    var i = 0
+    while i < args.len():
+        val arg = args[i]
+        if arg == "--provider" and i + 1 < args.len():
+            options.provider = args[i + 1].trim().to_lower()
+            i = i + 1
+        elif arg == "--mode" and i + 1 < args.len():
+            options.mode = args[i + 1].trim().to_lower()
+            i = i + 1
+        elif arg == "--watch":
+            options.watch = true
+        elif arg == "--no-color":
+            options.color = false
+        elif arg == "--hide-inputs":
+            options.show_inputs = false
+        elif arg == "--help" or arg == "-h":
+            options.help = true
+        i = i + 1
+    if options.provider == "":
+        options.provider = "auto"
+    if options.mode != "tui":
+        options.mode = "statusline"
+    options
+
+fn snapshot_for(provider: text) -> ProviderSnapshot:
+    val name = if provider == "gemini": "Gemini" elif provider == "claude": "Claude" else: "Codex"
+    var snapshot = empty_snapshot(name)
+    snapshot.note = "{name} local session data unavailable"
+    snapshot.last_tool = "idle"
+    snapshot
+
+fn collect_state(options: HudOptions) -> HudState:
+    var providers: [ProviderSnapshot] = []
+    if options.provider == "all" or options.provider == "auto":
+        providers.push(snapshot_for("codex"))
+        providers.push(snapshot_for("claude"))
+        providers.push(snapshot_for("gemini"))
+    else:
+        providers.push(snapshot_for(options.provider))
+    HudState(providers: providers, vcs: empty_vcs())
+
+fn main() -> i64:
+    val options = parse_options()
+    if options.help:
+        print help_text()
+        return 0
+
+    if options.watch:
+        return run_watch_loop(options)
+
+    val state = collect_state(options)
+    print render_output(state, options)
+    0
+
+fn run_watch_loop(options: HudOptions) -> i64:
+    while true:
+        val state = collect_state(options)
+        print ""
+        print "----- llm hud refresh -----"
+        print render_output(state, options)
+        thread_sleep(options.interval_ms)
+    0

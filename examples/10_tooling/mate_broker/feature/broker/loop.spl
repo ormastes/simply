@@ -1,0 +1,42 @@
+# feature/broker/loop — Main broker loop: receive → solicit bids → award → monitor
+
+fn broker_process_task(task_idx: i64) -> text:
+    # 1. Get task info
+    val task_id = BK_TASK_IDS[task_idx]
+    val content = BK_TASK_CONTENTS[task_idx]
+    val caps_str = BK_TASK_CAPS[task_idx]
+
+    # 2. Solicit bids
+    BK_TASK_STATUSES[task_idx] = "bidding"
+    val required_caps = _split_caps(caps_str)
+    val bids = broker_solicit_bids(task_id, required_caps)
+
+    if bids.len() == 0:
+        BK_TASK_STATUSES[task_idx] = "failed"
+        BK_TASK_ERRORS[task_idx] = "No capable agents available"
+        return "Task " + task_id + ": no agents available"
+
+    # 3. Award to best bid
+    val best = broker_select_best_bid(bids)
+    BK_TASK_STATUSES[task_idx] = "assigned"
+    BK_TASK_AGENTS[task_idx] = best.agent_id
+    BK_COMPLETED = BK_COMPLETED + 1
+
+    "Task " + task_id + " awarded to " + best.agent_id + " (score=" + best.score.to_text() + ")"
+
+fn broker_run_pending() -> text:
+    var results: [text] = []
+    var i = 0
+    while i < BK_TASK_COUNT:
+        if BK_TASK_STATUSES[i] == "pending":
+            val r = broker_process_task(i)
+            results.push(r)
+        i = i + 1
+    if results.len() == 0:
+        return "No pending tasks."
+    results.join("\n")
+
+fn _split_caps(caps_str: text) -> [text]:
+    if caps_str == "":
+        return []
+    caps_str.split(",")

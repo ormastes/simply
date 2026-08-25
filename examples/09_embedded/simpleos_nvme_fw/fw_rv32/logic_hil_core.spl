@@ -1,0 +1,32 @@
+fn rv32_hil_validate(cid: i64, op: i64, lba: i64, nblocks: i64, data: i64) -> i32:
+    if cid < 0:
+        return 1
+    if cid > 65535:
+        return 1
+    if op != 0 and op != 1 and op != 2 and op != 8 and op != 9:
+        return 1
+    if op == 0:
+        if lba != 0:
+            return 1
+        if nblocks != 0:
+            return 1
+        if data != 0:
+            return 1
+        return 0
+    if lba < 0:
+        return 1
+    if nblocks <= 0:
+        return 1
+    if lba >= 3072:
+        return 1
+    if nblocks > 3072:
+        return 1
+    if lba > 3072 - nblocks:
+        return 1
+    if op == 2 and data != 0:
+        return 1
+    if op == 8 and data != 0:
+        return 1
+    if op == 9 and data != 0:
+        return 1
+    0

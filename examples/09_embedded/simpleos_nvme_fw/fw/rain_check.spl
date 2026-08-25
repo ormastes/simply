@@ -1,0 +1,46 @@
+"""
+rain_check — internal RAID/RAIN single-channel failure recovery (gap-closure P8).
+
+Writes a host-data stripe across the channels, then simulates a die/channel failure and proves
+the lost data is reconstructed EXACTLY from the survivors + parity — for any single channel,
+data or parity. This is the resilience a production SSD needs against die/channel loss.
+
+Run: bin/simple run examples/09_embedded/simpleos_nvme_fw/fw/rain_check.spl
+"""
+
+use nvme_types.*
+use fil_scheduler.*
+use rain.*
+
+fn main():
+    var fail: i64 = 0
+    var r: Rain = rain_new()
+
+    # Write a stripe of host data words (one per channel).
+    var words: [i64] = []
+    var i: i64 = 0
+    while i < NUM_CHANNELS:
+        val w: i64 = 0xDEAD00 + i * 131
+        words.push(w)
+        i = i + 1
+    r.write_stripe(words)
+
+    # Channel 3 fails mid-life: its data word is gone, but reconstruction recovers it exactly.
+    val lost3: i64 = 0xDEAD00 + 3 * 131
+    val rec3: i64 = r.reconstruct(3)
+    fail = fail + expect_eq(rec3, lost3, "channel 3 failure: data reconstructed exactly")
+
+    # A different single-channel failure also recovers.
+    val lost7: i64 = 0xDEAD00 + 7 * 131
+    val rec7: i64 = r.reconstruct(7)
+    fail = fail + expect_eq(rec7, lost7, "channel 7 failure: data reconstructed exactly")
+
+    # Parity-channel failure: the parity is just recomputed from the surviving data.
+    val p: i64 = r.recompute_parity()
+    val p0: i64 = r.parity_word()
+    fail = fail + expect_eq(p, p0, "parity-channel failure: parity recomputed exactly")
+
+    if fail == 0:
+        print "RAIN OK"
+    else:
+        print "RAIN FAIL ({fail})"

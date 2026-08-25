@@ -1,0 +1,125 @@
+#![allow(unnamed_duplicate_typed_args)]
+# LLM Caret - OpenAI-Compatible API
+#
+# Generic OpenAI-compatible endpoint for Ollama, LM Studio, vLLM, LocalAI, etc.
+# Same protocol as OpenAI but configurable base URL and optional API key.
+
+extern fn rt_http_request(method: text, url: text, headers: text, body: text) -> (i64, text, text)
+
+use common.text.{escape_json}
+use std.nogc_async_mut.mcp.helpers.{Q, LB, RB}
+use std.nogc_async_mut.llm.json_helpers.{_unwrap_idx, extract_json_string, extract_json_value, extract_json_int}
+
+# ============================================================================
+# Response struct
+# ============================================================================
+
+struct CompatResponse:
+    content: text
+    model: text
+    finish_reason: text
+    prompt_tokens: i64
+    completion_tokens: i64
+    error: text
+    is_error: bool
+    raw: text
+
+# ============================================================================
+# Request building
+# ============================================================================
+
+fn build_compat_body(model: text, messages_json: text, max_tokens: i64, temperature: f64) -> text:
+    var parts: [text] = []
+    parts = parts + [Q() + "model" + Q() + ":" + Q() + model + Q()]
+    parts = parts + [Q() + "messages" + Q() + ":" + messages_json]
+    if max_tokens > 0:
+        parts = parts + [Q() + "max_tokens" + Q() + ":" + max_tokens.to_text()]
+    if temperature >= 0.0:
+        parts = parts + [Q() + "temperature" + Q() + ":" + temperature.to_text()]
+    var body = LB()
+    var i = 0
+    for part in parts:
+        if i > 0:
+            body = body + ","
+        body = body + part
+        i = i + 1
+    body = body + RB()
+    body
+
+fn build_compat_headers(api_key: text) -> text:
+    var h = "Content-Type: application/json"
+    if api_key != "":
+        h = "Authorization: Bearer " + api_key + "\n" + h
+    h
+
+# ============================================================================
+# Response parsing
+# ============================================================================
+
+fn parse_compat_response(raw: text) -> CompatResponse:
+    if raw.trim() == "":
+        return CompatResponse(
+            content: "",
+            model: "",
+            finish_reason: "",
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            error: "empty response",
+            is_error: true,
+            raw: ""
+        )
+    val error_msg = extract_json_string(raw, "message")
+    val has_content = extract_json_string(raw, "content")
+    if error_msg != "" and has_content == "":
+        return CompatResponse(
+            content: "",
+            model: "",
+            finish_reason: "error",
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            error: error_msg,
+            is_error: true,
+            raw: raw
+        )
+    val content_text = extract_json_string(raw, "content")
+    val model_val = extract_json_string(raw, "model")
+    val finish = extract_json_string(raw, "finish_reason")
+    val p_tok = extract_json_int(raw, "prompt_tokens")
+    val c_tok = extract_json_int(raw, "completion_tokens")
+    var final_finish = finish
+    if final_finish == "":
+        final_finish = "stop"
+    CompatResponse(
+        content: content_text,
+        model: model_val,
+        finish_reason: final_finish,
+        prompt_tokens: p_tok,
+        completion_tokens: c_tok,
+        error: "",
+        is_error: false,
+        raw: raw
+    )
+
+# ============================================================================
+# Send request
+# ============================================================================
+
+fn compat_send(base_url: text, api_key: text, model: text, messages_json: text, max_tokens: i64, temperature: f64) -> CompatResponse:
+    val url = base_url + "/v1/chat/completions"
+    val headers = build_compat_headers(api_key)
+    val body = build_compat_body(model, messages_json, max_tokens, temperature)
+    val result = rt_http_request("POST", url, headers, body)
+    val resp_body = result.1 ?? ""
+    val http_error = result.2 ?? ""
+    if http_error != "":
+        return CompatResponse(
+            content: "",
+            model: "",
+            finish_reason: "error",
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            error: "HTTP error: " + http_error,
+            is_error: true,
+            raw: resp_body
+        )
+    parse_compat_response(resp_body)

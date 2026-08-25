@@ -1,0 +1,85 @@
+# 35. Parallel Iterators - Thrust Equivalent
+#
+# Thrust's transform / reduce / inclusive_scan / copy_if / sort map onto the
+# std.gpu host helpers gpu_map / gpu_reduce / gpu_scan / gpu_filter / gpu_sort.
+# Each takes a plain [f32] plus a lambda (placeholder form `_ ** 2` or
+# explicit `\a, b: ...`) and returns Result<_, GpuError>.
+#
+# C++/Thrust equivalent:
+#   thrust::transform(d.begin(), d.end(), out.begin(), square());
+#   float s = thrust::reduce(d.begin(), d.end(), 0.0f, thrust::plus<float>());
+#   thrust::inclusive_scan(d.begin(), d.end(), out.begin());
+#   thrust::copy_if(d.begin(), d.end(), out.begin(), is_positive());
+#   thrust::sort(d.begin(), d.end());
+#
+# Composition: every stage returns a Result, so a pipeline unwraps between
+# stages with `?` (piping a Result straight into the next stage is an error).
+
+use std.gpu.*
+
+# GPU-backed parallel map: apply function to every element
+fn parallel_square(data: [f32]) -> Result<[f32], GpuError>:
+    gpu_map(data, _ ** 2)
+
+# GPU-backed parallel reduce: sum all elements
+fn parallel_sum(data: [f32]) -> Result<f32, GpuError>:
+    gpu_reduce(data, 0.0, _ + _)
+
+# GPU-backed prefix sum (inclusive scan)
+fn parallel_prefix_sum(data: [f32]) -> Result<[f32], GpuError>:
+    gpu_scan(data, 0.0, _ + _)
+
+# GPU-backed stream compaction
+fn parallel_filter_positive(data: [f32]) -> Result<[f32], GpuError>:
+    gpu_filter(data, _ > 0.0)
+
+# GPU-backed sort
+fn parallel_sort_ascending(data: [f32]) -> Result<[f32], GpuError>:
+    gpu_sort(data)
+
+# Composed pipeline: square -> keep > 10 -> sum. `?` unwraps each stage.
+fn pipeline_example(data: [f32]) -> Result<f32, GpuError>:
+    val squared = gpu_map(data, _ ** 2)?
+    val large = gpu_filter(squared, _ > 10.0)?
+    gpu_reduce(large, 0.0, _ + _)
+
+# Min/max via reduce with an explicit two-argument lambda
+fn parallel_min_max(data: [f32]) -> Result<(f32, f32), GpuError>:
+    if data.len() == 0:
+        return Ok((0.0, 0.0))
+    val min_val = gpu_reduce(data, data[0], \a, b: if a < b: a else: b)?
+    val max_val = gpu_reduce(data, data[0], \a, b: if a > b: a else: b)?
+    Ok((min_val, max_val))
+
+fn main():
+    val data = [3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0]
+    print "Input: {data}"
+
+    match parallel_square(data):
+        case Ok(r): print "Squared: {r}"
+        case Err(e): print "Error: {e.message}"
+
+    match parallel_sum(data):
+        case Ok(v): print "Sum: {v}"
+        case Err(e): print "Error: {e.message}"
+
+    match parallel_prefix_sum(data):
+        case Ok(r): print "Prefix sum: {r}"
+        case Err(e): print "Error: {e.message}"
+
+    val mixed = [-2.0, 3.0, -1.0, 5.0, -4.0, 7.0]
+    match parallel_filter_positive(mixed):
+        case Ok(r): print "Positive: {r}"
+        case Err(e): print "Error: {e.message}"
+
+    match parallel_sort_ascending(data):
+        case Ok(r): print "Sorted: {r}"
+        case Err(e): print "Error: {e.message}"
+
+    match pipeline_example(data):
+        case Ok(v): print "Pipeline (square, filter>10, sum): {v}"
+        case Err(e): print "Error: {e.message}"
+
+    match parallel_min_max(data):
+        case Ok(mm): print "Min: {mm.0}, Max: {mm.1}"
+        case Err(e): print "Error: {e.message}"

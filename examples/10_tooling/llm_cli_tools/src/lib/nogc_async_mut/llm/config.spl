@@ -1,0 +1,248 @@
+#![allow(unnamed_duplicate_typed_args)]
+# LLM Caret - Configuration
+#
+# Line-based SDN config parser for llm_caret.sdn.
+# Resolves API keys from environment variables.
+
+extern fn rt_env_get(key: text) -> text
+extern fn rt_file_read_text(path: text) -> text
+
+# ============================================================================
+# Module-level state
+# ============================================================================
+
+var CONFIG_LOADED = false
+var DEFAULT_PROVIDER = "claude_cli"
+var DEFAULT_HISTORY_FILE = ".llm_caret_history.sdn"
+var DEFAULT_MAX_HISTORY = 100
+
+# Claude CLI config
+var CLAUDE_CLI_PATH = "claude"
+var CLAUDE_CLI_MODEL = "claude-sonnet-4-20250514"
+var CLAUDE_CLI_EXTRA_ARGS = ""
+
+# Claude API config
+var CLAUDE_API_KEY_ENV = "ANTHROPIC_API_KEY"
+var CLAUDE_API_BASE_URL = "https://api.anthropic.com"
+var CLAUDE_API_MODEL = "claude-sonnet-4-20250514"
+
+# OpenAI config
+var OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
+var OPENAI_BASE_URL = "https://api.openai.com"
+var OPENAI_MODEL = "gpt-4o"
+
+# OpenAI-compatible config
+var COMPAT_BASE_URL = "http://localhost:11434"
+var COMPAT_MODEL = "llama3"
+var COMPAT_API_KEY_ENV = ""
+
+# Codex CLI config
+var CODEX_CLI_PATH = "codex"
+var CODEX_CLI_MODEL = "o4-mini"
+var CODEX_CLI_EXTRA_ARGS = ""
+
+# Gemini CLI config
+var GEMINI_CLI_PATH = "gemini"
+var GEMINI_CLI_MODEL = ""
+var GEMINI_CLI_EXTRA_ARGS = ""
+
+# Local torch config
+var LOCAL_MODEL_PATH = ""
+var LOCAL_PYTHON_PATH = "python3"
+
+# ============================================================================
+# Accessors
+# ============================================================================
+
+fn config_loaded() -> bool:
+    CONFIG_LOADED
+
+fn config_default_provider() -> text:
+    DEFAULT_PROVIDER
+
+fn config_history_file() -> text:
+    DEFAULT_HISTORY_FILE
+
+fn config_max_history() -> i64:
+    DEFAULT_MAX_HISTORY
+
+fn config_claude_cli_path() -> text:
+    CLAUDE_CLI_PATH
+
+fn config_claude_cli_model() -> text:
+    CLAUDE_CLI_MODEL
+
+fn config_claude_api_key() -> text:
+    val env_val = rt_env_get(CLAUDE_API_KEY_ENV) ?? ""
+    env_val
+
+fn config_claude_api_base_url() -> text:
+    CLAUDE_API_BASE_URL
+
+fn config_claude_api_model() -> text:
+    CLAUDE_API_MODEL
+
+fn config_openai_api_key() -> text:
+    val env_val = rt_env_get(OPENAI_API_KEY_ENV) ?? ""
+    env_val
+
+fn config_openai_base_url() -> text:
+    OPENAI_BASE_URL
+
+fn config_openai_model() -> text:
+    OPENAI_MODEL
+
+fn config_compat_base_url() -> text:
+    COMPAT_BASE_URL
+
+fn config_compat_model() -> text:
+    COMPAT_MODEL
+
+fn config_compat_api_key() -> text:
+    if COMPAT_API_KEY_ENV == "":
+        return ""
+    val env_val = rt_env_get(COMPAT_API_KEY_ENV) ?? ""
+    env_val
+
+fn config_codex_cli_path() -> text:
+    CODEX_CLI_PATH
+
+fn config_codex_cli_model() -> text:
+    CODEX_CLI_MODEL
+
+fn config_gemini_cli_path() -> text:
+    GEMINI_CLI_PATH
+
+fn config_gemini_cli_model() -> text:
+    GEMINI_CLI_MODEL
+
+fn config_local_model_path() -> text:
+    LOCAL_MODEL_PATH
+
+fn config_local_python_path() -> text:
+    LOCAL_PYTHON_PATH
+
+# ============================================================================
+# SDN Parser (line-based, NOT std.sdn.parser)
+# ============================================================================
+
+fn load_config(path: text) -> text:
+    val raw = rt_file_read_text(path) ?? ""
+    if raw == "":
+        return "config file not found or empty: " + path
+    parse_config_text(raw)
+
+fn parse_config_text(raw: text) -> text:
+    var current_section = ""
+    val lines = raw.split("\n")
+    for line in lines:
+        val trimmed = line.trim()
+        # Skip empty lines and comments
+        if trimmed == "" or trimmed.starts_with("#"):
+            continue
+        # Section header (no leading whitespace, ends with colon)
+        if not line.starts_with(" ") and not line.starts_with("\t") and trimmed.ends_with(":"):
+            current_section = trimmed.substring(0, trimmed.len() - 1)
+            continue
+        # Key-value pair (indented)
+        val colon_idx = _unwrap_idx_cfg(trimmed.index_of(":"))
+        if colon_idx > 0:
+            val key = trimmed.substring(0, colon_idx).trim()
+            val value = trimmed.substring(colon_idx + 1).trim()
+            _apply_config(current_section, key, value)
+    CONFIG_LOADED = true
+    ""
+
+fn _unwrap_idx_cfg(opt) -> i64:
+    match opt:
+        Some(i): return i
+        nil: return -1
+
+fn _apply_config(section: text, key: text, value: text):
+    if section == "defaults":
+        if key == "provider":
+            DEFAULT_PROVIDER = value
+        elif key == "history_file":
+            DEFAULT_HISTORY_FILE = value
+        elif key == "max_history":
+            DEFAULT_MAX_HISTORY = int(value)
+    elif section == "claude_cli":
+        if key == "cli_path":
+            CLAUDE_CLI_PATH = value
+        elif key == "model":
+            CLAUDE_CLI_MODEL = value
+        elif key == "extra_args":
+            CLAUDE_CLI_EXTRA_ARGS = value
+    elif section == "claude_api":
+        if key == "api_key_env":
+            CLAUDE_API_KEY_ENV = value
+        elif key == "base_url":
+            CLAUDE_API_BASE_URL = value
+        elif key == "model":
+            CLAUDE_API_MODEL = value
+    elif section == "openai":
+        if key == "api_key_env":
+            OPENAI_API_KEY_ENV = value
+        elif key == "base_url":
+            OPENAI_BASE_URL = value
+        elif key == "model":
+            OPENAI_MODEL = value
+    elif section == "openai_compat":
+        if key == "base_url":
+            COMPAT_BASE_URL = value
+        elif key == "model":
+            COMPAT_MODEL = value
+        elif key == "api_key_env":
+            COMPAT_API_KEY_ENV = value
+    elif section == "codex_cli":
+        if key == "cli_path":
+            CODEX_CLI_PATH = value
+        elif key == "model":
+            CODEX_CLI_MODEL = value
+        elif key == "extra_args":
+            CODEX_CLI_EXTRA_ARGS = value
+    elif section == "gemini_cli":
+        if key == "cli_path":
+            GEMINI_CLI_PATH = value
+        elif key == "model":
+            GEMINI_CLI_MODEL = value
+        elif key == "extra_args":
+            GEMINI_CLI_EXTRA_ARGS = value
+    elif section == "local_torch":
+        if key == "model_path":
+            LOCAL_MODEL_PATH = value
+        elif key == "python_path":
+            LOCAL_PYTHON_PATH = value
+
+# ============================================================================
+# Config with defaults (no file needed)
+# ============================================================================
+
+fn load_defaults():
+    CONFIG_LOADED = true
+
+fn reset_config():
+    CONFIG_LOADED = false
+    DEFAULT_PROVIDER = "claude_cli"
+    DEFAULT_HISTORY_FILE = ".llm_caret_history.sdn"
+    DEFAULT_MAX_HISTORY = 100
+    CLAUDE_CLI_PATH = "claude"
+    CLAUDE_CLI_MODEL = "claude-sonnet-4-20250514"
+    CLAUDE_CLI_EXTRA_ARGS = ""
+    CLAUDE_API_KEY_ENV = "ANTHROPIC_API_KEY"
+    CLAUDE_API_BASE_URL = "https://api.anthropic.com"
+    CLAUDE_API_MODEL = "claude-sonnet-4-20250514"
+    OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
+    OPENAI_BASE_URL = "https://api.openai.com"
+    OPENAI_MODEL = "gpt-4o"
+    COMPAT_BASE_URL = "http://localhost:11434"
+    COMPAT_MODEL = "llama3"
+    COMPAT_API_KEY_ENV = ""
+    CODEX_CLI_PATH = "codex"
+    CODEX_CLI_MODEL = "o4-mini"
+    CODEX_CLI_EXTRA_ARGS = ""
+    GEMINI_CLI_PATH = "gemini"
+    GEMINI_CLI_MODEL = ""
+    GEMINI_CLI_EXTRA_ARGS = ""
+    LOCAL_MODEL_PATH = ""
+    LOCAL_PYTHON_PATH = "python3"

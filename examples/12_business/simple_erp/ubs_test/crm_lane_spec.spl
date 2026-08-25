@@ -1,0 +1,108 @@
+# @cover src/lanes/crm.spl 80%
+"""
+# CRM Lane
+
+Leads flow through the ONE shared gate: session -> rbac -> validation ->
+idempotency. This spec pins the accepted path plus each fail-closed reason, and
+the lane's own domain operations (advance, pipeline value, open count).
+"""
+
+use std.spec
+use lanes.crm.{Lead, validate_lead, advance_lead, pipeline_value, open_lead_count, submit_lead_write}
+use framework.guarded.{Tenant, Actor, Session}
+use std.nogc_sync_mut.enterprise_store.store.{EnterpriseStore, store_open}
+use std.io_runtime.{file_exists, file_delete, dir_create_all}
+
+# Each scenario opens its own durable store: the interpreter backend caches
+# open databases per path in-process, so every it-block gets a fresh path.
+fn fresh_store(name: text) -> EnterpriseStore:
+    dir_create_all("build/test-artifacts")
+    val db = "build/test-artifacts/erp_crm_lane_" + name + ".db"
+    if file_exists(db):
+        file_delete(db)
+    store_open(db)
+
+describe "CRM lane — guarded writes":
+    it "accepts a valid write through the gate":
+        val tenant = Tenant { id: "t1", name: "Demo" }
+        val user = Actor { id: 1, name: "Mina", role: "operator" }
+        val session = Session { token: "sess-1", user_id: 1, tenant_id: "t1", active: true }
+        val lead = Lead { id: 1, name: "Acme", account: "Acme", contact: "Mina", stage: "new", value: 1000, next_action: "call" }
+        val store = fresh_store("s1")
+        val r = submit_lead_write(session, tenant, user, lead, "crm-1", store)
+        expect(r.ok).to_equal(true)
+        expect(r.reason).to_equal("accepted")
+        expect(r.ledger_key).to_equal("crm-1")
+
+    it "denies an inactive session":
+        val tenant = Tenant { id: "t1", name: "Demo" }
+        val user = Actor { id: 1, name: "Mina", role: "operator" }
+        val session = Session { token: "sess-1", user_id: 1, tenant_id: "t1", active: false }
+        val lead = Lead { id: 1, name: "Acme", account: "Acme", contact: "Mina", stage: "new", value: 1000, next_action: "call" }
+        val store = fresh_store("s2")
+        val r = submit_lead_write(session, tenant, user, lead, "crm-1", store)
+        assert_false(r.ok)
+        expect(r.reason).to_equal("invalid-session")
+
+    it "forbids an auditor from writing":
+        val tenant = Tenant { id: "t1", name: "Demo" }
+        val user = Actor { id: 3, name: "Jae", role: "auditor" }
+        val session = Session { token: "sess-3", user_id: 3, tenant_id: "t1", active: true }
+        val lead = Lead { id: 1, name: "Acme", account: "Acme", contact: "Mina", stage: "new", value: 1000, next_action: "call" }
+        val store = fresh_store("s3")
+        val r = submit_lead_write(session, tenant, user, lead, "crm-1", store)
+        assert_false(r.ok)
+        expect(r.reason).to_equal("forbidden")
+
+    it "rejects an invalid record":
+        val tenant = Tenant { id: "t1", name: "Demo" }
+        val user = Actor { id: 1, name: "Mina", role: "operator" }
+        val session = Session { token: "sess-1", user_id: 1, tenant_id: "t1", active: true }
+        val lead = Lead { id: 0, name: "", account: "Acme", contact: "Mina", stage: "new", value: -5, next_action: "call" }
+        val store = fresh_store("s4")
+        val r = submit_lead_write(session, tenant, user, lead, "crm-1", store)
+        assert_false(r.ok)
+        expect(r.reason).to_equal("invalid-record")
+
+    it "rejects a duplicate idempotency key":
+        val tenant = Tenant { id: "t1", name: "Demo" }
+        val user = Actor { id: 1, name: "Mina", role: "operator" }
+        val session = Session { token: "sess-1", user_id: 1, tenant_id: "t1", active: true }
+        val lead = Lead { id: 1, name: "Acme", account: "Acme", contact: "Mina", stage: "new", value: 1000, next_action: "call" }
+        val store = fresh_store("s5")
+        submit_lead_write(session, tenant, user, lead, "crm-1", store)
+        val r = submit_lead_write(session, tenant, user, lead, "crm-1", store)
+        assert_false(r.ok)
+        expect(r.reason).to_equal("duplicate-key")
+
+    it "rejects an empty idempotency key as an invalid record":
+        val tenant = Tenant { id: "t1", name: "Demo" }
+        val user = Actor { id: 1, name: "Mina", role: "operator" }
+        val session = Session { token: "sess-1", user_id: 1, tenant_id: "t1", active: true }
+        val lead = Lead { id: 1, name: "Acme", account: "Acme", contact: "Mina", stage: "new", value: 1000, next_action: "call" }
+        val store = fresh_store("s6")
+        val r = submit_lead_write(session, tenant, user, lead, "", store)
+        assert_false(r.ok)
+        expect(r.reason).to_equal("invalid-record")
+
+describe "CRM lane — domain operations":
+    it "validates a well-formed lead":
+        val lead = Lead { id: 2, name: "North", account: "North", contact: "Jun", stage: "quote", value: 4200, next_action: "send" }
+        assert_true(validate_lead(lead))
+
+    it "advances a lead to a new stage":
+        val lead = Lead { id: 1, name: "Acme", account: "Acme", contact: "Mina", stage: "new", value: 1000, next_action: "call" }
+        val moved = advance_lead(lead, "quote", "send quote")
+        expect(moved.stage).to_equal("quote")
+        expect(moved.next_action).to_equal("send quote")
+
+    it "sums pipeline value excluding won leads":
+        val a = Lead { id: 1, name: "Acme", account: "Acme", contact: "Mina", stage: "new", value: 100, next_action: "call" }
+        val b = Lead { id: 2, name: "North", account: "North", contact: "Jun", stage: "quote", value: 200, next_action: "send" }
+        val c = Lead { id: 3, name: "City", account: "City", contact: "Ara", stage: "won", value: 300, next_action: "handoff" }
+        var leads: [Lead] = []
+        leads.push(a)
+        leads.push(b)
+        leads.push(c)
+        expect(pipeline_value(leads)).to_equal(300)
+        expect(open_lead_count(leads)).to_equal(2)

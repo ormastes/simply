@@ -1,0 +1,86 @@
+# 82. Attention Kernels - Tests
+#
+# Hardware-independent: with identity projections (Q = K = V = input, Wo = I)
+# every output can be checked by hand; uniform inputs give uniform softmax.
+
+use std.gpu.*
+use self.main.{
+    fused_qkv_projection, multi_head_attention, output_projection,
+    make_identity_attention, identity, attention_blocks, HEAD_TILE
+}
+
+fn ramp(count: i64) -> [f32]:
+    [for i in 0..count: ((i % 5) - 2) * 0.5]
+
+describe "Multi-head attention kernels":
+    it "should create batched multi-head attention":
+        val attn = make_identity_attention(8, 2)
+        expect(attn.d_head).to_equal(4)
+        expect(attn.w_qkv.len()).to_equal(8 * 24)
+        expect(attn.wo.len()).to_equal(64)
+
+    it "should project to Q|K|V with identity weights":
+        val attn = make_identity_attention(4, 2)
+        val qkv = fused_qkv_projection([1.0, 2.0, 3.0, 4.0], attn.w_qkv, 1, 4)?
+        expect(qkv.len()).to_equal(12)
+        expect(qkv[0]).to_equal(1.0)   # Q
+        expect(qkv[5]).to_equal(2.0)   # K
+        expect(qkv[11]).to_equal(4.0)  # V
+
+    it "should compute forward pass with correct output size":
+        val attn = make_identity_attention(4, 2)
+        val out = attn.forward(ramp(2 * 3 * 4), 2, 3, false)?
+        expect(out.len()).to_equal(24)
+
+    it "should produce uniform attention for uniform keys (output = mean of V)":
+        # seq_len 2, d_model 2, one head; Q=K=V = rows [1 2], [3 4]
+        val attn = make_identity_attention(2, 1)
+        val qkv = fused_qkv_projection([1.0, 2.0, 3.0, 4.0], attn.w_qkv, 2, 2)?
+        # K rows differ, so make a qkv with identical keys explicitly
+        val qkv_same_k = [1.0, 2.0, 1.0, 1.0, 1.0, 2.0,
+                          3.0, 4.0, 1.0, 1.0, 3.0, 4.0]
+        val out = multi_head_attention(qkv_same_k, 1, 2, 1, 2, false)
+        expect((out[0] - 2.0).abs() < 1.0e-9).to_equal(true)
+        expect((out[1] - 3.0).abs() < 1.0e-9).to_equal(true)
+        expect(qkv.len()).to_equal(12)
+
+    it "should produce different outputs for different inputs":
+        val attn = make_identity_attention(4, 2)
+        val a = attn.forward(ramp(12), 1, 3, false)?
+        val b = attn.forward([for i in 0..12: (i % 3) * 1.0], 1, 3, false)?
+        expect(a[0] == b[0] and a[5] == b[5]).to_equal(false)
+
+    it "should handle single batch single position (output == input)":
+        val attn = make_identity_attention(4, 2)
+        val out = attn.forward([0.5, -1.0, 2.0, 0.25], 1, 1, false)?
+        expect(out[0]).to_equal(0.5)
+        expect(out[1]).to_equal(-1.0)
+        expect(out[2]).to_equal(2.0)
+        expect(out[3]).to_equal(0.25)
+
+    it "should handle causal masking (row 0 attends only to itself)":
+        val attn = make_identity_attention(4, 2)
+        val input = ramp(3 * 4)
+        val out = attn.forward(input, 1, 3, true)?
+        expect(out[0]).to_equal(input[0])
+        expect(out[3]).to_equal(input[3])
+
+    it "should handle multiple batches independently":
+        val attn = make_identity_attention(4, 2)
+        val one = attn.forward(ramp(12), 1, 3, false)?
+        val two = attn.forward(ramp(12) + ramp(12), 2, 3, false)?
+        expect(two.len()).to_equal(24)
+        expect(two[0]).to_equal(one[0])
+        expect(two[12]).to_equal(one[0])
+        expect(two[23]).to_equal(one[11])
+
+    it "should apply the output projection":
+        val out = output_projection([1.0, 2.0], [0.0, 1.0, 1.0, 0.0], 1, 2)?
+        expect(out[0]).to_equal(2.0)
+        expect(out[1]).to_equal(1.0)
+        expect(identity(3)[4]).to_equal(1.0)
+        expect(identity(3)[1]).to_equal(0.0)
+
+    it "should size the attention grid in HEAD_TILE query blocks":
+        expect(attention_blocks(HEAD_TILE)).to_equal(1)
+        expect(attention_blocks(HEAD_TILE + 1)).to_equal(2)

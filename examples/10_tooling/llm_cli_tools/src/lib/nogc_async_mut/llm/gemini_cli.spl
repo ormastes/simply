@@ -1,0 +1,137 @@
+#![allow(unnamed_duplicate_typed_args)]
+# LLM Caret - Gemini CLI Wrapper
+#
+# Wraps the Gemini CLI binary as a subprocess.
+# Two pure functions (fully testable without Gemini binary):
+#   - build_gemini_args: maps config to CLI flags
+#   - parse_gemini_json_response: parses JSON output
+# One impure function (integration):
+#   - gemini_cli_send: calls rt_process_run
+
+extern fn rt_process_run(cmd: text, args: [text]) -> (text, text, i64)
+
+use common.text.{escape_json}
+use std.nogc_async_mut.mcp.helpers.{Q, LB, RB}
+use std.nogc_async_mut.llm.json_helpers.{_unwrap_idx, extract_json_string, extract_json_value, extract_json_int, extract_json_bool}
+
+# ============================================================================
+# Response struct
+# ============================================================================
+
+struct GeminiCliResponse:
+    content: text
+    model: text
+    session_id: text
+    stop_reason: text
+    input_tokens: i64
+    output_tokens: i64
+    error: text
+    is_error: bool
+    raw: text
+
+# ============================================================================
+# Pure Function: build_gemini_args
+# ============================================================================
+
+fn build_gemini_args(prompt: text, model: text, output_format: text, session_id: text, extra_args: [text]) -> [text]:
+    var args: [text] = []
+    # Skip permission prompts by default
+    args = args + ["--sandbox", "off"]
+    # Prompt (required)
+    args = args + ["-p", prompt]
+    # Output format
+    if output_format != "":
+        args = args + ["--output-format", output_format]
+    else:
+        args = args + ["--output-format", "json"]
+    # Model
+    if model != "":
+        args = args + ["--model", model]
+    # Session resume
+    if session_id != "":
+        args = args + ["--resume", session_id]
+    # Extra args (appended at end)
+    for arg in extra_args:
+        if arg != "":
+            args = args + [arg]
+    args
+
+# Simplified builder
+fn build_gemini_args_simple(prompt: text) -> [text]:
+    build_gemini_args(prompt, "", "", "", [])
+
+# ============================================================================
+# Pure Function: parse_gemini_json_response
+# ============================================================================
+
+fn parse_gemini_json_response(raw: text) -> GeminiCliResponse:
+    if raw.trim() == "":
+        return GeminiCliResponse(
+            content: "",
+            model: "",
+            session_id: "",
+            stop_reason: "",
+            input_tokens: 0,
+            output_tokens: 0,
+            error: "empty response",
+            is_error: true,
+            raw: ""
+        )
+    # Extract fields from JSON output
+    # Gemini uses "response" field (not "result" like Claude)
+    val response_text = extract_json_string(raw, "response")
+    val model_text = extract_json_string(raw, "model")
+    val in_tok = extract_json_int(raw, "input_tokens")
+    val out_tok = extract_json_int(raw, "output_tokens")
+    val error_text = extract_json_string(raw, "error")
+    # Determine if error
+    var is_err = false
+    if error_text != "":
+        is_err = true
+    if response_text == "" and error_text == "":
+        # Check if the raw response has any meaningful content
+        val trimmed = raw.trim()
+        if trimmed != "":
+            is_err = false
+    # Determine stop reason
+    var final_stop = "end_turn"
+    if is_err:
+        final_stop = "error"
+    GeminiCliResponse(
+        content: response_text,
+        model: model_text,
+        session_id: "",
+        stop_reason: final_stop,
+        input_tokens: in_tok,
+        output_tokens: out_tok,
+        error: error_text,
+        is_error: is_err,
+        raw: raw
+    )
+
+# ============================================================================
+# Impure Function: gemini_cli_send
+# ============================================================================
+
+fn gemini_cli_send(cli_path: text, prompt: text, model: text, session_id: text, extra_args: [text]) -> GeminiCliResponse:
+    val args = build_gemini_args(prompt, model, "json", session_id, extra_args)
+    val result = rt_process_run(cli_path, args)
+    val stdout = result.0 ?? ""
+    val stderr = result.1 ?? ""
+    val exit_code = result.2
+    if exit_code != 0:
+        var err_msg = "gemini CLI exited with code " + exit_code.to_text()
+        if stderr != "":
+            err_msg = err_msg + ": " + stderr
+        return GeminiCliResponse(
+            content: "",
+            model: "",
+            session_id: "",
+            stop_reason: "error",
+            input_tokens: 0,
+            output_tokens: 0,
+            error: err_msg,
+            is_error: true,
+            raw: stdout
+        )
+    parse_gemini_json_response(stdout)

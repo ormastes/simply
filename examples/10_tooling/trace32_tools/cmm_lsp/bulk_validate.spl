@@ -1,0 +1,239 @@
+# CMM Parser Bulk Validator — Standalone Script
+#
+# Parses all CMM files under a directory tree and reports success/failure
+# statistics with error categorization.
+#
+# Usage:
+#   simple examples/10_tooling/trace32_tools/cmm_lsp/bulk_validate.spl [dir]
+#   (default dir: /opt/t32/demo)
+
+use cmm_parser.{parse_cmm_source}
+use cmm_analyzer.{analyze_program}
+use cmm_text_helpers.{is_cmm_file}
+use std.io_runtime.{read_file, file_exists, dir_list}
+
+extern fn sys_get_args() -> [text]
+
+# ---------------------------------------------------------------------------
+# Error categorization
+# ---------------------------------------------------------------------------
+
+fn categorize_error(msg: text) -> text:
+    if msg.contains("Unterminated block"):
+        return "Unterminated block"
+    if msg.contains("Expected expression"):
+        return "Expected expression"
+    if msg.contains("Expected command"):
+        return "Expected command"
+    if msg.contains("Unterminated string"):
+        return "Unterminated string"
+    if msg.contains("Unexpected token"):
+        return "Unexpected token"
+    if msg.contains("Expected"):
+        return "Expected (other)"
+    "Other"
+
+# ---------------------------------------------------------------------------
+# File collection
+# ---------------------------------------------------------------------------
+
+fn collect_cmm_files(dir: text, results: [text]):
+    val clean_dir = normalize_path(dir)
+    val entries = dir_list(clean_dir)
+    var i = 0
+    while i < entries.len():
+        val entry = entries[i]
+        # dir_list already filters "." and ".." in the C runtime,
+        # but guard against edge cases and skip hidden dotfiles/dotdirs.
+        if entry == "." or entry == ".." or entry.len() == 0:
+            i = i + 1
+            continue
+
+        val full_path = clean_dir + "/" + entry
+
+        if is_cmm_file(entry):
+            results.push(full_path)
+        else if is_likely_directory(entry):
+            collect_cmm_files(full_path, results)
+
+        i = i + 1
+
+# Determine if a directory entry is likely a directory (not a regular file).
+# Heuristic: files have an extension (dot followed by 1-4 alphanumeric chars at end).
+# Hidden entries (starting with dot) are skipped — they are neither recursed nor collected.
+fn is_likely_directory(name: text) -> bool:
+    # Skip hidden dotfiles/dotdirs (e.g. .git, .svn)
+    if name.len() > 0 and name[0:1] == ".":
+        return false
+    # Look for a file extension: last dot followed by 1-4 alnum chars to end
+    var last_dot = -1
+    var i = 0
+    while i < name.len():
+        if name[i:i + 1] == ".":
+            last_dot = i
+        i = i + 1
+    if last_dot < 0:
+        return true   # No dot at all → likely a directory
+    val ext_len = name.len() - last_dot - 1
+    if ext_len >= 1 and ext_len <= 4:
+        return false  # Looks like a file extension
+    true              # Dot but extension too long → likely a directory
+
+# Normalize a path: collapse "//", resolve "." and ".." components, strip trailing slash.
+fn normalize_path(p: text) -> text:
+    if p.len() == 0:
+        return "."
+    # Split on "/" into components
+    var parts: [text] = []
+    var start = 0
+    var i = 0
+    while i < p.len():
+        if p[i:i + 1] == "/":
+            if i > start:
+                val part = p[start:i]
+                if part == "..":
+                    if parts.len() > 0 and parts[parts.len() - 1] != "..":
+                        parts.pop()
+                    else:
+                        parts.push(part)
+                else if part != ".":
+                    parts.push(part)
+            else if i == 0:
+                parts.push("")  # Leading slash marker
+            start = i + 1
+        i = i + 1
+    # Handle last component
+    if start < p.len():
+        val part = p[start:p.len()]
+        if part == "..":
+            if parts.len() > 0 and parts[parts.len() - 1] != "..":
+                parts.pop()
+            else:
+                parts.push(part)
+        else if part != ".":
+            parts.push(part)
+    # Rejoin
+    if parts.len() == 0:
+        return "."
+    if parts.len() == 1 and parts[0] == "":
+        return "/"
+    parts.join("/")
+
+# ---------------------------------------------------------------------------
+# Error category tracking
+# ---------------------------------------------------------------------------
+
+struct ErrorCategory:
+    name: text
+    count: i64
+
+fn find_or_add_category(categories: [ErrorCategory], name: text) -> i64:
+    var i = 0
+    while i < categories.len():
+        if categories[i].name == name:
+            return i
+        i = i + 1
+    categories.push(ErrorCategory(name: name, count: 0))
+    categories.len() - 1
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+val args = sys_get_args()
+var target_dir = "/opt/t32/demo"
+if args.len() > 1:
+    target_dir = args[1]
+
+print "CMM Parser Bulk Validator"
+print "========================"
+print "Directory: {target_dir}"
+print ""
+
+if not file_exists(target_dir):
+    print "Error: directory not found: {target_dir}"
+else:
+    # Collect files
+    var cmm_files: [text] = []
+    collect_cmm_files(target_dir, cmm_files)
+    print "Found {cmm_files.len()} CMM files"
+    print ""
+
+    var total = 0
+    var ok = 0
+    var errors = 0
+    var skipped = 0
+    var total_stmts = 0
+    var total_diags = 0
+    var error_categories: [ErrorCategory] = []
+    var sample_errors: [text] = []
+
+    var i = 0
+    while i < cmm_files.len():
+        val path = cmm_files[i]
+        total = total + 1
+
+        val content = read_file(path) ?? ""
+        if content.starts_with("trace32 encrypted cmm file"):
+            skipped = skipped + 1
+            i = i + 1
+            continue
+
+        val program = parse_cmm_source(content)
+        total_stmts = total_stmts + program.statements.len()
+
+        if program.errors.len() > 0:
+            errors = errors + 1
+            # Categorize first error
+            val category = categorize_error(program.errors[0])
+            val idx = find_or_add_category(error_categories, category)
+            error_categories[idx] = ErrorCategory(name: error_categories[idx].name, count: error_categories[idx].count + 1)
+            # Sample up to 30 errors
+            if sample_errors.len() < 30:
+                sample_errors.push(path + ": " + program.errors[0])
+        else:
+            ok = ok + 1
+
+        # Analyze for diagnostics
+        val result = analyze_program(program)
+        total_diags = total_diags + result.diagnostics.len()
+
+        # Progress
+        if total % 100 == 0:
+            print "  ... {total} files processed"
+
+        i = i + 1
+
+    # Summary
+    print ""
+    print "=== Results ==="
+    print "Total files:         {total}"
+    print "Parsed OK:           {ok}"
+    print "Parse errors:        {errors}"
+    print "Skipped (encrypted): {skipped}"
+    print "Total statements:    {total_stmts}"
+    print "Total diagnostics:   {total_diags}"
+    print ""
+
+    # Error categories
+    if error_categories.len() > 0:
+        print "=== Error Categories ==="
+        var ci = 0
+        while ci < error_categories.len():
+            print "  {error_categories[ci].name}: {error_categories[ci].count}"
+            ci = ci + 1
+        print ""
+
+    # Sample errors
+    if sample_errors.len() > 0:
+        print "=== Sample Errors (max 30) ==="
+        var si = 0
+        while si < sample_errors.len():
+            print "  {sample_errors[si]}"
+            si = si + 1
+        print ""
+
+    # Success rate
+    if total > 0:
+        val pct = ok * 100 / total
+        print "Success rate: {pct}% ({ok}/{total})"

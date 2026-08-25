@@ -1,0 +1,5 @@
+#![allow(unnamed_duplicate_typed_args)]
+@allow(unnamed_duplicate_typed_args)
+# mcpgdb protocol compatibility surface for example callers.
+
+use app.mcpgdb.protocol.{make_init_response, make_tools_list}

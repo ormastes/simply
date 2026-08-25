@@ -1,0 +1,41 @@
+# Text Dataset — from scratch
+# Chapter 2: "Build a Large Language Model From Scratch" (Rasbt)
+#
+# Creates sliding window (input, target) pairs from a token sequence.
+# For language modeling: target is input shifted by 1 position.
+
+class TextSample:
+    input: [i64]       # Input token IDs [ctx_len]
+    target: [i64]      # Target token IDs [ctx_len] (shifted by 1)
+
+class TextDataset:
+    samples: [TextSample]
+    ctx_len: i64
+
+    # Create dataset from token IDs with sliding window
+    # stride: how many positions to advance between samples
+    static fn create(token_ids: [i64], ctx_len: i64, stride: i64) -> TextDataset:
+        var samples: [TextSample] = []
+        var start = 0
+        while start + ctx_len + 1 <= token_ids.len():
+            var input_ids: [i64] = []
+            var target_ids: [i64] = []
+            var i = 0
+            while i < ctx_len:
+                input_ids.push(token_ids[start + i])
+                target_ids.push(token_ids[start + i + 1])
+                i = i + 1
+            samples.push(TextSample(input: input_ids, target: target_ids))
+            start = start + stride
+        TextDataset(samples: samples, ctx_len: ctx_len)
+
+    fn len() -> i64:
+        self.samples.len()
+
+    fn get(index: i64) -> TextSample:
+        self.samples[index]
+
+fn text_dataset_create(token_ids: [i64], ctx_len: i64, stride: i64) -> TextDataset:
+    TextDataset.create(token_ids, ctx_len, stride)
+
+export TextSample, TextDataset, text_dataset_create

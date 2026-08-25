@@ -1,0 +1,102 @@
+# text char_at / starts_with / rt_string_from_byte_array-into-store probe
+# (bug: x64_freestanding_text_char_at_starts_with.md)
+#
+# Minimal freestanding --entry-closure probe. Builds a dynamic 11-byte text
+# ("/FSEXEC.ELF") via rt_push_byte + rt_string_from_byte_array, STORES it in
+# a local, then exercises char_at(i) for i=0,1,2 (decoding each returned
+# 1-char text back to a raw byte via rt_string_to_byte_array + rt_bytes_u8_at,
+# never via `.to_i64()` which is a known-stubbed no-op on this target) and
+# starts_with("/"). Prints raw i64 for char_at itself too (SSHPROBE9-style)
+# so the TAG_HEAP-vs-TAG_INT shape of the return value is visible directly.
+#
+# Modeled on rt_text_bytes_probe_entry.spl / abi_probe_entry.spl (no nvme/net/
+# vmm deps, direct port I/O serial + isa-debug-exit).
+
+extern fn serial_println(msg: text)
+extern fn rt_port_outb(port: u16, value: u8)
+extern fn rt_push_byte(arr: [u8], byte_val: i64) -> [u8]
+extern fn rt_string_from_byte_array(arr: [u8]) -> text
+extern fn rt_string_to_byte_array(s: text) -> [u8]
+extern fn rt_bytes_u8_at(arr: [u8], idx: i64) -> i64
+extern fn rt_string_char_at(s: text, idx: i64) -> i64
+
+struct _ProbeTextField:
+    value: text
+    next_offset: u64
+
+fn _build_text_field(bytes: [u8]) -> Result<_ProbeTextField, text>:
+    Ok(_ProbeTextField(
+        value: rt_string_from_byte_array(bytes),
+        next_offset: 0u64
+    ))
+
+fn _build_path_bytes() -> [u8]:
+    var out: [u8] = []
+    out = rt_push_byte(out, 0x2f)  # /
+    out = rt_push_byte(out, 0x46)  # F
+    out = rt_push_byte(out, 0x53)  # S
+    out = rt_push_byte(out, 0x45)  # E
+    out = rt_push_byte(out, 0x58)  # X
+    out = rt_push_byte(out, 0x45)  # E
+    out = rt_push_byte(out, 0x43)  # C
+    out = rt_push_byte(out, 0x2e)  # .
+    out = rt_push_byte(out, 0x45)  # E
+    out = rt_push_byte(out, 0x4c)  # L
+    out = rt_push_byte(out, 0x46)  # F
+    out
+
+fn _start():
+    val path_bytes = _build_path_bytes()
+
+    # Enum-wrapped struct-field store: matches the REAL shape that upstream
+    # flagged (_read_text_field_fast: Ok(_SshTextField(value: rt_string_from_
+    # byte_array(...), ...))) -- a heap handle flowing through a Result<T,E>
+    # payload channel, not just a plain local assignment.
+    val field_result = _build_text_field(path_bytes)
+    val stored: text = match field_result:
+        Ok(f): f.value
+        Err(_): "ERR"
+
+    val n = stored.len()
+    serial_println("[probe] len expected=11 actual={n}")
+
+    # Raw (undecoded) return of the builtin char_at dispatch, mirroring the
+    # original SSHPROBE9 diagnostic (extern decl forces raw i64, no unbox).
+    val c0_raw = rt_string_char_at(stored, 0)
+    val c1_raw = rt_string_char_at(stored, 1)
+    val c2_raw = rt_string_char_at(stored, 2)
+    serial_println("[probe] char_at raw c0={c0_raw} c1={c1_raw} c2={c2_raw}")
+
+    # Proper decode: char_at(i) returns a 1-char text (heap RuntimeValue) by
+    # design -- convert THAT back to bytes rather than misusing to_i64.
+    val ch0 = stored.char_at(0)
+    val ch1 = stored.char_at(1)
+    val ch2 = stored.char_at(2)
+    val b0 = rt_bytes_u8_at(rt_string_to_byte_array(ch0), 0)
+    val b1 = rt_bytes_u8_at(rt_string_to_byte_array(ch1), 0)
+    val b2 = rt_bytes_u8_at(rt_string_to_byte_array(ch2), 0)
+    serial_println("[probe] char_at decoded expected=47 70 83 actual={b0} {b1} {b2}")
+
+    val sw = stored.starts_with("/")
+    if sw:
+        serial_println("[probe] starts_with(/) = true")
+    else:
+        serial_println("[probe] starts_with(/) = false")
+
+    # Extra bisection: trim() result THEN starts_with (matches the exact
+    # shape that crashes in the deep sshd call stack: trimmed_command =
+    # command.trim(); trimmed_command.starts_with("/")).
+    val trimmed = stored.trim()
+    serial_println("[probe] trimmed len={trimmed.len()}")
+    val sw2 = trimmed.starts_with("/")
+    if sw2:
+        serial_println("[probe] trim().starts_with(/) = true")
+    else:
+        serial_println("[probe] trim().starts_with(/) = false")
+
+    if (n == 11 and b0 == 47 and b1 == 70 and b2 == 83 and sw):
+        serial_println("PROBE PASS text_char_at_store ok")
+    else:
+        serial_println("PROBE FAIL text_char_at_store wrong")
+
+    rt_port_outb(0xf4u16, 0x03u8)

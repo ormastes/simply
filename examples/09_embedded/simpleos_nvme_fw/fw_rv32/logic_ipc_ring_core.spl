@@ -1,0 +1,81 @@
+# logic_ipc_ring_core — PURE SPSC ring algebra (no shm/memory access; the thin
+# rv32/host drivers perform the actual loads/stores this file's verdicts
+# prescribe). Design contract: doc/05_design/hardware/nvme_fw_multicore/
+# fourcore_ipc_index_handle_design.md §4.
+#
+# Free-running counters: head is written only by the consumer, tail only by
+# the producer. empty = tail == head; full = tail - head == RING_DEPTH;
+# slot = counter & (RING_DEPTH - 1) (RING_DEPTH is a power of two).
+#
+# Packed verdict convention (ring_push_verdict / ring_pop_verdict):
+#   bit 32      = ok flag (1 = success, 0 = fail/rejected)
+#   bits [31:0] = slot index (0..RING_DEPTH-1); MEANINGLESS when ok == 0
+#   bits [63:33] = always 0 (reserved)
+# Unpack with ring_verdict_ok / ring_verdict_slot — never inspect the packed
+# i64 directly outside this file.
+
+use logic_ipc_layout_core.*
+
+fn ring_empty(head: i64, tail: i64) -> i32:
+    if tail == head:
+        return 1
+    0
+
+fn ring_full(head: i64, tail: i64) -> i32:
+    if (tail - head) == ring_depth():
+        return 1
+    0
+
+# Number of free slots. Fail-closed: a corrupted/out-of-range (head, tail)
+# pair (occupied < 0 or occupied > RING_DEPTH) reports 0 free slots rather
+# than a nonsensical or negative count.
+fn ring_free_slots(head: i64, tail: i64) -> i64:
+    val occupied: i64 = tail - head
+    if occupied < 0:
+        return 0
+    if occupied > ring_depth():
+        return 0
+    ring_depth() - occupied
+
+fn ring_can_push(head: i64, tail: i64) -> i32:
+    if ring_free_slots(head, tail) > 0:
+        return 1
+    0
+
+# Slot a free-running counter maps to. Fail-closed on a negative counter
+# (should never occur for a correctly-driven free-running counter).
+fn ring_slot_of(counter: i64) -> i64:
+    if counter < 0:
+        return ipc_null_idx()
+    counter & (ring_depth() - 1)
+
+# The slot the NEXT push (by the producer holding `tail`) would land in.
+fn ring_push_slot(tail: i64) -> i64:
+    ring_slot_of(tail)
+
+fn ring_verdict_pack(ok: i64, slot: i64) -> i64:
+    (ok << 32) | slot
+
+fn ring_verdict_ok(verdict: i64) -> i32:
+    if ((verdict >> 32) & 1) == 1:
+        return 1
+    0
+
+fn ring_verdict_slot(verdict: i64) -> i64:
+    verdict & 0xFFFFFFFF
+
+# Verdict for a producer wanting to push at (head, tail). ok=0 (ring full) ->
+# slot is meaningless (packed as 0). ok=1 -> slot is where the payload words
+# must be written before the driver advances tail.
+fn ring_push_verdict(head: i64, tail: i64) -> i64:
+    if ring_can_push(head, tail) == 1:
+        return ring_verdict_pack(1, ring_slot_of(tail))
+    ring_verdict_pack(0, 0)
+
+# Verdict for a consumer wanting to pop at (head, tail). ok=0 (ring empty) ->
+# slot is meaningless. ok=1 -> slot is where the payload words must be read
+# from before the driver advances head.
+fn ring_pop_verdict(head: i64, tail: i64) -> i64:
+    if ring_empty(head, tail) == 1:
+        return ring_verdict_pack(0, 0)
+    ring_verdict_pack(1, ring_slot_of(head))

@@ -1,0 +1,8 @@
+# llm-process-gen: managed source=pipe_verify_tools source_sha256=597e07db61bbeaac71c0da6fbf123a1cc0baddd381bf528258cf3c2c573a9b75 content_sha256=4c38b3999a2060a3038c1934ad6bc7d0a8d493b69aaecb2ae856a3a7e9809687
+skill_tools |skill, stage|
+    verify, verify
+
+tools |id, type, name, purpose|
+    simple_cli, cli, "bin/simple test", "Run focused and broad test verification"
+    smoke_core, cli, "bin/simple check src/compiler && bin/simple check src/lib", "Verify compiler/core/lib check paths"
+    smoke_mcp, cli, "bin/simple check src/app/mcp && bin/simple check src/app/simple_lsp_mcp && SIMPLE_LIB=src bin/simple test test/integration/app/mcp_stdio_integration_spec.spl --mode=interpreter", "Verify MCP/LSP checks and MCP stdio integration"

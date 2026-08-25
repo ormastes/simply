@@ -1,0 +1,108 @@
+# @cover src/kernel/durable_log.spl 80%
+"""
+# Durable Event Log — persistence with restore parity
+
+The event log is the only write surface, so it must survive a restart. Saving
+serialises it to an escape-safe line format; loading replays it and verifies the
+header's count and checksum. Load fails CLOSED: a missing file or a corrupted
+header yields an empty log, never a silently-partial one.
+"""
+
+use std.spec
+use kernel.event_log.{new_event_log, append, event_count, events_for}
+use kernel.durable_log.{escape_field, unescape_field, serialize_log, parse_log, log_checksum, save_log, load_log, restore_parity}
+use std.io_runtime.{write_file}
+
+describe "Durable log — save/load round-trip parity":
+    it "reloads a saved log with matching count and checksum":
+        var log = new_event_log()
+        log = append(log, "sale.write", 7, "amount=11000")
+        log = append(log, "inventory.move", 9, "sku=COFFEE")
+        val path = "build/simple_erp_dl_rt.log"
+        expect(save_log(path, log)).to_equal(true)
+        val loaded = load_log(path)
+        expect(event_count(loaded)).to_equal(2)
+        expect(restore_parity(log, loaded)).to_equal(true)
+
+    it "preserves kind, entity and payload through a round-trip":
+        var log = new_event_log()
+        log = append(log, "sale.write", 42, "amount=500|note=ok")
+        val path = "build/simple_erp_dl_fields.log"
+        expect(save_log(path, log)).to_equal(true)
+        val loaded = load_log(path)
+        var found_kind = ""
+        var found_payload = ""
+        for ev in events_for(loaded, 42):
+            found_kind = ev.kind
+            found_payload = ev.payload
+        expect(found_kind).to_equal("sale.write")
+        expect(found_payload).to_equal("amount=500|note=ok")
+
+describe "Durable log — field escaping":
+    it "round-trips a payload containing pipe, backslash and newline":
+        val tricky = "a|b\\c\nd"
+        val esc = escape_field(tricky)
+        expect(esc.contains("|")).to_equal(false)
+        expect(esc.contains("\n")).to_equal(false)
+        val back = unescape_field(esc)
+        expect(back).to_equal(tricky)
+
+    it "round-trips a tricky payload through save/load":
+        var log = new_event_log()
+        log = append(log, "note", 3, "left|right\\slash\nsecond")
+        val path = "build/simple_erp_dl_escape.log"
+        expect(save_log(path, log)).to_equal(true)
+        val loaded = load_log(path)
+        var found = ""
+        for ev in events_for(loaded, 3):
+            found = ev.payload
+        expect(found).to_equal("left|right\\slash\nsecond")
+
+describe "Durable log — checksum sensitivity":
+    it "changes when a payload is tampered":
+        var a = new_event_log()
+        a = append(a, "k", 1, "p1")
+        a = append(a, "k", 2, "p2")
+        var b = new_event_log()
+        b = append(b, "k", 1, "p1")
+        b = append(b, "k", 2, "pX")
+        val same = log_checksum(a) == log_checksum(b)
+        expect(same).to_equal(false)
+
+    it "changes when two events are swapped in order":
+        var a = new_event_log()
+        a = append(a, "k", 1, "p1")
+        a = append(a, "k", 2, "p2")
+        var c = new_event_log()
+        c = append(c, "k", 2, "p2")
+        c = append(c, "k", 1, "p1")
+        val same = log_checksum(a) == log_checksum(c)
+        expect(same).to_equal(false)
+
+describe "Durable log — fail-closed loads":
+    it "returns an empty log for a missing file":
+        val loaded = load_log("build/simple_erp_missing_xyz.log")
+        expect(event_count(loaded)).to_equal(0)
+
+    it "returns an empty log for a corrupted header":
+        val path = "build/simple_erp_bad_header.log"
+        write_file(path, "GARBAGE not a header\n0|k|1|p1")
+        val loaded = load_log(path)
+        expect(event_count(loaded)).to_equal(0)
+
+    it "returns an empty log when the header checksum disagrees":
+        val path = "build/simple_erp_bad_checksum.log"
+        write_file(path, "ubslog v1 count=1 checksum=999999\n0|k|1|p1")
+        val loaded = load_log(path)
+        expect(event_count(loaded)).to_equal(0)
+
+describe "Durable log — kind field escaping":
+    it "round-trips a kind containing the field separator":
+        var log = new_event_log()
+        log = append(log, "bad|kind", 1, "amount=1")
+        val path = "build/simple_erp_dl_kindpipe.log"
+        expect(save_log(path, log)).to_equal(true)
+        val loaded = load_log(path)
+        expect(event_count(loaded)).to_equal(1)
+        expect(restore_parity(log, loaded)).to_equal(true)
+        expect(loaded.events[0].kind).to_equal("bad|kind")

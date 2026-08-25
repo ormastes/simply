@@ -1,0 +1,36 @@
+# UBS Kernel — Accounting Posting Bridge
+#
+# Turns an accepted guarded-write into ledger facts: an immutable event appended
+# to the event log plus a balanced journal entry (debit cash, credit revenue)
+# that the projection layer sums. This keeps the SAP-parity invariant — every
+# accepted write posts a balanced entry into the event-sourced ledger — in one
+# place rather than open-coded per lane.
+
+use kernel.event_log.{EventLog, append}
+use kernel.projection.{JournalLine, JournalEntry, line, balances}
+use units.money.{money}
+
+# Chart-of-accounts ids. Cash is a debit-normal asset; revenue is credit-normal.
+fn cash_account() -> i64:
+    return 100
+
+fn revenue_account() -> i64:
+    return 400
+
+# The balanced journal entry for an accepted write: debit cash (+amount),
+# credit revenue (-amount). Signed lines sum to zero, so balances() holds.
+fn journal_for_accepted(entry_id: i64, currency: text, amount_minor: i64) -> JournalEntry:
+    var lines: [JournalLine] = []
+    lines.push(line(cash_account(), money(currency, amount_minor)))
+    lines.push(line(revenue_account(), money(currency, 0 - amount_minor)))
+    return JournalEntry { id: entry_id, lines: lines }
+
+# Append one accounting event for an accepted write; returns the new log so the
+# caller cannot mutate history in place.
+fn post_accepted_write(log: EventLog, action: text, entity: i64, amount_minor: i64) -> EventLog:
+    return append(log, action, entity, "amount={amount_minor}")
+
+# Re-export of the balanced-ledger invariant so posting callers need not reach
+# into the projection layer directly.
+fn posting_balanced(entry: JournalEntry) -> bool:
+    return balances(entry)

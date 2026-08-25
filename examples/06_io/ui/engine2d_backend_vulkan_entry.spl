@@ -1,0 +1,12 @@
+use std.gpu.engine2d.backend_vulkan.{VulkanBackend}
+use examples.ui.engine2d_backend_scene.{W, H, run_engine2d_scene_backend}
+
+fn main() -> i64:
+    print "  backend 'vulkan':"
+    var backend = VulkanBackend.create()
+    if not backend.init(W, H):
+        print "    -> skipped (Vulkan unavailable on this host)"
+        return 1
+    if run_engine2d_scene_backend(backend, "vulkan", false):
+        return 0
+    1

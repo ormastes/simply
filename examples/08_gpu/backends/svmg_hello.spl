@@ -1,0 +1,87 @@
+#!/usr/bin/env simple
+# Same GPU program, three backends, zero code changes.
+#
+# The program below is an SVM-G kernel (the stack VM every GPU lane runs).
+# Which backend executes it is decided ONLY by the `gpu:` section of the
+# `simple.sdn` in the current directory — see cuda/, vulkan/, metal/.
+#
+#   cd examples/08_gpu/backends/cuda   && bin/simple run ../svmg_hello.spl
+#   cd examples/08_gpu/backends/vulkan && bin/simple run ../svmg_hello.spl
+#   cd examples/08_gpu/backends/metal  && bin/simple run ../svmg_hello.spl
+#
+# A backend that is not usable on this host reports its own `skip:` reason
+# (e.g. `skip:metal-unavailable-not-macos` on Linux) instead of pretending.
+
+use std.nogc_sync_mut.notebook.gpu_config.{GpuConfig, load_project_gpu_config}
+use std.gc_async_mut.gpu_lane.cuda_lane_session.{CudaLaneSession}
+use std.gc_async_mut.gpu_lane.vulkan_lane_session.{VulkanLaneSession}
+use std.gc_async_mut.gpu_lane.metal_lane_session.{MetalLaneSession}
+use std.gc_async_mut.gpu_lane.cuda_vm_executor.{CudaVmExecutor}
+use std.gc_async_mut.gpu_lane.vulkan_vm_executor.{VulkanVmExecutor}
+use std.gc_async_mut.gpu_lane.metal_vm_executor.{MetalVmExecutor}
+use std.sffi.io.{file_read_bytes, file_read_text}
+
+# push (passed=1, value=9) as a RESULT record, then exit with code 3.
+val HELLO_PROGRAM = "PUSHI 1\nPUSHI 9\nSYS_RESULT\nPUSHI 3\nSYS_EXIT"
+val STEP_BUDGET = 1000
+# Run from backends/<backend>/ so the per-directory simple.sdn is picked up;
+# the checked-in SVM-G kernel artifacts live in the repo under src/lib.
+val REPO_ROOT = "../../../.."
+val LANE_DIR = "{REPO_ROOT}/src/lib/gc_async_mut/gpu_lane"
+
+fn probe_backend(backend: text) -> text:
+    """Ask the lane session whether this backend is usable here.
+    Returns "" when usable, otherwise the lane's own `skip:...` reason."""
+    val verdict = match backend:
+        case "cuda": CudaLaneSession.create().probe()
+        case "vulkan": VulkanLaneSession.create().probe()
+        case "metal": MetalLaneSession.create().probe()
+        case _: "skip:unknown-backend-{backend}"
+    if verdict.starts_with("skip:"): verdict else: ""
+
+fn run_hello(backend: text) -> text:
+    """Run HELLO_PROGRAM on `backend`; return a one-line deterministic summary."""
+    match backend:
+        case "cuda":
+            var ex = CudaVmExecutor.create()
+            val init_err = ex.init(file_read_bytes("{LANE_DIR}/svmg_cuda_kernel.ptx"))
+            if init_err != "": return "error: {init_err}"
+            val o = ex.run_source(HELLO_PROGRAM, STEP_BUDGET, 0)
+            summarize(o.ok, o.error, o.records.len(), o.exit_code)
+        case "vulkan":
+            var ex = VulkanVmExecutor.create()
+            val init_err = ex.init(file_read_bytes("{LANE_DIR}/svmg_vulkan_kernel.spv"))
+            if init_err != "": return "error: {init_err}"
+            val o = ex.run_source(HELLO_PROGRAM, STEP_BUDGET, 0)
+            summarize(o.ok, o.error, o.records.len(), o.exit_code)
+        case "metal":
+            var ex = MetalVmExecutor.create()
+            val init_err = ex.init(file_read_text("{LANE_DIR}/svmg_metal_kernel.metal"))
+            if init_err != "": return "error: {init_err}"
+            val o = ex.run_source(HELLO_PROGRAM, STEP_BUDGET, 0)
+            summarize(o.ok, o.error, o.records.len(), o.exit_code)
+        case _:
+            "error: unknown backend {backend}"
+
+fn summarize(ok: bool, error: text, records: i64, exit_code: i64) -> text:
+    if ok: "ok records={records} exit={exit_code}" else: "error: {error}"
+
+fn resolve_backend(config: GpuConfig) -> text:
+    """`auto` = first usable backend in the documented probe order."""
+    if config.backend != "auto":
+        return config.backend
+    for b in ["cuda", "vulkan", "metal"]:
+        if probe_backend(b) == "":
+            return b
+    "none"
+
+fn main():
+    val config = load_project_gpu_config()
+    val backend = resolve_backend(config)
+    print "config: backend={config.backend} submode={config.submode} arch={config.arch}"
+    print "resolved backend: {backend}"
+    val skip = probe_backend(backend)
+    if skip != "":
+        print "{skip}"
+        return
+    print run_hello(backend)

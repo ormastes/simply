@@ -1,0 +1,74 @@
+# CBOR Encoding/Decoding Demo
+# Demonstrates basic CBOR functionality
+
+use std.cbor.core.{cbor_encode_int, cbor_encode_unsigned, cbor_encode_text, cbor_encode_bytes, cbor_encode_bool, cbor_encode_null, cbor_encode_array_header, cbor_encode_map_header, cbor_decode_int, cbor_decode_text, cbor_decode_unsigned, cbor_hexdump, cbor_validate, cbor_item_size}
+
+fn main():
+    print "=== CBOR Encoding/Decoding Demo ==="
+    print ""
+
+    # Example 1: Integer encoding
+    print "Example 1: Integer encoding"
+    val int_small = cbor_encode_unsigned(10)
+    val int_large = cbor_encode_unsigned(1000)
+    print "Small int (10): {cbor_hexdump(int_small)}"
+    print "Large int (1000): {cbor_hexdump(int_large)}"
+    print ""
+
+    # Example 2: Text encoding
+    print "Example 2: Text string encoding"
+    val text_bytes = cbor_encode_text("hello")
+    print "Text 'hello': {cbor_hexdump(text_bytes)}"
+    print "Byte length: {text_bytes.len()}"
+    print ""
+
+    # Example 3: Decoding
+    print "Example 3: Decoding values"
+    val decoded_int = cbor_decode_unsigned(int_small, 0)
+    print "Decoded small int: {decoded_int.0} (consumed {decoded_int.1} bytes)"
+
+    val decoded_text = cbor_decode_text(text_bytes, 0)
+    print "Decoded text: '{decoded_text.0}' (consumed {decoded_text.1} bytes)"
+    print ""
+
+    # Example 4: Boolean and null
+    print "Example 4: Boolean and null values"
+    val bool_true = cbor_encode_bool(true)
+    val bool_false = cbor_encode_bool(false)
+    val null_val = cbor_encode_null()
+    print "Boolean true: {cbor_hexdump(bool_true)}"
+    print "Boolean false: {cbor_hexdump(bool_false)}"
+    print "Null: {cbor_hexdump(null_val)}"
+    print ""
+
+    # Example 5: Array header
+    print "Example 5: Array encoding"
+    var array_bytes = cbor_encode_array_header(3)
+    array_bytes = array_bytes + cbor_encode_int(1)
+    array_bytes = array_bytes + cbor_encode_int(2)
+    array_bytes = array_bytes + cbor_encode_int(3)
+    print "Array [1,2,3]: {cbor_hexdump(array_bytes)}"
+    print "Total bytes: {array_bytes.len()}"
+    print ""
+
+    # Example 6: Validation
+    print "Example 6: Validation"
+    val is_valid_int = cbor_validate(int_small)
+    val is_valid_text = cbor_validate(text_bytes)
+    val is_valid_array = cbor_validate(array_bytes)
+    print "Integer valid: {is_valid_int}"
+    print "Text valid: {is_valid_text}"
+    print "Array valid: {is_valid_array}"
+    print ""
+
+    # Example 7: Negative integers
+    print "Example 7: Negative integers"
+    val neg_int = cbor_encode_int(-42)
+    print "Negative -42: {cbor_hexdump(neg_int)}"
+    val decoded_neg = cbor_decode_int(neg_int, 0)
+    print "Decoded: {decoded_neg.0}"
+    print ""
+
+    print "=== Demo Complete ==="
+
+main()

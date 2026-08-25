@@ -1,0 +1,110 @@
+# x86_64 SSH + ring-3 CLANG-STREAM entry (Phase 2e Inc 1).
+#
+# Variant of ssh_ring3_entry.spl for the clang-over-SSH critical-unknown proof.
+# Two differences from the proven ssh_ring3_entry.spl:
+#
+#   1. NO boot-time /FSEXEC.ELF preload. ssh_ring3_entry.spl's preload reads
+#      the WHOLE file into the fixed 32 MiB simpleos_fat32_path_read_buf via
+#      simpleos_fat32_stream_read_at(0, buf, file_size) with NO destination
+#      bounds check (baremetal_stubs.c simpleos_fat32_stream_read_at trusts
+#      the caller's `len`) — safe for the small (~14 KB) /FSEXEC.ELF used by
+#      the other SSH demos, but for THIS image /FSEXEC.ELF is the 124.6 MB
+#      clang_static binary: preloading it whole would memcpy ~120 MB past the
+#      end of the 32 MiB static buffer into adjacent kernel .bss/.data —
+#      memory corruption before rt_net_init even runs. Dropped entirely: this
+#      entry exists specifically to prove the STREAMING post-net path (never
+#      preload), so skipping the preload is also the correct behavior, not
+#      just a safety patch.
+#   2. Same 384 MiB pmm_init_identity_range(0x80000000, 0x100000, 0x18000000)
+#      as ssh_ring3_entry.spl AND fs_exec_clang_stream_ring3_entry.spl (the
+#      proven boot-time clang-stream lane) — sized for the 124.6 MB payload +
+#      64 MiB user heap. Requires QEMU -m 2G.
+#
+# QEMU forwards host port 2222 -> guest 22 (see scripts/os/build_clang_over_ssh.shs).
+
+use build.os.generated.ssh_live_build_marker.{ssh_live_build_marker}
+use os.apps.sshd.sshd.{SshDaemon}
+use os.kernel.arch.x86_64.arch_init.{arch_x86_64_early_init}
+use os.kernel.memory.pmm.{pmm_init_identity_range, g_pmm}
+use os.kernel.memory.vmm.{vmm_init}
+use os.kernel.memory.vmm_address_space.{vmm_map_nvme_bar_high}
+use os.kernel.boot.mmio.{mmio_disable_test_mode}
+use arch.x86_64.ent_store_fat32_kernel_facade.{ent_store_kernel_probe}
+
+extern fn serial_println(msg: text)
+extern fn rt_net_init() -> i64
+extern fn rt_net_stats() -> i64
+extern fn rt_embedded_host_rsa_pkcs8() -> [u8]
+extern fn rt_embedded_host_rsa_public_blob() -> [u8]
+extern fn rt_x86_tss_init() -> i64
+extern fn simpleos_nvme_init() -> i64
+
+fn _start():
+    serial_println("")
+    serial_println("=== SimpleOS SSH + ring-3 CLANG-STREAM Boot (Phase 2e Inc 1) ===")
+    serial_println("[boot] Build marker:")
+    serial_println(ssh_live_build_marker())
+
+    # 0. Pin the MMIO layer to the real hardware path (see ssh_ring3_entry.spl
+    #    for the freestanding module-val rationale).
+    mmio_disable_test_mode()
+
+    # 1. Ring-3 machinery (SYSCALL MSRs + EFER.NXE via arch_init, TSS/rsp0).
+    arch_x86_64_early_init()
+    rt_x86_tss_init()
+    serial_println("[boot] arch-init + tss done")
+
+    # 2. NVMe + network up UNDER the boot page tables (before vmm switches cr3).
+    if simpleos_nvme_init() != 0:
+        serial_println("[FATAL] nvme init failed")
+        return
+    serial_println("[boot] nvme online")
+
+    # 2b. Enterprise-store in-guest probe (AC-17 rungs L3.5a/b). Placed HERE,
+    #     immediately after NVMe and before rt_net_init, because the probe
+    #     needs only the FAT32-on-NVMe filesystem: running it after network
+    #     bring-up made it unreachable on any host QEMU line without a
+    #     virtio-net device (rt_net_init rc=-152 returns from _start).
+    ent_store_kernel_probe()
+
+    # NO preload here (see module docstring) — the critical unknown this entry
+    # exists to prove is whether simpleos_fat32_stream_open/stream_read_at
+    # succeed for the sshd deferred clang spawn AFTER rt_net_init + vmm + SSH
+    # session activity (doc/08_tracking/bug/x64_ssh_kernel_fat32_stream_open_zero.md).
+
+    val net_init = rt_net_init()
+    serial_println("[boot] rt_net_init rc={net_init}")
+    if net_init < 0:
+        serial_println("[FATAL] SSH network init failed")
+        return
+    val _net_stats = rt_net_stats()
+
+    # 3. PMM + VMM + NVMe BAR high — required for ring-3 create_user_address_space
+    #    and for the FS-exec read path to reach NVMe post-vmm. 384 MiB pool
+    #    (see module docstring) — headroom for the 124.6 MB clang payload +
+    #    64 MiB user heap.
+    if not pmm_init_identity_range(0x80000000, 0x100000, 0x18000000):
+        serial_println("[FATAL] pmm init failed")
+        return
+    vmm_init(g_pmm, 0)
+    vmm_map_nvme_bar_high()
+    serial_println("[boot] pmm+vmm online (+nvme bar high) — net must survive this")
+
+    # 4. Production SSH daemon. A command starting with 'c' (e.g. `ssh ... clang`)
+    #    defers the CLANG heap-stream spawn (sshd.spl _sshd_run_pending_clang_exec)
+    #    from the shallow accept-loop frame.
+    var daemon = SshDaemon.new(22)
+    val rsa_pkcs8 = rt_embedded_host_rsa_pkcs8()
+    val rsa_public_blob = rt_embedded_host_rsa_public_blob()
+    if rsa_pkcs8.len() > 0 and rsa_public_blob.len() > 0:
+        serial_println("[boot] Live host key policy: Ed25519 enabled; RSA staged")
+    else:
+        serial_println("[boot] Live host key policy: Ed25519 only")
+
+    serial_println("[boot] Starting production SSH daemon on port 22")
+    serial_println("[ssh-live] production-daemon-starting port=22 hostfwd=2222")
+    match daemon.start():
+        Ok(_):
+            serial_println("[ssh-live] production-daemon-stopped")
+        Err(err):
+            serial_println("[FATAL] SSH daemon failed: {err}")

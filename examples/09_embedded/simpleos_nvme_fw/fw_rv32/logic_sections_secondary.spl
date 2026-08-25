@@ -1,0 +1,29 @@
+use logic_sections_core.*
+use logic_reactor.{rv32_reactor_selftest}
+use logic_policy_target.{rv32_policy_target_selftest}
+use logic_dram_durability.{rv32_dram_durability_selftest}
+use logic_wear_scrub.{rv32_wear_scrub_selftest}
+use logic_media_retire.{rv32_media_retire_selftest}
+use logic_power_cycle.{rv32_power_cycle_selftest}
+use logic_backpressure_abort.{rv32_backpressure_abort_selftest}
+use logic_feature_guard.{rv32_feature_guard_selftest}
+use logic_namespace_guard.{rv32_namespace_guard_selftest}
+use logic_target.{rv32_target_profile_selftest}
+use logic_task_pool.{rv32_task_pool_selftest}
+use logic_nand_read_level.{rv32_nand_read_level_selftest}
+
+fn nvme_fw_rv32_secondary_sections() -> i32:
+    var fail: i32 = 0
+    fail = fail + _nvme_fw_rv32_section_flag(rv32_reactor_selftest(), 4096)
+    fail = fail + _nvme_fw_rv32_section_flag(rv32_policy_target_selftest(), 8192)
+    fail = fail + _nvme_fw_rv32_section_flag(rv32_dram_durability_selftest(), 16384)
+    fail = fail + _nvme_fw_rv32_section_flag(rv32_wear_scrub_selftest(), 32768)
+    fail = fail + _nvme_fw_rv32_section_flag(rv32_media_retire_selftest(), 65536)
+    fail = fail + _nvme_fw_rv32_section_flag(rv32_power_cycle_selftest(), 131072)
+    fail = fail + _nvme_fw_rv32_section_flag(rv32_backpressure_abort_selftest(), 262144)
+    fail = fail + _nvme_fw_rv32_section_flag(rv32_feature_guard_selftest(), 524288)
+    fail = fail + _nvme_fw_rv32_section_flag(rv32_namespace_guard_selftest(), 1048576)
+    fail = fail + _nvme_fw_rv32_section_flag(rv32_target_profile_selftest(), 2097152)
+    fail = fail + _nvme_fw_rv32_section_flag(rv32_task_pool_selftest(), 4194304)
+    fail = fail + _nvme_fw_rv32_section_flag(rv32_nand_read_level_selftest(), 8388608)
+    fail

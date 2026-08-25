@@ -1,0 +1,108 @@
+# XPBD Cloth — physics + game2d demo
+use std.game2d as g
+use std.common.engine.math2d.{Vec2}
+use std.common.engine.color.{EngineColor}
+use std.nogc_sync_mut.engine.physics.solver.xpbd_solver.{XpbdWorld}
+
+class Game:
+    world: XpbdWorld
+
+    fn load(self):
+        pass_do_nothing
+
+    fn update(self, dt: f32):
+        val _ = dt
+
+    fn fixed_update(self, step: f32):
+        val _ = step
+        self.world.step(0.016)
+
+    fn draw(self, ctx: g.Canvas):
+        ctx.clear(EngineColor(r: 0.05, g: 0.05, b: 0.15, a: 1.0))
+        val cyan = EngineColor(r: 0.2, g: 0.8, b: 1.0, a: 1.0)
+        val white = EngineColor(r: 1.0, g: 1.0, b: 1.0, a: 1.0)
+        val red = EngineColor(r: 1.0, g: 0.3, b: 0.3, a: 1.0)
+        # Draw horizontal edges (row, col) -- (row, col+1)
+        var row = 0
+        while row < 8:
+            var col = 0
+            while col < 7:
+                val a = row * 8 + col
+                val b = row * 8 + col + 1
+                val pa = self.world.get_position(a)
+                val pb = self.world.get_position(b)
+                val x1 = 200.0 + pa.0 * 60.0
+                val y1 = 80.0 - pa.1 * 60.0
+                val x2 = 200.0 + pb.0 * 60.0
+                val y2 = 80.0 - pb.1 * 60.0
+                ctx.line(Vec2(x: x1, y: y1), Vec2(x: x2, y: y2), cyan)
+                col = col + 1
+            row = row + 1
+        # Draw vertical edges (row, col) -- (row+1, col)
+        var vr = 0
+        while vr < 7:
+            var vc = 0
+            while vc < 8:
+                val a = vr * 8 + vc
+                val b = (vr + 1) * 8 + vc
+                val pa = self.world.get_position(a)
+                val pb = self.world.get_position(b)
+                val x1 = 200.0 + pa.0 * 60.0
+                val y1 = 80.0 - pa.1 * 60.0
+                val x2 = 200.0 + pb.0 * 60.0
+                val y2 = 80.0 - pb.1 * 60.0
+                ctx.line(Vec2(x: x1, y: y1), Vec2(x: x2, y: y2), cyan)
+                vc = vc + 1
+            vr = vr + 1
+        # Draw particles
+        var pi = 0
+        while pi < 64:
+            val pos = self.world.get_position(pi)
+            val sx = 200.0 + pos.0 * 60.0
+            val sy = 80.0 - pos.1 * 60.0
+            val color = if pi == 0 or pi == 7: red else: white
+            ctx.circle(g.DrawMode.Fill, Vec2(x: sx, y: sy), 4.0, color)
+            pi = pi + 1
+        ctx.text("XPBD Cloth (fixed: red, dynamic: white)", Vec2(x: 10.0, y: 580.0), white)
+
+fn setup_cloth() -> XpbdWorld:
+    var world = XpbdWorld.create(4)
+    # 8x8 grid, spacing 0.5; row 0 top, row 7 bottom
+    # Top-left (index 0) and top-right (index 7) are fixed
+    var row = 0
+    while row < 8:
+        var col = 0
+        while col < 8:
+            val x = col.to_f64() * 0.5
+            val y = row.to_f64() * (-0.5)
+            val idx = row * 8 + col
+            if idx == 0 or idx == 7:
+                world.add_fixed_particle(x, y, 0.0)
+            else:
+                world.add_particle(x, y, 0.0, 1.0)
+            col = col + 1
+        row = row + 1
+    # Horizontal constraints
+    var hr = 0
+    while hr < 8:
+        var hc = 0
+        while hc < 7:
+            val a = hr * 8 + hc
+            val b = hr * 8 + hc + 1
+            world.add_distance_constraint(a, b, 80.0)
+            hc = hc + 1
+        hr = hr + 1
+    # Vertical constraints
+    var vr = 0
+    while vr < 7:
+        var vc = 0
+        while vc < 8:
+            val a = vr * 8 + vc
+            val b = (vr + 1) * 8 + vc
+            world.add_distance_constraint(a, b, 80.0)
+            vc = vc + 1
+        vr = vr + 1
+    world
+
+fn main():
+    g.run(Game(world: setup_cloth()), "Cloth", 800, 600)

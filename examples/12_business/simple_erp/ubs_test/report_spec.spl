@@ -1,0 +1,49 @@
+# @cover src/report/summary.spl 80%
+"""
+# Reporting — per-lane KPI summary
+
+Per-lane KPI totals feed both a plain-text report and the HTML dashboard.
+Totals are pure sums; lane_status is ok only when a lane has at least one
+accepted write AND denials do not outnumber accepted writes.
+"""
+
+use std.spec
+use report.summary.{LaneKpi, kpi, total_revenue, total_accepted, total_denied, lane_status, render_text_report}
+
+describe "Report summary — KPI totals and status":
+    it "sums revenue across lanes":
+        var kpis: [LaneKpi] = []
+        kpis.push(kpi("crm", 1, 0, 0))
+        kpis.push(kpi("sale", 1, 0, 11000))
+        kpis.push(kpi("restaurant", 1, 0, 15000))
+        expect(total_revenue(kpis)).to_equal(26000)
+
+    it "sums accepted and denied across lanes":
+        var kpis: [LaneKpi] = []
+        kpis.push(kpi("crm", 1, 1, 0))
+        kpis.push(kpi("sale", 2, 1, 11000))
+        expect(total_accepted(kpis)).to_equal(3)
+        expect(total_denied(kpis)).to_equal(2)
+
+    it "marks a lane ok when accepted > 0 and denied <= accepted":
+        val k = kpi("sale", 2, 1, 11000)
+        expect(lane_status(k)).to_equal("ok")
+
+    it "marks a lane ok when denied equals accepted":
+        val k = kpi("crm", 1, 1, 0)
+        expect(lane_status(k)).to_equal("ok")
+
+    it "marks a lane attention when denied outnumbers accepted":
+        val k = kpi("market", 1, 2, 5000)
+        expect(lane_status(k)).to_equal("attention")
+
+    it "marks a lane attention when nothing was accepted":
+        val k = kpi("restaurant", 0, 1, 0)
+        expect(lane_status(k)).to_equal("attention")
+
+    it "renders a text report with one line per lane and a total line":
+        var kpis: [LaneKpi] = []
+        kpis.push(kpi("sale", 1, 1, 11000))
+        val report = render_text_report(kpis)
+        expect(report).to_contain("lane=sale accepted=1 denied=1 revenue=11000 status=ok")
+        expect(report).to_contain("total revenue=11000 accepted=1 denied=1")

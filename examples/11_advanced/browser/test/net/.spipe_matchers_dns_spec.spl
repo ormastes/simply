@@ -1,0 +1,153 @@
+#![allow(REQC001)]
+#![allow(REQC004)]
+#![allow(unnamed_duplicate_typed_args)]
+"""
+# Dns
+
+Tests for dns functionality.
+"""
+# DNS Resolver Cache Tests
+#
+# Category: Browser Platform Networking
+# Status: Active
+#
+# Validates the DNS cache layer: lookup, store, invalidate, flush, and TTL
+# expiration. Tests operate on DnsCache directly to avoid system DNS calls.
+#
+# Run with: bin/simple test examples/browser/test/net/dns_spec.spl
+
+use std.spec
+use examples.browser.feature.net.dns.{DnsCacheEntry, DnsCache, DnsResolver}
+use examples.browser.shared.logging.{Logger, LogLevel}
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+fn make_cache(ttl: i64) -> DnsCache:
+    DnsCache.create(ttl)
+
+fn make_resolver(ttl: i64) -> DnsResolver:
+    DnsResolver.new(Logger.new("dns-test", LogLevel.Debug), ttl)
+
+fn sample_addresses() -> [text]:
+    ["93.184.216.34", "93.184.216.35"]
+
+# ============================================================================
+# DnsCache Tests
+# ============================================================================
+
+describe "DnsCache":
+    """
+    ## Dnscache Tests
+
+    Validates DnsCache functionality.
+    """
+
+    context "lookup on empty cache":
+        it "cache returns nil for unknown hostname":
+            var cache = make_cache(300)
+            val result = cache.lookup("unknown.example.com", 1000)
+            val is_nil = not result.?
+            expect is_nil == true
+
+    context "store and lookup":
+        it "resolve adds to cache":
+            var cache = make_cache(300)
+            cache.store("example.com", sample_addresses(), 1000, 60)
+            val size = cache.size()
+            expect size == 1
+
+        it "cache hit returns cached addresses":
+            var cache = make_cache(300)
+            val addrs = sample_addresses()
+            cache.store("example.com", addrs, 1000, 60)
+            val result = cache.lookup("example.com", 1010)
+            if val found = result:
+                expect found.len() == 2
+                expect found[0] == "93.184.216.34"
+                expect found[1] == "93.184.216.35"
+            else:
+                expect "cache hit should not be nil" == ""
+
+    context "invalidation":
+        it "invalidate removes from cache":
+            var cache = make_cache(300)
+            cache.store("example.com", sample_addresses(), 1000, 60)
+            cache.store("other.com", ["1.2.3.4"], 1000, 60)
+            expect cache.size() == 2
+            cache.invalidate("example.com")
+            expect cache.size() == 1
+            val removed = cache.lookup("example.com", 1010)
+            val is_nil = not removed.?
+            expect is_nil == true
+            # other.com still present
+            val remaining = cache.lookup("other.com", 1010)
+            expect remaining.? == true
+
+        it "flush_cache clears all entries":
+            var cache = make_cache(300)
+            cache.store("a.com", ["1.1.1.1"], 1000, 60)
+            cache.store("b.com", ["2.2.2.2"], 1000, 60)
+            cache.store("c.com", ["3.3.3.3"], 1000, 60)
+            expect cache.size() == 3
+            cache.flush()
+            expect cache.size() == 0
+            val a = cache.lookup("a.com", 1010)
+            val is_nil = not a.?
+            expect is_nil == true
+
+    context "TTL expiration":
+        it "expired entries are not returned":
+            var cache = make_cache(300)
+            # Store with TTL of 60 seconds at time 1000
+            cache.store("example.com", sample_addresses(), 1000, 60)
+            # Lookup at time 1050 (within TTL) should succeed
+            val before_expiry = cache.lookup("example.com", 1050)
+            expect before_expiry.? == true
+            # Lookup at time 1061 (past TTL of 60) should return nil
+            val after_expiry = cache.lookup("example.com", 1061)
+            val is_nil = not after_expiry.?
+            expect is_nil == true
+
+# ============================================================================
+# DnsCacheEntry Tests
+# ============================================================================
+
+describe "DnsCacheEntry":
+    it "is_expired returns false within TTL":
+        val entry = DnsCacheEntry.create("example.com", ["1.2.3.4"], 1000, 60)
+        expect entry.is_expired(1030) == false
+        expect entry.is_expired(1060) == false
+
+    it "is_expired returns true past TTL":
+        val entry = DnsCacheEntry.create("example.com", ["1.2.3.4"], 1000, 60)
+        expect entry.is_expired(1061) == true
+        expect entry.is_expired(2000) == true
+
+describe "DnsResolver":
+    it "resolve returns localhost without system lookup":
+        val resolver = make_resolver(300)
+        val result = resolver.resolve("localhost")
+        match result:
+            Ok(addresses):
+                expect addresses.len() == 1
+                expect addresses[0] == "127.0.0.1"
+            Err(_):
+                expect "localhost should resolve" == ""
+
+    it "resolve rejects invalid hostnames":
+        val resolver = make_resolver(300)
+        val result = resolver.resolve("bad host")
+        val is_err = match result:
+            Err(_): true
+            Ok(_): false
+        expect is_err == true
+
+    it "resolve fails honestly for unwired system DNS":
+        val resolver = make_resolver(300)
+        val result = resolver.resolve("example.com")
+        val is_err = match result:
+            Err(_): true
+            Ok(_): false
+        expect is_err == true

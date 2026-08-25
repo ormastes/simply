@@ -1,0 +1,146 @@
+"""
+fil_nand_emu_e2e_check — the full FTL stack driven end-to-end on the Vt-physics
+NeChip emulator (fil_nand_emu), reached through the new backend-selection seam
+`ftl_new_emu()` (fil_nand_emu was device-API-conformant before, but the FTL had
+never actually run on it — there was no seam).
+
+Everything here goes through the *host* FTL API (write / read / read_status /
+gc_once), never the device directly. Three absolute-oracle scenarios:
+
+  A. Round-trip across a block boundary. Distinct byte patterns written to a run
+     of LBAs round-trip exactly. The emulator backs an 8x4 S1 window while the
+     firmware addresses a 64x64 space, so a firmware block's 5th page fold-aliases
+     onto its own page 0 (doc §4 shrink). That collision surfaces HONESTLY as
+     SC_INTERNAL with the LBA left unmapped — never a silent wrong-data write — and
+     the allocator then crosses into the next block, so successful writes span two
+     distinct physical blocks.
+
+  B. Overwrite traffic + readback correctness, and an honest GC verdict. Log-
+     structured overwrites of one LBA each allocate a fresh page and the latest
+     version always reads back correctly; a failed (fold-collided) overwrite leaves
+     the previous version intact. GC is then shown to be STRUCTURALLY UNREACHABLE
+     on this backend: because fold-collisions retire a block at its 4th page, no
+     block ever fills to 64 pages to reach BLK_CLOSED, so gc_once() finds no victim
+     (UNMAP). This is asserted, not faked — a known limitation of running the real
+     64x64 FTL on the S1 window, recorded rather than masked.
+
+  C. The payoff the Vt model exists for: retention drift is FTL-visible AND, after
+     the L8 wiring pass, AUTO-RECOVERED. A page written 0x00, then aged one year on a
+     heavily P/E-cycled (worn) block, is retention-flipped to 0xFF at the default read
+     reference — proven REAL by a raw offset-0 device read that still FAILS ECC. The
+     production ftl.read path now drives the recovery ladder (design §2/§7): it sweeps
+     the Vref retry table, recovers the exact programmed 0x00, and read_status reports
+     SC_SUCCESS — no host retry logic, the FIL mount does it. The durable health sink
+     records the non-zero retry depth and the block is DEAR-marked for refresh.
+     (Pre-L8 this scenario asserted the OPPOSITE — 0xFF + SC_MEDIA_ERR, "no retry loop
+     in the FTL"; L8 is exactly the sanctioned change that adds the loop.)
+
+Run: bin/simple run examples/09_embedded/simpleos_nvme_fw/fw/fil_nand_emu_e2e_check.spl
+Gate: prints "FIL NAND EMU E2E OK" and exits 0.
+"""
+
+use nvme_types.*
+use fil.*
+use ftl.*
+
+fn main():
+    var fail: i64 = 0
+
+    # ── A. round-trip across a block boundary ────────────────────────────────
+    var ftl: Ftl = ftl_new_emu()
+
+    # LBAs 0..3 fill the first physical block's in-window pages; each write is a
+    # clean SC_SUCCESS and every pattern round-trips exactly (t=0, no drift).
+    fail = fail + expect_eq(ftl.write(0, 0xA0), SC_SUCCESS, "write lba0 ok")
+    fail = fail + expect_eq(ftl.write(1, 0xA1), SC_SUCCESS, "write lba1 ok")
+    fail = fail + expect_eq(ftl.write(2, 0xA2), SC_SUCCESS, "write lba2 ok")
+    fail = fail + expect_eq(ftl.write(3, 0xA3), SC_SUCCESS, "write lba3 ok")
+    fail = fail + expect_eq(ftl.read(0), 0xA0, "read lba0 round-trips")
+    fail = fail + expect_eq(ftl.read(1), 0xA1, "read lba1 round-trips")
+    fail = fail + expect_eq(ftl.read(2), 0xA2, "read lba2 round-trips")
+    fail = fail + expect_eq(ftl.read(3), 0xA3, "read lba3 round-trips")
+    fail = fail + expect_eq(ftl.read_status(0), SC_SUCCESS, "lba0 read_status clean")
+
+    # These four landed in the first physical block (ppn 0..3 => block 0).
+    val blk_a: i64 = ppn_block(ftl.lba_ppn(0))
+    fail = fail + expect_eq(ftl.lba_ppn(0), 0, "lba0 -> ppn 0 (block 0)")
+    fail = fail + expect_eq(blk_a, 0, "first run of writes is in physical block 0")
+
+    # The 5th page of block 0 fold-aliases onto its own page 0 (already programmed)
+    # -> the collision surfaces as SC_INTERNAL and the LBA stays UNMAPPED (no silent
+    # wrong-data write). This is the honest failure, not a masked one.
+    fail = fail + expect_eq(ftl.write(4, 0xA4), SC_INTERNAL, "fold-collision surfaces as SC_INTERNAL")
+    fail = fail + expect_eq(ftl.lba_ppn(4), UNMAP, "collided write left lba4 unmapped")
+    fail = fail + expect_eq(ftl.read(4), 0, "unmapped lba4 reads 0")
+
+    # The collision retired block 0, so the allocator opens the NEXT block. LBAs
+    # 5..8 write cleanly and round-trip, now in a DIFFERENT physical block — the
+    # block-boundary crossing.
+    fail = fail + expect_eq(ftl.write(5, 0xB5), SC_SUCCESS, "write lba5 ok (new block)")
+    fail = fail + expect_eq(ftl.write(6, 0xB6), SC_SUCCESS, "write lba6 ok")
+    fail = fail + expect_eq(ftl.write(7, 0xB7), SC_SUCCESS, "write lba7 ok")
+    fail = fail + expect_eq(ftl.write(8, 0xB8), SC_SUCCESS, "write lba8 ok")
+    fail = fail + expect_eq(ftl.read(5), 0xB5, "read lba5 round-trips")
+    fail = fail + expect_eq(ftl.read(8), 0xB8, "read lba8 round-trips")
+
+    val blk_b: i64 = ppn_block(ftl.lba_ppn(5))
+    fail = fail + expect_eq(ftl.lba_ppn(5), 64, "lba5 -> ppn 64 (block 1)")
+    fail = fail + expect_eq(if blk_b > blk_a: 1 else: 0, 1, "successful writes crossed a physical block boundary")
+
+    # Crossing did not disturb the earlier block's live data.
+    fail = fail + expect_eq(ftl.read(0), 0xA0, "lba0 still intact after crossing")
+    fail = fail + expect_eq(ftl.read(3), 0xA3, "lba3 still intact after crossing")
+
+    # ── B. overwrite traffic + readback correctness + honest GC verdict ──────
+    var ov: Ftl = ftl_new_emu()
+    fail = fail + expect_eq(ov.write(0, 0xC0), SC_SUCCESS, "ov: first write ok")
+    fail = fail + expect_eq(ov.read(0), 0xC0, "ov: reads first version")
+    fail = fail + expect_eq(ov.write(0, 0xC1), SC_SUCCESS, "ov: overwrite 1 ok")
+    fail = fail + expect_eq(ov.read(0), 0xC1, "ov: reads overwrite 1 (log-structured remap)")
+    fail = fail + expect_eq(ov.write(0, 0xC2), SC_SUCCESS, "ov: overwrite 2 ok")
+    fail = fail + expect_eq(ov.write(0, 0xC3), SC_SUCCESS, "ov: overwrite 3 ok")
+    fail = fail + expect_eq(ov.read(0), 0xC3, "ov: reads latest version")
+
+    # The next overwrite fold-collides (block's 5th page); it fails closed and the
+    # PREVIOUS version stays readable (a failed program never loses committed data).
+    fail = fail + expect_eq(ov.write(0, 0xCC), SC_INTERNAL, "ov: collided overwrite fails closed")
+    fail = fail + expect_eq(ov.read(0), 0xC3, "ov: last good version survives the failed overwrite")
+
+    # GC verdict: no block ever reaches BLK_CLOSED on the folded backend (collisions
+    # retire blocks at 4 pages), so gc_once() honestly finds no victim. Asserted, not
+    # faked — the structural limitation of the 64x64 FTL on the S1 window.
+    fail = fail + expect_eq(ov.gc_once(), UNMAP, "gc_once finds no victim on the S1-folded backend (documented limit)")
+
+    # ── C. retention drift is FTL-visible AND L8-auto-recovered (the payoff) ──
+    var rt: Ftl = ftl_new_emu()
+    fail = fail + expect_eq(rt.write(0, 0x00), SC_SUCCESS, "ret: program all-zero page")
+    fail = fail + expect_eq(rt.read(0), 0x00, "ret: fresh page reads back 0x00")
+    fail = fail + expect_eq(rt.read_status(0), SC_SUCCESS, "ret: fresh page status clean")
+
+    val worn_blk: i64 = ppn_block(rt.lba_ppn(0))
+    rt.emu_set_block_wear(worn_blk, 3000)       # heavily P/E-cycled block
+    rt.emu_advance_time_s(31536000.0)           # age one year
+
+    # The corruption is REAL: a raw offset-0 device read (no ladder) still senses the
+    # retention-flipped 0xFF and FAILS ECC — the ladder does genuine recovery below, not
+    # masking of a non-failure.
+    val raw: FilRead = rt.fil.read(rt.lba_ppn(0))
+    fail = fail + expect_eq(raw.data, 0xFF, "ret: raw offset-0 device read still senses flipped bits (0xFF)")
+    fail = fail + expect_eq(raw.code, NAND_ECC_FAIL, "ret: raw offset-0 device read still FAILS ECC (corruption is real)")
+
+    # POST-L8: the production ftl.read path DRIVES the recovery ladder — the drifted page
+    # is recovered to the exact programmed 0x00 and read_status reports SC_SUCCESS, with
+    # no host retry logic (the FIL mount does it, design §2). This REPLACES the pre-L8
+    # "no retry loop -> 0xFF / SC_MEDIA_ERR" assertions.
+    fail = fail + expect_eq(rt.read(0), 0x00, "ret: L8 ladder auto-recovers the drifted page to 0x00 through ftl.read")
+    fail = fail + expect_eq(rt.read_status(0), SC_SUCCESS, "ret: recovered read_status reports SC_SUCCESS")
+
+    # Observability: the recovering read needed >= 1 Vref retry rung (recorded in the
+    # durable health sink) and the block is DEAR-marked for refresh (design §4/§7).
+    fail = fail + expect_eq(bool_to_int(rt.health_retry_depth(worn_blk) > 0), 1, "ret: health recorded a non-zero retry depth")
+    fail = fail + expect_eq(rt.refresh_marked(worn_blk), 1, "ret: drifted block DEAR-marked for refresh after the recovered read")
+
+    if fail == 0:
+        print "FIL NAND EMU E2E OK"
+    else:
+        print "FIL NAND EMU E2E FAIL ({fail})"

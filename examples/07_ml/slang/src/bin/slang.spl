@@ -1,0 +1,17 @@
+# slang — product service entry point.
+#
+# Phase A1: stub. Prints help and exits. The real OpenAI-compatible HTTP
+# API + scheduler lands in Phase A6 (see main simple repo's
+# doc/05_design/slang/slang_master_plan.md).
+
+fn print_help() -> ():
+    print("slang — vLLM-like LLM serving engine for Simple / SimpleOS")
+    print("")
+    print("usage:")
+    print("  slang serve --model <pack_root> [--port 8080]")
+    print("  slang --help")
+    print("")
+    print("(A1 stub — serving lands in Phase A6)")
+
+fn main() -> ():
+    print_help()

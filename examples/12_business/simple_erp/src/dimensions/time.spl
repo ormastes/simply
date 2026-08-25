@@ -1,0 +1,21 @@
+# UBS Dimension — Time
+#
+# Owns effective-dating, scheduling and accrual. Every attribute is time-
+# versioned: records are never overwritten, they are superseded. `valid_to == 0`
+# means "open / still in effect".
+
+struct EffectiveDated:
+    val valid_from: i64
+    val valid_to: i64
+    val value: text
+
+fn effective(valid_from: i64, value: text) -> EffectiveDated:
+    return EffectiveDated { valid_from: valid_from, valid_to: 0, value: value }
+
+# True if `at` falls within [valid_from, valid_to) (valid_to == 0 ⇒ open-ended).
+fn in_effect(rec: EffectiveDated, at: i64) -> bool:
+    if at < rec.valid_from:
+        return false
+    if rec.valid_to == 0:
+        return true
+    return at < rec.valid_to

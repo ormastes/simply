@@ -1,0 +1,12 @@
+# Hello Async Web -- Async Web Backend Hello World
+#
+# Starts a concurrent HTTP + WebSocket server on port 8080.
+# Supports multiple browser tabs with live push updates.
+#
+# Open http://localhost:8080 in your browser.
+# Open multiple tabs to see concurrent connection handling.
+
+use app.ui.web.async_server.{run_async_web}
+
+fn main() -> i64:
+    return run_async_web("examples/ui/hello_web.ui.sdn", 8080)

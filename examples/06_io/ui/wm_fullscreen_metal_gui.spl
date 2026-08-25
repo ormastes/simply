@@ -1,0 +1,495 @@
+# wm_fullscreen_metal_gui.spl — Windowed <-> fullscreen WM demo on the Metal GPU
+# lane in a real on-screen winit window, with NATIVE-RESOLUTION fullscreen render.
+#
+# Proves the macOS host Simple WM app supports BOTH windowed and fullscreen modes
+# with genuine GPU render evidence AND correct fullscreen re-layout:
+#   - opens a real window (windowed), renders >=2 Metal GPU frames
+#     (gpu_frame_complete=true), logs `[wm-fullscreen] mode=windowed size=WxH`.
+#   - calls set_fullscreen(true), verifies is_fullscreen() and that the window
+#     inner size grew (read back from the real winit API, not assumed), logs
+#     `[wm-fullscreen] mode=fullscreen size=WxH`.
+#   - reads the REAL fullscreen dims and creates a SECOND Metal backend at native
+#     resolution (once), then re-evaluates every element's x/y/w/h + text size and
+#     re-renders the scene at native res in TWO modes:
+#       * fit: aspect-preserving scale = min(SW/W, SH/H), content centered,
+#         letterbox bars filled with the background color.
+#       * no-resize: content at its ORIGINAL element sizes anchored top-left,
+#         background color extended across the remaining screen.
+#     Presents each mode 1:1 (no upscaling → crisp pixels, no blocky bits), logs
+#     `[wm-fullscreen] scale_mode=fit screen=SWxSH content=CWxCH offset=OXxOY`
+#     and the no-resize equivalent.
+#   - returns to windowed, verifies is_fullscreen()==false, logs
+#     `[wm-fullscreen] restored=true`, exits 0.
+#
+# Mode order is selected via SIMPLE_WM_FS_SCALE_MODE ("fit" | "no-resize",
+# default "fit"); BOTH modes always run so a gate can check both.
+#
+# Launch (real window, macOS):
+#   SIMPLE_GUI_RUN_SKIP_NUDGE=1 scripts/gui/macos-gui-run.shs \
+#     examples/06_io/ui/wm_fullscreen_metal_gui.spl
+# Driven end-to-end by:
+#   scripts/check/check-macos-wm-fullscreen-metal-evidence.shs
+
+use std.gpu.engine2d.backend_metal.{MetalBackend}
+use std.io.window_winit.{WinitLoop, WinitWindow, WinitInput, winit_loop_new, winit_loop_free, winit_window_new, winit_window_free, winit_present_rgba, winit_poll_input, winit_window_set_fullscreen, winit_window_is_fullscreen, winit_window_get_size, winit_window_scale_factor}
+
+use std.io_runtime.{env_get}
+use std.common.string_core.{char_from_code}
+use std.gc_async_mut.gpu.browser_engine.simple_web_layout_engine2d_fast.{simple_web_layout_render_html_pixels_engine2d, engine2d_fast_metal_available}
+use std.common.ui.wm_chrome_theme.{wm_chrome_theme}
+
+extern fn rt_time_now_unix_micros() -> i64
+
+# 24-bit RGB value as a 6-char lowercase hex string, for honest corner-pixel
+# evidence in the background-fill marker.
+fn to_hex6(v: i64) -> text:
+    var out = ""
+    var shift = 20
+    while shift >= 0:
+        val nib = (v >> shift) & 0xF
+        var code = 48 + nib
+        if nib > 9:
+            code = 97 + (nib - 10)
+        out = out + char_from_code(code)
+        shift = shift - 4
+    out
+
+# Read three far corners of the presented native buffer and confirm they hold the
+# background color (bg fill must cover the WHOLE native buffer, not just the
+# content box). Prints "[wm-fullscreen] {label}_bg_corners=ok" or a =FAIL marker
+# carrying the actual hex values. `pixels` is the already-read native framebuffer.
+fn check_bg_corners(pixels: [u32], sw: i64, sh: i64, bg: u32, label: text) -> bool:
+    val want = (bg.to_i64()) & 0xFFFFFF
+    val i_tr = (1 * sw + (sw - 2))
+    val i_bl = ((sh - 2) * sw + 1)
+    val i_br = ((sh - 2) * sw + (sw - 2))
+    val tr = pixels[i_tr.to_i32()].to_i64() & 0xFFFFFF
+    val bl = pixels[i_bl.to_i32()].to_i64() & 0xFFFFFF
+    val br = pixels[i_br.to_i32()].to_i64() & 0xFFFFFF
+    if tr == want and bl == want and br == want:
+        print "[wm-fullscreen] {label}_bg_corners=ok bg={to_hex6(want)}"
+        return true
+    print "[wm-fullscreen] {label}_bg_corners=FAIL want={to_hex6(want)} tr={to_hex6(tr)} bl={to_hex6(bl)} br={to_hex6(br)}"
+    false
+
+val W: i32 = 320
+val H: i32 = 200
+
+fn pack(src: [u32]) -> [i64]:
+    var out: [i64] = [0; src.len()]
+    var i = 0
+    while i < src.len():
+        out[i] = src[i].to_i64() & 0xFFFFFF
+        i = i + 1
+    out
+
+# Scale a coordinate/size by a float factor, rounding to the nearest pixel.
+fn sc(v: i32, scale: f64) -> i32:
+    (v.to_f64() * scale).to_i32()
+
+# Scale a font size, never below 1px.
+fn sc_font(v: i32, scale: f64) -> i32:
+    var f = (v.to_f64() * scale).to_i32()
+    if f < 1:
+        f = 1
+    f
+
+# Draw the demo scene into `b`, offset by (ox, oy) and scaled by `scale`.
+# `b.clear` fills the WHOLE backend with the background color first, so both the
+# fit letterbox bars and the no-resize extended background are covered for free.
+# When `hires` is true (fullscreen fit) the title/label text is rendered with the
+# antialiased high-resolution GPU text path (draw_text_hires) instead of the
+# integer-scaled 5x7 bitmap, so scaled glyphs show smooth shapes, not big blocks.
+# `bg` for each hires call is the known solid color behind that text so the
+# opaque glyph block composites correctly (title over the blue bar, label over
+# the clear background).
+val BG_CLEAR: u32 = 0xFF14141Cu32
+val BAR_COLOR: u32 = 0xFF2D6CDFu32
+
+fn draw_scene_scaled(b: MetalBackend, ox: i32, oy: i32, scale: f64, label: text, hires: bool):
+    b.clear(BG_CLEAR)
+    b.draw_rect_filled(ox + sc(24, scale), oy + sc(24, scale), sc(W - 48, scale), sc(60, scale), BAR_COLOR)
+    val title_px = sc_font(8, scale)
+    val label_px = sc_font(6, scale)
+    if hires:
+        b.draw_text_hires(ox + sc(40, scale), oy + sc(44, scale), "WM FULLSCREEN DEMO", 0xFFFFFFFFu32, title_px, BAR_COLOR)
+        b.draw_text_hires(ox + sc(40, scale), oy + sc(110, scale), label, 0xFFB0C4DEu32, label_px, BG_CLEAR)
+    else:
+        b.draw_text(ox + sc(40, scale), oy + sc(44, scale), "WM FULLSCREEN DEMO", 0xFFFFFFFFu32, title_px)
+        b.draw_text(ox + sc(40, scale), oy + sc(110, scale), label, 0xFFB0C4DEu32, label_px)
+    # Frame-progress bar, fixed near-full for the still fullscreen image.
+    val bar_max_w = W - 80
+    var bar_w = 180 + 4 * 16
+    if bar_w > bar_max_w:
+        bar_w = bar_max_w
+    b.draw_rect_filled(ox + sc(40, scale), oy + sc(148, scale), sc(bar_w, scale), sc(24, scale), 0xFFE5533Du32)
+    b.draw_rect(ox + sc(20, scale), oy + sc(20, scale), sc(W - 40, scale), sc(H - 40, scale), 0xFF00E5FFu32)
+    b.present()
+
+# Render one Metal GPU frame into the windowed backend `b`, present it to the
+# window (the runtime upscales when the window is larger than the render buffer),
+# and report GPU completeness read back from the backend.
+fn render_and_present(b: MetalBackend, win: WinitWindow, phase: text, frame: i32) -> bool:
+    draw_scene_scaled(b, 0, 0, 1.0, phase, false)
+
+    val frame_complete = b.gpu_frame_complete
+    val pixels = b.read_pixels_gpu_only()
+    if not frame_complete:
+        print "frame {frame} phase={phase} FAIL gpu_frame_complete=false (software mirror fallback)"
+        return false
+    if pixels.len() < W * H:
+        print "frame {frame} phase={phase} FAIL GPU readback short ({pixels.len()} of {W * H})"
+        return false
+
+    val packed = pack(pixels)
+    winit_present_rgba(win, W.to_i64(), H.to_i64(), packed)
+    print "frame {frame} phase={phase} gpu_frame_complete=true pixels={pixels.len()}"
+    return true
+
+# Read back the native-resolution backend `nb` and present it 1:1 to the window
+# (no upscaling → crisp). This is the ONLY full readback+pack+present per mode.
+fn present_native(nb: MetalBackend, win: WinitWindow, sw: i64, sh: i64, phase: text, bg: u32, corner_label: text) -> bool:
+    val frame_complete = nb.gpu_frame_complete
+    val pixels = nb.read_pixels_gpu_only()
+    if not frame_complete:
+        print "frame native phase={phase} FAIL gpu_frame_complete=false (software mirror fallback)"
+        return false
+    val want = sw * sh
+    if pixels.len() < want:
+        print "frame native phase={phase} FAIL GPU readback short ({pixels.len()} of {want})"
+        return false
+    # Honest background-fill evidence: the same readback proves the far corners
+    # hold the demo bg color (bg must cover the entire native buffer).
+    val corners_ok = check_bg_corners(pixels, sw, sh, bg, corner_label)
+    val packed = pack(pixels)
+    winit_present_rgba(win, sw, sh, packed)
+    # Prove the present covers the full native surface 1:1 (dims + array length):
+    # a smaller buffer would take the runtime's nearest-neighbor upscale path.
+    print "[wm-fullscreen] {corner_label}_present={sw}x{sh} len={packed.len()}"
+    print "frame native phase={phase} gpu_frame_complete=true pixels={pixels.len()}"
+    return frame_complete and corners_ok
+
+# Hold the presented frame on screen for ~`secs` seconds, pumping the event loop
+# so the window stays live (and an external gate can screencapture it). Does NOT
+# re-read or re-pack the framebuffer.
+fn hold(lp: WinitLoop, secs: i64):
+    val until = rt_time_now_unix_micros() + secs * 1000000
+    while rt_time_now_unix_micros() < until:
+        val poll = winit_poll_input(lp)
+
+fn cleanup(b: MetalBackend, win: WinitWindow, lp: WinitLoop):
+    b.shutdown()
+    winit_window_free(win)
+    winit_loop_free(lp)
+
+# Render + present + hold one native-res fullscreen mode, emitting its marker.
+# mode is "fit" or "no-resize". Returns true when the GPU frame completed.
+fn run_fs_mode(nb: MetalBackend, win: WinitWindow, lp: WinitLoop, mode: text, sw: i64, sh: i64) -> bool:
+    var ox: i32 = 0
+    var oy: i32 = 0
+    var scale = 1.0
+    var cw: i64 = W.to_i64()
+    var ch: i64 = H.to_i64()
+    if mode == "fit":
+        val scale_x = sw.to_f64() / W.to_f64()
+        val scale_y = sh.to_f64() / H.to_f64()
+        # min(scale_x, scale_y): whichever axis binds. Set the bound axis to the
+        # exact screen extent so content=screen on that axis; letterbox the other.
+        if scale_x <= scale_y:
+            scale = scale_x
+            cw = sw
+            ch = (H.to_f64() * scale).to_i64()
+        else:
+            scale = scale_y
+            ch = sh
+            cw = (W.to_f64() * scale).to_i64()
+        ox = ((sw - cw) / 2).to_i32()
+        oy = ((sh - ch) / 2).to_i32()
+    else:
+        scale = 1.0
+        cw = W.to_i64()
+        ch = H.to_i64()
+        ox = 0
+        oy = 0
+
+    # Only the aspect-fit fullscreen mode upsizes text (scale > 1); render it with
+    # the antialiased high-resolution GPU text path so scaled glyphs stay smooth.
+    # no-resize keeps original element sizes, so its bitmap text is already crisp.
+    val use_hires = mode == "fit"
+    # Avoid parentheses in the hi-res label: the 8x16 glyph provider has no glyph
+    # for '(' / ')' and substitutes '?', so use a dash separator instead.
+    draw_scene_scaled(nb, ox, oy, scale, "fullscreen native-res - {mode}", use_hires)
+    if use_hires:
+        val title_px = sc_font(8, scale)
+        print "[wm-fullscreen] text_render=vector px={title_px}"
+    # Corner-check label: "noresize" for no-resize (bg must fill the whole screen
+    # outside the top-left content), "fit" for the letterbox bars.
+    var corner_label = "fit"
+    if mode == "no-resize":
+        corner_label = "noresize"
+    val ok = present_native(nb, win, sw, sh, "fullscreen-{mode}", BG_CLEAR, corner_label)
+    print "[wm-fullscreen] scale_mode={mode} screen={sw}x{sh} content={cw}x{ch} offset={ox}x{oy}"
+    hold(lp, 4)
+    return ok
+
+# ---------------------------------------------------------------------------
+# Phase 2c: WEB-ENGINE fullscreen. Instead of direct MetalBackend draw calls,
+# this phase expresses a WM desktop as ONE HTML/CSS document and rasterizes it
+# through the real web layout engine on the fast Engine2D Metal path
+# (HTML -> layout -> Draw IR -> Engine2D/Metal GPU -> one-shot readback), then
+# presents those pixels 1:1 in the same on-screen window. This proves the full
+# CSS render chain drives the fullscreen window, visibly distinct from the
+# direct-draw fit/no-resize phases (a 3-window styled desktop).
+# ---------------------------------------------------------------------------
+
+# 24-bit ARGB color -> CSS "#RRGGBB" (alpha dropped; chrome colors are opaque).
+fn css_hex(color: u32) -> text:
+    val rgb = color.to_i64() & 0xFFFFFF
+    "#" + to_hex6(rgb)
+
+# Build a WM-style desktop as a single HTML/CSS document laid out for a `w`x`h`
+# render surface: a full-screen desktop backdrop (compositor_bg) plus THREE
+# windows, each a body panel (host_window_body), an accent titlebar (accent),
+# a title text line and a content text line (text_primary). Every color comes
+# from wm_chrome_theme() rendered to a CSS hex, so an installed theme reskins it.
+# All interpolated values are precomputed into vars (the interpolator only
+# substitutes plain identifiers, not arithmetic/indexing), and the outer <style>
+# uses doubled braces for the literal CSS `{`/`}`.
+fn wm_web_scene_html(w: i32, h: i32) -> text:
+    val theme = wm_chrome_theme()
+    val bg_hex = css_hex(theme.compositor_bg)
+    val body_hex = css_hex(theme.host_window_body)
+    val accent_hex = css_hex(theme.accent)
+    val text_hex = css_hex(theme.text_primary)
+    val win_top = (h.to_f64() * 0.14).to_i32()
+    val title_h = (h.to_f64() * 0.07).to_i32()
+    val win_h = (h.to_f64() * 0.60).to_i32()
+    val margin = (w.to_f64() * 0.04).to_i32()
+    val gap = (w.to_f64() * 0.03).to_i32()
+    val win_w = (w - 2 * margin - 2 * gap) / 3
+    val title_font = (title_h.to_f64() * 0.5).to_i32()
+    val body_font = (h.to_f64() * 0.022).to_i32()
+    val pad = (w.to_f64() * 0.01).to_i32()
+    val titles = ["Terminal", "Files", "Editor"]
+    val lines = ["$ simple build --release", "README.md   main.spl", "fn main -> i64: return 0"]
+    var body = ""
+    var i: i32 = 0
+    while i < 3:
+        val x = margin + i * (win_w + gap)
+        val tx = x + pad
+        val ty = win_top + pad
+        val cy = win_top + title_h + pad
+        val cw = win_w - 2 * pad
+        val t = titles[i]
+        val ln = lines[i]
+        body = body + "<div style='position:absolute;left:{x}px;top:{win_top}px;width:{win_w}px;height:{win_h}px;background:{body_hex}'></div>"
+        body = body + "<div style='position:absolute;left:{x}px;top:{win_top}px;width:{win_w}px;height:{title_h}px;background:{accent_hex}'></div>"
+        body = body + "<div style='position:absolute;left:{tx}px;top:{ty}px;width:{cw}px;height:{title_font}px;color:{text_hex};font:{title_font}px monospace;overflow:hidden;white-space:nowrap'>{t}</div>"
+        body = body + "<div style='position:absolute;left:{tx}px;top:{cy}px;width:{cw}px;height:{body_font}px;color:{text_hex};font:{body_font}px monospace;overflow:hidden;white-space:nowrap'>{ln}</div>"
+        i = i + 1
+    val head = "<!DOCTYPE html><html><head><style>body{{margin:0;width:{w}px;height:{h}px;background:{bg_hex}}}</style></head><body>"
+    head + body + "</body></html>"
+
+# Render the WM web scene through the fast Engine2D Metal web lane and present it
+# 1:1 to the fullscreen window. Renders at PHYSICAL fullscreen dims for crisp
+# Retina pixels; if the physical render overruns the ~90s wall budget it re-renders
+# at logical (half) dims and lets the runtime stretch the present 2x. Emits the
+# web_engine=render / web_engine=presented markers the gate keys on. Returns true
+# only when the GPU-backed CSS render produced a full-surface framebuffer.
+fn run_web_engine_phase(win: WinitWindow, lp: WinitLoop, sw: i64, sh: i64) -> bool:
+    if not engine2d_fast_metal_available():
+        print "[wm-fullscreen] web_engine=unavailable"
+        return false
+    var rw = sw
+    var rh = sh
+    var dims_label = "physical"
+    val html_phys = wm_web_scene_html(sw.to_i32(), sh.to_i32())
+    val t0 = rt_time_now_unix_micros()
+    var pixels = simple_web_layout_render_html_pixels_engine2d(html_phys, sw.to_i32(), sh.to_i32(), "metal")
+    val elapsed = rt_time_now_unix_micros() - t0
+    var html_len = html_phys.len()
+    if elapsed > 90000000:
+        # Physical render exceeded the wall budget; re-render at logical (half)
+        # dims — the runtime nearest-neighbor-stretches the present 2x to physical.
+        val lw = sw / 2
+        val lh = sh / 2
+        val html_log = wm_web_scene_html(lw.to_i32(), lh.to_i32())
+        pixels = simple_web_layout_render_html_pixels_engine2d(html_log, lw.to_i32(), lh.to_i32(), "metal")
+        rw = lw
+        rh = lh
+        html_len = html_log.len()
+        dims_label = "logical"
+    val want = rw * rh
+    if pixels.len() < want:
+        print "[wm-fullscreen] web_engine=short pixels={pixels.len()} want={want}"
+        return false
+    print "[wm-fullscreen] web_engine=render html_len={html_len} screen={rw}x{rh} pixels={pixels.len()}"
+    if dims_label == "logical":
+        print "[wm-fullscreen] web_engine_dims=logical reason=physical-render-exceeded-90s"
+    else:
+        print "[wm-fullscreen] web_engine_dims=physical"
+    val packed = pack(pixels)
+    winit_present_rgba(win, rw, rh, packed)
+    print "[wm-fullscreen] web_engine=presented dims={rw}x{rh} len={packed.len()}"
+    # Hold generously: the external gate only learns this frame is on screen by
+    # tailing the marker above, then has to re-activate the app (osascript) and
+    # run two screencaptures. On a loaded host that round trip measured >4s, so
+    # a 4s hold let the demo restore to windowed BEFORE the shot was taken — the
+    # capture then photographed the desktop and the accent gate failed on pixels
+    # that were never the demo's. Keep this comfortably above the capture cost.
+    hold(lp, 20)
+    return true
+
+fn main() -> i64:
+    print "WM Fullscreen Metal GUI — windowed <-> fullscreen, native-res fit/no-resize"
+
+    if (env_get("SIMPLE_GUI") ?? "") != "1":
+        print "[wm-fullscreen] error=no-gui-requested (launch via macos-gui-run.shs / gate)"
+        return 2
+
+    var first_mode = env_get("SIMPLE_WM_FS_SCALE_MODE") ?? "fit"
+    if first_mode != "no-resize":
+        first_mode = "fit"
+    var second_mode = "no-resize"
+    if first_mode == "no-resize":
+        second_mode = "fit"
+    print "[wm-fullscreen] scale_mode_order={first_mode},{second_mode}"
+
+    val lp = winit_loop_new()
+    if not lp.is_valid:
+        print "[wm-fullscreen] error=no-gui-runtime"
+        return 1
+    val win = winit_window_new(lp, W.to_i64(), H.to_i64(), "WM Fullscreen Metal")
+    if not win.is_valid:
+        print "[wm-fullscreen] error=window-create-failed"
+        winit_loop_free(lp)
+        return 1
+
+    var b = MetalBackend.create()
+    if not b.init(W, H):
+        print "[wm-fullscreen] error=metal-init-failed"
+        winit_window_free(win)
+        winit_loop_free(lp)
+        return 1
+
+    # ---------------------------------------------------------------------
+    # Phase 1: windowed — render >=2 GPU frames.
+    # ---------------------------------------------------------------------
+    var ok = true
+    var f = 0
+    while f < 3:
+        if not render_and_present(b, win, "windowed", f):
+            ok = false
+        val poll_win = winit_poll_input(lp)
+        f = f + 1
+    if not ok:
+        print "[wm-fullscreen] error=windowed-gpu-frame-incomplete"
+        cleanup(b, win, lp)
+        return 1
+
+    val (win_w, win_h) = winit_window_get_size(win)
+    print "[wm-fullscreen] mode=windowed size={win_w}x{win_h}"
+
+    # ---------------------------------------------------------------------
+    # Phase 2: fullscreen — set, then verify from real API readback.
+    # ---------------------------------------------------------------------
+    val applied = winit_window_set_fullscreen(win, true)
+    if not applied:
+        print "[wm-fullscreen] error=set-fullscreen-failed"
+        cleanup(b, win, lp)
+        return 1
+
+    # macOS fullscreen resize is asynchronous: pump + present (windowed backend,
+    # upscaled — cheap) until the real window inner size reflects the transition.
+    var fs_w: i64 = win_w
+    var fs_h: i64 = win_h
+    var settle = 0
+    while settle < 60:
+        val poll_settle = winit_poll_input(lp)
+        val settle_frame = render_and_present(b, win, "fullscreen-settle", 0)
+        val (cw2, ch2) = winit_window_get_size(win)
+        fs_w = cw2
+        fs_h = ch2
+        if cw2 > win_w:
+            settle = 1000
+        else:
+            settle = settle + 1
+
+    val is_fs = winit_window_is_fullscreen(win)
+    print "[wm-fullscreen] is_fullscreen={is_fs}"
+    print "[wm-fullscreen] mode=fullscreen size={fs_w}x{fs_h}"
+    # winit_window_get_size reports PHYSICAL inner-size pixels (updated by the
+    # present handler from window.inner_size()); the native backend below is
+    # created at exactly these dims so present is a 1:1 copy — crisp on Retina,
+    # no logical-point pixel doubling. Report the backing scale for the record.
+    val scale_factor = winit_window_scale_factor(win)
+    print "[wm-fullscreen] surface=physical scale_factor={scale_factor}"
+
+    if not is_fs:
+        print "[wm-fullscreen] error=is-fullscreen-false-after-set"
+        cleanup(b, win, lp)
+        return 1
+    if fs_w <= win_w:
+        print "[wm-fullscreen] error=fullscreen-size-did-not-grow (was {win_w}, now {fs_w})"
+        cleanup(b, win, lp)
+        return 1
+
+    # ---------------------------------------------------------------------
+    # Phase 2b: native-resolution re-render. Create ONE backend at the real
+    # fullscreen dims (creation costs ~seconds interpreted — do it once), then
+    # render BOTH modes so edges stay crisp at native res (no pixel blow-up).
+    # ---------------------------------------------------------------------
+    var nb = MetalBackend.create()
+    if not nb.init(fs_w.to_i32(), fs_h.to_i32()):
+        print "[wm-fullscreen] error=metal-native-init-failed ({fs_w}x{fs_h})"
+        cleanup(b, win, lp)
+        return 1
+    # Native res is physical Retina (~7.3M px). The CPU software mirror would
+    # re-rasterize every op at that size under the interpreter (minutes); the GPU
+    # framebuffer is the source of truth (read back GPU-only), so drop the mirror.
+    nb.use_gpu_only()
+
+    if not run_fs_mode(nb, win, lp, first_mode, fs_w, fs_h):
+        ok = false
+    if not run_fs_mode(nb, win, lp, second_mode, fs_w, fs_h):
+        ok = false
+    nb.shutdown()
+    if not ok:
+        print "[wm-fullscreen] error=fullscreen-gpu-frame-incomplete"
+        cleanup(b, win, lp)
+        return 1
+
+    # ---------------------------------------------------------------------
+    # Phase 2c: web-engine fullscreen — render a WM desktop via the HTML/CSS
+    # layout engine on the fast Metal path and present it in the same window.
+    # (nb is already shut down, so only the web lane's own Engine2D is live.)
+    # ---------------------------------------------------------------------
+    if not run_web_engine_phase(win, lp, fs_w, fs_h):
+        print "[wm-fullscreen] error=web-engine-phase-failed"
+        cleanup(b, win, lp)
+        return 1
+
+    # ---------------------------------------------------------------------
+    # Phase 3: restore to windowed — verify is_fullscreen() clears.
+    # ---------------------------------------------------------------------
+    val restored = winit_window_set_fullscreen(win, false)
+    var r = 0
+    while r < 4:
+        val poll_restore = winit_poll_input(lp)
+        val restore_frame = render_and_present(b, win, "restored", 0)
+        r = r + 1
+
+    val is_fs_after = winit_window_is_fullscreen(win)
+    val (rw, rh) = winit_window_get_size(win)
+    print "[wm-fullscreen] restored_size={rw}x{rh} is_fullscreen_after={is_fs_after}"
+
+    if restored and not is_fs_after:
+        print "[wm-fullscreen] restored=true"
+    else:
+        print "[wm-fullscreen] restored=false"
+        cleanup(b, win, lp)
+        return 1
+
+    print "[wm-fullscreen] done windowed={win_w}x{win_h} fullscreen={fs_w}x{fs_h}"
+    cleanup(b, win, lp)
+    return 0

@@ -1,0 +1,4 @@
+use logic_task_pool_cases.*
+
+fn rv32_task_pool_selftest() -> i32:
+    rv32_task_pool_cases_selftest()

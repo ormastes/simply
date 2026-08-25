@@ -1,0 +1,17 @@
+schema: spipe.edge
+version: 1
+record: edge
+identity: uid
+direction: subject_to_object
+fields:
+  uid: opaque_uid(E)
+  edge_type: enum(contains,classifies,evidence_for,derives,satisfies,realizes,schedules,specifies,implements,verifies,covers,produces,links_to,aliases,supersedes,extends,promoted_from,depends_on,mounted_as)
+  from_uid: opaque_uid
+  to_uid: opaque_uid
+  origin: enum(explicit,generated,structural,lexical_inference,semantic_inference,llm_inference)
+  status: enum(accepted,proposed,rejected,stale,superseded)
+  confidence_milli: uint_0_to_1000
+  created_by: non_empty_text
+  created_at_revision: immutable_revision
+  evidence_uids: sorted_unique(opaque_uid)
+  generator: generator_descriptor|null

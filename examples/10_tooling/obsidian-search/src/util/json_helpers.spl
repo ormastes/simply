@@ -1,0 +1,261 @@
+# JSON construction utilities for MCP protocol messages
+#
+# Provides helper functions for building JSON strings without
+# a full JSON library. Adapted from src/app/lsp_mcp/main.spl.
+
+# --- Character helpers ---
+
+fn Q() -> text:
+    "\""
+
+fn LB() -> text:
+    "{"
+
+fn RB() -> text:
+    "}"
+
+fn SB_L() -> text:
+    "["
+
+fn SB_R() -> text:
+    "]"
+
+# --- JSON escaping ---
+
+fn escape_json(s: text) -> text:
+    var result = s
+    result = result.replace(r"\", r"\\")
+    result = result.replace(Q(), r"\" + Q())
+    result = result.replace("\n", r"\n")
+    result = result.replace("\r", r"\r")
+    result = result.replace("\t", r"\t")
+    result
+
+# --- JSON value constructors ---
+
+fn js(s: text) -> text:
+    Q() + escape_json(s) + Q()
+
+fn ji(n: i64) -> text:
+    str(n)
+
+fn jf(n: f64) -> text:
+    str(n)
+
+fn jb(b: bool) -> text:
+    if b:
+        "true"
+    else:
+        "false"
+
+fn jnull() -> text:
+    "null"
+
+# --- JSON pair (key:value) ---
+
+fn jp(key: text, value: text) -> text:
+    Q() + key + Q() + ":" + value
+
+# --- JSON object constructors ---
+
+fn jo0() -> text:
+    LB() + RB()
+
+fn jo1(p1: text) -> text:
+    LB() + p1 + RB()
+
+fn jo2(p1: text, p2: text) -> text:
+    LB() + p1 + "," + p2 + RB()
+
+fn jo3(p1: text, p2: text, p3: text) -> text:
+    LB() + p1 + "," + p2 + "," + p3 + RB()
+
+fn jo4(p1: text, p2: text, p3: text, p4: text) -> text:
+    LB() + p1 + "," + p2 + "," + p3 + "," + p4 + RB()
+
+fn jo5(p1: text, p2: text, p3: text, p4: text, p5: text) -> text:
+    LB() + p1 + "," + p2 + "," + p3 + "," + p4 + "," + p5 + RB()
+
+fn jo6(p1: text, p2: text, p3: text, p4: text, p5: text, p6: text) -> text:
+    LB() + p1 + "," + p2 + "," + p3 + "," + p4 + "," + p5 + "," + p6 + RB()
+
+# --- JSON array from list ---
+
+fn ja(items: [text]) -> text:
+    SB_L() + items.join(",") + SB_R()
+
+# --- JSON object from pairs list ---
+
+fn jo(pairs: [text]) -> text:
+    LB() + pairs.join(",") + RB()
+
+# --- Safe substring (avoids interpreter mutation bug) ---
+
+fn safe_substr(s: text, start: i64, end_pos: i64) -> text:
+    var parts: [text] = []
+    var i = 0
+    for ch in s:
+        if i >= end_pos:
+            break
+        if i >= start:
+            parts.push(ch)
+        i = i + 1
+    parts.join("")
+
+fn json_char_at(s: text, index: i64) -> text:
+    s.substring(index, index + 1)
+
+fn json_starts_with_at(s: text, start: i64, needle: text) -> bool:
+    if start < 0:
+        return false
+    if start + needle.len() > s.len():
+        return false
+    var i = 0
+    while i < needle.len():
+        if json_char_at(s, start + i) != json_char_at(needle, i):
+            return false
+        i = i + 1
+    true
+
+fn json_find_text(haystack: text, needle: text) -> i64:
+    if needle == "":
+        return 0
+    if haystack.len() < needle.len():
+        return -1
+    var i = 0
+    while i <= haystack.len() - needle.len():
+        if json_starts_with_at(haystack, i, needle):
+            return i
+        i = i + 1
+    -1
+
+fn json_read_nested_end(s: text, start_index: i64) -> i64:
+    var i = start_index
+    var depth = 0
+    var in_string = false
+    var escaped = false
+    while i < s.len():
+        val ch = json_char_at(s, i)
+        if in_string:
+            if escaped:
+                escaped = false
+            elif ch == "\\":
+                escaped = true
+            elif ch == Q():
+                in_string = false
+        else:
+            if ch == Q():
+                in_string = true
+            elif ch == LB() or ch == SB_L():
+                depth = depth + 1
+            elif ch == RB() or ch == SB_R():
+                depth = depth - 1
+                if depth == 0:
+                    return i
+        i = i + 1
+    -1
+
+fn unescape_json_string(s: text) -> text:
+    var parts: [text] = []
+    var i = 0
+    while i < s.len():
+        val ch = json_char_at(s, i)
+        if ch != "\\":
+            parts.push(ch)
+            i = i + 1
+            continue
+        if i + 1 >= s.len():
+            parts.push(ch)
+            i = i + 1
+            continue
+        val next = json_char_at(s, i + 1)
+        if next == "n":
+            parts.push("\n")
+        elif next == "r":
+            parts.push("\r")
+        elif next == "t":
+            parts.push("\t")
+        elif next == Q():
+            parts.push(Q())
+        elif next == "\\":
+            parts.push("\\")
+        else:
+            parts.push(next)
+        i = i + 2
+    parts.join("")
+
+fn split_after_json_key(json: text, key: text) -> text:
+    val search = Q() + key + Q() + ":"
+    val parts = json.split(search)
+    if parts.len() < 2:
+        return ""
+    parts[1]
+
+fn read_json_string_value(rest: text) -> text:
+    val marker = "__OBS_JSON_STRING_MARKER__"
+    val marked = rest.replace(Q(), marker)
+    val parts = marked.split(marker)
+    if parts.len() < 2:
+        return ""
+    parts[1]
+
+# --- Field extraction from raw JSON ---
+
+fn extract_field(json: text, key: text) -> text:
+    val raw = extract_field_raw(json, key)
+    if raw == "null":
+        return ""
+    if raw.starts_with(Q()):
+        val parts = raw.split(Q())
+        if parts.len() >= 2:
+            return parts[1]
+    raw
+
+fn extract_field_raw(json: text, key: text) -> text:
+    val after = split_after_json_key(json, key)
+    if after == "":
+        return "null"
+    var rest = after
+    rest = rest.trim()
+    if rest == "":
+        return "null"
+    if rest.starts_with(Q()):
+        val value_marker = "__OBS_JSON_STRING_MARKER__"
+        val value_marked = rest.replace(Q(), value_marker)
+        val value_parts = value_marked.split(value_marker)
+        if value_parts.len() < 2:
+            return "null"
+        return js(value_parts[1])
+    if rest.starts_with(LB()) or rest.starts_with(SB_L()):
+        return rest
+    var raw = rest.split(",")[0]
+    raw = raw.split(RB())[0]
+    raw = raw.split(SB_R())[0]
+    raw = raw.trim()
+    if raw == "":
+        return "null"
+    raw
+
+fn extract_id(json: text) -> text:
+    extract_field_raw(json, "id")
+
+fn extract_nested(json: text, key: text) -> text:
+    extract_field(json, key)
+
+# Extract nested field from arguments sub-object
+fn extract_arg(json: text, key: text) -> text:
+    extract_field(json, key)
+
+# --- JSON-RPC response builders ---
+
+fn make_json_result(id: text, result: text) -> text:
+    jo3(jp("jsonrpc", js("2.0")), jp("id", id), jp("result", result))
+
+fn make_error(id: text, code: i64, message: text) -> text:
+    val err = jo2(jp("code", str(code)), jp("message", js(message)))
+    jo3(jp("jsonrpc", js("2.0")), jp("id", id), jp("error", err))
+
+fn tool_text_result(id: text, output: text) -> text:
+    val content = SB_L() + jo2(jp("type", js("text")), jp("text", js(output))) + SB_R()
+    val result = jo1(jp("content", content))
+    make_json_result(id, result)

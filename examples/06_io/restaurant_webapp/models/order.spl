@@ -1,0 +1,99 @@
+use std.database.{DbCodec, DbValue, DbRow, TableSchema, Column, ColumnType, Database}
+use std.web_framework.model.{Repository}
+use std.web_framework.pagination.{Paginator, Page}
+
+class Order:
+    id: i64
+    table_number: text
+    status: text
+    items_json: text
+    subtotal: i64
+    tax: i64
+    total: i64
+    payment_method: text
+    payment_status: text
+    notes: text
+    created_at: text
+    updated_at: text
+
+class OrderCodec:
+    fn table_name() -> text:
+        "orders"
+
+    fn columns() -> List<text>:
+        ["table_number", "status", "items_json", "subtotal", "tax", "total",
+         "payment_method", "payment_status", "notes", "created_at", "updated_at"]
+
+    fn encode(o: Order) -> List<DbValue>:
+        [
+            DbValue.text(o.table_number),
+            DbValue.text(o.status),
+            DbValue.text(o.items_json),
+            DbValue.integer(o.subtotal),
+            DbValue.integer(o.tax),
+            DbValue.integer(o.total),
+            DbValue.text(o.payment_method),
+            DbValue.text(o.payment_status),
+            DbValue.text(o.notes),
+            DbValue.text(o.created_at),
+            DbValue.text(o.updated_at)
+        ]
+
+    fn decode(row: DbRow) -> Order:
+        Order(
+            id: row.get_i64("id"),
+            table_number: row.get_text("table_number"),
+            status: row.get_text("status"),
+            items_json: row.get_text("items_json"),
+            subtotal: row.get_i64("subtotal"),
+            tax: row.get_i64("tax"),
+            total: row.get_i64("total"),
+            payment_method: row.get_text("payment_method"),
+            payment_status: row.get_text("payment_status"),
+            notes: row.get_text("notes"),
+            created_at: row.get_text("created_at"),
+            updated_at: row.get_text("updated_at")
+        )
+
+    fn schema() -> TableSchema:
+        TableSchema(
+            name: "orders",
+            columns: [
+                Column(name: "id", col_type: ColumnType.integer, primary_key: true, auto_increment: true),
+                Column(name: "table_number", col_type: ColumnType.text, nullable: false),
+                Column(name: "status", col_type: ColumnType.text, nullable: false),
+                Column(name: "items_json", col_type: ColumnType.text, nullable: false),
+                Column(name: "subtotal", col_type: ColumnType.integer, nullable: false),
+                Column(name: "tax", col_type: ColumnType.integer, nullable: false),
+                Column(name: "total", col_type: ColumnType.integer, nullable: false),
+                Column(name: "payment_method", col_type: ColumnType.text, nullable: false),
+                Column(name: "payment_status", col_type: ColumnType.text, nullable: false),
+                Column(name: "notes", col_type: ColumnType.text, nullable: false),
+                Column(name: "created_at", col_type: ColumnType.text, nullable: false),
+                Column(name: "updated_at", col_type: ColumnType.text, nullable: false)
+            ]
+        )
+
+fn create_order_repository(db: Database) -> Repository<Order>:
+    Repository<Order>(db: db, codec: OrderCodec())
+
+fn find_orders_by_status(repo: Repository<Order>, status: text) -> List<Order>:
+    repo.find_where("status = ? ORDER BY created_at DESC", [DbValue.text(status)])
+
+fn find_all_orders(repo: Repository<Order>) -> List<Order>:
+    repo.find_where("1=1 ORDER BY created_at DESC", [])
+
+fn find_order_by_id(repo: Repository<Order>, id: i64) -> Result<Order, text>:
+    repo.find_by_id(id)
+
+fn format_order_sticker(order: Order) -> text:
+    var sticker = "================================\n"
+    sticker = sticker + "  ORDER #{order.id}\n"
+    sticker = sticker + "  Table: {order.table_number}\n"
+    sticker = sticker + "--------------------------------\n"
+    sticker = sticker + "  {order.items_json}\n"
+    sticker = sticker + "--------------------------------\n"
+    sticker = sticker + "  Total: ${order.total / 100}.{order.total % 100}\n"
+    sticker = sticker + "  Status: {order.status}\n"
+    sticker = sticker + "================================\n"
+    sticker

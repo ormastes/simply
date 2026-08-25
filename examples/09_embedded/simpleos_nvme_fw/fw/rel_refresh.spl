@@ -1,0 +1,142 @@
+"""
+rel_refresh — Algorithm 3: FCR/DEAR-lite refresh.
+
+Contract: doc/05_design/hardware/nand_recovery/recovery_algorithms_design.md §4
+(design §9 lane L5, depends on L1 rel_types.spl + L2 rel_health.spl's OBSERVATION
+semantics only — see import note below). Taxonomy lineage:
+doc/01_research/hardware/nand_recovery/nand_ssd_recovery_prevention_taxonomy.md
+§3.3 FCR (Flash Correct-and-Refresh: read, correct, rewrite before errors exceed
+ECC) + DEAR (Dynamic Error-Aware Refresh: runtime error-behavior-triggered) +
+§3.11 (ECC-correction-count-triggered refresh).
+
+Pure-policy leaf (design §0 / architecture §0 LAW): imports ONLY `nvme_types.*` +
+`nd_types.*` + `rel_types.*` — never fil/ftl, and deliberately NEVER rel_health.
+The design's decision fn signature (§4 / §1.2 "the FTL decision fns ...take the
+UNPACKED SCALAR FIELDS of that snapshot rather than the struct itself, so the pure
+fns stay minimal and interpreter-safe... The layer unpacks RelBlockObs -> scalars
+at the call site") takes `corrected_events`/`needed_retry` as plain i64 params the
+FTL caller assembles each tick from ITS OWN RelHealth handle. This module never
+holds, reads, or duplicates RelHealth's counters (guide "rel_health.spl (landed
+L2) — your triggers consume its observation semantics; do not duplicate its
+counters — the design doc says which state lives where") — it only OWNS
+`RelRefreshState` (`last_prog_seq`, `marked`, rel_types.spl §1.3).
+
+Three triggers on the coarse 0/1/2+ ECC signal + a firmware-side clock proxy
+(design §4, implemented verbatim below, first-match-wins priority order):
+  1. DEAR (retry-success). `needed_retry == 1` -> refresh NOW. The strongest
+     early signal: this read's recovery ladder already needed >=1 Vref retry
+     (depth > 0) to decode, i.e. the block is ACTIVELY drifting. A single
+     retry-success is enough — the design's rule is `== 1`, not a count.
+  2. FCR (corrected-event trend). `corrected_events >= REL_REFRESH_ERR_EVENTS()`
+     (3) -> refresh. Counts corrected READS (the coarse §note-coarse signal —
+     `fil_ecc.ecc_decode` yields only a 0/1/2+ bucket, never a per-bit
+     magnitude), not corrected BITS — refresh well before the block
+     accumulates enough drift for a 2-bit uncorrectable word.
+  3. Age proxy (workload-relative, no wall clock). The FW has no wall clock
+     (inventory A10) — only the monotonic FTL `next_seq`. `cur_seq -
+     last_prog_seq[blk] >= REL_REFRESH_AGE_SEQ()` (100000) -> refresh. This
+     approximates dwell-under-workload, NOT elapsed wall-time (a drive idle a
+     year with no writes shows zero seq-age) — marked phenomenological in the
+     design, honest limit, not redesigned here.
+Hysteresis / dedupe: `marked[blk] == 1` short-circuits ALL three triggers to
+Accept ("already queued") BEFORE any trigger is evaluated — this is the
+design's only budget/hysteresis mechanism at this lane. The single
+one-reclaim-slot-per-tick BUDGET across gc/refresh/scrub/wl is `rel_tick_select`
+(design §7, L8), out of scope for this pure decision fn.
+
+Write-reset discipline (design §4 pseudocode, implemented verbatim):
+`rel_refresh_on_write` is called whenever a block is (re)programmed — it stamps
+`last_prog_seq = cur_seq` (resets the age-proxy clock for fresh data) and
+clears `marked` (a previous refresh mark is stale once the data has actually
+been rewritten). `rel_refresh_enqueue` sets `marked[blk] = 1` when the FTL
+actually queues the MarkForRefresh verdict for actuation (so a re-check on an
+already-queued block doesn't re-fire before the rewrite lands).
+
+No `rel_refresh_on_erase` (deliberate, matches the design, not an omission).
+Design §7 "Erase-reset discipline (all three per-block policies clear on
+erase)" names EXACTLY `rel_vref_decay_on_erase` (§3), `rel_disturb_clear` (§5),
+and `rel_health_on_erase` (§7) as "all three" — `rel_refresh` is not among
+them. This module's per-block staleness is reset differently: `marked` and
+`last_prog_seq` go stale only until the recycled block is REPROGRAMMED, at
+which point `rel_refresh_on_write` (above) resets both in one call; an erased
+free block carries no read traffic and `rel_refresh_due` is never evaluated
+against it, so a distinct erase-time reset here would be a duplicate no-op.
+The "sticky re-fire" §7 warns about is specifically `RelHealth.corrected_events`
+(L2's job via `rel_health_on_erase`) surviving into a recycled block's first
+corrected read — this module's own trigger (2) reads that same
+`corrected_events` as a caller-supplied scalar, so once L2 clears it on erase,
+trigger (2) cannot sticky-refire either; no duplicate state exists here to go
+stale.
+
+Typed-dimensions law (rel_types.spl docstring, guide "TYPED DIMENSIONS LAW"):
+`blk` parameters are `NdBlock` (matches `rel_vref`/`rel_disturb`/`rel_wear`);
+`RelRefreshState.last_prog_seq`/`marked` stay dense `[i64]` arrays indexed by
+the flat block id — converted at the array-index boundary via `.idx`, and at
+the `RelAction.arg` flat boundary the same way.
+"""
+
+use nvme_types.*
+use nd_types.*
+use rel_types.*
+
+# ── Constants (design §4 constants table) ──────────────────────────────────────
+fn REL_REFRESH_ERR_EVENTS() -> i64:
+    3   # With SECDED (1-bit correct / 2-bit fail), 3 distinct corrected-reads is
+        # a conservative early trigger — refresh long before drift produces a
+        # 2-bit uncorrectable word.
+
+fn REL_REFRESH_AGE_SEQ() -> i64:
+    100000   # Workload-relative; sized so the age trigger fires on genuinely
+             # stale blocks, not hot ones (a hot block is rewritten —
+             # last_prog_seq resets — long before 100K seq elapse).
+             # Phenomenological; re-fit against emu drift.
+
+# ── Constructor (this lane's *_new fn — rel_types.spl deliberately provides no ─
+# per-policy state-struct constructors; each lane owns its own, per rel_types.spl
+# header docstring "Module-boundary law", matching rel_disturb_new/rel_wear_new).
+fn rel_refresh_new() -> RelRefreshState:
+    var last_prog_seq: [i64] = []
+    var marked: [i64] = []
+    var i: i64 = 0
+    while i < NUM_BLOCKS:
+        last_prog_seq.push(0)
+        marked.push(0)
+        i = i + 1
+    RelRefreshState(last_prog_seq: last_prog_seq, marked: marked)
+
+# ── Decision: FCR/DEAR-lite refresh verdict (design §4, implemented verbatim) ──
+# corrected_events: from the caller's RelHealth handle (RelHealth.corrected_events
+# unpacked to a scalar by the FTL call site, design §1.2). needed_retry: 1 iff
+# this read's recovery ladder needed >=1 Vref retry to decode (depth > 0), 0
+# otherwise. Both are UNPACKED SCALARS — this leaf never sees RelHealth itself.
+fn rel_refresh_due(st: RelRefreshState, blk: NdBlock, cur_seq: i64,
+                    corrected_events: i64, needed_retry: i64) -> RelAction:
+    val b: i64 = blk.idx
+    if st.marked[b] == 1:
+        return rel_action(rel_act_accept(), 0)               # already queued
+    if needed_retry == 1:                                    # (1) DEAR
+        return rel_action(rel_act_refresh(), b)
+    if corrected_events >= REL_REFRESH_ERR_EVENTS():          # (2) FCR error trend
+        return rel_action(rel_act_refresh(), b)
+    if (cur_seq - st.last_prog_seq[b]) >= REL_REFRESH_AGE_SEQ():  # (3) age proxy
+        return rel_action(rel_act_refresh(), b)
+    return rel_action(rel_act_accept(), 0)
+
+# ── State transition: a block was (re)programmed — reset the age clock and ────
+# clear any stale refresh mark (design §4, implemented verbatim). Called from
+# the FTL write path (host write, GC relocation write, or the refresh rewrite
+# itself) — return-the-object, caller reassigns.
+fn rel_refresh_on_write(st: RelRefreshState, blk: NdBlock, cur_seq: i64) -> RelRefreshState:
+    var out = st
+    val b: i64 = blk.idx
+    out.last_prog_seq[b] = cur_seq
+    out.marked[b] = 0                                         # fresh data: clear
+    return out
+
+# ── State transition: the FTL actually queued the MarkForRefresh verdict for ──
+# actuation — set the dedupe flag so a re-check before the rewrite lands does
+# not re-fire (design §4, implemented verbatim). Return-the-object.
+fn rel_refresh_enqueue(st: RelRefreshState, blk: NdBlock) -> RelRefreshState:
+    var out = st
+    out.marked[blk.idx] = 1
+    return out

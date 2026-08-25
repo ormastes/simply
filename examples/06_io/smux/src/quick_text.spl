@@ -1,0 +1,95 @@
+# Quick-Text Button Panel
+# Configurable text snippet buttons for fast input.
+# Bottom bar or floating panel with Alt+N shortcuts.
+
+# ============================================================================
+# Quick Text Entry
+# ============================================================================
+
+struct QuickTextEntry:
+    label: text
+    snippet: text
+    shortcut: text
+
+# ============================================================================
+# Quick Text Panel
+# ============================================================================
+
+class QuickTextPanel:
+    entries: [QuickTextEntry]
+    visible: bool
+    selected_index: i32
+
+    static fn create() -> QuickTextPanel:
+        QuickTextPanel(entries: [], visible: false, selected_index: -1)
+
+    static fn create_with_defaults() -> QuickTextPanel:
+        var entries: [QuickTextEntry] = []
+        entries.push(QuickTextEntry(label: "Continue", snippet: "Please continue.", shortcut: "1"))
+        entries.push(QuickTextEntry(label: "Approve", snippet: "Looks good, proceed.", shortcut: "2"))
+        entries.push(QuickTextEntry(label: "Fix tests", snippet: "Fix the failing tests.", shortcut: "3"))
+        QuickTextPanel(entries: entries, visible: false, selected_index: -1)
+
+    me add_entry(label: text, snippet: text, shortcut: text):
+        self.entries.push(QuickTextEntry(label: label, snippet: snippet, shortcut: shortcut))
+
+    me toggle():
+        self.visible = not self.visible
+
+    me show():
+        self.visible = true
+
+    me hide():
+        self.visible = false
+
+    fn is_visible() -> bool:
+        self.visible
+
+    # Get snippet by shortcut index (0-based)
+    fn get_snippet(index: i32) -> text:
+        if index < 0 or index >= self.entries.len() as i32:
+            return ""
+        return self.entries[index].snippet
+
+    # Render as a horizontal bar
+    fn render(screen_width: i32, use_nerd: bool) -> text:
+        if not self.visible:
+            return ""
+        if self.entries.len() == 0:
+            return ""
+        val esc = "\u{001b}"
+        var line = ""
+        var total_width = 0
+        var i = 0
+        while i < self.entries.len():
+            val entry = self.entries[i]
+            val btn_text = " Alt+{entry.shortcut}:{entry.label} "
+            if total_width + btn_text.len() + 1 > screen_width:
+                break
+            if i > 0:
+                line = "{line} "
+                total_width = total_width + 1
+            line = "{line}{esc}[44m{esc}[37m{btn_text}{esc}[0m"
+            total_width = total_width + btn_text.len()
+            i = i + 1
+        return line
+
+    # Check if a click at x position hits a button, return index
+    fn hit_test(x: i32) -> i32:
+        var offset = 0
+        var i = 0
+        while i < self.entries.len():
+            val entry = self.entries[i]
+            val btn_width = entry.label.len() + entry.shortcut.len() + 7  # " Alt+N:Label "
+            if i > 0:
+                offset = offset + 1
+            if x >= offset and x < offset + btn_width:
+                return i as i32
+            offset = offset + btn_width
+            i = i + 1
+        return -1
+
+    fn height() -> i32:
+        if self.visible and self.entries.len() > 0:
+            return 1
+        return 0

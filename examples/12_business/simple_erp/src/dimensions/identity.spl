@@ -1,0 +1,17 @@
+# UBS Dimension — Identity
+#
+# Owns "who a party is" (person / org / system). HR, IAM, and CRM each contribute
+# slices to the same Party rather than keeping separate copies of a person.
+
+enum PartyKind:
+    Person
+    Org
+    System
+
+struct Party:
+    val id: i64
+    val kind: PartyKind
+    val display: text
+
+fn party(id: i64, kind: PartyKind, display: text) -> Party:
+    return Party { id: id, kind: kind, display: display }

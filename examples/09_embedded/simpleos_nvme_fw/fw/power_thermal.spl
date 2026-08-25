@@ -1,0 +1,196 @@
+"""
+power_thermal — NVMe power states + thermal throttling (gap-closure P7).
+
+Real SSD firmware is a power/thermal manager: it exposes NVMe power states (Set/Get Features
+FEAT_POWER_MGMT) and throttles throughput when the composite temperature crosses a threshold,
+raising a SMART critical warning (and an AER-reportable event) when it goes critical. This models
+that control logic: activity heats the device (less in lower-power states), passive cooling pulls
+it back toward an idle baseline, and the throttle latches over the threshold and releases when
+cool. Temperatures are in kelvin to match the SMART `temperature` field.
+
+Additive: a verified control component, tested directly (a threshold model has no deeper
+falsifiable invariant — no Lean ceremony).
+"""
+
+use nvme_types.*
+use nvme_admin_types.*       # FEAT_POWER_MGMT, FEAT_TEMP_THRESH
+
+val NUM_POWER_STATES:   i64 = 5
+val THERMAL_BASE_K:     i64 = 313     # 40°C idle baseline
+val THERMAL_THROTTLE_K: i64 = 353     # 80°C — throttle engages
+val THERMAL_CRIT_K:     i64 = 363     # 90°C — SMART critical warning
+
+struct PowerThermal:
+    power_state:     i64
+    temp_k:          i64
+    crit_k:          i64
+    throttled:       i64
+    throttle_events: i64
+
+fn power_thermal_new() -> PowerThermal:
+    PowerThermal(power_state: 0, temp_k: THERMAL_BASE_K, crit_k: THERMAL_CRIT_K, throttled: 0, throttle_events: 0)
+
+impl PowerThermal:
+    # Set Features FEAT_POWER_MGMT: select a power state (0 = highest performance). Invalid
+    # states are rejected with the NVMe "invalid field" status, leaving the state unchanged.
+    me set_power_state(ps: i64) -> i64:
+        if ps < 0 or ps >= NUM_POWER_STATES:
+            return SC_INVALID_FIELD
+        me.power_state = ps
+        SC_SUCCESS
+
+    me get_power_state(self) -> i64:
+        if me.power_state < 0:
+            return 0
+        if me.power_state >= NUM_POWER_STATES:
+            return NUM_POWER_STATES - 1
+        me.power_state
+
+    me set_temperature_threshold(tk: i64) -> i64:
+        if tk <= THERMAL_BASE_K:
+            return SC_INVALID_FIELD
+        me.crit_k = tk
+        SC_SUCCESS
+
+    me get_temperature_threshold(self) -> i64:
+        if me.crit_k <= THERMAL_BASE_K:
+            return THERMAL_CRIT_K
+        me.crit_k
+
+    # Account for `ops` units of work this tick: activity heats the device (scaled down in
+    # lower-power states), passive cooling pulls it toward the baseline. The throttle latches
+    # over THERMAL_THROTTLE_K and releases below it; a fresh engagement counts an event.
+    me tick(ops: i64):
+        # Heat in ∝ activity, scaled down in lower-power states (PS0 is hottest). The /3 is a
+        # calibration knob so a throttling load equilibrates near the threshold band — not an
+        # absolute device constant; real silicon needs measured tuning.
+        var safe_ops: i64 = ops
+        if safe_ops < 0:
+            safe_ops = 0
+        if safe_ops > FW_SAFE_I64_LIMIT / NUM_POWER_STATES:
+            safe_ops = FW_SAFE_I64_LIMIT / NUM_POWER_STATES
+        var ps: i64 = me.power_state
+        if ps < 0:
+            ps = 0
+        if ps >= NUM_POWER_STATES:
+            ps = NUM_POWER_STATES - 1
+        val heat: i64 = safe_ops * (NUM_POWER_STATES - ps) / 3
+        me.temp_k = me.temp_k + heat
+        # Cool out ∝ the excess over ambient (Newtonian): temperature reaches an equilibrium
+        # under sustained load and decays back toward baseline when idle.
+        val excess: i64 = me.temp_k - THERMAL_BASE_K
+        if excess > 0:
+            me.temp_k = me.temp_k - (excess / 4 + 1)
+        if me.temp_k < THERMAL_BASE_K:
+            me.temp_k = THERMAL_BASE_K
+        if me.temp_k >= THERMAL_THROTTLE_K:
+            if me.throttled == 0:
+                me.throttle_events = me.throttle_count() + 1
+            me.throttled = 1
+        if me.temp_k < THERMAL_THROTTLE_K:
+            me.throttled = 0
+
+    # Ops budget this tick: full when cool, sharply reduced when throttling.
+    me throttle_factor(self) -> i64:
+        if me.throttled != 0:
+            return 1
+        8
+
+    me temperature_k(self) -> i64:
+        if me.temp_k < THERMAL_BASE_K:
+            return THERMAL_BASE_K
+        me.temp_k
+
+    me is_throttled(self) -> i64:
+        if me.throttled == 0:
+            return 0
+        1
+
+    me throttle_count(self) -> i64:
+        if me.throttle_events < 0:
+            return 0
+        me.throttle_events
+
+    # SMART composite-temperature critical-warning bit (set over the critical threshold).
+    me critical_warning(self) -> i64:
+        if me.temperature_k() >= me.get_temperature_threshold():
+            return 1
+        0
+
+# ── Self-test ─────────────────────────────────────────────────────────────────
+fn power_thermal_selftest() -> i64:
+    var fail: i64 = 0
+    var pt: PowerThermal = power_thermal_new()
+
+    # Power-state get/set round-trip; invalid state rejected and ignored.
+    fail = fail + expect_eq(pt.get_power_state(), 0, "pt: default power state 0")
+    fail = fail + expect_eq(pt.set_power_state(3), SC_SUCCESS, "pt: set a valid power state")
+    fail = fail + expect_eq(pt.get_power_state(), 3, "pt: power state updated")
+    fail = fail + expect_eq(pt.set_power_state(99), SC_INVALID_FIELD, "pt: invalid power state rejected")
+    fail = fail + expect_eq(pt.get_power_state(), 3, "pt: invalid set leaves state unchanged")
+    fail = fail + expect_eq(pt.get_temperature_threshold(), THERMAL_CRIT_K, "pt: default thermal threshold")
+    fail = fail + expect_eq(pt.set_temperature_threshold(340), SC_SUCCESS, "pt: set thermal threshold")
+    fail = fail + expect_eq(pt.get_temperature_threshold(), 340, "pt: thermal threshold updated")
+    fail = fail + expect_eq(pt.set_temperature_threshold(THERMAL_BASE_K), SC_INVALID_FIELD, "pt: invalid thermal threshold rejected")
+    fail = fail + expect_eq(pt.get_temperature_threshold(), 340, "pt: invalid threshold leaves previous value")
+    pt.power_state = -7
+    fail = fail + expect_eq(pt.get_power_state(), 0, "pt: negative corrupted power state getter clamps to PS0")
+    pt.power_state = NUM_POWER_STATES + 7
+    fail = fail + expect_eq(pt.get_power_state(), NUM_POWER_STATES - 1, "pt: oversized corrupted power state getter clamps to slowest PS")
+    pt.power_state = 3
+    pt.crit_k = THERMAL_BASE_K
+    fail = fail + expect_eq(pt.get_temperature_threshold(), THERMAL_CRIT_K, "pt: corrupted threshold getter returns default critical threshold")
+    pt.crit_k = 340
+    pt.power_state = -1
+    pt.tick(3)
+    fail = fail + expect_eq(pt.temperature_k(), 316, "pt: negative corrupted power state clamps hot")
+    pt.temp_k = THERMAL_BASE_K
+    pt.power_state = NUM_POWER_STATES + 4
+    pt.tick(3)
+    fail = fail + expect_eq(pt.temperature_k(), THERMAL_BASE_K, "pt: oversized corrupted power state clamps cool")
+    pt.tick(-10)
+    fail = fail + expect_eq(pt.temperature_k(), THERMAL_BASE_K, "pt: negative work tick is inert")
+    pt.tick(FW_OVERFLOW_TEST_SIZE)
+    fail = fail + expect_eq(pt.is_throttled(), 1, "pt: oversized work tick saturates hot without overflow")
+    pt.temp_k = -10
+    fail = fail + expect_eq(pt.temperature_k(), THERMAL_BASE_K, "pt: corrupted negative temperature getter clamps to baseline")
+    pt.throttled = 7
+    fail = fail + expect_eq(pt.is_throttled(), 1, "pt: corrupted throttle flag keeps reduced budget")
+    fail = fail + expect_eq(pt.throttle_factor(), 1, "pt: corrupted throttle flag throttles IO")
+    pt.throttle_events = -2
+    fail = fail + expect_eq(pt.throttle_count(), 0, "pt: corrupted throttle count clamps to zero")
+    pt.temp_k = THERMAL_THROTTLE_K + 20
+    pt.throttled = 0
+    pt.tick(0)
+    fail = fail + expect_eq(pt.throttle_count(), 1, "pt: corrupted throttle count increments from zero")
+    pt.temp_k = THERMAL_BASE_K
+    pt.throttled = 0
+    pt.crit_k = -1
+    fail = fail + expect_eq(pt.critical_warning(), 0, "pt: corrupted critical threshold does not raise warning at baseline")
+    pt.crit_k = 340
+
+    # A cool device is not throttled and runs at full budget.
+    fail = fail + expect_eq(pt.is_throttled(), 0, "pt: cool device not throttled")
+    fail = fail + expect_eq(pt.throttle_factor(), 8, "pt: full throttle factor when cool")
+
+    # Sustained heavy load (power state 0 = max heat) drives temperature over the threshold.
+    var pt2: PowerThermal = power_thermal_new()
+    var i: i64 = 0
+    while i < 20:
+        pt2.tick(10)
+        i = i + 1
+    fail = fail + expect_eq(pt2.is_throttled(), 1, "pt: heavy load engages the throttle")
+    fail = fail + expect_eq(pt2.throttle_factor(), 1, "pt: throttled budget reduced")
+    var te_ok: i64 = 0
+    if pt2.throttle_count() > 0:
+        te_ok = 1
+    fail = fail + expect_eq(te_ok, 1, "pt: throttle engagement counted")
+
+    # Idle ticks cool it back below the threshold and release the throttle.
+    var j: i64 = 0
+    while j < 100:
+        pt2.tick(0)
+        j = j + 1
+    fail = fail + expect_eq(pt2.is_throttled(), 0, "pt: cooling releases the throttle")
+
+    fail

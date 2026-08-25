@@ -1,0 +1,119 @@
+#![allow(unnamed_duplicate_typed_args)]
+# Korean Stock MCP - Protocol I/O, initialize, tools list
+
+# --- Initialize response ---
+
+fn make_init_response(id: text) -> text:
+    if INIT_CACHE != "":
+        return make_json_result(id, INIT_CACHE)
+    var tools_cap = jo1(jp("listChanged", "true"))
+    var caps = jo1(jp("tools", tools_cap))
+    val server_info = jo3(
+        jp("name", js(SERVER_NAME)),
+        jp("version", js(SERVER_VERSION)),
+        jp("instructions", js("Korean stock market MCP server. Provides real-time stock prices, OHLCV data, market indices, company info, and news from KRX, DART, and news sources."))
+    )
+    val result = jo3(
+        jp("protocolVersion", js("2024-11-05")),
+        jp("capabilities", caps),
+        jp("serverInfo", server_info)
+    )
+    INIT_CACHE = result
+    make_json_result(id, result)
+
+# --- Tools list (12 tools) ---
+
+fn make_tools_list(id: text) -> text:
+    if TOOLS_CACHE != "":
+        return make_json_result(id, TOOLS_CACHE)
+
+    var tool_parts: [text] = []
+
+    # Stock price tools
+    tool_parts.push(make_tool_schema("stock_price", "Get current stock price for a Korean stock by ticker code (e.g., 005930 for Samsung)", make_stock_price_props(), "[" + js("ticker") + "]"))
+    tool_parts.push(make_tool_schema("stock_ohlcv", "Get OHLCV (Open/High/Low/Close/Volume) history for a Korean stock", make_stock_ohlcv_props(), "[" + js("ticker") + "]"))
+    tool_parts.push(make_tool_schema("stock_search", "Search for Korean stocks by name or partial ticker", make_stock_search_props(), "[" + js("query") + "]"))
+    tool_parts.push(make_tool_schema("stock_list", "List all stocks on a Korean market (KOSPI/KOSDAQ)", make_stock_list_props(), "[]"))
+
+    # Market tools
+    tool_parts.push(make_tool_schema("market_index", "Get Korean market index value (KOSPI, KOSDAQ, KPI200)", make_market_index_props(), "[]"))
+    tool_parts.push(make_tool_schema("market_cap", "Get market capitalization ranking for Korean stocks", make_market_cap_props(), "[]"))
+    tool_parts.push(make_tool_schema("sector_performance", "Get sector performance data for Korean market", make_sector_performance_props(), "[]"))
+    tool_parts.push(make_tool_schema("stock_compare", "Compare multiple Korean stocks side by side", make_stock_compare_props(), "[" + js("tickers") + "]"))
+
+    # Company info (DART)
+    tool_parts.push(make_tool_schema("company_info", "Get company information from DART (requires DART_API_KEY)", make_company_info_props(), "[" + js("corp_code") + "]"))
+    tool_parts.push(make_tool_schema("financial_statements", "Get financial statements from DART (requires DART_API_KEY)", make_financial_statements_props(), "[" + js("corp_code") + "]"))
+
+    # News
+    tool_parts.push(make_tool_schema("market_news", "Get latest Korean stock market news", make_market_news_props(), "[]"))
+    tool_parts.push(make_tool_schema("stock_news", "Get news for a specific Korean stock", make_stock_news_props(), "[" + js("query") + "]"))
+
+    val tools = SB_L() + tool_parts.join(",") + SB_R()
+    val result = jo1(jp("tools", tools))
+    TOOLS_CACHE = result
+    make_json_result(id, result)
+
+fn make_tool_schema(name: text, description: text, props: text, req: text) -> text:
+    var schema = jo3(
+        jp("type", js("object")),
+        jp("properties", props),
+        jp("required", req)
+    )
+    jo3(
+        jp("name", js(name)),
+        jp("description", js(description)),
+        jp("inputSchema", schema)
+    )
+
+# --- Tool property schemas ---
+
+fn make_stock_price_props() -> text:
+    jo1(jp("ticker", jo2(jp("type", js("string")), jp("description", js("Stock ticker code (e.g., 005930)")))))
+
+fn make_stock_ohlcv_props() -> text:
+    jo3(
+        jp("ticker", jo2(jp("type", js("string")), jp("description", js("Stock ticker code")))),
+        jp("days", jo2(jp("type", js("integer")), jp("description", js("Number of days of history (default: 30)")))),
+        jp("market", jo2(jp("type", js("string")), jp("description", js("Market: KOSPI or KOSDAQ (default: KOSPI)"))))
+    )
+
+fn make_stock_search_props() -> text:
+    jo1(jp("query", jo2(jp("type", js("string")), jp("description", js("Stock name or partial ticker to search")))))
+
+fn make_stock_list_props() -> text:
+    jo1(jp("market", jo2(jp("type", js("string")), jp("description", js("Market: KOSPI, KOSDAQ, or ALL (default: ALL)")))))
+
+fn make_market_index_props() -> text:
+    jo1(jp("index_name", jo2(jp("type", js("string")), jp("description", js("Index name: KOSPI, KOSDAQ, KPI200 (default: KOSPI)")))))
+
+fn make_market_cap_props() -> text:
+    jo2(
+        jp("market", jo2(jp("type", js("string")), jp("description", js("Market: KOSPI or KOSDAQ (default: KOSPI)")))),
+        jp("top_n", jo2(jp("type", js("integer")), jp("description", js("Number of top companies (default: 20)"))))
+    )
+
+fn make_sector_performance_props() -> text:
+    jo1(jp("market", jo2(jp("type", js("string")), jp("description", js("Market: KOSPI or KOSDAQ (default: KOSPI)")))))
+
+fn make_stock_compare_props() -> text:
+    jo1(jp("tickers", jo2(jp("type", js("string")), jp("description", js("Comma-separated ticker codes (e.g., 005930,000660,035420)")))))
+
+fn make_company_info_props() -> text:
+    jo1(jp("corp_code", jo2(jp("type", js("string")), jp("description", js("DART corporation code or stock ticker")))))
+
+fn make_financial_statements_props() -> text:
+    jo3(
+        jp("corp_code", jo2(jp("type", js("string")), jp("description", js("DART corporation code or stock ticker")))),
+        jp("year", jo2(jp("type", js("string")), jp("description", js("Fiscal year (default: current year)")))),
+        jp("report_type", jo2(jp("type", js("string")), jp("description", js("Report type: annual, semi, quarterly (default: annual)"))))
+    )
+
+fn make_market_news_props() -> text:
+    jo1(jp("max_items", jo2(jp("type", js("integer")), jp("description", js("Maximum number of news items (default: 10)")))))
+
+fn make_stock_news_props() -> text:
+    jo2(
+        jp("query", jo2(jp("type", js("string")), jp("description", js("Stock name or ticker to search news for")))),
+        jp("max_items", jo2(jp("type", js("integer")), jp("description", js("Maximum number of news items (default: 10)"))))
+    )

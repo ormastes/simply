@@ -1,0 +1,124 @@
+#!/usr/bin/env simple
+# GPU Programming Example - Runtime Compatible
+#
+# This example works with the runtime parser (no compiler needed)
+
+use std.gpu_runtime.{gpu_available, gpu_backend_name, gpu_ctx_info, gpu_alloc_zeros, gpu_tensor_is_cuda, gpu_tensor_numel, gpu_stream_create, gpu_stream_sync, gpu_async_upload_batch}
+
+fn example1_detect_gpu():
+    """Example 1: Detect GPU availability."""
+    print "=== Example 1: GPU Detection ==="
+
+    val available = gpu_available()
+    val backend = gpu_backend_name()
+
+    print "GPU Available: {available}"
+    print "Backend: {backend}"
+
+    if available:
+        print "✓ GPU is ready for use"
+    else:
+        print "⚠ Using CPU fallback"
+
+    print ""
+
+fn example2_allocate_memory():
+    """Example 2: Allocate GPU memory."""
+    print "=== Example 2: GPU Memory Allocation ==="
+
+    if not gpu_available():
+        print "⚠ Skipped (no GPU)"
+        print ""
+        return
+
+    # Allocate 100x100 matrix on GPU 0
+    val tensor = gpu_alloc_zeros(100, 100, use_gpu: true, device_id: 0)
+
+    # Check if on GPU
+    val is_cuda = gpu_tensor_is_cuda(tensor)
+    val num_elements = gpu_tensor_numel(tensor)
+
+    print "Allocated tensor: {num_elements} elements"
+    print "On GPU: {is_cuda}"
+    print "✓ GPU allocation successful"
+    print ""
+
+fn example3_streams():
+    """Example 3: Async streams."""
+    print "=== Example 3: Async Streams ==="
+
+    if not gpu_available():
+        print "⚠ Skipped (no GPU)"
+        print ""
+        return
+
+    # Create stream for async operations
+    val stream = gpu_stream_create(0)
+    print "Created CUDA stream"
+
+    # Upload batches asynchronously
+    print "Uploading 3 batches (async)..."
+
+    val batch1 = gpu_async_upload_batch(10, 10, device_id: 0, stream_handle: stream)
+    val batch2 = gpu_async_upload_batch(10, 10, device_id: 0, stream_handle: stream)
+    val batch3 = gpu_async_upload_batch(10, 10, device_id: 0, stream_handle: stream)
+
+    print "Batches queued on stream"
+
+    # Wait for all uploads
+    gpu_stream_sync(stream)
+    print "✓ All uploads complete"
+    print ""
+
+fn example4_context_style():
+    """Example 4: Context-style API."""
+    print "=== Example 4: Context-Style API ==="
+
+    # Print GPU info (like ctx.info())
+    gpu_ctx_info()
+    print ""
+
+fn example5_simple_training_loop():
+    """Example 5: Simple training loop pattern."""
+    print "=== Example 5: Training Loop Pattern ==="
+
+    if not gpu_available():
+        print "⚠ Skipped (no GPU)"
+        print ""
+        return
+
+    val num_batches = 5
+    val batch_size = 64
+    val stream = gpu_stream_create(0)
+
+    print "Training for {num_batches} batches"
+    print "Batch size: {batch_size}"
+    print ""
+
+    for i in 0..num_batches:
+        # Upload batch (async)
+        val gpu_batch = gpu_async_upload_batch(batch_size, batch_size, device_id: 0, stream_handle: stream)
+
+        # In real training: forward, backward, optimize
+        # For now, just sync
+        gpu_stream_sync(stream)
+
+        print "  Batch {i + 1}/{num_batches} processed"
+
+    print "✓ Training complete"
+    print ""
+
+fn main():
+    print "GPU Programming - Runtime Compatible\n"
+    print "====================================\n"
+
+    example1_detect_gpu()
+    example2_allocate_memory()
+    example3_streams()
+    example4_context_style()
+    example5_simple_training_loop()
+
+    print "====================================\n"
+    print "All examples complete! ✓\n"
+    print "Note: This API works with runtime parser"
+    print "      (no compiler needed)"

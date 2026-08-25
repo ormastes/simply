@@ -1,0 +1,225 @@
+# LLM Caret - Type Definitions
+#
+# Core types for unified LLM access: messages, requests, responses,
+# streaming events, and provider configuration.
+#
+# Message is the FIRST struct (import compatibility).
+
+# ============================================================================
+# Message - Chat message (role + content)
+# ============================================================================
+
+struct Message:
+    role: text
+    content: text
+
+fn new_message(role: text, content: text) -> Message:
+    Message(role: role, content: content)
+
+fn new_user_message(content: text) -> Message:
+    Message(role: "user", content: content)
+
+fn new_assistant_message(content: text) -> Message:
+    Message(role: "assistant", content: content)
+
+fn new_system_message(content: text) -> Message:
+    Message(role: "system", content: content)
+
+# ============================================================================
+# ChatRequest - Request to send to an LLM provider
+# ============================================================================
+
+struct ChatRequest:
+    provider: text
+    model: text
+    messages: [Message]
+    system_prompt: text
+    max_tokens: i64
+    temperature: f64
+    session_id: text
+    max_turns: i64
+    stream: bool
+    json_schema: text
+    tools: [text]
+    extra_args: [text]
+
+fn new_chat_request() -> ChatRequest:
+    ChatRequest(
+        provider: "",
+        model: "",
+        messages: [],
+        system_prompt: "",
+        max_tokens: 0,
+        temperature: -1.0,
+        session_id: "",
+        max_turns: 0,
+        stream: false,
+        json_schema: "",
+        tools: [],
+        extra_args: []
+    )
+
+fn new_chat_request_with_prompt(prompt: text) -> ChatRequest:
+    ChatRequest(
+        provider: "",
+        model: "",
+        messages: [Message(role: "user", content: prompt)],
+        system_prompt: "",
+        max_tokens: 0,
+        temperature: -1.0,
+        session_id: "",
+        max_turns: 0,
+        stream: false,
+        json_schema: "",
+        tools: [],
+        extra_args: []
+    )
+
+# ============================================================================
+# ChatResponse - Response from an LLM provider
+# ============================================================================
+
+struct ChatResponse:
+    content: text
+    model: text
+    provider: text
+    session_id: text
+    stop_reason: text
+    input_tokens: i64
+    output_tokens: i64
+    error: text
+    is_error: bool
+    raw: text
+
+fn new_chat_response() -> ChatResponse:
+    ChatResponse(
+        content: "",
+        model: "",
+        provider: "",
+        session_id: "",
+        stop_reason: "",
+        input_tokens: 0,
+        output_tokens: 0,
+        error: "",
+        is_error: false,
+        raw: ""
+    )
+
+fn new_error_response(error_msg: text) -> ChatResponse:
+    ChatResponse(
+        content: "",
+        model: "",
+        provider: "",
+        session_id: "",
+        stop_reason: "error",
+        input_tokens: 0,
+        output_tokens: 0,
+        error: error_msg,
+        is_error: true,
+        raw: ""
+    )
+
+fn new_success_response(content: text) -> ChatResponse:
+    ChatResponse(
+        content: content,
+        model: "",
+        provider: "",
+        session_id: "",
+        stop_reason: "end_turn",
+        input_tokens: 0,
+        output_tokens: 0,
+        error: "",
+        is_error: false,
+        raw: ""
+    )
+
+# ============================================================================
+# StreamEvent - Streaming response event
+# ============================================================================
+
+struct StreamEvent:
+    event_type: text
+    content: text
+    session_id: text
+    model: text
+    stop_reason: text
+    input_tokens: i64
+    output_tokens: i64
+
+fn new_stream_event(event_type: text, content: text) -> StreamEvent:
+    StreamEvent(
+        event_type: event_type,
+        content: content,
+        session_id: "",
+        model: "",
+        stop_reason: "",
+        input_tokens: 0,
+        output_tokens: 0
+    )
+
+fn new_text_delta(content: text) -> StreamEvent:
+    StreamEvent(
+        event_type: "text_delta",
+        content: content,
+        session_id: "",
+        model: "",
+        stop_reason: "",
+        input_tokens: 0,
+        output_tokens: 0
+    )
+
+fn new_message_stop(stop_reason: text) -> StreamEvent:
+    StreamEvent(
+        event_type: "message_stop",
+        content: "",
+        session_id: "",
+        model: "",
+        stop_reason: stop_reason,
+        input_tokens: 0,
+        output_tokens: 0
+    )
+
+# ============================================================================
+# ProviderConfig - Configuration for a single provider
+# ============================================================================
+
+struct ProviderConfig:
+    provider_type: text
+    base_url: text
+    api_key: text
+    model: text
+    cli_path: text
+    python_path: text
+    model_path: text
+    extra_args: [text]
+
+fn new_provider_config(provider_type: text) -> ProviderConfig:
+    ProviderConfig(
+        provider_type: provider_type,
+        base_url: "",
+        api_key: "",
+        model: "",
+        cli_path: "",
+        python_path: "",
+        model_path: "",
+        extra_args: []
+    )
+
+# ============================================================================
+# Helper predicates
+# ============================================================================
+
+fn is_user_message(msg: Message) -> bool:
+    msg.role == "user"
+
+fn is_assistant_message(msg: Message) -> bool:
+    msg.role == "assistant"
+
+fn is_system_message(msg: Message) -> bool:
+    msg.role == "system"
+
+fn response_ok(resp: ChatResponse) -> bool:
+    not resp.is_error
+
+fn response_has_content(resp: ChatResponse) -> bool:
+    resp.content != "" and not resp.is_error

@@ -1,0 +1,115 @@
+"""
+nvme_ct — custom-typed shared interface for the pure-Simple NVMe host/device
+emulator. Domain newtypes + geometry + physical-address codec + the command /
+completion records every module builds against. Types + pure helpers only (no
+`impl`/`me`), so it is cheap to import everywhere.
+
+CUSTOM TYPING (read before using): Simple `newtype` gives nominal *domain* types
+(Lba, Ppn, Ch, ...) that document intent and keep signatures honest. On this
+compiler newtypes are NOT enforced for argument passing and direct arithmetic on
+a newtype erases to i64, so the discipline is: pass/return/store newtypes at
+interfaces; for math, unwrap `.value`, compute in i64, rewrap. Raw payload arrays
+stay `[i64]`. The real guarantees (address bijection, bounds, memcpy-length
+safety, queue invariants) are proven in Lean4 — see emu/proofs/*.lean.
+
+GEOMETRY: 2 channels x 2 banks x 2 planes x 2 blocks x 8 pages = 128 physical
+pages. ppn = ((((ch*BANKS+bank)*PLANES+plane)*BLOCKS+block)*PAGES+page).
+"""
+
+# ── Geometry (plain i64 for arithmetic) ───────────────────────────────────────
+val CHANNELS:         i64 = 2
+val BANKS_PER_CH:     i64 = 2
+val PLANES_PER_BANK:  i64 = 2
+val BLOCKS_PER_PLANE: i64 = 2
+val PAGES_PER_BLOCK:  i64 = 8
+val NUM_BLOCKS:       i64 = 16    # CHANNELS*BANKS_PER_CH*PLANES_PER_BANK*BLOCKS_PER_PLANE
+val NUM_PAGES:        i64 = 128   # NUM_BLOCKS * PAGES_PER_BLOCK
+val LBA_COUNT:        i64 = 96    # surfaced LBAs (~75%, rest over-provision)
+val WORDS_PER_PAGE:   i64 = 4     # page payload = 4 i64 words (small, host-runnable)
+
+# ── Sentinels ─────────────────────────────────────────────────────────────────
+val UNMAP:  i64 = -1
+val NO_PPN: i64 = -1
+
+# ── NVMe opcodes (host <-> device data path) ──────────────────────────────────
+val OP_FLUSH: i64 = 0x00
+val OP_WRITE: i64 = 0x01
+val OP_READ:  i64 = 0x02
+val OP_TRIM:  i64 = 0x09
+
+# ── Status codes ──────────────────────────────────────────────────────────────
+val SC_SUCCESS:    i64 = 0x00
+val SC_INTERNAL:   i64 = 0x06
+val SC_LBA_RANGE:  i64 = 0x80
+val SC_MEDIA_ERR:  i64 = 0x281
+val SC_DMA_ERROR:  i64 = 0x04   # memcpy/DMA seam reported a transfer fault
+
+# ── Domain newtypes (highly custom typed; unwrap .value for math) ─────────────
+newtype Lba   = i64   # logical block address
+newtype Ppn   = i64   # physical page number (linear)
+newtype Ch    = i64   # NAND channel
+newtype Bank  = i64   # bank / LUN on a channel
+newtype Plane = i64   # plane within a bank
+newtype Block = i64   # block within a plane
+newtype Page  = i64   # page within a block
+newtype Cid   = i64   # command id
+newtype Qid   = i64   # queue id
+newtype Addr  = i64   # shared-memory word offset (a "PRP" pointer)
+
+# ── Physical-address codec (ppa <-> linear ppn). Proven in proofs/addr.lean ───
+fn ppa_to_ppn(ch: Ch, bank: Bank, plane: Plane, block: Block, page: Page) -> Ppn:
+    Ppn(value: ((((ch.value * BANKS_PER_CH + bank.value) * PLANES_PER_BANK + plane.value) * BLOCKS_PER_PLANE + block.value) * PAGES_PER_BLOCK + page.value))
+
+fn ppn_page(p: Ppn) -> Page:
+    Page(value: p.value % PAGES_PER_BLOCK)
+
+fn ppn_block(p: Ppn) -> Block:
+    Block(value: (p.value / PAGES_PER_BLOCK) % BLOCKS_PER_PLANE)
+
+fn ppn_plane(p: Ppn) -> Plane:
+    Plane(value: (p.value / PAGES_PER_BLOCK / BLOCKS_PER_PLANE) % PLANES_PER_BANK)
+
+fn ppn_bank(p: Ppn) -> Bank:
+    Bank(value: (p.value / PAGES_PER_BLOCK / BLOCKS_PER_PLANE / PLANES_PER_BANK) % BANKS_PER_CH)
+
+fn ppn_channel(p: Ppn) -> Ch:
+    Ch(value: (p.value / PAGES_PER_BLOCK / BLOCKS_PER_PLANE / PLANES_PER_BANK / BANKS_PER_CH))
+
+# Linear block index 0..NUM_BLOCKS for a ppn (channel/bank/plane/block flattened).
+fn ppn_block_index(p: Ppn) -> i64:
+    p.value / PAGES_PER_BLOCK
+
+fn block_first_ppn(block_index: i64) -> Ppn:
+    Ppn(value: block_index * PAGES_PER_BLOCK)
+
+# ── Command / completion records (carry typed fields + a PRP into shared mem) ──
+struct Command:
+    cid:    Cid
+    opcode: i64
+    lba:    Lba
+    prp:    Addr   # shared-memory word offset of the data buffer
+    nwords: i64    # transfer length, in i64 words
+
+fn command_make(cid: Cid, opcode: i64, lba: Lba, prp: Addr, nwords: i64) -> Command:
+    Command(cid: cid, opcode: opcode, lba: lba, prp: prp, nwords: nwords)
+
+struct Completion:
+    cid:    Cid
+    status: i64
+    info:   i64   # device->host scalar (e.g. words transferred)
+
+fn completion_make(cid: Cid, status: i64, info: i64) -> Completion:
+    Completion(cid: cid, status: status, info: info)
+
+# ── Tiny test helper (reused across emu self-tests) ───────────────────────────
+fn expect_eq(got: i64, want: i64, label: text) -> i64:
+    if got == want:
+        print "  PASS: {label} ({got})"
+        return 0
+    print "  FAIL: {label} -- expected {want} got {got}"
+    1
+
+fn bool_i64(b: bool) -> i64:
+    if b:
+        return 1
+    0

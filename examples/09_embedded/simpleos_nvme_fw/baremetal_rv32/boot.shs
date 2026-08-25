@@ -1,0 +1,92 @@
+#!/bin/sh
+# Boot the bare-metal RV32 NAND/FTL demo ELF under QEMU and check the PASS
+# marker (mirrors fw_rv32/boot.shs). Fail-closed: a missing ELF is a hard
+# error, never a skip.
+#
+# Usage: sh examples/09_embedded/simpleos_nvme_fw/baremetal_rv32/boot.shs [path-to-elf]
+# Requires: qemu-system-riscv32.
+cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
+
+if [ "${1:-}" = "--self-test" ]; then
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_dir"' EXIT
+  fake_bin="$tmp_dir/bin"
+  mkdir -p "$fake_bin"
+  cat >"$fake_bin/qemu-system-riscv32" <<'EOF'
+#!/bin/sh
+serial=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -serial)
+      shift
+      serial="${1#file:}"
+      ;;
+  esac
+  shift
+done
+[ -n "$serial" ] || exit 3
+case "${NAND_BOOT_RV32_FAKE_SERIAL:-pass}" in
+  pass)
+    printf '%s\n' "=== RV32 NAND/FTL Bare-Metal Demo ===" "Tests: 10/10 passed" "ALL RV32 NAND CHECKS PASS" >"$serial"
+    ;;
+  missing)
+    printf '%s\n' "=== RV32 NAND/FTL Bare-Metal Demo ===" "Tests: 9/10 passed" >"$serial"
+    ;;
+  fail)
+    printf '%s\n' "=== RV32 NAND/FTL Bare-Metal Demo ===" "ALL RV32 NAND CHECKS PASS" "[FAIL] FTL write LBA=0 — write error" >"$serial"
+    ;;
+  *)
+    exit 4
+    ;;
+esac
+EOF
+  chmod +x "$fake_bin/qemu-system-riscv32"
+  fake_elf="$tmp_dir/fake.elf"
+  : >"$fake_elf"
+
+  PATH="$fake_bin:$PATH" NAND_BOOT_RV32_FAKE_SERIAL=pass sh "$0" "$fake_elf" >"$tmp_dir/pass.out"
+  grep -Fq "RESULT: PASS" "$tmp_dir/pass.out" || {
+    echo "STATUS: FAIL nand-boot-rv32-boot self-test: fake pass did not pass" >&2
+    exit 1
+  }
+
+  if PATH="$fake_bin:$PATH" NAND_BOOT_RV32_FAKE_SERIAL=missing sh "$0" "$fake_elf" >"$tmp_dir/missing.out" 2>&1; then
+    echo "STATUS: FAIL nand-boot-rv32-boot self-test: missing marker passed" >&2
+    exit 1
+  fi
+  grep -Fq "RESULT: FAIL (marker not found)" "$tmp_dir/missing.out" || {
+    echo "STATUS: FAIL nand-boot-rv32-boot self-test: missing marker reason absent" >&2
+    exit 1
+  }
+
+  if PATH="$fake_bin:$PATH" NAND_BOOT_RV32_FAKE_SERIAL=fail sh "$0" "$fake_elf" >"$tmp_dir/fail.out" 2>&1; then
+    echo "STATUS: FAIL nand-boot-rv32-boot self-test: serial FAIL marker passed" >&2
+    exit 1
+  fi
+  grep -Fq "RESULT: FAIL (serial failure marker found)" "$tmp_dir/fail.out" || {
+    echo "STATUS: FAIL nand-boot-rv32-boot self-test: serial FAIL reason absent" >&2
+    exit 1
+  }
+
+  echo "STATUS: PASS nand-boot-rv32-boot self-test"
+  exit 0
+fi
+
+ELF="${1:-build/nand_boot_rv32.elf}"
+LOG="build/nand_boot_rv32_serial.log"
+if [ ! -f "$ELF" ]; then
+  echo "missing-media: $ELF (build it with baremetal_rv32/build.shs first)"
+  exit 2
+fi
+mkdir -p "$(dirname "$LOG")"; rm -f "$LOG"
+# M-mode direct boot, no OpenSBI (the linker loads at 0x80000000); 16550 UART at 0x10000000.
+timeout 15 qemu-system-riscv32 -machine virt -cpu rv32 -m 128M -nographic -bios none \
+  -kernel "$ELF" -serial file:"$LOG" </dev/null >/dev/null 2>&1
+echo "--- serial ---"; cat "$LOG" 2>/dev/null; echo "--- end ---"
+if ! grep -q "ALL RV32 NAND CHECKS PASS" "$LOG" 2>/dev/null; then
+  echo "RESULT: FAIL (marker not found)"; exit 1
+fi
+if grep -q "FAIL" "$LOG" 2>/dev/null; then
+  echo "RESULT: FAIL (serial failure marker found)"; exit 1
+fi
+echo "RESULT: PASS"

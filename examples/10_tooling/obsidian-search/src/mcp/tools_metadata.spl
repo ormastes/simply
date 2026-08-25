@@ -1,0 +1,122 @@
+# MCP Tool schemas for metadata management (Phase B)
+#
+# Defines 6 tool schemas: manage_frontmatter, add_tags, remove_tags,
+# rename_tag, batch_read_notes, list_files.
+
+use src.util.json_helpers.{js, jp, jo, jo1, jo2, jo3, jo4, ja, LB, RB, SB_L, SB_R}
+
+# --- Tool schema builders (reuse pattern from tools.spl) ---
+
+fn make_string_prop(description: text) -> text:
+    jo2(jp("type", js("string")), jp("description", js(description)))
+
+fn make_int_prop(description: text) -> text:
+    jo2(jp("type", js("integer")), jp("description", js(description)))
+
+fn make_tool_rw(name: text, description: text, props: text, required: text, read_only: bool) -> text:
+    val schema = jo3(
+        jp("type", js("object")),
+        jp("properties", props),
+        jp("required", required)
+    )
+    val ro_hint = if read_only: "true" else: "false"
+    val dest_hint = if read_only: "false" else: "false"
+    val idemp_hint = if read_only: "true" else: "false"
+    val annotations = jo3(
+        jp("readOnlyHint", ro_hint),
+        jp("destructiveHint", dest_hint),
+        jp("idempotentHint", idemp_hint)
+    )
+    var tool_obj = LB()
+    tool_obj = tool_obj + jp("name", js(name))
+    tool_obj = tool_obj + "," + jp("description", js(description))
+    tool_obj = tool_obj + "," + jp("inputSchema", schema)
+    tool_obj = tool_obj + "," + jp("annotations", annotations)
+    tool_obj = tool_obj + RB()
+    tool_obj
+
+# --- Make all 6 metadata tools ---
+
+fn make_metadata_tools() -> [text]:
+    var tools: [text] = []
+
+    # 1. manage_frontmatter
+    var mf_props = LB()
+    mf_props = mf_props + jp("path", make_string_prop("Relative path to the note in the vault"))
+    mf_props = mf_props + "," + jp("operation", make_string_prop("Operation: get, set, delete, or get_all"))
+    mf_props = mf_props + "," + jp("field", make_string_prop("Field name (required for get/set/delete)"))
+    mf_props = mf_props + "," + jp("value", make_string_prop("Value to set (required for set operation)"))
+    mf_props = mf_props + RB()
+    tools.push(make_tool_rw(
+        "manage_frontmatter",
+        "Manage YAML frontmatter fields in an Obsidian note. Supports get, set, delete, and get_all operations.",
+        mf_props,
+        ja([js("path"), js("operation")]),
+        false
+    ))
+
+    # 2. add_tags
+    var at_props = LB()
+    at_props = at_props + jp("path", make_string_prop("Relative path to the note in the vault"))
+    at_props = at_props + "," + jp("tags", make_string_prop("Comma-separated list of tags to add"))
+    at_props = at_props + RB()
+    tools.push(make_tool_rw(
+        "add_tags",
+        "Add one or more tags to a note's frontmatter tags array.",
+        at_props,
+        ja([js("path"), js("tags")]),
+        false
+    ))
+
+    # 3. remove_tags
+    var rt_props = LB()
+    rt_props = rt_props + jp("path", make_string_prop("Relative path to the note in the vault"))
+    rt_props = rt_props + "," + jp("tags", make_string_prop("Comma-separated list of tags to remove"))
+    rt_props = rt_props + RB()
+    tools.push(make_tool_rw(
+        "remove_tags",
+        "Remove one or more tags from a note's frontmatter tags array.",
+        rt_props,
+        ja([js("path"), js("tags")]),
+        false
+    ))
+
+    # 4. rename_tag
+    var rn_props = LB()
+    rn_props = rn_props + jp("old_tag", make_string_prop("Current tag name to rename"))
+    rn_props = rn_props + "," + jp("new_tag", make_string_prop("New tag name to replace with"))
+    rn_props = rn_props + RB()
+    tools.push(make_tool_rw(
+        "rename_tag",
+        "Rename a tag across all notes in the vault (both frontmatter and inline #tag occurrences).",
+        rn_props,
+        ja([js("old_tag"), js("new_tag")]),
+        false
+    ))
+
+    # 5. batch_read_notes
+    var br_props = LB()
+    br_props = br_props + jp("paths", make_string_prop("Comma-separated list of relative note paths to read"))
+    br_props = br_props + RB()
+    tools.push(make_tool_rw(
+        "batch_read_notes",
+        "Read multiple notes at once. Returns content and metadata for each note.",
+        br_props,
+        ja([js("paths")]),
+        true
+    ))
+
+    # 6. list_files
+    var lf_props = LB()
+    lf_props = lf_props + jp("directory", make_string_prop("Subdirectory to list (default: vault root)"))
+    lf_props = lf_props + "," + jp("pattern", make_string_prop("Glob pattern to filter files (default: *.md)"))
+    lf_props = lf_props + RB()
+    tools.push(make_tool_rw(
+        "list_files",
+        "List files in the vault, optionally filtered by directory and glob pattern.",
+        lf_props,
+        ja([]),
+        true
+    ))
+
+    tools

@@ -1,0 +1,13 @@
+{{#layout "application"}}
+
+<h1>Our Menu</h1>
+
+{{#each templates}}
+<div class="card">
+    <h2>{{name}}</h2>
+    <p>{{description}}</p>
+    <a href="/menu/{{id}}" class="btn">View Menu</a>
+</div>
+{{/each}}
+
+{{/layout}}

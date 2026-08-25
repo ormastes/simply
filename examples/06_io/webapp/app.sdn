@@ -1,0 +1,20 @@
+app:
+  name: "todo-app"
+  env: "development"
+  secret_key: "${TODO_SECRET_KEY}"
+
+server:
+  listen: "0.0.0.0:3000"
+  worker_count: 0
+
+database:
+  path: "todos.db"
+
+session:
+  store: "database"
+  ttl_seconds: 86400
+  cookie_name: "_todo_session"
+
+assets:
+  path: "public"
+  fingerprint: false

@@ -1,0 +1,113 @@
+# Unit tests for periodic notes & template module
+# @cover src/core/periodic.spl 80%
+
+use src.core.periodic.{get_daily_note_path, get_periodic_note_path, get_today_date, apply_template, list_templates, compute_quarter, extract_year, extract_month, format_daily_filename, filename_stem, list_contains}
+
+describe "periodic":
+    """Tests for periodic notes and template functions"""
+
+    describe "get_daily_note_path":
+        it "returns default path for date":
+            # Default folder is "daily", default format is YYYY-MM-DD
+            # Uses a vault path that has no .obsidian/daily-notes.json
+            val path = get_daily_note_path("/tmp/test_vault_nonexistent", "2024-06-15")
+            expect(path).to_contain("daily/")
+            expect(path).to_contain("2024-06-15")
+            expect(path).to_end_with(".md")
+
+        it "includes vault path prefix":
+            val path = get_daily_note_path("/my/vault", "2024-01-01")
+            expect(path).to_start_with("/my/vault/")
+
+    describe "get_periodic_note_path":
+        it "returns weekly path":
+            val path = get_periodic_note_path("/vault", "weekly", "2024-06-15")
+            expect(path).to_start_with("/vault/weekly/")
+            expect(path).to_contain("2024-W")
+            expect(path).to_end_with(".md")
+
+        it "returns monthly path":
+            val path = get_periodic_note_path("/vault", "monthly", "2024-06-15")
+            expect(path).to_equal("/vault/monthly/2024-06.md")
+
+        it "returns quarterly path":
+            val path = get_periodic_note_path("/vault", "quarterly", "2024-06-15")
+            expect(path).to_equal("/vault/quarterly/2024-Q2.md")
+
+        it "returns yearly path":
+            val path = get_periodic_note_path("/vault", "yearly", "2024-06-15")
+            expect(path).to_equal("/vault/yearly/2024.md")
+
+        it "computes Q1 for January":
+            val path = get_periodic_note_path("/vault", "quarterly", "2024-01-20")
+            expect(path).to_contain("Q1")
+
+        it "computes Q3 for September":
+            val path = get_periodic_note_path("/vault", "quarterly", "2024-09-10")
+            expect(path).to_contain("Q3")
+
+        it "computes Q4 for December":
+            val path = get_periodic_note_path("/vault", "quarterly", "2024-12-25")
+            expect(path).to_contain("Q4")
+
+    describe "date helpers":
+        it "extracts year from date":
+            expect(extract_year("2024-06-15")).to_equal("2024")
+
+        it "extracts month from date":
+            expect(extract_month("2024-06-15")).to_equal("06")
+
+        it "computes quarter for month 3":
+            expect(compute_quarter("2024-03-15")).to_equal(1)
+
+        it "computes quarter for month 7":
+            expect(compute_quarter("2024-07-01")).to_equal(3)
+
+    describe "format_daily_filename":
+        it "replaces YYYY-MM-DD format":
+            val result = format_daily_filename("2024-06-15", "YYYY-MM-DD")
+            expect(result).to_equal("2024-06-15")
+
+        it "handles custom format":
+            val result = format_daily_filename("2024-06-15", "YYYY_MM_DD")
+            expect(result).to_equal("2024_06_15")
+
+    describe "filename_stem":
+        it "extracts stem from simple filename":
+            expect(filename_stem("meeting.md")).to_equal("meeting")
+
+        it "extracts stem from path":
+            expect(filename_stem("notes/daily/2024-01-15.md")).to_equal("2024-01-15")
+
+        it "handles no extension":
+            expect(filename_stem("readme")).to_equal("readme")
+
+    describe "list_contains":
+        it "finds existing item":
+            val items: [text] = ["a", "b", "c"]
+            expect(list_contains(items, "b")).to_equal(true)
+
+        it "returns false for missing item":
+            val items: [text] = ["a", "b", "c"]
+            expect(list_contains(items, "d")).to_equal(false)
+
+    describe "apply_template":
+        it "replaces variables in template":
+            # Uses the sample_vault fixture which has templates/meeting.md
+            val vault = "test/fixtures/sample_vault"
+            val ok = apply_template(vault, "templates/meeting.md", "meetings/standup-2024-06-15.md", "title=Monday Standup")
+            # Result depends on file system; just verify the function runs
+            # In interpreter mode this verifies the function signature and types
+            expect(ok.?).to_equal(true)
+
+    describe "get_today_date":
+        it "returns a date string":
+            val today = get_today_date()
+            expect(today.len()).to_be_greater_than(0)
+            # Should contain dashes for YYYY-MM-DD format
+            expect(today).to_contain("-")
+
+    describe "list_templates":
+        it "returns empty for nonexistent vault":
+            val templates = list_templates("/tmp/nonexistent_vault_xyz")
+            expect(templates.len()).to_equal(0)

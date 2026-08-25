@@ -1,0 +1,137 @@
+"""
+fil_nand_emu_check — conformance + physics regression for the Vt-backed NAND.
+
+Two oracles, absolute (known values at known points), not self-comparison:
+
+  A. The fil-facing seam of `NandEmu` matches `fil_nand_device` behaviour for the
+     same ops — program/read round-trip (data + OOB + stored ECC), the no-overwrite
+     status code, erase clearing + count, bad-block rejection, one-shot program /
+     erase faults, and injected read bit-flip count. Two honest real-NAND
+     divergences are asserted directly: an erased page reads FFh (not the
+     placeholder 0), OOB still UNMAP.
+
+  B. The physics the backend exists for: a page programmed onto a WORN block and
+     aged one year reads back with real bit flips at the default read reference
+     (the programmed cells' threshold voltage has drooped below vref), and reads
+     CLEAN once the reference is lowered (read-retry) — the exact FTL-visible
+     retention failure. A Sudden-Power-Off during program is also shown to leave
+     the page silently unwritten.
+
+Addresses stay within the S1 window (blocks 0-7, pages 0-3) so nothing fold-aliases.
+
+Run: bin/simple run examples/09_embedded/simpleos_nvme_fw/fw/fil_nand_emu_check.spl
+Gate: prints "FIL NAND EMU OK" and exits 0.
+"""
+
+use nvme_types.*
+use fil_nand.*        # NandRead
+use fil_ecc.*         # ecc_compute
+use fil_nand_emu.*    # NandEmu
+use std.hardware.nand_emu.nand_types.{NeFault, NeFaultKind, NeOpKind}
+
+fn main():
+    var fail: i64 = 0
+
+    # ── A. conformance: matches fil_nand_device for the same ops ─────────────
+    var emu: NandEmu = nand_emu_new()
+
+    # Program + read round-trips main byte + OOB + stored ECC exactly at t=0
+    # (no drift), just like fil_nand_device.
+    val pa: i64 = block_first_ppn(3) + 1        # block 3, page 1 (in-window, 1:1)
+    fail = fail + expect_eq(emu.program(pa, 42, 7, 0xAB), NAND_OK, "program returns NAND_OK")
+    val r0: NandRead = emu.read_page(pa)
+    fail = fail + expect_eq(r0.data, 0xAB, "read main byte round-trips")
+    fail = fail + expect_eq(r0.lba, 42, "read OOB lba round-trips")
+    fail = fail + expect_eq(r0.seq, 7, "read OOB seq round-trips")
+    fail = fail + expect_eq(r0.ecc, ecc_compute(0xAB, 42, 7), "read stored ECC round-trips")
+    fail = fail + expect_eq(r0.err, 0, "read err == 0 on a clean page")
+
+    val pd: i64 = block_first_ppn(2) + 3        # block 2, page 3 (distinct S1 cell)
+    fail = fail + expect_eq(emu.program(pd, 13, 13, 13), NAND_OK, "program second page")
+    val rd: NandRead = emu.read_page(pd)
+    fail = fail + expect_eq(rd.data, 13, "second page main byte round-trips")
+    fail = fail + expect_eq(rd.lba, 13, "second page OOB lba round-trips")
+
+    # No overwrite without an erase (NAND cannot turn a 0 back into a 1).
+    fail = fail + expect_eq(emu.program(pa, 99, 9, 0x55), NAND_PROG_FAIL, "no-overwrite -> PROG_FAIL")
+    fail = fail + expect_eq(emu.read_page(pa).data, 0xAB, "refused overwrite left the page intact")
+
+    # Real-NAND erased state: a never-programmed page reads FFh (divergence from
+    # fil_nand_device's placeholder 0), OOB still UNMAP.
+    val pu: i64 = block_first_ppn(6) + 2
+    val ru: NandRead = emu.read_page(pu)
+    fail = fail + expect_eq(ru.data, 0xFF, "erased page reads FFh (real NAND erased state)")
+    fail = fail + expect_eq(ru.lba, UNMAP, "erased page OOB reads UNMAP")
+
+    # Erase clears the block (data -> FFh, OOB -> UNMAP) and bumps the erase count.
+    fail = fail + expect_eq(emu.erase_count(3), 0, "erase_count before erase")
+    fail = fail + expect_eq(emu.erase_block(3), NAND_OK, "erase returns NAND_OK")
+    val re: NandRead = emu.read_page(pa)
+    fail = fail + expect_eq(re.lba, UNMAP, "OOB cleared after erase")
+    fail = fail + expect_eq(re.data, 0xFF, "erased page reads FFh after erase")
+    fail = fail + expect_eq(emu.erase_count(3), 1, "erase_count after erase")
+    fail = fail + expect_eq(emu.program(pa, 1, 1, 0x77), NAND_OK, "reprogram after erase ok")
+
+    # Bad block: program + erase both rejected.
+    emu.set_bad(7)
+    fail = fail + expect_eq(emu.program(block_first_ppn(7), 1, 1, 1), NAND_BAD_BLOCK, "program to bad block -> BAD_BLOCK")
+    fail = fail + expect_eq(emu.erase_block(7), NAND_BAD_BLOCK, "erase of bad block -> BAD_BLOCK")
+
+    # One-shot program fault then recovery.
+    emu.inject_prog_fail(4)
+    val p4: i64 = block_first_ppn(4)
+    fail = fail + expect_eq(emu.program(p4, 5, 5, 0x33), NAND_PROG_FAIL, "inject_prog_fail -> PROG_FAIL")
+    fail = fail + expect_eq(emu.program(p4, 5, 5, 0x33), NAND_OK, "program ok after one-shot clears")
+    fail = fail + expect_eq(emu.read_page(p4).data, 0x33, "post-recovery read round-trips")
+
+    # One-shot erase fault then recovery.
+    emu.inject_erase_fail(5)
+    fail = fail + expect_eq(emu.erase_block(5), NAND_ERASE_FAIL, "inject_erase_fail -> ERASE_FAIL")
+    fail = fail + expect_eq(emu.erase_block(5), NAND_OK, "erase ok after one-shot clears")
+
+    # Injected read bit-flip count surfaces in the read err field; data stays intact.
+    val pf: i64 = block_first_ppn(1)
+    fail = fail + expect_eq(emu.program(pf, 2, 2, 0x5A), NAND_OK, "program bit-flip test page")
+    emu.inject_read_bitflip(pf, 3)
+    fail = fail + expect_eq(emu.read_page(pf).err, 3, "injected bit-flip count -> read err")
+    fail = fail + expect_eq(emu.read_page(pf).data, 0x5A, "data intact under bit-flip injection")
+    emu.inject_read_bitflip(pf, -1)
+    fail = fail + expect_eq(emu.read_page(pf).err, 0, "negative bit-flip injection clamps to zero")
+
+    # Silent media corruption: read returns the corrupted byte, stored ECC intact.
+    emu.corrupt_page_data(pf, 0x5B)
+    val rc: NandRead = emu.read_page(pf)
+    fail = fail + expect_eq(rc.data, 0x5B, "corrupt_page_data changes sensed byte")
+    fail = fail + expect_eq(rc.ecc, ecc_compute(0x5A, 2, 2), "corrupt_page_data leaves stored ECC intact")
+
+    # ── B. physics: retention on a worn block flips bits, retry recovers ──────
+    var ret: NandEmu = nand_emu_new()
+    val rp: i64 = block_first_ppn(0)            # block 0, page 0 (in-window)
+    # Program 0x00: all eight column-0 cells are driven to the programmed lobe,
+    # so there are no erased cells at the read column to muddy the retry margin.
+    fail = fail + expect_eq(ret.program(rp, 100, 1, 0x00), NAND_OK, "program worn-block page")
+    fail = fail + expect_eq(ret.read_page(rp).data, 0x00, "fresh programmed page reads back exactly")
+
+    ret.set_block_wear(0, 3000)                 # model a heavily P/E-cycled block
+    ret.advance_time_s(31536000.0)              # age one year
+
+    val aged: NandRead = ret.read_page(rp)      # default reference (vref = 128)
+    ret.set_vref_offset(-20)                    # read-retry reference (vref = 108)
+    val clean: NandRead = ret.read_page(rp)
+    ret.set_vref_offset(0)
+    print "  PROBE retention: aged.data={aged.data} clean.data={clean.data} aged.err={aged.err}"
+
+    fail = fail + expect_eq(aged.data, 0xFF, "aged worn page reads flipped bits at default vref")
+    fail = fail + expect_eq(clean.data, 0x00, "read-retry offset recovers the data cleanly")
+
+    # ── B'. Sudden-Power-Off during program leaves the page silently unwritten ─
+    var spo: NandEmu = nand_emu_new()
+    val sp: i64 = block_first_ppn(1) + 1
+    spo.inject(NeFault(kind: NeFaultKind.SuddenPowerOff, op: NeOpKind.Program, at_pulse: 1, target_row: -1, target_block: -1, arg_ns: 0))
+    fail = fail + expect_eq(spo.program(sp, 55, 5, 0x00), NAND_OK, "SPO program does not raise the FAIL bit")
+    fail = fail + expect_eq(spo.read_page(sp).data, 0xFF, "SPO aborted the ISPP -> page stayed erased (torn write)")
+
+    if fail == 0:
+        print "FIL NAND EMU OK"
+    else:
+        print "FIL NAND EMU FAIL ({fail})"

@@ -1,0 +1,119 @@
+use std.cuda.{cuda_init, cuda_device_count, cuda_device_get, cuda_ctx_create, cuda_mem_alloc, cuda_mem_free, cuda_sync}
+use std.common.binary_io.{f32_to_bits, f32_from_bits}
+use gc_async_mut.gpu_ops.{gpu_global_id_x, gpu_local_id_x, gpu_block_dim_x, gpu_load_f32, gpu_store_f32, gpu_atomic_add_i32, gpu_atomic_add_f32, gpu_shared_array_f32, gpu_shared_load_f32, gpu_shared_store_f32, gpu_syncthreads}
+use gc_async_mut.gpu_types.{GpuPtr}
+
+extern fn rt_cuda_memcpy_htod_array(dst: i64, src: [u8], size: i64) -> i64
+extern fn rt_cuda_memcpy_dtoh(dst_host: i64, src_device: i64, size: i64) -> i64
+extern fn rt_alloc(size: i64) -> i64
+extern fn rt_free(ptr: i64)
+extern fn rt_ptr_read_u8(ptr: i64, offset: i64) -> i64
+
+fn upload_bytes(dev: i64, bs: [u8]) -> bool:
+    rt_cuda_memcpy_htod_array(dev, bs, bs.len()) == 0
+
+fn download_bytes(dev: i64, size: i64) -> [u8]:
+    val staging = rt_alloc(size)
+    val rc = rt_cuda_memcpy_dtoh(staging, dev, size)
+    var out: [u8] = []
+    if rc == 0:
+        for i in 0..size:
+            out.push(rt_ptr_read_u8(staging, i) as u8)
+    rt_free(staging)
+    out
+
+fn f32s_to_bytes(xs: [f32]) -> [u8]:
+    var out: [u8] = []
+    for x in xs:
+        val b = f32_to_bits(x)
+        out.push((b & 0xFFu32) as u8)
+        out.push(((b >> 8) & 0xFFu32) as u8)
+        out.push(((b >> 16) & 0xFFu32) as u8)
+        out.push(((b >> 24) & 0xFFu32) as u8)
+    out
+
+fn bytes_to_f32s(bs: [u8]) -> [f32]:
+    var out: [f32] = []
+    val n = bs.len() / 4
+    for i in 0..n:
+        val b = (bs[i*4] as u32) | ((bs[i*4+1] as u32) << 8) | ((bs[i*4+2] as u32) << 16) | ((bs[i*4+3] as u32) << 24)
+        out.push(f32_from_bits(b))
+    out
+
+fn bytes_to_i32s(bs: [u8]) -> [i64]:
+    var out: [i64] = []
+    val n = bs.len() / 4
+    for i in 0..n:
+        out.push((bs[i*4] as i64) | ((bs[i*4+1] as i64) << 8) | ((bs[i*4+2] as i64) << 16) | ((bs[i*4+3] as i64) << 24))
+    out
+
+fn as_gpu(p: i64, size: i64) -> GpuPtr:
+    GpuPtr(device_ptr: p, size: size, is_valid: p > 0)
+
+@gpu_kernel
+fn scale_k(a: GpuPtr, c: GpuPtr, n: i64):
+    val i = gpu_global_id_x()
+    if i < n:
+        gpu_store_f32(c, i, gpu_load_f32(a, i) * 2.0)
+
+@gpu_kernel
+fn count_k(cnt: GpuPtr, n: i64):
+    val i = gpu_global_id_x()
+    if i < n:
+        gpu_atomic_add_i32(cnt, 0, 1)
+
+@gpu_kernel
+fn reduce_k(a: GpuPtr, out: GpuPtr, n: i64):
+    val sh = gpu_shared_array_f32(256)
+    val tid = gpu_local_id_x()
+    val gi = gpu_global_id_x()
+    if gi < n:
+        gpu_shared_store_f32(sh, tid, gpu_load_f32(a, gi))
+    else:
+        gpu_shared_store_f32(sh, tid, 0.0)
+    gpu_syncthreads()
+    var s = gpu_block_dim_x() / 2
+    while s > 0:
+        if tid < s:
+            gpu_shared_store_f32(sh, tid, gpu_shared_load_f32(sh, tid) + gpu_shared_load_f32(sh, tid + s))
+        gpu_syncthreads()
+        s = s / 2
+    if tid == 0:
+        gpu_atomic_add_f32(out, 0, gpu_shared_load_f32(sh, 0))
+
+fn main():
+    print "init={cuda_init()} count={cuda_device_count()}"
+    val ctx = cuda_ctx_create(cuda_device_get(0))
+    print "ctx>0={ctx > 0}"
+    val n = 1024
+    var h: [f32] = []
+    for i in 0..n:
+        h.push(1.0 + (i as f32))
+    val a = cuda_mem_alloc(n * 4)
+    val c = cuda_mem_alloc(n * 4)
+    print "alloc {a > 0} {c > 0}"
+    print "upload {upload_bytes(a, f32s_to_bytes(h))}"
+    val back = bytes_to_f32s(download_bytes(a, n * 4))
+    print "roundtrip len={back.len()} b0={back[0]} b1023={back[1023]} (expect 1.0, 1024.0)"
+    scale_k<<<grid: (4, 1, 1), block: (256, 1, 1)>>>(as_gpu(a, n*4), as_gpu(c, n*4), n)
+    print "sync {cuda_sync()}"
+    val r = bytes_to_f32s(download_bytes(c, n * 4))
+    print "scale r0={r[0]} r1023={r[1023]} (expect 2.0, 2048.0)"
+    val cnt = cuda_mem_alloc(4)
+    var z: [u8] = [0u8, 0u8, 0u8, 0u8]
+    upload_bytes(cnt, z)
+    count_k<<<grid: (4, 1, 1), block: (256, 1, 1)>>>(as_gpu(cnt, 4), n)
+    cuda_sync()
+    val rc = bytes_to_i32s(download_bytes(cnt, 4))
+    print "count={rc[0]} (expect 1024)"
+    val out = cuda_mem_alloc(4)
+    upload_bytes(out, z)
+    reduce_k<<<grid: (4, 1, 1), block: (256, 1, 1)>>>(as_gpu(a, n*4), as_gpu(out, 4), n)
+    cuda_sync()
+    val ro = bytes_to_f32s(download_bytes(out, 4))
+    print "sum={ro[0]} (expect 524800.0)"
+    cuda_mem_free(a)
+    cuda_mem_free(c)
+    cuda_mem_free(cnt)
+    cuda_mem_free(out)
+    print "done"

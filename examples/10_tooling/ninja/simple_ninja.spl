@@ -1,0 +1,201 @@
+## simple_ninja — Ninja-like fast build system for SimpleOS
+##
+## Parses build.ninja files and executes build rules with
+## dependency tracking and parallel execution.
+##
+## Usage:
+##   bin/simple run examples/ninja/simple_ninja.spl
+##   bin/simple run examples/ninja/simple_ninja.spl -- -j 4
+##   bin/simple run examples/ninja/simple_ninja.spl -- -f build.ninja hello
+##   bin/simple run examples/ninja/simple_ninja.spl -- -n -v
+
+use std.fs
+use std.process
+use std.text
+use std.cli
+
+# Import project modules
+use ninja_parser
+use ninja_builder
+
+# --- CLI ---
+
+struct NinjaCliArgs:
+    build_file: text
+    targets: [text]
+    jobs: i64
+    dry_run: bool
+    verbose: bool
+    show_help: bool
+    clean: bool
+
+fn parse_cli_args(args: [text]) -> NinjaCliArgs:
+    """Parse command-line arguments."""
+    var build_file = "build.ninja"
+    var targets: [text] = []
+    var jobs = 1
+    var dry_run = false
+    var verbose = false
+    var show_help = false
+    var clean = false
+
+    var i = 0
+    while i < args.len():
+        val arg = args[i]
+
+        if arg == "-f":
+            i = i + 1
+            if i < args.len():
+                build_file = args[i]
+
+        else if arg == "-j":
+            i = i + 1
+            if i < args.len():
+                jobs = args[i].parse_int()
+
+        else if arg == "-n" or arg == "--dry-run":
+            dry_run = true
+
+        else if arg == "-v" or arg == "--verbose":
+            verbose = true
+
+        else if arg == "-t":
+            i = i + 1
+            if i < args.len() and args[i] == "clean":
+                clean = true
+
+        else if arg == "--help" or arg == "-h":
+            show_help = true
+
+        else if not arg.starts_with("-"):
+            targets.push(arg)
+
+        i = i + 1
+
+    # Auto-detect parallelism if not specified
+    if jobs <= 0:
+        jobs = detect_cpu_count()
+
+    NinjaCliArgs(
+        build_file: build_file,
+        targets: targets,
+        jobs: jobs,
+        dry_run: dry_run,
+        verbose: verbose,
+        show_help: show_help,
+        clean: clean,
+    )
+
+fn detect_cpu_count() -> i64:
+    """Detect the number of CPU cores available."""
+    val result = process.run("nproc", [])
+    if result.exit_code == 0:
+        val n = result.stdout.trim().parse_int()
+        if n > 0:
+            return n
+    # Fallback for macOS
+    val result2 = process.run("sysctl", ["-n", "hw.ncpu"])
+    if result2.exit_code == 0:
+        val n = result2.stdout.trim().parse_int()
+        if n > 0:
+            return n
+    # Default
+    4
+
+fn print_help():
+    print "simple_ninja -- Ninja-like fast build system"
+    print ""
+    print "Usage:"
+    print "  simple_ninja [options] [targets...]"
+    print ""
+    print "Options:"
+    print "  -f FILE       Specify build file (default: build.ninja)"
+    print "  -j N          Number of parallel jobs (default: auto-detect)"
+    print "  -n, --dry-run Show commands without executing"
+    print "  -v, --verbose Show full command lines"
+    print "  -t clean      Remove all built outputs"
+    print "  --help, -h    Show this help"
+    print ""
+    print "Build file format:"
+    print "  rule cc"
+    print "    command = cc -c $in -o $out"
+    print "    description = CC $out"
+    print ""
+    print "  build foo.o: cc foo.c"
+    print "  build foo.o: cc foo.c | header.h"
+    print "  build foo.o: cc foo.c || generated.h"
+    print ""
+    print "  pool heavy"
+    print "    depth = 2"
+    print ""
+    print "  default hello"
+
+# --- Clean ---
+
+fn clean_outputs(build_file: NinjaBuildFile):
+    """Remove all output files."""
+    var count = 0
+    for edge in build_file.build_edges:
+        for out in edge.outputs:
+            if fs.exists(out):
+                fs.remove(out)
+                print "[ninja] Removed {out}"
+                count = count + 1
+    print "[ninja] Cleaned {count} files."
+
+# --- Main ---
+
+fn main():
+    val args = cli.args()
+    val cli_args = parse_cli_args(args)
+
+    if cli_args.show_help:
+        print_help()
+        return
+
+    # Read build file
+    if not fs.exists(cli_args.build_file):
+        print "[ninja] Error: {cli_args.build_file} not found"
+        process.exit(1)
+
+    val build_file = parse_ninja_file(cli_args.build_file)
+
+    # Clean mode
+    if cli_args.clean:
+        clean_outputs(build_file)
+        return
+
+    # Determine targets
+    var targets = cli_args.targets
+    if targets.len() == 0:
+        targets = get_default_targets(build_file)
+
+    if targets.len() == 0:
+        print "[ninja] Error: no targets specified and no default targets"
+        process.exit(1)
+
+    # Report
+    val total_edges = build_file.build_edges.len()
+    print "[ninja] {total_edges} build edges, {build_file.rules.len()} rules"
+    if cli_args.jobs > 1:
+        print "[ninja] Using {cli_args.jobs} parallel jobs"
+
+    # Build
+    val state = create_build_state(
+        build_file,
+        targets,
+        cli_args.jobs,
+        cli_args.dry_run,
+        cli_args.verbose,
+    )
+
+    val ok = build_targets(state)
+
+    if ok:
+        if state.total_tasks == 0:
+            print "[ninja] No work to do."
+        else:
+            print "[ninja] Build complete."
+    else:
+        print "[ninja] Build FAILED."
+        process.exit(1)

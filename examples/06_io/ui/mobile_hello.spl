@@ -1,0 +1,16 @@
+# Mobile Hello — Simple GUI lib over the Tauri (v2) mobile backend.
+#
+# Exercises the core mobile widgets: list, button, textfield/input (textbox),
+# scroll, checkbox and radio. The same .ui.sdn renders inside the Tauri iOS /
+# Android webview shell (tools/tauri-shell) and on the desktop Tauri window.
+#
+# Desktop launch (identical render path to mobile):
+#   tools/tauri-shell/run-desktop.command bin/simple examples/ui/mobile_hello.ui.sdn
+#
+# iOS / Android: the shell bundles `bin/simple` and runs this entry inside the
+# native webview (see tools/tauri-shell/run-ios.command / run-android.command).
+
+use app.ui.tauri.app.{run_tauri_mobile}
+
+fn main() -> i64:
+    return run_tauri_mobile("examples/ui/mobile_hello.ui.sdn", 3000)

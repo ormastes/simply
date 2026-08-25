@@ -1,0 +1,153 @@
+#!/usr/bin/env simple
+# MIR Serialization Integration Test
+#
+# Demonstrates that MIR serialization works by:
+# 1. Creating simple MIR structures
+# 2. Serializing them to JSON
+# 3. Verifying the output
+
+use compiler.mir.*
+use compiler.hir.SymbolId
+use compiler.lexer.Span
+use app.io
+
+fn main():
+    print "Testing MIR Serialization..."
+    print ""
+
+    # Test 1: Serialize types
+    print "=== Type Serialization ==="
+    val i64_type = MirType(kind: MirTypeKind.I64)
+    val json1 = serialize_mir_type(i64_type)
+    print "I64 type: {json1}"
+
+    val bool_type = MirType(kind: MirTypeKind.Bool)
+    val json2 = serialize_mir_type(bool_type)
+    print "Bool type: {json2}"
+
+    val ptr_type = MirType(kind: MirTypeKind.Ptr(i64_type, true))
+    val json3 = serialize_mir_type(ptr_type)
+    print "Ptr<I64, mut> type: {json3}"
+    print ""
+
+    # Test 2: Serialize constants
+    print "=== Constant Value Serialization ==="
+    val const_int = MirConstValue.Int(42)
+    val json4 = serialize_const_value(const_int)
+    print "Int(42): {json4}"
+
+    val const_bool = MirConstValue.Bool(true)
+    val json5 = serialize_const_value(const_bool)
+    print "Bool(true): {json5}"
+
+    val const_str = MirConstValue.Str("hello")
+    val json6 = serialize_const_value(const_str)
+    print "Str(\"hello\"): {json6}"
+    print ""
+
+    # Test 3: Serialize operands
+    print "=== Operand Serialization ==="
+    val local_id = LocalId(id: 5)
+    val operand1 = MirOperand(kind: MirOperandKind.Copy(local_id))
+    val json7 = serialize_operand(operand1)
+    print "Copy(local 5): {json7}"
+
+    val operand2 = MirOperand(kind: MirOperandKind.Move(local_id))
+    val json8 = serialize_operand(operand2)
+    print "Move(local 5): {json8}"
+
+    val operand3 = MirOperand(kind: MirOperandKind.Const(const_int, i64_type))
+    val json9 = serialize_operand(operand3)
+    print "Const(42, i64): {json9}"
+    print ""
+
+    # Test 4: Serialize binary operations
+    print "=== Binary Operation Serialization ==="
+    print "Add: {serialize_binop(MirBinOp.Add)}"
+    print "Mul: {serialize_binop(MirBinOp.Mul)}"
+    print "Eq: {serialize_binop(MirBinOp.Eq)}"
+    print "BroadcastAdd: {serialize_binop(MirBinOp.BroadcastAdd)}"
+    print ""
+
+    # Test 5: Serialize instructions
+    print "=== Instruction Serialization ==="
+    val dest = LocalId(id: 1)
+    val inst1 = MirInstKind.Const(dest, const_int, i64_type)
+    val json10 = serialize_mir_inst_kind(inst1)
+    print "Const instruction: {json10}"
+
+    val src = LocalId(id: 2)
+    val inst2 = MirInstKind.Copy(dest, src)
+    val json11 = serialize_mir_inst_kind(inst2)
+    print "Copy instruction: {json11}"
+    print ""
+
+    # Test 6: Serialize terminators
+    print "=== Terminator Serialization ==="
+    val target = BlockId(id: 3)
+    val term1 = MirTerminator.Goto(target)
+    val json12 = serialize_mir_terminator(term1)
+    print "Goto(block 3): {json12}"
+
+    val term2 = MirTerminator.Return(Some(operand1))
+    val json13 = serialize_mir_terminator(term2)
+    print "Return(Some(...)): {json13}"
+
+    val term3 = MirTerminator.Return(nil)
+    val json14 = serialize_mir_terminator(term3)
+    print "Return(None): {json14}"
+    print ""
+
+    # Test 7: Serialize a simple function
+    print "=== Function Serialization ==="
+    val signature = MirSignature(
+        params: [i64_type],
+        return_type: i64_type,
+        is_variadic: false
+    )
+
+    val local = MirLocal(
+        id: LocalId(id: 0),
+        name: Some("x"),
+        type_: i64_type,
+        kind: LocalKind.Arg(0)
+    )
+
+    val entry_block = MirBlock(
+        id: BlockId(id: 0),
+        label: Some("entry"),
+        instructions: [],
+        terminator: MirTerminator.Return(Some(MirOperand(kind: MirOperandKind.Copy(LocalId(id: 0)))))
+    )
+
+    val func = MirFunction(
+        symbol: SymbolId(id: 1),
+        name: "identity",
+        signature: signature,
+        locals: [local],
+        blocks: [entry_block],
+        entry_block: BlockId(id: 0),
+        span: Span(file: "", start: 0, end: 0),
+        generic_params: [],
+        is_generic_template: false,
+        specialization_of: nil,
+        type_bindings: {}
+    )
+
+    val json15 = serialize_mir_function(func)
+    print "Function JSON (first 200 chars):"
+    if json15.len() > 200:
+        print json15[0:200] + "..."
+    else:
+        print json15
+    print ""
+
+    # Test 8: JSON string escaping
+    print "=== JSON String Escaping ==="
+    print "Quotes: {escape_json_string("say \"hello\"")}"
+    print "Backslash: {escape_json_string("path\\to\\file")}"
+    print "Newline: {escape_json_string("line1\nline2")}"
+    print "Tab: {escape_json_string("col1\tcol2")}"
+    print ""
+
+    print "✅ All serialization tests completed!"

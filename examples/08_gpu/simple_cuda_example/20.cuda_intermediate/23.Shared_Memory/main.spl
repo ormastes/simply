@@ -1,0 +1,317 @@
+# Exercise 23: Shared Memory - Parallel Reduction
+#
+# Three reduction kernels of increasing quality, each writing one partial sum
+# per block into `output[blockIdx.x]`; the host adds the partials:
+#
+#   reduce_naive       interleaved addressing with `tid % (2*s) == 0`
+#                      (divergent warps, bank conflicts)
+#   reduce_sequential  sequential addressing `if tid < s: sh[tid] += sh[tid+s]`
+#                      (no divergence within a warp until s < 32)
+#   reduce_optimized   first add during the global load (each thread reads two
+#                      elements, half as many blocks) + sequential addressing
+#
+# Kernels are hand-written PTX launched through `std.cuda` (see
+# lib/gpu_test_helpers.spl for why). They mirror reduction.cu in
+# cuda_exercise/20.cuda_intermediate/23.Shared_Memory.
+
+use ..gpu_test_helpers.{
+    gpu_setup, gpu_teardown,
+    gpu_upload_f32s, gpu_download_f32s, gpu_alloc_zeroed_words, gpu_free_ptr,
+    gpu_load_ptx, gpu_unload, gpu_run_1d, grid_for
+}
+
+val BLOCK_SIZE = 256
+
+val PTX = """
+.version 7.0
+.target sm_75
+.address_size 64
+
+// Interleaved addressing:  for (s = 1; s < blockDim; s *= 2) if (tid % (2s) == 0) sh[tid] += sh[tid + s]
+.visible .entry reduce_naive(.param .u64 input, .param .u64 output, .param .u64 n)
+{
+    .reg .pred %p<6>;
+    .reg .b32 %r<20>;
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<20>;
+    .shared .align 4 .b8 sh[1024];
+    ld.param.u64 %rd1, [input];
+    ld.param.u64 %rd2, [output];
+    ld.param.u64 %rd3, [n];
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r4, %r1, %r2, %r3;
+    cvt.u64.u32 %rd4, %r4;
+    mov.f32 %f1, 0f00000000;
+    setp.ge.u64 %p1, %rd4, %rd3;
+    @%p1 bra STORE;
+    shl.b64 %rd5, %rd4, 2;
+    add.u64 %rd6, %rd1, %rd5;
+    ld.global.f32 %f1, [%rd6];
+STORE:
+    mov.u64 %rd7, sh;
+    cvt.u64.u32 %rd8, %r3;
+    shl.b64 %rd9, %rd8, 2;
+    add.u64 %rd10, %rd7, %rd9;
+    st.shared.f32 [%rd10], %f1;
+    bar.sync 0;
+    mov.u32 %r5, 1;
+LOOP:
+    setp.ge.u32 %p2, %r5, %r2;
+    @%p2 bra AFTER;
+    shl.b32 %r6, %r5, 1;
+    rem.u32 %r7, %r3, %r6;
+    setp.ne.u32 %p3, %r7, 0;
+    @%p3 bra SKIP;
+    cvt.u64.u32 %rd11, %r5;
+    shl.b64 %rd12, %rd11, 2;
+    add.u64 %rd13, %rd10, %rd12;
+    ld.shared.f32 %f2, [%rd10];
+    ld.shared.f32 %f3, [%rd13];
+    add.f32 %f4, %f2, %f3;
+    st.shared.f32 [%rd10], %f4;
+SKIP:
+    bar.sync 0;
+    mov.u32 %r5, %r6;
+    bra LOOP;
+AFTER:
+    setp.ne.u32 %p4, %r3, 0;
+    @%p4 bra DONE;
+    ld.shared.f32 %f5, [%rd7];
+    cvt.u64.u32 %rd14, %r1;
+    shl.b64 %rd15, %rd14, 2;
+    add.u64 %rd16, %rd2, %rd15;
+    st.global.f32 [%rd16], %f5;
+DONE:
+    ret;
+}
+
+// Sequential addressing:  for (s = blockDim/2; s > 0; s >>= 1) if (tid < s) sh[tid] += sh[tid + s]
+.visible .entry reduce_sequential(.param .u64 input, .param .u64 output, .param .u64 n)
+{
+    .reg .pred %p<6>;
+    .reg .b32 %r<20>;
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<20>;
+    .shared .align 4 .b8 sh[1024];
+    ld.param.u64 %rd1, [input];
+    ld.param.u64 %rd2, [output];
+    ld.param.u64 %rd3, [n];
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r4, %r1, %r2, %r3;
+    cvt.u64.u32 %rd4, %r4;
+    mov.f32 %f1, 0f00000000;
+    setp.ge.u64 %p1, %rd4, %rd3;
+    @%p1 bra STORE;
+    shl.b64 %rd5, %rd4, 2;
+    add.u64 %rd6, %rd1, %rd5;
+    ld.global.f32 %f1, [%rd6];
+STORE:
+    mov.u64 %rd7, sh;
+    cvt.u64.u32 %rd8, %r3;
+    shl.b64 %rd9, %rd8, 2;
+    add.u64 %rd10, %rd7, %rd9;
+    st.shared.f32 [%rd10], %f1;
+    bar.sync 0;
+    shr.u32 %r5, %r2, 1;
+LOOP:
+    setp.eq.u32 %p2, %r5, 0;
+    @%p2 bra AFTER;
+    setp.ge.u32 %p3, %r3, %r5;
+    @%p3 bra SKIP;
+    cvt.u64.u32 %rd11, %r5;
+    shl.b64 %rd12, %rd11, 2;
+    add.u64 %rd13, %rd10, %rd12;
+    ld.shared.f32 %f2, [%rd10];
+    ld.shared.f32 %f3, [%rd13];
+    add.f32 %f4, %f2, %f3;
+    st.shared.f32 [%rd10], %f4;
+SKIP:
+    bar.sync 0;
+    shr.u32 %r5, %r5, 1;
+    bra LOOP;
+AFTER:
+    setp.ne.u32 %p4, %r3, 0;
+    @%p4 bra DONE;
+    ld.shared.f32 %f5, [%rd7];
+    cvt.u64.u32 %rd14, %r1;
+    shl.b64 %rd15, %rd14, 2;
+    add.u64 %rd16, %rd2, %rd15;
+    st.global.f32 [%rd16], %f5;
+DONE:
+    ret;
+}
+
+// First add during load: i = blockIdx*(2*blockDim) + tid; sh[tid] = in[i] + in[i + blockDim]
+// then sequential addressing. Launch with half as many blocks.
+.visible .entry reduce_optimized(.param .u64 input, .param .u64 output, .param .u64 n)
+{
+    .reg .pred %p<8>;
+    .reg .b32 %r<24>;
+    .reg .f32 %f<10>;
+    .reg .b64 %rd<24>;
+    .shared .align 4 .b8 sh[1024];
+    ld.param.u64 %rd1, [input];
+    ld.param.u64 %rd2, [output];
+    ld.param.u64 %rd3, [n];
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    shl.b32 %r8, %r2, 1;
+    mad.lo.u32 %r4, %r1, %r8, %r3;
+    cvt.u64.u32 %rd4, %r4;
+    mov.f32 %f1, 0f00000000;
+    setp.ge.u64 %p1, %rd4, %rd3;
+    @%p1 bra STORE;
+    shl.b64 %rd5, %rd4, 2;
+    add.u64 %rd6, %rd1, %rd5;
+    ld.global.f32 %f1, [%rd6];
+    cvt.u64.u32 %rd17, %r2;
+    add.u64 %rd18, %rd4, %rd17;
+    setp.ge.u64 %p5, %rd18, %rd3;
+    @%p5 bra STORE;
+    shl.b64 %rd19, %rd18, 2;
+    add.u64 %rd20, %rd1, %rd19;
+    ld.global.f32 %f6, [%rd20];
+    add.f32 %f1, %f1, %f6;
+STORE:
+    mov.u64 %rd7, sh;
+    cvt.u64.u32 %rd8, %r3;
+    shl.b64 %rd9, %rd8, 2;
+    add.u64 %rd10, %rd7, %rd9;
+    st.shared.f32 [%rd10], %f1;
+    bar.sync 0;
+    shr.u32 %r5, %r2, 1;
+LOOP:
+    setp.eq.u32 %p2, %r5, 0;
+    @%p2 bra AFTER;
+    setp.ge.u32 %p3, %r3, %r5;
+    @%p3 bra SKIP;
+    cvt.u64.u32 %rd11, %r5;
+    shl.b64 %rd12, %rd11, 2;
+    add.u64 %rd13, %rd10, %rd12;
+    ld.shared.f32 %f2, [%rd10];
+    ld.shared.f32 %f3, [%rd13];
+    add.f32 %f4, %f2, %f3;
+    st.shared.f32 [%rd10], %f4;
+SKIP:
+    bar.sync 0;
+    shr.u32 %r5, %r5, 1;
+    bra LOOP;
+AFTER:
+    setp.ne.u32 %p4, %r3, 0;
+    @%p4 bra DONE;
+    ld.shared.f32 %f5, [%rd7];
+    cvt.u64.u32 %rd14, %r1;
+    shl.b64 %rd15, %rd14, 2;
+    add.u64 %rd16, %rd2, %rd15;
+    st.global.f32 [%rd16], %f5;
+DONE:
+    ret;
+}
+"""
+
+# ----------------------------------------------------------------------------
+# Host helpers
+# ----------------------------------------------------------------------------
+
+fn make_data(n: i64, fill: f32) -> [f32]:
+    var out: [f32] = []
+    for i in 0..n:
+        out.push(fill)
+    out
+
+fn make_sequential(n: i64) -> [f32]:
+    var out: [f32] = []
+    for i in 0..n:
+        out.push(i as f32)
+    out
+
+fn cpu_sum(data: [f32]) -> f32:
+    var total: f32 = 0.0
+    for x in data:
+        total = total + x
+    total
+
+# Run one reduction kernel: upload, launch `blocks` blocks, download the
+# per-block partials and add them on the host.
+fn run_reduction(module: i64, kernel: text, data: [f32], blocks: i64) -> Result<f32, text>:
+    val n = data.len()
+    if n == 0:
+        return Ok(0.0)
+    val input = gpu_upload_f32s(data)
+    val output = gpu_alloc_zeroed_words(blocks)
+    if input == 0 or output == 0:
+        return Err("alloc failed")
+    val ok = gpu_run_1d(module, kernel, blocks, BLOCK_SIZE, [input, output, n])
+    val partials = gpu_download_f32s(output, blocks)
+    gpu_free_ptr(input)
+    gpu_free_ptr(output)
+    if not ok or partials.len() != blocks:
+        return Err("{kernel} launch failed")
+    Ok(cpu_sum(partials))
+
+fn run_reduce_naive(module: i64, data: [f32]) -> Result<f32, text>:
+    run_reduction(module, "reduce_naive", data, grid_for(data.len(), BLOCK_SIZE))
+
+fn run_reduce_sequential(module: i64, data: [f32]) -> Result<f32, text>:
+    run_reduction(module, "reduce_sequential", data, grid_for(data.len(), BLOCK_SIZE))
+
+fn run_reduce_optimized(module: i64, data: [f32]) -> Result<f32, text>:
+    # each block consumes 2 * BLOCK_SIZE elements
+    run_reduction(module, "reduce_optimized", data, grid_for(data.len(), 2 * BLOCK_SIZE))
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+
+fn main():
+    val ctx = gpu_setup(0)
+    if ctx == 0:
+        print "No CUDA device available; nothing to run."
+        return
+    val module = gpu_load_ptx(PTX)
+    if module == 0:
+        print "PTX module failed to load; nothing to run."
+        gpu_teardown(ctx)
+        return
+
+    val n = 65536
+    val data = make_data(n, 1.0)
+    val expected = cpu_sum(data)
+    print "Reducing {n} elements (all 1.0), CPU reference = {expected}"
+
+    print "=== reduce_naive (interleaved addressing) ==="
+    match run_reduce_naive(module, data):
+        case Ok(s):
+            print "  sum = {s}"
+        case Err(e):
+            print "  error: {e}"
+
+    print "=== reduce_sequential (sequential addressing) ==="
+    match run_reduce_sequential(module, data):
+        case Ok(s):
+            print "  sum = {s}"
+        case Err(e):
+            print "  error: {e}"
+
+    print "=== reduce_optimized (first add during load) ==="
+    match run_reduce_optimized(module, data):
+        case Ok(s):
+            print "  sum = {s}"
+        case Err(e):
+            print "  error: {e}"
+
+    print "=== sequential input 0..1023 (expected 523776.0) ==="
+    match run_reduce_optimized(module, make_sequential(1024)):
+        case Ok(s):
+            print "  sum = {s}"
+        case Err(e):
+            print "  error: {e}"
+
+    gpu_unload(module)
+    gpu_teardown(ctx)
+    print "All shared memory demos complete."

@@ -1,0 +1,111 @@
+#![allow(unnamed_duplicate_typed_args)]
+# LLM Caret - Chat Session Management
+#
+# Maintains conversation history in module-level state.
+# Provides add, clear, truncate operations.
+
+use common.text.{escape_json}
+use std.nogc_async_mut.mcp.helpers.{Q, LB, RB}
+
+# ============================================================================
+# Module-level state
+# ============================================================================
+
+var CHAT_ROLES: [text] = []
+var CHAT_CONTENTS: [text] = []
+var CHAT_SYSTEM_PROMPT = ""
+var CHAT_MAX_HISTORY = 100
+
+# ============================================================================
+# History management
+# ============================================================================
+
+fn chat_clear():
+    CHAT_ROLES = []
+    CHAT_CONTENTS = []
+
+fn chat_set_system_prompt(prompt: text):
+    CHAT_SYSTEM_PROMPT = prompt
+
+fn chat_get_system_prompt() -> text:
+    CHAT_SYSTEM_PROMPT
+
+fn chat_set_max_history(max_items: i64):
+    CHAT_MAX_HISTORY = max_items
+
+fn chat_add_message(role: text, content: text):
+    CHAT_ROLES.push(role)
+    CHAT_CONTENTS.push(content)
+    # Truncate if over limit
+    if CHAT_ROLES.len() > CHAT_MAX_HISTORY:
+        chat_truncate(CHAT_MAX_HISTORY)
+
+fn chat_add_user(content: text):
+    chat_add_message("user", content)
+
+fn chat_add_assistant(content: text):
+    chat_add_message("assistant", content)
+
+fn chat_history_len() -> i64:
+    CHAT_ROLES.len()
+
+fn chat_get_role(idx: i64) -> text:
+    if idx >= 0 and idx < CHAT_ROLES.len():
+        return CHAT_ROLES[idx]
+    ""
+
+fn chat_get_content(idx: i64) -> text:
+    if idx >= 0 and idx < CHAT_CONTENTS.len():
+        return CHAT_CONTENTS[idx]
+    ""
+
+fn chat_truncate(keep_last: i64):
+    if CHAT_ROLES.len() <= keep_last:
+        return
+    val start = CHAT_ROLES.len() - keep_last
+    var new_roles: [text] = []
+    var new_contents: [text] = []
+    var i = start
+    while i < CHAT_ROLES.len():
+        new_roles.push(CHAT_ROLES[i])
+        new_contents.push(CHAT_CONTENTS[i])
+        i = i + 1
+    CHAT_ROLES = new_roles
+    CHAT_CONTENTS = new_contents
+
+# ============================================================================
+# Build messages JSON from history
+# ============================================================================
+
+fn chat_build_messages_json() -> text:
+    var items: [text] = []
+    var i = 0
+    while i < CHAT_ROLES.len():
+        var msg_parts: [text] = []
+        msg_parts.push(LB())
+        msg_parts.push(Q() + "role" + Q() + ":" + Q() + CHAT_ROLES[i] + Q() + ",")
+        msg_parts.push(Q() + "content" + Q() + ":" + Q() + escape_json(CHAT_CONTENTS[i]) + Q())
+        msg_parts.push(RB())
+        items.push(msg_parts.join(""))
+        i = i + 1
+    var parts: [text] = []
+    parts.push("[")
+    var j = 0
+    for item in items:
+        if j > 0:
+            parts.push(",")
+        parts.push(item)
+        j = j + 1
+    parts.push("]")
+    parts.join("")
+
+# Get last message content (useful for getting the latest assistant reply)
+fn chat_last_content() -> text:
+    if CHAT_CONTENTS.len() == 0:
+        return ""
+    CHAT_CONTENTS[CHAT_CONTENTS.len() - 1]
+
+fn chat_last_role() -> text:
+    if CHAT_ROLES.len() == 0:
+        return ""
+    CHAT_ROLES[CHAT_ROLES.len() - 1]

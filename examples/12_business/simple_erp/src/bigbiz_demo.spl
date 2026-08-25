@@ -1,0 +1,170 @@
+# Big-Business Demo Entrypoint — durability, snapshots, keys, tenant
+# serialization, and org-as-data, end to end.
+#
+# NOTE: durable_log.spl / snapshot.spl / key_index.spl are owned by a
+# concurrently-written stage-1 agent. This file is written against the
+# EXACT contract given for those modules:
+#   kernel.durable_log.{save_log, load_log, restore_parity}
+#   kernel.key_index.{KeyIndex, key_index_new, key_index_has, key_index_add}
+#   kernel.snapshot.{BalanceSnapshot, take_snapshot, balance_with_snapshot}
+# If those files are not present yet when this runs, only steps (d) and (e)
+# (commit_queue + org, both owned by this change) can be exercised directly;
+# steps (a)-(c) are written to the contract and will compile/run once the
+# stage-1 modules land.
+
+use kernel.durable_log.{save_log, load_log, restore_parity}
+use kernel.key_index.{KeyIndex, key_index_new, key_index_has, key_index_add}
+use kernel.snapshot.{BalanceSnapshot, take_snapshot, balance_with_snapshot}
+use kernel.event_log.{EventLog, new_event_log, append, event_count}
+use kernel.posting.{journal_for_accepted, cash_account}
+use kernel.projection.{JournalEntry, account_balance}
+use kernel.commit_queue.{PendingWrite, queue_new, enqueue, drain_tenant}
+use framework.org.{RoleDef, role_def_with, default_roles, org_role_can, ApprovalChain, chain_satisfied, chain_next}
+use framework.registry.{LaneDef, default_lanes, lane_def}
+
+# (a) 1000 posted events, saved to disk, reloaded, checked bit-for-bit.
+fn run_durability() -> EventLog:
+    var log = new_event_log()
+    var i = 0
+    while i < 1000:
+        log = append(log, "sale.write", i, "amount=100")
+        i = i + 1
+
+    save_log("build/simple_erp_bigbiz_events.log", log)
+    val loaded = load_log("build/simple_erp_bigbiz_events.log")
+    val parity = restore_parity(log, loaded)
+
+    print "bigbiz-ok events={event_count(log)} parity={parity}"
+    return log
+
+# (b) 200 journal entries; a snapshot taken at 100 plus the remaining 100
+# must equal the same total as a zero snapshot plus all 200.
+fn run_snapshot():
+    var entries: [JournalEntry] = []
+    var i = 0
+    while i < 200:
+        entries.push(journal_for_accepted(i, "USD", 100))
+        i = i + 1
+
+    val expected_minor = 200 * 100
+
+    var tail: [JournalEntry] = []
+    var j = 100
+    while j < 200:
+        tail.push(entries[j])
+        j = j + 1
+
+    val snap_head = take_snapshot(entries, 100, cash_account(), "USD")
+    val from_snapshot = balance_with_snapshot(snap_head, tail)
+
+    val snap_zero = take_snapshot(entries, 0, cash_account(), "USD")
+    val from_zero = balance_with_snapshot(snap_zero, entries)
+
+    val direct = account_balance(entries, cash_account(), "USD")
+
+    val balance_match = (from_snapshot == expected_minor and from_zero == expected_minor and direct.minor == expected_minor)
+    print "snapshot-ok balance_match={balance_match}"
+
+# Total keys across all buckets. KeyIndex only exposes `buckets: [[text]]`, so
+# this is a plain read over that field, not a modification of key_index.spl.
+fn total_keys(idx: KeyIndex) -> i64:
+    var total = 0
+    for bucket in idx.buckets:
+        total = total + bucket.length()
+    return total
+
+# (c) 200 keys indexed; presence, absence, and duplicate-add non-doubling.
+fn run_keys():
+    var idx = key_index_new()
+    var i = 0
+    while i < 200:
+        idx = key_index_add(idx, "k{i}")
+        i = i + 1
+
+    var all_found = true
+    var j = 0
+    while j < 200:
+        if !key_index_has(idx, "k{j}"):
+            all_found = false
+        j = j + 1
+
+    var none_missing_found = true
+    var k = 0
+    while k < 200:
+        if key_index_has(idx, "miss{k}"):
+            none_missing_found = false
+        k = k + 1
+
+    val before = total_keys(idx)
+    idx = key_index_add(idx, "k0")
+    val after = total_keys(idx)
+    val dup_rejected = (before == after)
+
+    print "keys-ok indexed={before} found={all_found} missing_rejected={none_missing_found} dup_rejected={dup_rejected}"
+
+# (d) Interleaved per-tenant writes, drained tenant-by-tenant, must come out
+# in FIFO order per tenant with no cross-tenant interleaving preserved from
+# the drained tenant.
+fn run_queue():
+    var q = queue_new()
+    q = enqueue(q, PendingWrite { tenant_id: "t1", kind: "sale.write", entity: 1, payload: "t1a" })
+    q = enqueue(q, PendingWrite { tenant_id: "t2", kind: "sale.write", entity: 2, payload: "t2a" })
+    q = enqueue(q, PendingWrite { tenant_id: "t1", kind: "sale.write", entity: 3, payload: "t1b" })
+    q = enqueue(q, PendingWrite { tenant_id: "t2", kind: "sale.write", entity: 4, payload: "t2b" })
+
+    var log = new_event_log()
+    val drain1 = drain_tenant(q, "t1", log)
+    log = drain1.log
+    q = drain1.queue
+    val drain2 = drain_tenant(q, "t2", log)
+    log = drain2.log
+
+    val order_ok = (
+        log.events[0].payload == "t1a" and
+        log.events[1].payload == "t1b" and
+        log.events[2].payload == "t2a" and
+        log.events[3].payload == "t2b"
+    )
+    print "queue-ok serialized={order_ok}"
+
+# (e) Org roles and approval chains as registry data, extended with the
+# clinic lane and a read-only "clerk" role.
+fn run_org():
+    var lanes = default_lanes()
+    lanes.push(lane_def("clinic", "/api/clinic/appointments", 200000, "admin"))
+
+    var clerk_extra: [text] = []
+    clerk_extra.push("report.read")
+    var roles = default_roles()
+    roles.push(role_def_with("clerk", false, clerk_extra))
+
+    val operator_writes = org_role_can(roles, lanes, "operator", "sale.write")
+    val clerk_reads = org_role_can(roles, lanes, "clerk", "report.read")
+    val clerk_no_write = !org_role_can(roles, lanes, "clerk", "sale.write")
+
+    val chain = ApprovalChain { required_roles: ["manager", "finance"] }
+    var in_order: [text] = []
+    in_order.push("manager")
+    in_order.push("finance")
+    var out_of_order: [text] = []
+    out_of_order.push("finance")
+    out_of_order.push("manager")
+    var partial: [text] = []
+    partial.push("manager")
+
+    val chain_ok = (
+        chain_satisfied(chain, in_order) and
+        !chain_satisfied(chain, out_of_order) and
+        chain_next(chain, partial) == "finance"
+    )
+
+    val roles_ok = (operator_writes and clerk_reads and clerk_no_write and chain_ok)
+    print "org-ok roles_ok={roles_ok} chains=ordered"
+
+fn main():
+    run_durability()
+    run_snapshot()
+    run_keys()
+    run_queue()
+    run_org()
+    print "bigbiz-ready durability=file snapshot=materialized keys=indexed commits=serialized org=registry"

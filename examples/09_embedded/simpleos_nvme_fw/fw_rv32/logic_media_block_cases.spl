@@ -1,0 +1,18 @@
+use logic_media_retire_core.*
+
+fn rv32_media_block_cases_selftest() -> i32:
+    if _rv32_media_block_valid(0) != 0:
+        return 1
+    if _rv32_media_block_valid(63) != 0:
+        return 1
+    if _rv32_media_block_valid(-1) == 0:
+        return 1
+    if _rv32_media_block_valid(64) == 0:
+        return 1
+    if _rv32_media_spare_valid(56) != 0:
+        return 1
+    if _rv32_media_spare_valid(63) != 0:
+        return 1
+    if _rv32_media_spare_valid(55) == 0:
+        return 1
+    0

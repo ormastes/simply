@@ -1,0 +1,54 @@
+# Reporting — per-lane KPI summary
+#
+# Turns the five suite lanes (CRM, reservation, sale, market, restaurant)
+# into a small, uniform KPI shape so a report or dashboard can render every
+# lane the same way instead of hand-rolling per-lane formatting.
+
+struct LaneKpi:
+    val lane: text
+    val accepted: i64
+    val denied: i64
+    val revenue_minor: i64
+
+fn kpi(lane: text, accepted: i64, denied: i64, revenue_minor: i64) -> LaneKpi:
+    return LaneKpi { lane: lane, accepted: accepted, denied: denied, revenue_minor: revenue_minor }
+
+fn total_revenue(kpis: [LaneKpi]) -> i64:
+    var total = 0
+    for k in kpis:
+        total = total + k.revenue_minor
+    return total
+
+fn total_accepted(kpis: [LaneKpi]) -> i64:
+    var total = 0
+    for k in kpis:
+        total = total + k.accepted
+    return total
+
+fn total_denied(kpis: [LaneKpi]) -> i64:
+    var total = 0
+    for k in kpis:
+        total = total + k.denied
+    return total
+
+# ok when the lane has at least one accepted write and denials do not
+# outnumber accepted writes; otherwise the lane needs attention.
+fn lane_status(k: LaneKpi) -> text:
+    if k.accepted > 0 and k.denied <= k.accepted:
+        return "ok"
+    return "attention"
+
+fn render_text_report(kpis: [LaneKpi]) -> text:
+    var lines: [text] = []
+    for k in kpis:
+        val status = lane_status(k)
+        lines.push("lane={k.lane} accepted={k.accepted} denied={k.denied} revenue={k.revenue_minor} status={status}")
+    val total_line = "total revenue={total_revenue(kpis)} accepted={total_accepted(kpis)} denied={total_denied(kpis)}"
+    lines.push(total_line)
+    var report = ""
+    for line in lines:
+        if report == "":
+            report = line
+        else:
+            report = report + "\n" + line
+    return report

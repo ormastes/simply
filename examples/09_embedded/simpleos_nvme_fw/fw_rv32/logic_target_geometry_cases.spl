@@ -1,0 +1,24 @@
+use logic_policy_target_core.*
+
+fn rv32_target_geometry_cases_selftest() -> i32:
+    if _rv32_target_channels(1) != 2:
+        return 1
+    if _rv32_target_channels(2) != 8:
+        return 1
+    if _rv32_target_ways(2) != 8:
+        return 1
+    if _rv32_target_hardware(0) != 0:
+        return 1
+    if _rv32_target_hardware(2) != 1:
+        return 1
+    if _rv32_target_blocks_per_slice(2) != 4:
+        return 1
+    if _rv32_target_blocks_per_slice(99) != 1:
+        return 1
+    if _rv32_target_pcie_vendor_id(1) != 0x10EE:
+        return 1
+    if _rv32_target_pcie_vendor_id(2) != 0x10EE:
+        return 1
+    if _rv32_target_pcie_vendor_id(99) != 0x1B36:
+        return 1
+    0

@@ -1,0 +1,66 @@
+use std.database.{DbCodec, DbValue, DbRow, TableSchema, Column, ColumnType, Database}
+use std.web_framework.model.{ActiveModel, Repository}
+use std.web_framework.form_validation.{Validator, Required, MinLength, MaxLength}
+
+class MenuGroup:
+    id: i64
+    template_id: i64
+    name: text
+    description: text
+    sort_order: i64
+    created_at: text
+
+class MenuGroupCodec:
+    fn table_name() -> text:
+        "menu_groups"
+
+    fn columns() -> List<text>:
+        ["template_id", "name", "description", "sort_order", "created_at"]
+
+    fn encode(g: MenuGroup) -> List<DbValue>:
+        [
+            DbValue.integer(g.template_id),
+            DbValue.text(g.name),
+            DbValue.text(g.description),
+            DbValue.integer(g.sort_order),
+            DbValue.text(g.created_at)
+        ]
+
+    fn decode(row: DbRow) -> MenuGroup:
+        MenuGroup(
+            id: row.get_i64("id"),
+            template_id: row.get_i64("template_id"),
+            name: row.get_text("name"),
+            description: row.get_text("description"),
+            sort_order: row.get_i64("sort_order"),
+            created_at: row.get_text("created_at")
+        )
+
+    fn schema() -> TableSchema:
+        TableSchema(
+            name: "menu_groups",
+            columns: [
+                Column(name: "id", col_type: ColumnType.integer, primary_key: true, auto_increment: true),
+                Column(name: "template_id", col_type: ColumnType.integer, nullable: false),
+                Column(name: "name", col_type: ColumnType.text, nullable: false),
+                Column(name: "description", col_type: ColumnType.text, nullable: false),
+                Column(name: "sort_order", col_type: ColumnType.integer, nullable: false),
+                Column(name: "created_at", col_type: ColumnType.text, nullable: false)
+            ]
+        )
+
+fn create_group_repository(db: Database) -> Repository<MenuGroup>:
+    Repository<MenuGroup>(db: db, codec: MenuGroupCodec())
+
+fn group_validator() -> Validator:
+    val v = Validator.new()
+    v.add_rule("name", Required())
+    v.add_rule("name", MinLength(length: 1))
+    v.add_rule("name", MaxLength(length: 100))
+    v
+
+fn find_groups_for_template(repo: Repository<MenuGroup>, template_id: i64) -> List<MenuGroup>:
+    repo.find_where("template_id = ? ORDER BY sort_order", [DbValue.integer(template_id)])
+
+fn find_group_by_id(repo: Repository<MenuGroup>, id: i64) -> Result<MenuGroup, text>:
+    repo.find_by_id(id)

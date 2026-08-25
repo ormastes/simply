@@ -1,0 +1,86 @@
+#!/usr/bin/env simple
+# CUDA Basic Example - Native CUDA without PyTorch
+#
+# Demonstrates direct CUDA driver bindings via SFFI (std.cuda):
+# device enumeration, device memory, memset, device-to-device copy and
+# stream synchronisation. Memory is released explicitly with cuda_mem_free.
+#
+# Timing events are not shown: the deployed runtime has no event backing
+# (rt_cuda_event_create returns -1 with the cuda feature on). Total device
+# memory is likewise not queried — no memory-query extern exists yet.
+
+use std.cuda.{cuda_available, cuda_init, cuda_device_count, cuda_get_device_name, cuda_device_get, cuda_device_compute_capability, cuda_ctx_create, cuda_mem_alloc, cuda_mem_free, cuda_memset, cuda_memcpy_dtod, cuda_stream_create, cuda_stream_sync, cuda_stream_destroy}
+
+fn main():
+    print "CUDA Direct FFI - Basic Example\n"
+    print "================================\n"
+
+    if not cuda_available():
+        print "CUDA not available on this system"
+        print "   (Make sure NVIDIA drivers are installed)"
+        return
+
+    print "CUDA is available\n"
+    val init_rc = cuda_init()
+    if init_rc != 0:
+        print "cuInit failed: {init_rc}"
+        return
+
+    val device_count = cuda_device_count()
+    print "Devices found: {device_count}"
+
+    for device_id in 0..device_count:
+        val name = cuda_get_device_name(device_id)
+        val cap = cuda_device_compute_capability(cuda_device_get(device_id))
+        print "  Device {device_id}: {name}"
+        print "    Compute capability: {cap / 10}.{cap % 10}\n"
+
+    if device_count == 0:
+        print "No CUDA devices available"
+        return
+
+    print "=== Using Device 0 ===\n"
+    val ctx = cuda_ctx_create(cuda_device_get(0))
+    if ctx <= 0:
+        print "Context creation failed: {ctx}"
+        return
+
+    print "Creating CUDA stream..."
+    val stream = cuda_stream_create()
+    print "Stream created (default stream, handle {stream.handle})\n"
+
+    print "Allocating device memory (1 MB)..."
+    val mem_size = 1024 * 1024
+    val device_mem = cuda_mem_alloc(mem_size)
+    if device_mem <= 0:
+        print "Memory allocation failed: {device_mem}"
+        return
+    print "Memory allocated\n"
+
+    print "Filling memory with zeros..."
+    val memset_rc = cuda_memset(device_mem, 0, mem_size)
+    print "memset rc={memset_rc}"
+
+    print "Synchronizing stream..."
+    val synced = cuda_stream_sync(stream)
+    print "Stream synchronized: {synced}\n"
+
+    print "Allocating second memory block (1 MB)..."
+    val device_mem2 = cuda_mem_alloc(mem_size)
+    if device_mem2 <= 0:
+        print "Second allocation failed: {device_mem2}"
+        cuda_mem_free(device_mem)
+        return
+    print "Second block allocated\n"
+
+    print "Copying from block 1 to block 2 (device-to-device)..."
+    val copy_rc = cuda_memcpy_dtod(device_mem2, device_mem, mem_size)
+    val copy_synced = cuda_stream_sync(stream)
+    print "Copy complete: rc={copy_rc} synced={copy_synced}\n"
+
+    cuda_mem_free(device_mem2)
+    cuda_mem_free(device_mem)
+    cuda_stream_destroy(stream)
+
+    print "================================\n"
+    print "All operations complete"

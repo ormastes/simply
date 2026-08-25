@@ -1,0 +1,84 @@
+# Copy to .spipe/llm-finetune-process/attempts/<attempt_id>.sdn.
+
+attempt:
+  attempt_id: ""
+  goal: ""
+  app_or_server_target: ""
+
+research:
+  research_doc: ""
+  data_sources:
+    - name: ""
+      source: ""
+      license: ""
+      download_command: ""
+      checksum: ""
+      cache_path: ""
+
+requirements:
+  feature_option: ""
+  nfr_option: ""
+  selected_by: ""
+  selection_doc: ""
+
+process_docs:
+  requirements_doc: ""
+  nfr_doc: ""
+  plan_doc: ""
+  architecture_doc: ""
+  design_doc: ""
+
+model_research:
+  research_doc: ""
+  candidate_model: ""
+  license: ""
+  context_length: ""
+  fit: ""
+  constraints: ""
+  decision: ""
+
+model_architecture:
+  architecture_doc: ""
+  model_family: ""
+  data_strategy: ""
+  training_strategy: ""
+  deployment_target: ""
+  fallback: ""
+
+model:
+  base_model: ""
+  base_model_revision: ""
+  base_model_reason: ""
+  deployment_target: ""
+
+tuning:
+  method: ""
+  training_script: ""
+  training_command: ""
+  model_artifact: ""
+
+evaluation:
+  eval_command: ""
+  metrics: ""
+  target: ""
+  result: ""
+
+decision:
+  status: ""
+  retry_target: ""
+  next_attempt: ""
+  notes: ""
+
+app_handoff:
+  app_target: ""
+  usage: ""
+  handoff_doc: ""
+  license_constraints: ""
+  safety_eval: ""
+  deployment_evidence: ""
+
+retune:
+  reason: ""
+  source_eval: ""
+  next_attempt: ""
+  retry_target: ""

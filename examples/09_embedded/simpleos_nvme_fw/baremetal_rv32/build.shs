@@ -1,0 +1,95 @@
+#!/bin/sh
+# Build the bare-metal RV32 NAND/FTL demo (nand_boot.c) into a QEMU-bootable
+# ELF (hardening-review gap: this artifact had no build script anywhere).
+#
+# nand_boot.c is fully self-contained C (own UART driver + _start via
+# `.text.entry`, see its header comment) — unlike fw_rv32/, there is no
+# Simple source to compile; this is a plain cross-compile + link against
+# linker.ld.
+#
+# Target: riscv32-unknown-none-elf (QEMU virt, -bios none), per nand_boot.c
+# header. Toolchain probe order (first found wins), mirroring
+# fw_rv32/build.shs's use of riscv64-unknown-elf-gcc plus repo-wide fallback
+# convention (see scripts/check/check-riscv64-fpga-simpleos-preflight.shs):
+#   1. riscv64-unknown-elf-gcc (multilib, -march=rv32imafdc -mabi=ilp32d)
+#   2. riscv32-unknown-elf-gcc (native rv32 target)
+#   3. clang --target=riscv32-unknown-none-elf + ld.lld (LLVM fallback)
+# Fails closed with an actionable message if none are present — never fakes
+# a build.
+#
+# Usage: sh examples/09_embedded/simpleos_nvme_fw/baremetal_rv32/build.shs
+set -e
+cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
+
+SRC_DIR="examples/09_embedded/simpleos_nvme_fw/baremetal_rv32"
+SRC="$SRC_DIR/nand_boot.c"
+LD_SCRIPT="$SRC_DIR/linker.ld"
+OUT="build/nand_boot_rv32.elf"
+OBJ="build/test-artifacts/nand_boot_rv32.o"
+LOG_DIR="build/test-artifacts"
+OUT_LOG="$LOG_DIR/nand_boot_rv32_build.out"
+ERR_LOG="$LOG_DIR/nand_boot_rv32_build.err"
+MARCH="rv32imafdc"
+MABI="ilp32d"
+
+mkdir -p "$(dirname "$OUT")" "$LOG_DIR"
+: >"$OUT_LOG"
+: >"$ERR_LOG"
+
+TOOLCHAIN=""
+if command -v riscv64-unknown-elf-gcc >/dev/null 2>&1; then
+  TOOLCHAIN="riscv64-unknown-elf-gcc"
+elif command -v riscv32-unknown-elf-gcc >/dev/null 2>&1; then
+  TOOLCHAIN="riscv32-unknown-elf-gcc"
+elif command -v clang >/dev/null 2>&1 \
+    && clang --target=riscv32-unknown-none-elf -march="$MARCH" -mabi="$MABI" -c -x c /dev/null -o /dev/null >/dev/null 2>&1; then
+  TOOLCHAIN="clang"
+else
+  echo "NAND_BOOT_RV32_TOOLCHAIN_MISSING: no usable RISC-V32 cross toolchain found." >&2
+  echo "  Tried: riscv64-unknown-elf-gcc, riscv32-unknown-elf-gcc, clang --target=riscv32-unknown-none-elf" >&2
+  echo "  Install one (e.g. riscv64-unknown-elf-gcc from riscv-gnu-toolchain, or a clang build with the" >&2
+  echo "  RISCV backend enabled) and re-run: sh $SRC_DIR/build.shs" >&2
+  exit 2
+fi
+echo "NAND_BOOT_RV32_TOOLCHAIN=$TOOLCHAIN" | tee -a "$OUT_LOG"
+
+rm -f "$OUT" "$OBJ"
+
+case "$TOOLCHAIN" in
+  riscv64-unknown-elf-gcc|riscv32-unknown-elf-gcc)
+    if ! "$TOOLCHAIN" -march="$MARCH" -mabi="$MABI" -ffreestanding -fno-pic -fno-pie -nostdlib -O2 -Wall \
+        -c "$SRC" -o "$OBJ" >>"$OUT_LOG" 2>>"$ERR_LOG"; then
+      echo "NAND_BOOT_RV32_BUILD_FAILED compile out=$OUT_LOG err=$ERR_LOG" >&2
+      tail -n 40 "$ERR_LOG" >&2 || true
+      exit 1
+    fi
+    if ! "$TOOLCHAIN" -march="$MARCH" -mabi="$MABI" -ffreestanding -fno-pic -fno-pie -nostdlib \
+        -Wl,-T,"$LD_SCRIPT" -Wl,--no-relax -Wl,--gc-sections \
+        -o "$OUT" "$OBJ" >>"$OUT_LOG" 2>>"$ERR_LOG"; then
+      echo "NAND_BOOT_RV32_BUILD_FAILED link out=$OUT_LOG err=$ERR_LOG" >&2
+      tail -n 40 "$ERR_LOG" >&2 || true
+      exit 1
+    fi
+    ;;
+  clang)
+    if ! clang --target=riscv32-unknown-none-elf -march="$MARCH" -mabi="$MABI" -ffreestanding -fno-pic -fno-pie \
+        -nostdlib -O2 -Wall -c "$SRC" -o "$OBJ" >>"$OUT_LOG" 2>>"$ERR_LOG"; then
+      echo "NAND_BOOT_RV32_BUILD_FAILED compile out=$OUT_LOG err=$ERR_LOG" >&2
+      tail -n 40 "$ERR_LOG" >&2 || true
+      exit 1
+    fi
+    if ! command -v ld.lld >/dev/null 2>&1; then
+      echo "NAND_BOOT_RV32_TOOLCHAIN_MISSING: clang fallback path needs ld.lld for linking (not found)." >&2
+      exit 2
+    fi
+    if ! ld.lld -m elf32lriscv -T "$LD_SCRIPT" --no-relax --gc-sections -o "$OUT" "$OBJ" >>"$OUT_LOG" 2>>"$ERR_LOG"; then
+      echo "NAND_BOOT_RV32_BUILD_FAILED link out=$OUT_LOG err=$ERR_LOG" >&2
+      tail -n 40 "$ERR_LOG" >&2 || true
+      exit 1
+    fi
+    ;;
+esac
+
+echo "NAND_BOOT_RV32_BUILD_DONE out=$OUT" | tee -a "$OUT_LOG"
+ls -la "$OUT" 2>/dev/null
+file "$OUT" 2>/dev/null || true

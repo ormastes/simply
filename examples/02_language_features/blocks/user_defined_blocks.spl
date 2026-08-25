@@ -1,0 +1,130 @@
+# User-Defined Block Demo
+# ======================
+# Shows how users can create their own custom blocks
+
+use compiler.blocks.{define_block, validated_block, BlockBuilder}
+use compiler.blocks.blocks.registry.{register_block}
+use compiler.blocks.modes.{LexerMode}
+use compiler.blocks.value.{BlockValue}
+
+print("=== User-Defined Block Demo ===\n")
+
+# ============================================================================
+# Example 1: Simple Heredoc Block (3 lines)
+# ============================================================================
+
+print("1. Creating heredoc block...")
+
+val heredoc = define_block("heredoc", LexerMode.Raw, Ok(BlockValue.Raw(_.trim())))
+
+register_block(heredoc)
+print("   ✓ heredoc block registered\n")
+
+# Now users can use it:
+# val content = heredoc{
+#     Multi-line text
+#     Goes here
+# }
+
+# ============================================================================
+# Example 2: Port Number Block with Validation
+# ============================================================================
+
+print("2. Creating port block with validation...")
+
+fn parse_port(text: text) -> Result<BlockValue, text>:
+    val trimmed = text.trim()
+    match trimmed.parse_int():
+        case Some(num):
+            Ok(BlockValue.Custom("Port", num))
+        case None:
+            Err("Invalid port: must be an integer")
+
+fn validate_port(value: BlockValue) -> [text]:
+    match value:
+        case Custom("Port", num):
+            if num < 1 or num > 65535:
+                ["Port must be 1-65535, got {num}"]
+            else:
+                []
+        case _:
+            ["Expected port number"]
+
+val port = validated_block("port", LexerMode.Raw, parse_port, validate_port)
+register_block(port)
+print("   ✓ port block registered\n")
+
+# Usage: val server_port = port{ 8080 }
+
+# ============================================================================
+# Example 3: Color Block (Hex Colors)
+# ============================================================================
+
+print("3. Creating color block...")
+
+fn parse_color(text: text) -> Result<BlockValue, text>:
+    val trimmed = text.trim()
+    if trimmed.starts_with("#") and trimmed.len() == 7:
+        Ok(BlockValue.Custom("Color", trimmed))
+    else:
+        Err("Color must be hex format: #RRGGBB")
+
+val color = define_block("color", LexerMode.Raw, parse_color)
+register_block(color)
+print("   ✓ color block registered\n")
+
+# Usage: val primary = color{ #FF5733 }
+
+# ============================================================================
+# Example 4: Comment Block (Builder API)
+# ============================================================================
+
+print("4. Creating comment block with Builder API...")
+
+val comment = BlockBuilder("comment")
+    .raw_text()
+    .simple_parser(Ok(BlockValue.Raw(_)))
+    .description("Comment block - ignored at runtime")
+    .build()
+
+register_block(comment)
+print("   ✓ comment block registered\n")
+
+# Usage: comment{ This is ignored }
+
+# ============================================================================
+# Example 5: Config Block
+# ============================================================================
+
+print("5. Creating config block...")
+
+fn parse_config(text: text) -> Result<BlockValue, text>:
+    # Simple key=value parser
+    val lines = text.trim().split("\n")
+    var config = {}
+    for line in lines:
+        val parts = line.trim().split("=")
+        if parts.len() == 2:
+            config = config.insert(parts[0].trim(), parts[1].trim())
+    Ok(BlockValue.Custom("Config", config))
+
+val config_block = define_block("config", LexerMode.Raw, parse_config)
+register_block(config_block)
+print("   ✓ config block registered\n")
+
+# Usage:
+# val settings = config{
+#     port=8080
+#     host=localhost
+#     debug=true
+# }
+
+# ============================================================================
+# Summary
+# ============================================================================
+
+print("\n=== Summary ===")
+print("✓ 5 custom block types defined")
+print("✓ All blocks registered and ready to use")
+print("✓ Users can now write: heredoc{}, port{}, color{}, comment{}, config{}")
+print("\nThat's how easy it is to create custom blocks in Simple!")

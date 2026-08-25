@@ -1,0 +1,104 @@
+# x86_64 Toolchain EXEC Probe
+#
+# Distinct from `toolchain_vfs_probe_entry.spl`. The VFS probe proves the Clang
+# app fixture is readable and prepared as a task. This probe proves in-guest
+# compiler *operation*: it spawns /sys/apps/clang on hello.c and requires a real
+# compile artifact to appear on the guest filesystem before declaring success.
+#
+# Until the Phase-1 kernel exec keystone (live ring-3 handoff into the prepared
+# task) lands, there is no way to actually run the compiler in-guest, so this
+# lane reports the honest terminal `[toolchain-exec] blocked: in-guest exec
+# (Phase 1)` and does NOT print TEST PASSED. That is not a skip: the completion
+# contract (`toolchain_exec_probe_serial_accepts_completion`) returns false for
+# the blocked state, so the lane cannot be mistaken for green.
+#
+# ONE-LINE FLIP (Phase 1): change `exec_handoff_live()` to return `true`. After
+# the flip the lane FAILS (not skips) if clang is absent, and only PASSES when a
+# real compile artifact is observed.
+
+extern fn serial_println(msg: text)
+extern fn rt_port_outb(port: u16, value: u8)
+extern fn simpleos_fat32_read_path_size(path: text) -> i64
+
+use os.services.pcimgr.pcimgr.{pcimgr_init}
+use os.services.vfs.vfs_init.{vfs_boot_init, g_vfs_read_executable_bytes}
+use os.kernel.loader.x86_64_fs_exec_spawn.{x86_64_fs_exec_spawn}
+
+# Freestanding module-var init never runs, so `_mmio_test_mode` reads
+# garbage-true; force hardware MMIO before pcimgr/vfs touch devices.
+use os.kernel.boot.mmio.{mmio_disable_test_mode}
+
+val CLANG_APP_PATH: text = "/sys/apps/clang"
+val CLANG_SOURCE_PATH: text = "/usr/share/simpleos/toolchain/clang/hello.c"
+val CLANG_SOURCE_FAT32: text = "/SYS/CLANGHEL.C"
+val CLANG_ARTIFACT_FAT32: text = "/TMP/HELLO.O"
+
+# Phase-1 gate. Live ring-3 handoff into the prepared user task is owned by the
+# kernel exec keystone. Flip this single `false` to `true` once that lands.
+fn exec_handoff_live() -> bool:
+    false
+
+fn _emit_blocked():
+    serial_println("[toolchain-exec] blocked: in-guest exec (Phase 1)")
+    serial_println("[toolchain-exec] compiler-ran app=clang status=blocked reason=in-guest-exec-phase1")
+
+fn _start():
+    mmio_disable_test_mode()
+    serial_println("")
+    serial_println("=== SimpleOS Toolchain EXEC Probe ===")
+    pcimgr_init()
+    if not vfs_boot_init():
+        serial_println("[toolchain-exec] fail storage-init")
+        serial_println("[toolchain-exec] compiler-ran app=clang status=fail reason=storage-init")
+        serial_println("TEST FAILED")
+        rt_port_outb(0xf4, 0)
+        return
+    serial_println("[toolchain-exec] storage-ready")
+
+    # Runtime clang-payload presence (real byte read from the guest FS).
+    val clang_bytes = g_vfs_read_executable_bytes(CLANG_APP_PATH)
+    val clang_present = clang_bytes.len() > 4
+    if clang_present:
+        serial_println("[toolchain-exec] clang-present path={CLANG_APP_PATH} bytes={clang_bytes.len()}")
+
+    if not exec_handoff_live():
+        # Honest until-Phase-1 terminal: distinct blocked marker, no TEST PASSED.
+        _emit_blocked()
+        rt_port_outb(0xf4, 0)
+        return
+
+    # --- Below here only runs once the Phase-1 flip is true. ---
+    if not clang_present:
+        serial_println("[toolchain-exec] compiler-ran app=clang status=fail reason=clang-payload-absent")
+        serial_println("TEST FAILED")
+        rt_port_outb(0xf4, 0)
+        return
+
+    val source_size = simpleos_fat32_read_path_size(CLANG_SOURCE_FAT32)
+    if source_size <= 0:
+        serial_println("[toolchain-exec] compiler-ran app=clang status=fail reason=input-source-absent")
+        serial_println("TEST FAILED")
+        rt_port_outb(0xf4, 0)
+        return
+    serial_println("[toolchain-exec] input-source path={CLANG_SOURCE_PATH} bytes={source_size}")
+
+    # Live handoff: spawn the compiler on hello.c writing an object artifact.
+    val pid = x86_64_fs_exec_spawn(CLANG_APP_PATH, [CLANG_SOURCE_PATH, "-c", "-o", "/tmp/hello.o"], [])
+    if pid <= 0:
+        serial_println("[toolchain-exec] compiler-ran app=clang status=fail reason=spawn-rc={pid}")
+        serial_println("TEST FAILED")
+        rt_port_outb(0xf4, 0)
+        return
+
+    # Success requires a REAL compile artifact, never the spawn pid alone.
+    val artifact_size = simpleos_fat32_read_path_size(CLANG_ARTIFACT_FAT32)
+    if artifact_size <= 0:
+        serial_println("[toolchain-exec] compiler-ran app=clang status=fail reason=no-compile-artifact")
+        serial_println("TEST FAILED")
+        rt_port_outb(0xf4, 0)
+        return
+
+    serial_println("[toolchain-exec] compile-artifact path={CLANG_ARTIFACT_FAT32} bytes={artifact_size}")
+    serial_println("[toolchain-exec] compiler-ran app=clang status=ok pid={pid} artifact_bytes={artifact_size}")
+    serial_println("TEST PASSED")
+    rt_port_outb(0xf4, 0)

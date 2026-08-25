@@ -1,0 +1,141 @@
+#!/usr/bin/env simple
+# Winit Windowing Demo
+#
+# Demonstrates cross-platform windowing with event handling.
+# Shows window creation, event polling, keyboard, and mouse input.
+
+use app.io.window_ffi.{
+    EventLoop, window_create_event_loop, window_destroy_event_loop,
+    window_poll_events, Window, window_create, window_destroy,
+    WindowConfig, window_config_default,
+    window_set_title, window_request_redraw,
+    window_get_size, window_set_size, Size,
+    EventType, event_get_type_code, event_parse_type,
+    event_window_resized, event_keyboard_input,
+    event_mouse_button, event_mouse_moved,
+    KeyState, VirtualKey, MouseButton
+}
+use app.io.{print}
+
+fn main():
+    print "=== Winit Windowing Demo ==="
+    print ""
+
+    # Create event loop
+    val event_loop = window_create_event_loop()
+
+    if not event_loop.is_valid:
+        print "ERROR: Failed to create event loop"
+        return
+
+    print "✓ Event loop created"
+
+    # Create window with custom configuration
+    var config = window_config_default()
+    config.width = 800
+    config.height = 600
+    config.title = "Simple Window Demo"
+    config.resizable = true
+
+    val window = window_create(event_loop, config.width, config.height, config.title)
+
+    if not window.is_valid:
+        print "ERROR: Failed to create window"
+        window_destroy_event_loop(event_loop)
+        return
+
+    print "✓ Window created: {config.width}x{config.height} \"{config.title}\""
+    print ""
+    print "=== Event Loop Running ==="
+    print "Controls:"
+    print "  - ESC: Exit"
+    print "  - W/A/S/D: Print movement keys"
+    print "  - Mouse: Click and move to see events"
+    print "  - Resize window to see resize events"
+    print ""
+
+    # Event loop
+    var running = true
+    var frame_count = 0
+    var mouse_x = 0.0
+    var mouse_y = 0.0
+
+    while running:
+        # Poll events (max 100 events per frame)
+        val events = window_poll_events(event_loop, 100)
+
+        # Process events (simplified - in real implementation would iterate)
+        # For demo purposes, we'll just show the concept
+
+        frame_count = frame_count + 1
+
+        # Update window title every 60 frames
+        if frame_count % 60 == 0:
+            val new_title = "Simple Window Demo - Frame {frame_count}"
+            window_set_title(window, new_title)
+
+        # In a real implementation, you would:
+        # 1. Iterate through events batch
+        # 2. Handle each event type
+        # 3. Update application state
+        # 4. Render to window
+        # 5. Request redraw
+
+        # Request window redraw
+        window_request_redraw(window)
+
+        # Simulate event handling (placeholder)
+        # In reality, we'd get actual events from the batch
+        var simulated_event_type = frame_count % 100
+
+        if simulated_event_type == 10:
+            print "[Frame {frame_count}] Example: Window resized to 800x600"
+        elif simulated_event_type == 30:
+            print "[Frame {frame_count}] Example: Key pressed - W (move up)"
+        elif simulated_event_type == 50:
+            print "[Frame {frame_count}] Example: Mouse clicked at (400, 300)"
+        elif simulated_event_type == 70:
+            print "[Frame {frame_count}] Example: Mouse moved to (450, 350)"
+
+        # Exit after 300 frames (demo purposes)
+        if frame_count >= 300:
+            print ""
+            print "Demo completed after {frame_count} frames"
+            running = false
+
+    print ""
+    print "=== Cleanup ==="
+
+    # Cleanup
+    window_destroy(window)
+    print "✓ Window destroyed"
+
+    window_destroy_event_loop(event_loop)
+    print "✓ Event loop destroyed"
+
+    print ""
+    print "Demo finished successfully!"
+
+# Example of a more realistic event handler (for reference)
+fn handle_event_example(event_type: EventType):
+    """
+    This shows how you would handle different event types
+    in a real application. Not called in this demo.
+    """
+    if event_type == EventType.WindowCloseRequested:
+        print "User requested window close"
+        # Set running = false
+    elif event_type == EventType.WindowResized:
+        print "Window was resized"
+        # Update viewport/rendering
+    elif event_type == EventType.KeyboardInput:
+        print "Keyboard input received"
+        # Process key state
+    elif event_type == EventType.MouseButton:
+        print "Mouse button clicked"
+        # Process mouse click
+    elif event_type == EventType.MouseMoved:
+        print "Mouse moved"
+        # Update mouse position
+    else:
+        pass  # Ignore other events

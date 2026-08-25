@@ -1,0 +1,47 @@
+pub fn _rv32_power_counter_cap() -> i64:
+    1000000
+
+pub fn _rv32_power_counter_clamped(value: i64) -> i64:
+    val cap: i64 = _rv32_power_counter_cap()
+    if value == cap:
+        return cap
+    if value == cap + 1:
+        return cap
+    if value < 0:
+        return 0
+    if value > cap:
+        return cap
+    value
+
+fn _rv32_power_counter_next(value: i64) -> i64:
+    val cap: i64 = _rv32_power_counter_cap()
+    if value == cap:
+        return cap
+    if value == cap + 1:
+        return cap
+    if value < 0:
+        return 1
+    if value >= cap:
+        return cap
+    value + 1
+
+pub fn _rv32_power_cycles_after(power_cycles: i64) -> i64:
+    _rv32_power_counter_next(power_cycles)
+
+pub fn _rv32_unsafe_after(unsafe_shutdowns: i64, dirty_since_checkpoint: i64) -> i64:
+    if dirty_since_checkpoint != 0:
+        return _rv32_power_counter_next(unsafe_shutdowns)
+    _rv32_power_counter_clamped(unsafe_shutdowns)
+
+pub fn _rv32_dirty_after_checkpoint() -> i64:
+    0
+
+pub fn _rv32_dirty_after_write(write_status: i64, volatile_write_cache: i64) -> i64:
+    if write_status != 0:
+        return 0
+    if volatile_write_cache == 0:
+        return 0
+    1
+
+pub fn _rv32_dirty_after_power_cycle() -> i64:
+    0

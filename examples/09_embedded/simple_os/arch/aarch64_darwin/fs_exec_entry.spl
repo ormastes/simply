@@ -1,0 +1,112 @@
+"""
+aarch64-apple-darwin Hosted FS-Exec Acceptance Entry.
+
+**Feature IDs:** #QEMU-SYSTEST-MULTIARCH-AC7
+**Category:** OS system test — hosted native process (NOT bare-metal / NOT QEMU)
+
+This program runs as a native macOS Apple Silicon (aarch64-apple-darwin) process
+directly on the host filesystem. It is NOT a bare-metal kernel, NOT EL0/EL1 code,
+and NOT launched by QEMU. The OS loader (dyld / ld64) handles Mach-O loading.
+
+Test contract: read an app file from the host filesystem, validate its header,
+"launch" it as a child process, capture its exit, and print the HOSTED_* marker
+family to stdout. The systest contract captures stdout (not a UART serial line).
+
+Entry convention: top-level `fn main()` — the darwin runtime calls main().
+Host FS access via standard Simple IO externs (rt_file_exists, rt_file_read_bytes,
+rt_process_run_timeout). No serial_println, no semihosting, no rt_qemu_exit_success —
+all bare-metal only. Success markers are only printed on actual clean spawn + exit 0.
+
+Markers asserted (honest hosted semantics):
+  HOSTED_FS_READ_OK     — host-FS open + read of a real file succeeded (bytes > 4)
+  HOSTED_APP_PARSE_OK   — first 4 bytes validate as a known magic (SMF or ELF magic)
+  HOSTED_PROCESS_LAUNCH_OK — rt_process_run_timeout spawned the app as a child process
+  HOSTED_EXIT_OK        — child exited (exit_code captured, process lifecycle complete)
+  TEST PASSED           — all acceptance criteria met
+
+NOT claimed:
+  - ELF_LOAD_OK (the host dyld loader handles Mach-O; we do not map PT_LOAD segments)
+  - user-svc-exit:ok (EL0 round-trip — bare-metal only)
+  - SMF_WM_GUI_LAUNCH_OK (no desktop shell on this lane)
+  - NATIVE_GUI_PROCESS_RENDER_OK (no GPU/display on this lane)
+"""
+
+extern fn rt_file_exists(path: text) -> bool
+extern fn rt_file_read_bytes(path: text) -> [u8]
+extern fn rt_process_run_timeout(cmd: text, args: [text], timeout_ms: i64) -> (text, text, i32)
+
+# SMF magic: 'S','M','F',0x01 — matches staged hello_world.smf on Mac builds
+val SMF_MAGIC_BYTE0: i64 = 83   # 'S'
+val SMF_MAGIC_BYTE1: i64 = 77   # 'M'
+val SMF_MAGIC_BYTE2: i64 = 70   # 'F'
+# ELF magic: 0x7F,'E','L','F' — fallback for ELF-format apps
+val ELF_MAGIC_BYTE0: i64 = 127  # 0x7F
+
+fn _fail(stage: text):
+    print "[aarch64-darwin-hosted] FAIL stage={stage}"
+    print "HOSTED_PREFLIGHT_FAILED stage={stage}"
+    print "TEST FAILED"
+
+fn _has_smf_magic(bytes: [u8]) -> bool:
+    if bytes.len() < 4:
+        return false
+    val b0 = bytes[0].to_i64()
+    val b1 = bytes[1].to_i64()
+    val b2 = bytes[2].to_i64()
+    (b0 == SMF_MAGIC_BYTE0 and b1 == SMF_MAGIC_BYTE1 and b2 == SMF_MAGIC_BYTE2)
+
+fn _has_elf_magic(bytes: [u8]) -> bool:
+    if bytes.len() < 4:
+        return false
+    bytes[0].to_i64() == ELF_MAGIC_BYTE0
+
+fn main():
+    print ""
+    print "=== SimpleOS aarch64-apple-darwin hosted fs-exec acceptance ==="
+    print "[aarch64-darwin-hosted] mode=native-host-process arch=aarch64-apple-darwin"
+
+    # Staged app path: build system stages hello_world.smf into build/os/darwin-aarch64/
+    # for the Mac build. On Linux this file is absent → HOSTED_FS_READ_OK fails → RED.
+    val app_path = "build/os/darwin-aarch64/hello_world.smf"
+
+    if not rt_file_exists(app_path):
+        _fail("fs-absent path={app_path}")
+        return
+
+    val bytes = rt_file_read_bytes(app_path)
+    val byte_len = bytes.len()
+    if byte_len <= 4:
+        _fail("fs-empty path={app_path} bytes={byte_len}")
+        return
+
+    print "HOSTED_FS_READ_OK path={app_path} bytes={byte_len}"
+
+    # Validate header magic — accept SMF or ELF
+    val magic_ok = _has_smf_magic(bytes) or _has_elf_magic(bytes)
+    if not magic_ok:
+        _fail("parse-magic path={app_path}")
+        return
+
+    print "HOSTED_APP_PARSE_OK path={app_path}"
+
+    # Launch as a child process with a 10s timeout.
+    # The child is expected to print to stdout and exit 0.
+    # Only print success markers if the process actually spawned and exited clean.
+    val result = rt_process_run_timeout(app_path, [app_path], 10000)
+    val child_stdout = result[0]
+    val child_exit = result[2]
+
+    if child_exit < 0:
+        # Negative exit = spawn failure (exec error, timeout, etc.)
+        _fail("spawn-failed path={app_path} exit={child_exit}")
+        return
+
+    print "HOSTED_PROCESS_LAUNCH_OK path={app_path}"
+    print "[aarch64-darwin-hosted] child-stdout-len={child_stdout.len()}"
+
+    if child_exit != 0:
+        _fail("child-nonzero path={app_path} exit={child_exit}")
+        return
+
+    print "HOSTED_EXIT_OK exit_code={child_exit}"
+    print "TEST PASSED"

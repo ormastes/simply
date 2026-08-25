@@ -1,0 +1,157 @@
+# Kernel-tier rt_file_* facade over the FAT32-on-NVMe C API (AC-17 rung b).
+#
+# Why this exists NEXT TO src/os/userlib/rt_file_facade.spl instead of the
+# kernel entry importing that module: the userland facade routes through
+# os.userlib.syscall_raw's `rt_x86_syscall`, which executes the real
+# `syscall` instruction. From the ring-0 kernel entry that is a syscall-layer
+# mismatch: `sysret` unconditionally returns to CPL3, so a ring-0 caller
+# would resume kernel code with user privileges — memory corruption, not
+# evidence. Per the recorded lane protocol, the externs are instead backed
+# at THIS entry's tier by the kernel's own file API in baremetal_stubs.c.
+#
+# Primitives (all proven in this kernel image):
+#   simpleos_fat32_stream_open(path)   -> file size, -1 if absent (the same
+#       existence probe fs_exec_resolve uses for PATH resolution)
+#   entstore_fat32_read_slice_text — C-side byte extraction (see the
+#       mmio_read8 binding note below for why this is not done in Simple)
+#   entstore_fat32_write_text — uniquely-named C wrapper over
+#       fat32_write_file. NOT rt_file_write_text/rt_file_read_text: those
+#       names are shadowed by Simple-side @export stubs (tls_shim's
+#       rt_file_read_text returns ""), and their C failure logs are gated
+#       off under SIMPLE_OS_LOG_MODE=off.
+#
+# Runtime-boundary record:
+#   runtime_need: rt_file_exists/size/read_text_at/atomic_write for
+#     std.enterprise_store.file_backend executing in the kernel entry.
+#   facade_checked: os.userlib.rt_file_facade — REJECTED at ring 0
+#     (syscall/sysret CPL mismatch above); it remains the SMF/ring-3 provider.
+#   chosen_path: @export("C") kernel-tier providers over the FAT32 C API.
+#   rejected_shortcuts: issuing syscalls from ring 0; host-side stubs posing
+#     as guest evidence; forking file_backend for the kernel.
+#
+# Tier deviations (recorded, not hidden):
+#   - atomic_write is a whole-file FAT32 rewrite (fat32_write_file frees the
+#     old chain, writes the new). Power-cut atomicity is NOT provided at this
+#     tier; single-writer boot-time probe only.
+#   - reads are capped at 32 KiB here — plenty for the probe store, stated
+#     so nobody trusts this facade for big files.
+#
+# Freestanding discipline: no module-level array initializers, no trait
+# objects; C-side byte extraction and static serial
+# markers only — dynamic-text interpolation is avoided in verdict lines
+# (x64 freestanding dynamic-text interpolation bug).
+
+extern fn serial_println(msg: text)
+extern fn simpleos_fat32_stream_open(path: text) -> i64
+extern fn entstore_fat32_set_path(path: text) -> i64
+extern fn entstore_fat32_write_pending(content: text) -> i64
+# Read-back is done in C. An `extern fn mmio_read8` declared HERE does NOT
+# bind to the kernel's Simple os.kernel.boot.mmio.mmio_read8 — it binds to the
+# C symbol of that name (type_stubs.c / auto_stubs.c weak), whose body is
+# `return NIL_VALUE`, so every extracted byte was 0. That, not the FAT32
+# layer, is why rung L3.5b missed while write/size/open all passed.
+extern fn entstore_fat32_read_slice_text(path: text, offset: i64, size: i64) -> text
+extern fn entstore_fat32_dump_first16(path: text)
+
+# rt_file_exists / rt_file_size are DECLARED here and DEFINED IN C
+# (baremetal_stubs.c), never as Simple `@export("C")` providers. Lane W10-B
+# measured why: both names sit in codegen's `text_arg_indices` table
+# (compiler/src/codegen/instr/calls.rs, and the LLVM twin in
+# codegen/llvm/functions/calls.rs), so every Simple call site lowers
+# `rt_file_exists(p)` into `rt_file_exists(rt_string_data(p), rt_string_len(p))`
+# — a raw (ptr, len) pair. A Simple provider written `fn rt_file_exists(path:
+# text)` takes ONE boxed RuntimeValue and would receive the raw data pointer in
+# its place, so it cannot be correct no matter who wins the link.
+# `rt_file_read_text_at` / `rt_file_atomic_write` are NOT in that table (nor in
+# `boxed_text_arg_indices`, which holds only rt_string_builder_push), pass boxed
+# values, and so remain Simple `@export("C")` providers below.
+extern fn rt_file_exists(path: text) -> bool
+extern fn rt_file_size(path: text) -> i64
+
+# Two single-text-arg calls, never one two-text call: the C side documents the
+# measured miscompile (second (ptr,len) pair arrived as garbage, so a 5-byte
+# write asked for 480 KB and filled the volume). Latch path, then write.
+fn entstore_fat32_write_text(path: text, content: text) -> i64:
+    if entstore_fat32_set_path(path) != 0:
+        return -1
+    entstore_fat32_write_pending(content)
+
+val _ENT_READ_CAP: i64 = 32768
+
+@export("C")
+fn rt_file_read_text_at(path: text, offset: i64, size: i64) -> text:
+    if offset < 0 or size <= 0:
+        return ""
+    val fsize = simpleos_fat32_stream_open(path)
+    if fsize <= 0 or fsize > _ENT_READ_CAP:
+        return ""
+    if offset >= fsize:
+        return ""
+    entstore_fat32_read_slice_text(path, offset, size)
+
+@export("C")
+fn rt_file_atomic_write(path: text, content: text) -> bool:
+    entstore_fat32_write_text(path, content) == 0
+
+# Boot-time probe (called by ssh_ring3_clang_entry): exercises the facade
+# plus std.enterprise_store.file_backend against the real FAT32-on-NVMe fs
+# and reports over serial. Kept here so the entry stays a thin boot script.
+use std.nogc_sync_mut.enterprise_store.file_backend.{fb_is_store, fb_open, fb_insert, fb_count}
+
+fn ent_store_kernel_probe():
+    serial_println("[ent-store] probe begin (kernel-tier FAT32 facade)")
+    # Facade self-check, mirroring rt_file_facade_probe_main's markers.
+    val e = rt_file_exists("/NOSUCH.TXT")
+    val s = rt_file_size("/NOSUCH.TXT")
+    serial_println("rt_file facade probe: exists={e} size={s}")
+    if rt_file_exists("/HELLO.C"):
+        serial_println("[ent-store] hello-c-exists=OK")
+    else:
+        serial_println("[ent-store] hello-c-exists=MISS")
+    val hf = simpleos_fat32_stream_open("/HELLO.C")
+    serial_println("[ent-store] hello fsize={hf}")
+    val wrc = entstore_fat32_write_text("/PROBE.TXT", "hello")
+    serial_println("[ent-store] direct write rc={wrc}")
+    val pf = simpleos_fat32_stream_open("/PROBE.TXT")
+    serial_println("[ent-store] probe-file fsize={pf}")
+    val mw = rt_file_atomic_write("/ENTHEAD.TXT", "SPLSTORE1\n")
+    # Ground-truth C dump of the bytes the extraction path sees (lane W8-B
+    # diagnostic): kept permanently so a future read-back miss is immediately
+    # classifiable as absent / shifted / mis-assembled.
+    entstore_fat32_dump_first16("/ENTHEAD.TXT")
+    val head = rt_file_read_text_at("/ENTHEAD.TXT", 0, 9)
+    serial_println("[ent-store] head read-back={head}")
+    if mw and head == "SPLSTORE1":
+        serial_println("[ent-store] facade write+read-back=OK")
+    else:
+        serial_println("[ent-store] facade write+read-back=FAIL")
+    # Enterprise file backend end-to-end on the guest filesystem.
+    val store = "/ENTSTORE.TXT"
+    val opened = fb_open(store)
+    if opened:
+        serial_println("[ent-store] open=OK")
+    else:
+        serial_println("[ent-store] open=FAIL")
+    val ins1 = fb_insert(store, "sales", ["sku", "qty"], ["apple", "3"])
+    val ins2 = fb_insert(store, "sales", ["sku", "qty"], ["pear", "5"])
+    if ins1 and ins2:
+        serial_println("[ent-store] insert=OK")
+    else:
+        serial_println("[ent-store] insert=FAIL")
+    val cnt = fb_count(store, "sales")
+    val cnt_ok = cnt == "2"
+    if cnt_ok:
+        serial_println("[ent-store] count=2 OK")
+    else:
+        serial_println("[ent-store] count=FAIL")
+    val magic_ok = fb_is_store(store)
+    if magic_ok:
+        serial_println("[ent-store] magic=OK")
+    else:
+        serial_println("[ent-store] magic=FAIL")
+    if opened and ins1 and ins2 and cnt_ok and magic_ok:
+        serial_println("enterprise store open=true verify=[] (file-backend, in-guest FAT32)")
+    else:
+        serial_println("[ent-store] PROBE FAILED")
+
+export ent_store_kernel_probe

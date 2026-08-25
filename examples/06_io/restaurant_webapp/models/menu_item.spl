@@ -1,0 +1,90 @@
+use std.database.{DbCodec, DbValue, DbRow, TableSchema, Column, ColumnType, Database}
+use std.web_framework.model.{ActiveModel, Repository}
+use std.web_framework.form_validation.{Validator, Required, MinLength, MaxLength}
+use std.web_framework.pagination.{Paginator, Page}
+
+class MenuItem:
+    id: i64
+    group_id: i64
+    name: text
+    description: text
+    price: i64
+    available: bool
+    sort_order: i64
+    created_at: text
+    updated_at: text
+
+class MenuItemCodec:
+    fn table_name() -> text:
+        "menu_items"
+
+    fn columns() -> List<text>:
+        ["group_id", "name", "description", "price", "available", "sort_order", "created_at", "updated_at"]
+
+    fn encode(item: MenuItem) -> List<DbValue>:
+        [
+            DbValue.integer(item.group_id),
+            DbValue.text(item.name),
+            DbValue.text(item.description),
+            DbValue.integer(item.price),
+            DbValue.integer(if item.available: 1 else: 0),
+            DbValue.integer(item.sort_order),
+            DbValue.text(item.created_at),
+            DbValue.text(item.updated_at)
+        ]
+
+    fn decode(row: DbRow) -> MenuItem:
+        MenuItem(
+            id: row.get_i64("id"),
+            group_id: row.get_i64("group_id"),
+            name: row.get_text("name"),
+            description: row.get_text("description"),
+            price: row.get_i64("price"),
+            available: row.get_i64("available") != 0,
+            sort_order: row.get_i64("sort_order"),
+            created_at: row.get_text("created_at"),
+            updated_at: row.get_text("updated_at")
+        )
+
+    fn schema() -> TableSchema:
+        TableSchema(
+            name: "menu_items",
+            columns: [
+                Column(name: "id", col_type: ColumnType.integer, primary_key: true, auto_increment: true),
+                Column(name: "group_id", col_type: ColumnType.integer, nullable: false),
+                Column(name: "name", col_type: ColumnType.text, nullable: false),
+                Column(name: "description", col_type: ColumnType.text, nullable: false),
+                Column(name: "price", col_type: ColumnType.integer, nullable: false),
+                Column(name: "available", col_type: ColumnType.integer, nullable: false),
+                Column(name: "sort_order", col_type: ColumnType.integer, nullable: false),
+                Column(name: "created_at", col_type: ColumnType.text, nullable: false),
+                Column(name: "updated_at", col_type: ColumnType.text, nullable: false)
+            ]
+        )
+
+fn create_item_repository(db: Database) -> Repository<MenuItem>:
+    Repository<MenuItem>(db: db, codec: MenuItemCodec())
+
+fn item_validator() -> Validator:
+    val v = Validator.new()
+    v.add_rule("name", Required())
+    v.add_rule("name", MinLength(length: 1))
+    v.add_rule("name", MaxLength(length: 200))
+    v
+
+fn find_items_for_group(repo: Repository<MenuItem>, group_id: i64) -> List<MenuItem>:
+    repo.find_where("group_id = ? ORDER BY sort_order", [DbValue.integer(group_id)])
+
+fn find_item_by_id(repo: Repository<MenuItem>, id: i64) -> Result<MenuItem, text>:
+    repo.find_by_id(id)
+
+fn find_available_items_for_group(repo: Repository<MenuItem>, group_id: i64) -> List<MenuItem>:
+    repo.find_where("group_id = ? AND available = 1 ORDER BY sort_order", [DbValue.integer(group_id)])
+
+fn format_price(cents: i64) -> text:
+    val dollars = cents / 100
+    val remainder = cents % 100
+    if remainder < 10:
+        "{dollars}.0{remainder}"
+    else:
+        "{dollars}.{remainder}"

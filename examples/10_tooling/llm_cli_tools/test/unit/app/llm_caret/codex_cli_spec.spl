@@ -1,0 +1,401 @@
+# LLM Caret Codex CLI Specification
+#
+# Tests pure functions: build_codex_args, parse_codex_jsonl_response.
+# No subprocess calls in unit tests.
+
+import std.spec
+
+# ============================================================================
+# Inline helpers
+# ============================================================================
+
+fn _LB() -> text:
+    "{(123 as char)}"
+
+fn _RB() -> text:
+    "{(125 as char)}"
+
+fn _Q() -> text:
+    "\""
+
+fn _unwrap_idx(opt) -> i64:
+    match opt:
+        Some(i): return i
+        nil: return -1
+
+fn _escape_json(s: text) -> text:
+    var result = ""
+    var i = 0
+    while i < s.len():
+        val ch = s[i]
+        if ch == "\\":
+            result = result + "\\\\"
+        elif ch == "\"":
+            result = result + "\\\""
+        elif ch == "\n":
+            result = result + "\\n"
+        elif ch == "\r":
+            result = result + "\\r"
+        elif ch == "\t":
+            result = result + "\\t"
+        else:
+            result = result + ch
+        i = i + 1
+    result
+
+fn _extract_json_string(json: text, key: text) -> text:
+    val quote = "\""
+    val search = quote + key + quote + ":"
+    val idx = _unwrap_idx(json.index_of(search))
+    if idx < 0:
+        return ""
+    val slen = search.len()
+    val start = idx + slen
+    val after = json.substring(start)
+    val trimmed = after.trim()
+    if trimmed.starts_with(quote):
+        val rest = trimmed.substring(1)
+        var end = 0
+        var escaped = false
+        while end < rest.len():
+            val ch = rest[end]
+            if escaped:
+                escaped = false
+            elif ch == "\\":
+                escaped = true
+            elif ch == "\"":
+                return rest.substring(0, end)
+            end = end + 1
+    ""
+
+fn _extract_json_value(json: text, key: text) -> text:
+    val search = _Q() + key + _Q() + ":"
+    val idx = _unwrap_idx(json.index_of(search))
+    if idx < 0:
+        return "null"
+    val slen = search.len()
+    val start = idx + slen
+    val after = json.substring(start)
+    val trimmed = after.trim()
+    var end = 0
+    while end < trimmed.len():
+        val ch = trimmed[end]
+        if ch == "," or ch == _RB() or ch == "]":
+            break
+        end = end + 1
+    trimmed.substring(0, end).trim()
+
+fn _extract_json_bool(json: text, key: text) -> bool:
+    val raw = _extract_json_value(json, key)
+    raw == "true"
+
+# ============================================================================
+# Inline structs
+# ============================================================================
+
+struct CodexCliResponse:
+    content: text
+    model: text
+    session_id: text
+    stop_reason: text
+    input_tokens: i64
+    output_tokens: i64
+    error: text
+    is_error: bool
+    raw: text
+
+# ============================================================================
+# Functions under test (inlined)
+# ============================================================================
+
+fn build_codex_args(prompt: text, model: text, json_mode: bool, instructions: text, sandbox: text, extra_args: [text]) -> [text]:
+    var args: [text] = []
+    args = args + ["exec"]
+    if json_mode:
+        args = args + ["--json"]
+    if model != "":
+        args = args + ["--model", model]
+    if instructions != "":
+        args = args + ["--instructions", instructions]
+    args = args + ["--full-auto"]
+    if sandbox != "":
+        args = args + ["--sandbox", sandbox]
+    else:
+        args = args + ["--sandbox", "off"]
+    args = args + [prompt]
+    for arg in extra_args:
+        if arg != "":
+            args = args + [arg]
+    args
+
+fn parse_codex_jsonl_response(raw: text) -> CodexCliResponse:
+    if raw.trim() == "":
+        return CodexCliResponse(
+            content: "",
+            model: "",
+            session_id: "",
+            stop_reason: "",
+            input_tokens: 0,
+            output_tokens: 0,
+            error: "empty response",
+            is_error: true,
+            raw: ""
+        )
+    val lines = raw.split("\n")
+    var content = ""
+    var model_text = ""
+    var error_text = ""
+    var is_err = false
+    for line in lines:
+        val trimmed = line.trim()
+        if trimmed == "":
+            continue
+        val etype = _extract_json_string(trimmed, "type")
+        if etype == "error":
+            is_err = true
+            error_text = _extract_json_string(trimmed, "message")
+            if error_text == "":
+                error_text = _extract_json_string(trimmed, "text")
+            if error_text == "":
+                error_text = "unknown error"
+            continue
+        if etype == "message":
+            val role = _extract_json_string(trimmed, "role")
+            if role == "assistant":
+                val text_val = _extract_json_string(trimmed, "text")
+                if text_val != "":
+                    content = text_val
+            continue
+        if etype == "output_text":
+            val text_val = _extract_json_string(trimmed, "text")
+            if text_val != "":
+                content = text_val
+            continue
+        val mdl = _extract_json_string(trimmed, "model")
+        if mdl != "":
+            model_text = mdl
+    var stop = "end_turn"
+    if is_err:
+        stop = "error"
+    CodexCliResponse(
+        content: content,
+        model: model_text,
+        session_id: "",
+        stop_reason: stop,
+        input_tokens: 0,
+        output_tokens: 0,
+        error: error_text,
+        is_error: is_err,
+        raw: raw
+    )
+
+# ============================================================================
+# Test helpers
+# ============================================================================
+
+fn args_contain(args: [text], needle: text) -> bool:
+    for arg in args:
+        if arg == needle:
+            return true
+    false
+
+fn args_get_flag_value(args: [text], flag: text) -> text:
+    var i = 0
+    while i < args.len() - 1:
+        if args[i] == flag:
+            return args[i + 1]
+        i = i + 1
+    ""
+
+fn args_last(args: [text]) -> text:
+    if args.len() == 0:
+        return ""
+    args[args.len() - 1]
+
+# Helper to build mock JSONL assistant message
+fn mock_jsonl_message(text_val: text) -> text:
+    var r = _LB()
+    r = r + _Q() + "type" + _Q() + ":" + _Q() + "message" + _Q() + ","
+    r = r + _Q() + "role" + _Q() + ":" + _Q() + "assistant" + _Q() + ","
+    r = r + _Q() + "content" + _Q() + ":[" + _LB()
+    r = r + _Q() + "type" + _Q() + ":" + _Q() + "output_text" + _Q() + ","
+    r = r + _Q() + "text" + _Q() + ":" + _Q() + _escape_json(text_val) + _Q()
+    r = r + _RB() + "]"
+    r = r + _RB()
+    r
+
+fn mock_jsonl_error(msg: text) -> text:
+    var r = _LB()
+    r = r + _Q() + "type" + _Q() + ":" + _Q() + "error" + _Q() + ","
+    r = r + _Q() + "message" + _Q() + ":" + _Q() + _escape_json(msg) + _Q()
+    r = r + _RB()
+    r
+
+fn mock_jsonl_model(model_val: text) -> text:
+    var r = _LB()
+    r = r + _Q() + "model" + _Q() + ":" + _Q() + model_val + _Q()
+    r = r + _RB()
+    r
+
+# ============================================================================
+# Tests: Arg Building
+# ============================================================================
+
+describe "build_codex_args - minimal":
+    it "starts with exec subcommand":
+        val args = build_codex_args("Hello", "", false, "", "", [])
+        expect(args[0]).to_equal("exec")
+
+    it "includes --full-auto":
+        val args = build_codex_args("Hello", "", false, "", "", [])
+        expect(args_contain(args, "--full-auto")).to_equal(true)
+
+    it "defaults sandbox to off":
+        val args = build_codex_args("Hello", "", false, "", "", [])
+        expect(args_get_flag_value(args, "--sandbox")).to_equal("off")
+
+    it "prompt is last positional arg":
+        val args = build_codex_args("Hello world", "", false, "", "", [])
+        # Prompt should be the last arg before any extra_args
+        expect(args_contain(args, "Hello world")).to_equal(true)
+
+    it "has no model flag when empty":
+        val args = build_codex_args("Hi", "", false, "", "", [])
+        expect(args_contain(args, "--model")).to_equal(false)
+
+    it "has no instructions flag when empty":
+        val args = build_codex_args("Hi", "", false, "", "", [])
+        expect(args_contain(args, "--instructions")).to_equal(false)
+
+    it "has no json flag when json_mode is false":
+        val args = build_codex_args("Hi", "", false, "", "", [])
+        expect(args_contain(args, "--json")).to_equal(false)
+
+describe "build_codex_args - model":
+    it "includes model flag":
+        val args = build_codex_args("Hi", "o4-mini", false, "", "", [])
+        expect(args_get_flag_value(args, "--model")).to_equal("o4-mini")
+
+    it "supports o3 model":
+        val args = build_codex_args("Hi", "o3", false, "", "", [])
+        expect(args_get_flag_value(args, "--model")).to_equal("o3")
+
+describe "build_codex_args - json mode":
+    it "includes json flag when true":
+        val args = build_codex_args("Hi", "", true, "", "", [])
+        expect(args_contain(args, "--json")).to_equal(true)
+
+describe "build_codex_args - instructions":
+    it "includes instructions":
+        val args = build_codex_args("Hi", "", false, "You are a pirate", "", [])
+        expect(args_get_flag_value(args, "--instructions")).to_equal("You are a pirate")
+
+describe "build_codex_args - sandbox":
+    it "uses custom sandbox value":
+        val args = build_codex_args("Hi", "", false, "", "network-only", [])
+        expect(args_get_flag_value(args, "--sandbox")).to_equal("network-only")
+
+    it "defaults sandbox to off when empty":
+        val args = build_codex_args("Hi", "", false, "", "", [])
+        expect(args_get_flag_value(args, "--sandbox")).to_equal("off")
+
+describe "build_codex_args - extra args":
+    it "appends extra args":
+        val args = build_codex_args("Hi", "", false, "", "", ["--no-cache"])
+        expect(args_contain(args, "--no-cache")).to_equal(true)
+
+    it "skips empty extra args":
+        val args = build_codex_args("Hi", "", false, "", "", ["", "--flag", ""])
+        expect(args_contain(args, "--flag")).to_equal(true)
+        expect(args_contain(args, "")).to_equal(false)
+
+describe "build_codex_args - combined":
+    it "builds complete args":
+        val args = build_codex_args("prompt", "o4-mini", true, "be helpful", "network-only", ["--no-cache"])
+        expect(args[0]).to_equal("exec")
+        expect(args_contain(args, "--json")).to_equal(true)
+        expect(args_get_flag_value(args, "--model")).to_equal("o4-mini")
+        expect(args_get_flag_value(args, "--instructions")).to_equal("be helpful")
+        expect(args_contain(args, "--full-auto")).to_equal(true)
+        expect(args_get_flag_value(args, "--sandbox")).to_equal("network-only")
+        expect(args_contain(args, "prompt")).to_equal(true)
+        expect(args_contain(args, "--no-cache")).to_equal(true)
+
+# ============================================================================
+# Tests: JSONL Response Parsing
+# ============================================================================
+
+describe "parse_codex_jsonl_response - success":
+    it "parses assistant message with output_text":
+        val jsonl = mock_jsonl_message("Hello world!")
+        val resp = parse_codex_jsonl_response(jsonl)
+        expect(resp.content).to_equal("Hello world!")
+        expect(resp.is_error).to_equal(false)
+        expect(resp.stop_reason).to_equal("end_turn")
+
+    it "parses multiline JSONL with model info":
+        val line1 = mock_jsonl_model("o4-mini")
+        val line2 = mock_jsonl_message("The answer is 42")
+        val jsonl = line1 + "\n" + line2
+        val resp = parse_codex_jsonl_response(jsonl)
+        expect(resp.content).to_equal("The answer is 42")
+        expect(resp.model).to_equal("o4-mini")
+        expect(resp.is_error).to_equal(false)
+
+    it "preserves raw response":
+        val jsonl = mock_jsonl_message("Hi")
+        val resp = parse_codex_jsonl_response(jsonl)
+        expect(resp.raw).to_equal(jsonl)
+
+describe "parse_codex_jsonl_response - error":
+    it "parses error event":
+        val jsonl = mock_jsonl_error("Rate limited")
+        val resp = parse_codex_jsonl_response(jsonl)
+        expect(resp.is_error).to_equal(true)
+        expect(resp.error).to_equal("Rate limited")
+        expect(resp.stop_reason).to_equal("error")
+
+    it "handles empty response":
+        val resp = parse_codex_jsonl_response("")
+        expect(resp.is_error).to_equal(true)
+        expect(resp.error).to_equal("empty response")
+
+    it "handles whitespace-only response":
+        val resp = parse_codex_jsonl_response("   ")
+        expect(resp.is_error).to_equal(true)
+        expect(resp.error).to_equal("empty response")
+
+describe "parse_codex_jsonl_response - multiline content":
+    it "extracts text from assistant message":
+        val line1 = mock_jsonl_model("o4-mini")
+        val line2 = mock_jsonl_message("Line 1\\nLine 2")
+        val jsonl = line1 + "\n" + line2
+        val resp = parse_codex_jsonl_response(jsonl)
+        expect(resp.content).to_contain("Line 1")
+
+    it "uses last assistant message content":
+        val line1 = mock_jsonl_message("first")
+        val line2 = mock_jsonl_message("second")
+        val jsonl = line1 + "\n" + line2
+        val resp = parse_codex_jsonl_response(jsonl)
+        expect(resp.content).to_equal("second")
+
+describe "parse_codex_jsonl_response - edge cases":
+    it "handles missing model field":
+        val jsonl = mock_jsonl_message("Hello")
+        val resp = parse_codex_jsonl_response(jsonl)
+        expect(resp.content).to_equal("Hello")
+        expect(resp.model).to_equal("")
+
+    it "defaults session_id to empty":
+        val jsonl = mock_jsonl_message("Hello")
+        val resp = parse_codex_jsonl_response(jsonl)
+        expect(resp.session_id).to_equal("")
+
+    it "handles error with empty message":
+        var err_line = _LB()
+        err_line = err_line + _Q() + "type" + _Q() + ":" + _Q() + "error" + _Q()
+        err_line = err_line + _RB()
+        val resp = parse_codex_jsonl_response(err_line)
+        expect(resp.is_error).to_equal(true)
+        expect(resp.error).to_equal("unknown error")

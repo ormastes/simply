@@ -1,0 +1,103 @@
+# Panel / Text / Divider — Per-Widget Rendering Demo
+#
+# Non-interactive demo that builds a tree with a titled panel containing
+# three text widgets separated by dividers, renders to an 80x24 screen
+# buffer, and verifies the output contains the expected strings.
+# Prints PASS/FAIL for each check and returns 0 on success, 1 on failure.
+
+use common.ui.builder.{column, panel, text_widget, divider, statusbar, build_tree_with_title}
+use common.ui.widget.{UIState}
+use common.ui.layout.{compute_layout}
+use common.ui.state.{init_state}
+use app.ui.tui.screen.{Screen}
+use app.ui.render.widgets.{render_tui_tree}
+
+fn build_demo_tree() -> UIState:
+    """Build a panel with three text widgets separated by dividers."""
+    val line1 = text_widget("line1", "Line 1")
+    val sep1 = divider("sep1")
+    val line2 = text_widget("line2", "Line 2")
+    val sep2 = divider("sep2")
+    val line3 = text_widget("line3", "Line 3")
+
+    val demo_panel = panel("demo_panel", "Demo Panel", [line1, sep1, line2, sep2, line3])
+
+    val status = statusbar("status", "NORMAL", "Panel Text Divider Demo")
+    val root = column("root", [demo_panel, status])
+    val tree = build_tree_with_title(root, "Panel Text Divider Demo", "dark")
+    return init_state(tree)
+
+fn check(label: text, condition: bool, failures: i32) -> i32:
+    if condition:
+        print "PASS: {label}"
+        return failures
+    else:
+        print "FAIL: {label}"
+        return failures + 1
+
+fn main() -> i64:
+    var failures = 0
+
+    # --- Build the widget tree ---
+    val state = build_demo_tree()
+    val ids = state.tree.all_widget_ids()
+    failures = check("tree built with {ids.len()} widgets (expect >= 8)", ids.len() >= 8, failures)
+
+    # --- Compute layout for 80x24 ---
+    val width = 80
+    val height = 24
+    val rects = compute_layout(state.tree.root, 0, 0, width, height - 1)
+    failures = check("layout computed with {rects.len()} rects", rects.len() > 0, failures)
+
+    # --- Render to screen buffer ---
+    var screen = Screen.new(width, height - 1)
+    screen = render_tui_tree(screen, state.tree.root, rects, state)
+
+    # Collect raw buffer text (no ANSI escapes needed for content checks)
+    var buf_text = ""
+    var row = 0
+    while row < height - 1:
+        buf_text = "{buf_text}{screen.buffer[row]}\n"
+        row = row + 1
+
+    # Print the rendered buffer for visual inspection
+    print "--- Rendered buffer ({width}x{height - 1}) ---"
+    print buf_text
+    print "--- End buffer ---"
+
+    # --- Verify panel ---
+    failures = check("buffer contains panel title 'Demo Panel'", buf_text.contains("Demo Panel"), failures)
+    # Panel border: draw_box produces Unicode box-drawing corners (┌┐└┘) and lines
+    failures = check("buffer contains panel border corner", buf_text.contains("\u{250c}"), failures)
+
+    # --- Verify text widgets ---
+    failures = check("buffer contains 'Line 1'", buf_text.contains("Line 1"), failures)
+    failures = check("buffer contains 'Line 2'", buf_text.contains("Line 2"), failures)
+    failures = check("buffer contains 'Line 3'", buf_text.contains("Line 3"), failures)
+
+    # --- Verify dividers ---
+    # Dividers render via draw_hline with '-' characters.
+    # The panel border also uses '-', so count occurrences of lines that are
+    # mostly dashes inside the panel interior (rows between the top and bottom
+    # border).  A simpler heuristic: the buffer must contain at least three
+    # separate rows with long runs of '-' (top border, 2 dividers, bottom border).
+    var dash_rows = 0
+    row = 0
+    while row < height - 1:
+        val line = screen.buffer[row]
+        # Count dashes using contains — avoids byte/char index mismatch
+        # with Unicode box-drawing characters in the buffer
+        if line.contains("\u{2500}") or line.contains("-"):
+            dash_rows = dash_rows + 1
+        row = row + 1
+
+    # Expect >= 4 dash rows: top border, sep1, sep2, bottom border
+    failures = check("at least 4 rows with horizontal dashes (borders + dividers), got {dash_rows}", dash_rows >= 4, failures)
+
+    # --- Summary ---
+    if failures == 0:
+        print "All checks passed."
+        return 0
+    else:
+        print "{failures} check(s) failed."
+        return 1

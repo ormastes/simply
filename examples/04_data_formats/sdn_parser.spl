@@ -1,0 +1,237 @@
+#!/usr/bin/env simple
+# SDN Parser Usage Example
+#
+# Demonstrates the standard SDN integration pattern established in Phase 3.
+# This pattern is used throughout the compiler for configuration and data files.
+#
+# SDN (Simple Data Notation) is Simple's native data format, similar to YAML/TOML
+# but designed specifically for Simple's type system.
+#
+# NOTE: This example shows the patterns used in the compiled compiler.
+# The runtime parser has limitations (is_alnum() not available), so this is
+# primarily a reference for understanding the codebase patterns.
+
+use std.sdn.{parse, SdnValue}
+
+# RUNTIME LIMITATION: SDN parser currently only works in compiled mode
+# See memory/MEMORY.md for details on runtime parser limitations
+
+# ============================================================================
+# Pattern 1: Basic SDN Parsing
+# ============================================================================
+
+fn example_basic_parsing():
+    """Parse simple SDN content."""
+    val content = """
+    name: "Simple Compiler"
+    version: "0.5.0"
+    features:
+        - "self-hosting"
+        - "pure-simple"
+        - "zero-rust"
+    """
+
+    # Standard pattern: parse + error handling
+    val parse_result = parse(content)
+    if parse_result.err.?:
+        print "Parse error: {parse_result.unwrap_err()}"
+        return
+
+    val sdn_value = parse_result.unwrap()
+    print "Parsed successfully!"
+
+    # Extract data from parsed SDN
+    match sdn_value:
+        case SdnValue.Dict(d):
+            if d.contains_key("name"):
+                match d["name"]:
+                    case SdnValue.String(s):
+                        print "Project: {s}"
+                    case _: ()
+        case _: ()
+
+# ============================================================================
+# Pattern 2: Structured Data Extraction
+# ============================================================================
+
+struct ProjectConfig:
+    """Example configuration structure."""
+    name: text
+    version: text
+    features: [text]
+
+fn extract_project_config(sdn_value: SdnValue) -> ProjectConfig?:
+    """Extract typed configuration from SDN value.
+
+    This is the standard extraction helper pattern used in:
+    - db_atomic.spl (table extraction)
+    - dl/config_loader.spl (DL config)
+    - exp/artifact.spl (artifact metadata)
+    """
+    match sdn_value:
+        case SdnValue.Dict(d):
+            # Extract required fields
+            var name = ""
+            var version = ""
+            var features: [text] = []
+
+            if d.contains_key("name"):
+                match d["name"]:
+                    case SdnValue.String(s): name = s
+                    case _: return nil
+
+            if d.contains_key("version"):
+                match d["version"]:
+                    case SdnValue.String(s): version = s
+                    case _: return nil
+
+            if d.contains_key("features"):
+                match d["features"]:
+                    case SdnValue.Array(items):
+                        for item in items:
+                            match item:
+                                case SdnValue.String(s):
+                                    features.push(s)
+                                case _: ()
+                    case _: ()
+
+            Some(ProjectConfig(name: name, version: version, features: features))
+        case _:
+            nil
+
+fn example_structured_extraction():
+    """Extract structured data using helper function."""
+    val content = """
+    name: "example-project"
+    version: "1.0.0"
+    features:
+        - "networking"
+        - "database"
+    """
+
+    val parse_result = parse(content)
+    if parse_result.err.?:
+        print "Parse failed"
+        return
+
+    val config = extract_project_config(parse_result.unwrap())
+    if config.?:
+        val c = config.unwrap()
+        print "Config loaded: {c.name} v{c.version}"
+        print "Features: {c.features.len()}"
+    else:
+        print "Failed to extract config"
+
+# ============================================================================
+# Pattern 3: Table Format (Database Integration)
+# ============================================================================
+
+fn example_table_format():
+    """Parse SDN table format used in database files.
+
+    Table format example:
+        todos |id, priority, description, status|
+            0, P1, "Implement feature", open
+            1, P2, "Write docs", closed
+    """
+    val content = """
+    todos |id, priority, description, status|
+        0, P1, "Implement feature", open
+        1, P2, "Write docs", closed
+    """
+
+    val parse_result = parse(content)
+    if parse_result.err.?:
+        print "Parse failed"
+        return
+
+    # Extract table using SDN table parser
+    # (See src/lib/db_atomic.spl for full implementation)
+    print "Table format parsed successfully"
+
+# ============================================================================
+# Pattern 4: Configuration with Defaults
+# ============================================================================
+
+struct ServerConfig:
+    """Configuration with default values."""
+    host: text
+    port: i64
+    timeout: i64
+
+impl ServerConfig:
+    static fn default() -> ServerConfig:
+        ServerConfig(host: "localhost", port: 8080, timeout: 30)
+
+fn parse_server_config(content: text) -> ServerConfig:
+    """Parse config with fallback to defaults."""
+    val parse_result = parse(content)
+
+    # Start with defaults
+    var config = ServerConfig.default()
+
+    if parse_result.ok.?:
+        val sdn_value = parse_result.unwrap()
+        match sdn_value:
+            case SdnValue.Dict(d):
+                # Override defaults with parsed values
+                if d.contains_key("host"):
+                    match d["host"]:
+                        case SdnValue.String(s): config.host = s
+                        case _: ()
+
+                if d.contains_key("port"):
+                    match d["port"]:
+                        case SdnValue.Int(n): config.port = n
+                        case _: ()
+
+                if d.contains_key("timeout"):
+                    match d["timeout"]:
+                        case SdnValue.Int(n): config.timeout = n
+                        case _: ()
+            case _: ()
+
+    config
+
+fn example_config_with_defaults():
+    """Load configuration with defaults."""
+    val content = """
+    host: "0.0.0.0"
+    port: 9000
+    """
+
+    val config = parse_server_config(content)
+    print "Server: {config.host}:{config.port} (timeout: {config.timeout}s)"
+
+# ============================================================================
+# Main Examples
+# ============================================================================
+
+fn main():
+    print "=== SDN Parser Usage Examples ==="
+    print ""
+
+    print "Example 1: Basic Parsing"
+    example_basic_parsing()
+    print ""
+
+    print "Example 2: Structured Extraction"
+    example_structured_extraction()
+    print ""
+
+    print "Example 3: Table Format"
+    example_table_format()
+    print ""
+
+    print "Example 4: Config with Defaults"
+    example_config_with_defaults()
+    print ""
+
+    print "✓ All examples completed"
+    print ""
+    print "See also:"
+    print "  - src/lib/db_atomic.spl (table parsing)"
+    print "  - src/lib/src/dl/config_loader.spl (DL config)"
+    print "  - src/lib/src/exp/config.spl (experiment config)"
+
+main()

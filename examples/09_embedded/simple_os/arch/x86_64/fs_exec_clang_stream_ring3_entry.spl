@@ -1,0 +1,104 @@
+# x86_64 STREAMING clang launch entry (Track 3d).
+#
+# Launches the 124.6 MB freestanding clang_static (/FSEXEC.ELF on the FAT32
+# image) through the GENERAL streaming loader x86_64_fs_exec_enter_stream_ring3
+# — NOT the bespoke fs_elf_exec_smoke harness. Every PT_LOAD segment is pulled
+# straight off disk via simpleos_fat32_stream_read_at into freshly allocated pmm
+# frames; only a bounded ELF header + phdr prefix is ever resident. The general
+# loader now maps a 64 MiB anonymous user heap + rt_user_heap_init so clang's
+# SimpleOS-ABI mmap(10)/brk(15)/debug_write(60)/exit(0) syscalls are serviced.
+#
+# argv[0] is the binary path (/FSEXEC.ELF); we pass "--version" as argv[1], so
+# clang prints its version banner via syscall 60 (serial) and exits(0).
+#
+# Reads the target PRE-vmm — same ordering fs_exec_stream_ring3_entry.spl uses —
+# so this lane stays independent of the post-vmm NVMe DMA path.
+
+extern fn serial_println(msg: text)
+extern fn rt_debug_exit_success()
+extern fn rt_x86_tss_init() -> i64
+extern fn simpleos_nvme_init() -> i64
+extern fn simpleos_fat32_path_read_buffer_addr() -> u64
+extern fn simpleos_fat32_stream_open(path: text) -> i64
+extern fn simpleos_fat32_stream_read_at(file_off: u64, dst: u64, len: u64) -> i64
+
+use os.kernel.arch.x86_64.arch_init.{arch_x86_64_early_init}
+use os.kernel.memory.pmm.{pmm_init_identity_range, g_pmm}
+use os.kernel.memory.vmm.{vmm_init}
+use os.kernel.memory.vmm_address_space.{vmm_map_nvme_bar_high}
+use os.kernel.loader.x86_64_fs_exec_ring3.{x86_64_fs_exec_enter_stream_heap_ring3}
+
+# clang_static is written to the FAT image as /FSEXEC.ELF by fsexec_mkimg_big.spl.
+fn _target_path() -> text: "/FSEXEC.ELF"
+
+fn spl_start():
+    serial_println("")
+    serial_println("=== SimpleOS x86_64 STREAMING clang launch (Track 3d) ===")
+
+    arch_x86_64_early_init()
+    serial_println("[clang-stream] arch-init + syscall MSRs done")
+    rt_x86_tss_init()
+
+
+    if simpleos_nvme_init() != 0:
+        serial_println("[clang-stream] FAIL nvme init")
+        serial_println("TEST FAILED")
+        rt_debug_exit_success()
+        return
+    serial_println("[clang-stream] nvme online")
+
+    # Open the stream and read ONLY a bounded header+phdr prefix — never the whole
+    # 124.6 MB file. The stream stays open; the handoff's _map_pt_loads pulls each
+    # PT_LOAD's bytes from it during mapping.
+    val path = _target_path()
+    val fsize = simpleos_fat32_stream_open(path)
+    if fsize <= 64:
+        serial_println("[clang-stream] FAIL open path={path} rc={fsize}")
+        serial_println("TEST FAILED")
+        rt_debug_exit_success()
+        return
+    val hdr_buf = simpleos_fat32_path_read_buffer_addr()
+    val HDR_CAP: i64 = 65536
+    val want = if fsize < HDR_CAP: fsize else: HDR_CAP
+    val hdr_n = simpleos_fat32_stream_read_at(0.to_u64(), hdr_buf, want.to_u64())
+    if hdr_n < 64:
+        serial_println("[clang-stream] FAIL header read rc={hdr_n}")
+        serial_println("TEST FAILED")
+        rt_debug_exit_success()
+        return
+    serial_println("[clang-stream] header path={path} file_size={fsize} hdr_bytes={hdr_n}")
+
+    # pmm pool: 2 GiB total. kernel_end MUST cover the FULL kernel memory image —
+    # this kernel's RW segment (.bss + .heap) ends at 0x17608000.
+    # Constraint: 128 MB base load (0x08000000) + ~118 MB kernel RW extent = ~0x17608000.
+    # Round up to page boundary: 0x18000000 (384 MiB) provides headroom for the
+    # 124.6 MB clang payload (~32k frames) + 64 MiB user heap.
+    # TODO: derive kernel_end from a linker end symbol (__bss_end from linker.ld)
+    #       instead of this constant; see src/os/kernel/arch/x86_64/boot.spl
+    #       for the precedent extern fn _get_kernel_end() approach.
+    # Requires QEMU -m 2G.
+    if not pmm_init_identity_range(0x80000000, 0x100000, 0x18000000):
+        serial_println("[clang-stream] FAIL pmm_init")
+        serial_println("TEST FAILED")
+        rt_debug_exit_success()
+        return
+    vmm_init(g_pmm, 0)
+    # NVMe BAR at an exclusive higher-half slot BEFORE creating the user AS so
+    # the AS inherits it (ring-0 syscall handler reaches the disk under user cr3).
+    vmm_map_nvme_bar_high()
+    serial_println("[clang-stream] pmm+vmm online")
+
+    val argv: [text] = ["-cc1", "-triple", "x86_64-unknown-simpleos", "-emit-obj", "-o", "/hello.o", "-x", "c", "/hello.c"]
+    val envp: [text] = []
+    serial_println("[clang-stream] streaming PT_LOADs + entering ring-3 clang ...")
+    # Frame binary_path (argv[0]) = "clang", not the 8.3 on-disk name: the clang
+    # driver deduces its mode from argv[0] (the proven smoke lane also passed
+    # "clang"). The stream is already open by `path`; binary_path only feeds the
+    # SysV frame here.
+    val rc = x86_64_fs_exec_enter_stream_heap_ring3("clang", hdr_buf, hdr_n.to_u64(), fsize.to_u64(), argv, envp)
+    serial_println("[clang-stream] clang handoff returned rc={rc}")
+    if rc == 0:
+        serial_println("CLANG FILE-LAUNCH WORKS rc=0")
+    else:
+        serial_println("[clang-stream] clang exited rc={rc}")
+    rt_debug_exit_success()

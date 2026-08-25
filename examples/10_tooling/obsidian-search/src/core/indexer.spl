@@ -1,0 +1,646 @@
+# Indexer — in-memory storage using module-level globals
+#
+# Classes are pass-by-value in the interpreter, so we use
+# module-level arrays with manual counters for mutable state.
+#
+# Performance: uses dict indices for O(1) lookups by ID, path, and note_id.
+
+use src.core.note_parser.{parse_frontmatter, extract_wikilinks, extract_tags, extract_tasks, chunk_by_heading}
+use src.core.vault_scanner.{scan_vault, relative_path}
+use std.io_runtime.{read_file, file_size}
+
+# --- Record types ---
+
+struct NoteRecord:
+    id: i64
+    path: text
+    title: text
+    aliases: text
+    tags: text
+    frontmatter: text
+    mtime: i64
+    weight: f64
+
+struct ChunkRecord:
+    id: i64
+    note_id: i64
+    chunk_type: text
+    heading_path: text
+    text_content: text
+
+struct LinkRecord:
+    id: i64
+    src_note_id: i64
+    dst_path: text
+    anchor_text: text
+
+struct TaskRecord:
+    id: i64
+    note_id: i64
+    status: text
+    text_content: text
+    line_num: i64
+
+# --- Dummy handle for API compatibility ---
+
+struct IndexDb:
+    is_valid: bool
+
+# --- Module-level storage ---
+
+var DB_NOTES: [NoteRecord] = []
+var DB_CHUNKS: [ChunkRecord] = []
+var DB_LINKS: [LinkRecord] = []
+var DB_TASKS: [TaskRecord] = []
+var DB_NOTE_COUNT: i64 = 0
+var DB_CHUNK_COUNT: i64 = 0
+var DB_LINK_COUNT: i64 = 0
+var DB_TASK_COUNT: i64 = 0
+var DB_NEXT_ID: i64 = 1
+var VAULT_INDEXED: bool = false
+
+# --- Index maps for O(1) lookups ---
+
+var IDX_NOTE_BY_ID: {text: i64} = {}
+var IDX_NOTE_BY_PATH: {text: i64} = {}
+var IDX_CHUNKS_BY_NOTE: {text: [i64]} = {}
+var IDX_LINKS_BY_SRC: {text: [i64]} = {}
+var IDX_LINKS_BY_DST: {text: [i64]} = {}
+var IDX_TASKS_BY_NOTE: {text: [i64]} = {}
+
+# --- Authority / backlink cache ---
+
+var CACHE_BACKLINK_COUNT: {text: i64} = {}
+var CACHE_AUTHORITY: {text: f64} = {}
+var CACHE_VALID: bool = false
+
+# --- Lazy init ---
+
+fn ensure_indexed(db: IndexDb, vault_path: text):
+    if VAULT_INDEXED:
+        return
+    if vault_path == "":
+        return
+    reindex_vault(db, vault_path)
+    VAULT_INDEXED = true
+
+# --- Batch result struct ---
+
+struct NoteIndexResult:
+    note: NoteRecord
+    chunks: [ChunkRecord]
+    links: [LinkRecord]
+    tasks: [TaskRecord]
+
+# --- Database lifecycle ---
+
+fn open_index_memory() -> IndexDb:
+    DB_NOTES = []
+    DB_CHUNKS = []
+    DB_LINKS = []
+    DB_TASKS = []
+    DB_NOTE_COUNT = 0
+    DB_CHUNK_COUNT = 0
+    DB_LINK_COUNT = 0
+    DB_TASK_COUNT = 0
+    DB_NEXT_ID = 1
+    IDX_NOTE_BY_ID = {}
+    IDX_NOTE_BY_PATH = {}
+    IDX_CHUNKS_BY_NOTE = {}
+    IDX_LINKS_BY_SRC = {}
+    IDX_LINKS_BY_DST = {}
+    IDX_TASKS_BY_NOTE = {}
+    CACHE_BACKLINK_COUNT = {}
+    CACHE_AUTHORITY = {}
+    CACHE_VALID = false
+    IndexDb(is_valid: true)
+
+fn open_index_db(path: text) -> IndexDb:
+    open_index_memory()
+
+fn close_index_db(db: IndexDb):
+    pass_dn
+
+fn create_schema(db: IndexDb) -> bool:
+    true
+
+# --- ID generation ---
+
+fn next_id() -> i64:
+    val id = DB_NEXT_ID
+    DB_NEXT_ID = DB_NEXT_ID + 1
+    id
+
+# --- Index a single note ---
+
+fn index_note(db: IndexDb, full_path: text, rel_path: text, content: text, mtime: i64) -> i64:
+    val meta = parse_frontmatter(content)
+    val aliases_str = meta.aliases.join(",")
+
+    # Merge frontmatter tags and inline tags
+    val inline_tags = extract_tags(content)
+    var all_tags: [text] = []
+    for t in meta.tags:
+        all_tags.push(t)
+    for t in inline_tags:
+        var found = false
+        for existing in all_tags:
+            if existing == t:
+                found = true
+                break
+        if not found:
+            all_tags.push(t)
+    val all_tags_str = all_tags.join(",")
+
+    # Remove existing note if present
+    remove_note(db, rel_path)
+
+    # Create note record
+    val note_id = next_id()
+    val note = NoteRecord(
+        id: note_id,
+        path: rel_path,
+        title: meta.title,
+        aliases: aliases_str,
+        tags: all_tags_str,
+        frontmatter: meta.frontmatter_raw,
+        mtime: mtime,
+        weight: 1.0
+    )
+    DB_NOTES = DB_NOTES + [note]
+    val note_idx = DB_NOTE_COUNT
+    DB_NOTE_COUNT = DB_NOTE_COUNT + 1
+    IDX_NOTE_BY_ID[str(note_id)] = note_idx
+    IDX_NOTE_BY_PATH[rel_path] = note_idx
+
+    # Create chunk records
+    val chunks = chunk_by_heading(content)
+    for chunk in chunks:
+        val chunk_id = next_id()
+        val cr = ChunkRecord(
+            id: chunk_id,
+            note_id: note_id,
+            chunk_type: chunk.chunk_type,
+            heading_path: chunk.heading_path,
+            text_content: chunk.text_content
+        )
+        val chunk_idx = DB_CHUNK_COUNT
+        DB_CHUNKS = DB_CHUNKS + [cr]
+        DB_CHUNK_COUNT = DB_CHUNK_COUNT + 1
+        val cn_key = str(note_id)
+        if IDX_CHUNKS_BY_NOTE[cn_key].?:
+            IDX_CHUNKS_BY_NOTE[cn_key] = IDX_CHUNKS_BY_NOTE[cn_key] + [chunk_idx]
+        else:
+            IDX_CHUNKS_BY_NOTE[cn_key] = [chunk_idx]
+
+    # Create link records
+    val wikilinks = extract_wikilinks(content)
+    for link in wikilinks:
+        val link_id = next_id()
+        val lr = LinkRecord(
+            id: link_id,
+            src_note_id: note_id,
+            dst_path: link.target,
+            anchor_text: link.alias
+        )
+        val link_idx = DB_LINK_COUNT
+        DB_LINKS = DB_LINKS + [lr]
+        DB_LINK_COUNT = DB_LINK_COUNT + 1
+        val ls_key = str(note_id)
+        if IDX_LINKS_BY_SRC[ls_key].?:
+            IDX_LINKS_BY_SRC[ls_key] = IDX_LINKS_BY_SRC[ls_key] + [link_idx]
+        else:
+            IDX_LINKS_BY_SRC[ls_key] = [link_idx]
+        val ld_key = link.target
+        if IDX_LINKS_BY_DST[ld_key].?:
+            IDX_LINKS_BY_DST[ld_key] = IDX_LINKS_BY_DST[ld_key] + [link_idx]
+        else:
+            IDX_LINKS_BY_DST[ld_key] = [link_idx]
+
+    # Create task records
+    val tasks_list = extract_tasks(content)
+    for task in tasks_list:
+        val task_id = next_id()
+        val tr = TaskRecord(
+            id: task_id,
+            note_id: note_id,
+            status: task.status,
+            text_content: task.text_content,
+            line_num: task.line_num
+        )
+        val task_idx = DB_TASK_COUNT
+        DB_TASKS = DB_TASKS + [tr]
+        DB_TASK_COUNT = DB_TASK_COUNT + 1
+        val tn_key = str(note_id)
+        if IDX_TASKS_BY_NOTE[tn_key].?:
+            IDX_TASKS_BY_NOTE[tn_key] = IDX_TASKS_BY_NOTE[tn_key] + [task_idx]
+        else:
+            IDX_TASKS_BY_NOTE[tn_key] = [task_idx]
+
+    CACHE_VALID = false
+    note_id
+
+# --- Index a single note (batch-collect variant) ---
+
+fn index_note_collect(full_path: text, rel_path: text, content: text, mtime: i64) -> NoteIndexResult:
+    val meta = parse_frontmatter(content)
+    val aliases_str = meta.aliases.join(",")
+
+    val inline_tags = extract_tags(content)
+    var all_tags: [text] = []
+    for t in meta.tags:
+        all_tags.push(t)
+    for t in inline_tags:
+        var found = false
+        for existing in all_tags:
+            if existing == t:
+                found = true
+                break
+        if not found:
+            all_tags.push(t)
+    val all_tags_str = all_tags.join(",")
+
+    val note_id = next_id()
+    val note = NoteRecord(
+        id: note_id,
+        path: rel_path,
+        title: meta.title,
+        aliases: aliases_str,
+        tags: all_tags_str,
+        frontmatter: meta.frontmatter_raw,
+        mtime: mtime,
+        weight: 1.0
+    )
+
+    var local_chunks: [ChunkRecord] = []
+    val chunks = chunk_by_heading(content)
+    for chunk in chunks:
+        val chunk_id = next_id()
+        val cr = ChunkRecord(
+            id: chunk_id,
+            note_id: note_id,
+            chunk_type: chunk.chunk_type,
+            heading_path: chunk.heading_path,
+            text_content: chunk.text_content
+        )
+        local_chunks.push(cr)
+
+    var local_links: [LinkRecord] = []
+    val wikilinks = extract_wikilinks(content)
+    for link in wikilinks:
+        val link_id = next_id()
+        val lr = LinkRecord(
+            id: link_id,
+            src_note_id: note_id,
+            dst_path: link.target,
+            anchor_text: link.alias
+        )
+        local_links.push(lr)
+
+    var local_tasks: [TaskRecord] = []
+    val tasks_list = extract_tasks(content)
+    for task in tasks_list:
+        val task_id = next_id()
+        val tr = TaskRecord(
+            id: task_id,
+            note_id: note_id,
+            status: task.status,
+            text_content: task.text_content,
+            line_num: task.line_num
+        )
+        local_tasks.push(tr)
+
+    NoteIndexResult(note: note, chunks: local_chunks, links: local_links, tasks: local_tasks)
+
+# --- Remove a note and its dependents ---
+
+fn remove_note(db: IndexDb, rel_path: text):
+    var note_id: i64 = -1
+    if IDX_NOTE_BY_PATH[rel_path].?:
+        val idx = IDX_NOTE_BY_PATH[rel_path]
+        if idx < DB_NOTE_COUNT:
+            note_id = DB_NOTES[idx].id
+    else:
+        for n in DB_NOTES:
+            if n.path == rel_path:
+                note_id = n.id
+                break
+    if note_id < 0:
+        return
+
+    var new_notes: [NoteRecord] = []
+    var nc: i64 = 0
+    for n in DB_NOTES:
+        if n.id != note_id:
+            new_notes.push(n)
+            nc = nc + 1
+    DB_NOTES = new_notes
+    DB_NOTE_COUNT = nc
+
+    var new_chunks: [ChunkRecord] = []
+    var cc: i64 = 0
+    for c in DB_CHUNKS:
+        if c.note_id != note_id:
+            new_chunks.push(c)
+            cc = cc + 1
+    DB_CHUNKS = new_chunks
+    DB_CHUNK_COUNT = cc
+
+    var new_links: [LinkRecord] = []
+    var lc: i64 = 0
+    for l in DB_LINKS:
+        if l.src_note_id != note_id:
+            new_links.push(l)
+            lc = lc + 1
+    DB_LINKS = new_links
+    DB_LINK_COUNT = lc
+
+    var new_tasks: [TaskRecord] = []
+    var tc: i64 = 0
+    for t in DB_TASKS:
+        if t.note_id != note_id:
+            new_tasks.push(t)
+            tc = tc + 1
+    DB_TASKS = new_tasks
+    DB_TASK_COUNT = tc
+
+    # Rebuild indices after removal
+    rebuild_indices()
+
+# --- Rebuild all indices from arrays ---
+
+fn rebuild_indices():
+    IDX_NOTE_BY_ID = {}
+    IDX_NOTE_BY_PATH = {}
+    IDX_CHUNKS_BY_NOTE = {}
+    IDX_LINKS_BY_SRC = {}
+    IDX_LINKS_BY_DST = {}
+    IDX_TASKS_BY_NOTE = {}
+
+    var i: i64 = 0
+    for n in DB_NOTES:
+        IDX_NOTE_BY_ID[str(n.id)] = i
+        IDX_NOTE_BY_PATH[n.path] = i
+        i = i + 1
+
+    i = 0
+    for c in DB_CHUNKS:
+        val ck = str(c.note_id)
+        if IDX_CHUNKS_BY_NOTE[ck].?:
+            IDX_CHUNKS_BY_NOTE[ck] = IDX_CHUNKS_BY_NOTE[ck] + [i]
+        else:
+            IDX_CHUNKS_BY_NOTE[ck] = [i]
+        i = i + 1
+
+    i = 0
+    for l in DB_LINKS:
+        val sk = str(l.src_note_id)
+        if IDX_LINKS_BY_SRC[sk].?:
+            IDX_LINKS_BY_SRC[sk] = IDX_LINKS_BY_SRC[sk] + [i]
+        else:
+            IDX_LINKS_BY_SRC[sk] = [i]
+        val dk = l.dst_path
+        if IDX_LINKS_BY_DST[dk].?:
+            IDX_LINKS_BY_DST[dk] = IDX_LINKS_BY_DST[dk] + [i]
+        else:
+            IDX_LINKS_BY_DST[dk] = [i]
+        i = i + 1
+
+    i = 0
+    for t in DB_TASKS:
+        val tk = str(t.note_id)
+        if IDX_TASKS_BY_NOTE[tk].?:
+            IDX_TASKS_BY_NOTE[tk] = IDX_TASKS_BY_NOTE[tk] + [i]
+        else:
+            IDX_TASKS_BY_NOTE[tk] = [i]
+        i = i + 1
+
+    CACHE_VALID = false
+
+# --- Staleness check ---
+
+fn is_stale(db: IndexDb, rel_path: text, current_mtime: i64) -> bool:
+    if IDX_NOTE_BY_PATH[rel_path].?:
+        val idx = IDX_NOTE_BY_PATH[rel_path]
+        if idx < DB_NOTE_COUNT:
+            return current_mtime > DB_NOTES[idx].mtime
+    true
+
+# --- Full vault reindex ---
+
+fn reindex_vault(db: IndexDb, vault_path: text) -> i64:
+    val files = scan_vault(vault_path)
+    var batch_notes: [NoteRecord] = []
+    var batch_chunks: [ChunkRecord] = []
+    var batch_links: [LinkRecord] = []
+    var batch_tasks: [TaskRecord] = []
+    var indexed_count: i64 = 0
+    for file in files:
+        val rel = relative_path(file, vault_path)
+        val fsize = file_size(file)
+        if is_stale(db, rel, fsize):
+            val content = read_file(file) ?? ""
+            val result = index_note_collect(file, rel, content, fsize)
+            batch_notes.push(result.note)
+            for c in result.chunks:
+                batch_chunks.push(c)
+            for l in result.links:
+                batch_links.push(l)
+            for t in result.tasks:
+                batch_tasks.push(t)
+            indexed_count = indexed_count + 1
+    DB_NOTES = batch_notes
+    DB_CHUNKS = batch_chunks
+    DB_LINKS = batch_links
+    DB_TASKS = batch_tasks
+    DB_NOTE_COUNT = batch_notes.len()
+    DB_CHUNK_COUNT = batch_chunks.len()
+    DB_LINK_COUNT = batch_links.len()
+    DB_TASK_COUNT = batch_tasks.len()
+
+    # Build indices after bulk load
+    rebuild_indices()
+    # Build caches
+    rebuild_caches()
+    indexed_count
+
+# --- Cache computation ---
+
+fn rebuild_caches():
+    CACHE_BACKLINK_COUNT = {}
+    CACHE_AUTHORITY = {}
+
+    # Count unique backlinks per destination
+    # For each link, count how many unique sources point to each destination
+    var dst_sources: {text: {text: bool}} = {}
+    for link in DB_LINKS:
+        val dst = link.dst_path
+        if not dst_sources[dst].?:
+            dst_sources[dst] = {}
+        dst_sources[dst][str(link.src_note_id)] = true
+
+    # Also index by note path and note name for matching
+    for n in DB_NOTES:
+        val name = note_name_from_path_simple(n.path)
+        val stripped = strip_extension_simple(n.path)
+        var total_sources: {text: bool} = {}
+
+        # Collect sources matching by name, path, or stripped path
+        if dst_sources[name].?:
+            for k in dst_sources[name].keys():
+                total_sources[k] = true
+        if dst_sources[n.path].?:
+            for k in dst_sources[n.path].keys():
+                total_sources[k] = true
+        if dst_sources[stripped].?:
+            for k in dst_sources[stripped].keys():
+                total_sources[k] = true
+
+        val count = total_sources.keys().len()
+        CACHE_BACKLINK_COUNT[n.path] = count
+
+    # Compute authority scores using cached backlink counts
+    for n in DB_NOTES:
+        val my_backlinks = CACHE_BACKLINK_COUNT[n.path] ?? 0
+        var authority = float(my_backlinks)
+
+        # Add weighted backlink counts of sources
+        val name = note_name_from_path_simple(n.path)
+        val stripped = strip_extension_simple(n.path)
+        var src_ids: {text: bool} = {}
+        if dst_sources[name].?:
+            for k in dst_sources[name].keys():
+                src_ids[k] = true
+        if dst_sources[n.path].?:
+            for k in dst_sources[n.path].keys():
+                src_ids[k] = true
+        if dst_sources[stripped].?:
+            for k in dst_sources[stripped].keys():
+                src_ids[k] = true
+
+        for src_id_str in src_ids.keys():
+            val src_idx_opt = IDX_NOTE_BY_ID[src_id_str]
+            if src_idx_opt.?:
+                val src_note = DB_NOTES[src_idx_opt]
+                val src_bl = CACHE_BACKLINK_COUNT[src_note.path] ?? 0
+                authority = authority + float(src_bl) * 0.3
+
+        CACHE_AUTHORITY[n.path] = authority
+
+    CACHE_VALID = true
+
+# --- Simple path utilities (avoid circular import with graph) ---
+
+fn strip_extension_simple(path: text) -> text:
+    val dot_idx_result = path.last_index_of(".")
+    match dot_idx_result:
+        Some(i):
+            return path.substring(0, i)
+        nil:
+            return path
+    path
+
+fn note_name_from_path_simple(path: text) -> text:
+    var name = path
+    val slash_idx_result = path.last_index_of("/")
+    match slash_idx_result:
+        Some(i):
+            name = path.substring(i + 1, path.len())
+        nil: pass_dn
+    val dot_idx_result = name.last_index_of(".")
+    match dot_idx_result:
+        Some(i):
+            return name.substring(0, i)
+        nil:
+            return name
+    name
+
+# --- Accessors ---
+
+fn get_note_by_id(db: IndexDb, note_id: i64) -> NoteRecord:
+    val key = str(note_id)
+    if IDX_NOTE_BY_ID[key].?:
+        val idx = IDX_NOTE_BY_ID[key]
+        if idx < DB_NOTE_COUNT:
+            return DB_NOTES[idx]
+    NoteRecord(id: 0, path: "", title: "", aliases: "", tags: "", frontmatter: "", mtime: 0, weight: 0.0)
+
+fn get_note_by_path(db: IndexDb, path: text) -> NoteRecord:
+    if IDX_NOTE_BY_PATH[path].?:
+        val idx = IDX_NOTE_BY_PATH[path]
+        if idx < DB_NOTE_COUNT:
+            return DB_NOTES[idx]
+    NoteRecord(id: 0, path: "", title: "", aliases: "", tags: "", frontmatter: "", mtime: 0, weight: 0.0)
+
+fn note_count(db: IndexDb) -> i64:
+    DB_NOTE_COUNT
+
+fn link_count(db: IndexDb) -> i64:
+    DB_LINK_COUNT
+
+fn task_count(db: IndexDb) -> i64:
+    DB_TASK_COUNT
+
+fn get_chunks_for_note(db: IndexDb, note_id: i64) -> [ChunkRecord]:
+    var result: [ChunkRecord] = []
+    val key = str(note_id)
+    if IDX_CHUNKS_BY_NOTE[key].?:
+        val indices = IDX_CHUNKS_BY_NOTE[key]
+        for idx in indices:
+            if idx < DB_CHUNK_COUNT:
+                result.push(DB_CHUNKS[idx])
+    result
+
+fn get_links_from_note(db: IndexDb, note_id: i64) -> [LinkRecord]:
+    var result: [LinkRecord] = []
+    val key = str(note_id)
+    if IDX_LINKS_BY_SRC[key].?:
+        val indices = IDX_LINKS_BY_SRC[key]
+        for idx in indices:
+            if idx < DB_LINK_COUNT:
+                result.push(DB_LINKS[idx])
+    result
+
+fn get_links_to_target(db: IndexDb, target: text) -> [LinkRecord]:
+    var result: [LinkRecord] = []
+    if IDX_LINKS_BY_DST[target].?:
+        val indices = IDX_LINKS_BY_DST[target]
+        for idx in indices:
+            if idx < DB_LINK_COUNT:
+                result.push(DB_LINKS[idx])
+    result
+
+fn get_tasks_for_note(db: IndexDb, note_id: i64) -> [TaskRecord]:
+    var result: [TaskRecord] = []
+    val key = str(note_id)
+    if IDX_TASKS_BY_NOTE[key].?:
+        val indices = IDX_TASKS_BY_NOTE[key]
+        for idx in indices:
+            if idx < DB_TASK_COUNT:
+                result.push(DB_TASKS[idx])
+    result
+
+fn all_notes(db: IndexDb) -> [NoteRecord]:
+    DB_NOTES
+
+fn all_chunks(db: IndexDb) -> [ChunkRecord]:
+    DB_CHUNKS
+
+fn all_links(db: IndexDb) -> [LinkRecord]:
+    DB_LINKS
+
+fn all_tasks(db: IndexDb) -> [TaskRecord]:
+    DB_TASKS
+
+# --- Cache accessors ---
+
+fn get_cached_backlink_count(path: text) -> i64:
+    CACHE_BACKLINK_COUNT[path] ?? 0
+
+fn get_cached_authority(path: text) -> f64:
+    if CACHE_AUTHORITY[path].?:
+        return CACHE_AUTHORITY[path]
+    0.0
+
+fn is_cache_valid() -> bool:
+    CACHE_VALID

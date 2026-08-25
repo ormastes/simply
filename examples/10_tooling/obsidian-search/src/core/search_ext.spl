@@ -1,0 +1,390 @@
+# Extended search — fuzzy, date-range, alias, search-replace, reindex
+#
+# Phase C (Enhanced Search) for obsidian-search MCP server.
+# Implements FR-07 (fuzzy), FR-08 (search-replace), FR-09 (date-range),
+# FR-10 (alias indexing), FR-19 (reindex).
+
+use src.core.vault_scanner.{scan_vault, relative_path}
+use std.io_runtime.{read_file, write_file}
+use src.core.note_parser.{parse_frontmatter}
+use src.core.search_engine.{SearchResult, quicksort_results}
+use src.util.json_helpers.{safe_substr}
+
+# --- Trigram generation ---
+
+fn trigrams(s: text) -> [text]:
+    val lower = ("" + s).lower()
+    var result: [text] = []
+    if lower.len() < 3:
+        if lower.len() > 0:
+            result.push(lower)
+        return result
+    var i = 0
+    while i <= lower.len() - 3:
+        val tri = safe_substr(lower, i, i + 3)
+        result.push(tri)
+        i = i + 1
+    result
+
+# --- Trigram similarity (Jaccard) ---
+
+fn list_contains(items: [text], item: text) -> bool:
+    for x in items:
+        if x == item:
+            return true
+    false
+
+fn trigram_similarity(a: text, b: text) -> f64:
+    val tris_a = trigrams(a)
+    val tris_b = trigrams(b)
+    if tris_a.len() == 0 and tris_b.len() == 0:
+        return 1.0
+    if tris_a.len() == 0 or tris_b.len() == 0:
+        return 0.0
+
+    # Build union and intersection
+    var union_tris: [text] = []
+    var intersection_count = 0
+
+    # Add all from a to union
+    for t in tris_a:
+        if not list_contains(union_tris, t):
+            union_tris.push(t)
+
+    # Check b against a for intersection, add new to union
+    for t in tris_b:
+        if not list_contains(union_tris, t):
+            union_tris.push(t)
+
+    # Count intersection: trigrams present in both
+    for t in union_tris:
+        if list_contains(tris_a, t) and list_contains(tris_b, t):
+            intersection_count = intersection_count + 1
+
+    if union_tris.len() == 0:
+        return 0.0
+
+    float(intersection_count) / float(union_tris.len())
+
+# --- Path title helper ---
+
+fn path_title(rel_path: text) -> text:
+    var name = rel_path
+    val slash_idx = rel_path.last_index_of("/")
+    match slash_idx:
+        Some(i):
+            name = rel_path.substring(i + 1, rel_path.len())
+        nil:
+            name = rel_path
+    if name.ends_with(".md"):
+        return safe_substr(name, 0, name.len() - 3)
+    name
+
+# --- Fuzzy search ---
+
+fn fuzzy_search(vault_path: text, query: text, threshold: f64, limit: i64) -> [SearchResult]:
+    var results: [SearchResult] = []
+    if vault_path == "" or query.trim() == "":
+        return results
+
+    val files = scan_vault(vault_path)
+    val lower_query = ("" + query).lower()
+
+    for file in files:
+        val rel_path = relative_path(file, vault_path)
+        val content = read_file(file) ?? ""
+        val meta = parse_frontmatter(content)
+        val title = if meta.title != "": meta.title else: path_title(rel_path)
+
+        # Check title similarity
+        var best_score = trigram_similarity(lower_query, title)
+
+        # Check alias similarities
+        for alias in meta.aliases:
+            val alias_score = trigram_similarity(lower_query, alias)
+            if alias_score > best_score:
+                best_score = alias_score
+
+        if best_score >= threshold:
+            val tags = meta.tags.join(",")
+            var snippet = ""
+            if content.len() > 200:
+                snippet = safe_substr(content, 0, 200) + "..."
+            else:
+                snippet = content
+            results.push(SearchResult(
+                note_id: 0,
+                path: rel_path,
+                title: title,
+                snippet: snippet,
+                bm25_score: best_score,
+                tags: tags,
+                mtime: 0
+            ))
+
+    # Sort by score descending
+    if results.len() > 1:
+        quicksort_results(results, 0, results.len() - 1)
+
+    # Return top N
+    if results.len() <= limit:
+        return results
+    var final_results: [SearchResult] = []
+    var count = 0
+    for r in results:
+        if count >= limit:
+            break
+        final_results.push(r)
+        count = count + 1
+    final_results
+
+# --- Search and replace in a single note ---
+
+fn count_occurrences(haystack: text, needle: text) -> i64:
+    if needle == "" or needle.len() > haystack.len():
+        return 0
+    var count: i64 = 0
+    var i = 0
+    while i <= haystack.len() - needle.len():
+        val segment = safe_substr(haystack, i, i + needle.len())
+        if segment == needle:
+            count = count + 1
+            i = i + needle.len()
+        else:
+            i = i + 1
+    count
+
+fn join_path(vault_path: text, rel_path: text) -> text:
+    var base = vault_path
+    if base != "" and not base.ends_with("/"):
+        base = base + "/"
+    base + rel_path
+
+fn search_replace_in_note(vault_path: text, rel_path: text, search: text, replace: text, dry_run: bool) -> (i64, text):
+    if search == "":
+        return (0, "empty search string")
+    val full_path = join_path(vault_path, rel_path)
+    val content = read_file(full_path) ?? ""
+    if content == "":
+        return (0, "file not found or empty")
+
+    val match_count = count_occurrences(content, search)
+    if match_count == 0:
+        return (0, "no matches found")
+
+    val new_content = content.replace(search, replace)
+
+    if dry_run:
+        # Build a preview: show first replacement context
+        var preview = "Found {match_count} occurrence(s) of '{search}' in {rel_path}"
+        return (match_count, preview)
+
+    # Actually write
+    write_file(full_path, new_content)
+    (match_count, "replaced {match_count} occurrence(s) in {rel_path}")
+
+# --- Search and replace vault-wide ---
+
+fn search_replace_in_vault(vault_path: text, search: text, replace: text, dry_run: bool) -> (i64, i64):
+    if vault_path == "" or search == "":
+        return (0, 0)
+    val files = scan_vault(vault_path)
+    var files_modified: i64 = 0
+    var total_matches: i64 = 0
+
+    for file in files:
+        val rel_path = relative_path(file, vault_path)
+        val result = search_replace_in_note(vault_path, rel_path, search, replace, dry_run)
+        val match_count = result.0
+        if match_count > 0:
+            files_modified = files_modified + 1
+            total_matches = total_matches + match_count
+
+    (files_modified, total_matches)
+
+# --- Date range search ---
+
+fn extract_date_from_filename(rel_path: text) -> text:
+    # Look for YYYY-MM-DD pattern in filename
+    val name = path_title(rel_path)
+    if name.len() < 10:
+        return ""
+    # Check if first 10 chars match YYYY-MM-DD pattern
+    val candidate = safe_substr(name, 0, 10)
+    if candidate.len() == 10:
+        val ch4 = safe_substr(candidate, 4, 5)
+        val ch7 = safe_substr(candidate, 7, 8)
+        if ch4 == "-" and ch7 == "-":
+            return candidate
+    ""
+
+fn search_by_date_range(vault_path: text, start_date: text, end_date: text, query: text, limit: i64) -> [SearchResult]:
+    var results: [SearchResult] = []
+    if vault_path == "":
+        return results
+
+    val files = scan_vault(vault_path)
+    val lower_query = ("" + query).lower()
+
+    for file in files:
+        val rel_path = relative_path(file, vault_path)
+        val content = read_file(file) ?? ""
+        val meta = parse_frontmatter(content)
+        val title = if meta.title != "": meta.title else: path_title(rel_path)
+
+        # Get date from frontmatter or filename
+        var note_date = ""
+        if meta.frontmatter_raw.contains("date:"):
+            # Extract date from raw frontmatter
+            val lines = meta.frontmatter_raw.split("\n")
+            for line in lines:
+                val trimmed = line.trim()
+                if trimmed.starts_with("date:"):
+                    note_date = safe_substr(trimmed, 5, trimmed.len()).trim()
+                    # Remove surrounding quotes
+                    if note_date.starts_with("\"") and note_date.ends_with("\""):
+                        note_date = safe_substr(note_date, 1, note_date.len() - 1)
+                    break
+        if note_date == "":
+            note_date = extract_date_from_filename(rel_path)
+
+        if note_date == "":
+            continue
+
+        # Lexicographic date comparison (YYYY-MM-DD strings)
+        val in_range = note_date >= start_date and note_date <= end_date
+        if not in_range:
+            continue
+
+        # Optional text query filter
+        if lower_query != "":
+            val lower_title = ("" + title).lower()
+            val lower_content = ("" + content).lower()
+            if not lower_title.contains(lower_query) and not lower_content.contains(lower_query):
+                continue
+
+        val tags = meta.tags.join(",")
+        var snippet = ""
+        if content.len() > 200:
+            snippet = safe_substr(content, 0, 200) + "..."
+        else:
+            snippet = content
+
+        results.push(SearchResult(
+            note_id: 0,
+            path: rel_path,
+            title: title,
+            snippet: "date: {note_date}",
+            bm25_score: 1.0,
+            tags: tags,
+            mtime: 0
+        ))
+
+        if results.len() >= limit:
+            break
+
+    results
+
+# --- Search with alias matching ---
+
+fn search_with_aliases(vault_path: text, query: text, limit: i64) -> [SearchResult]:
+    var results: [SearchResult] = []
+    if vault_path == "" or query.trim() == "":
+        return results
+
+    val files = scan_vault(vault_path)
+    val lower_query = ("" + query).lower()
+
+    for file in files:
+        val rel_path = relative_path(file, vault_path)
+        val content = read_file(file) ?? ""
+        val meta = parse_frontmatter(content)
+        val title = if meta.title != "": meta.title else: path_title(rel_path)
+
+        var score = 0.0
+
+        # Title match (10x boost)
+        val lower_title = ("" + title).lower()
+        if lower_title.contains(lower_query):
+            score = score + 10.0
+
+        # Alias match (5x boost)
+        for alias in meta.aliases:
+            val lower_alias = ("" + alias).lower()
+            if lower_alias.contains(lower_query):
+                score = score + 5.0
+                break
+
+        # Content match (1x)
+        val lower_content = ("" + content).lower()
+        if lower_content.contains(lower_query):
+            score = score + 1.0
+
+        if score > 0.0:
+            val tags = meta.tags.join(",")
+            var snippet = ""
+            if content.len() > 200:
+                snippet = safe_substr(content, 0, 200) + "..."
+            else:
+                snippet = content
+
+            results.push(SearchResult(
+                note_id: 0,
+                path: rel_path,
+                title: title,
+                snippet: snippet,
+                bm25_score: score,
+                tags: tags,
+                mtime: 0
+            ))
+
+    # Sort by score descending
+    if results.len() > 1:
+        quicksort_results(results, 0, results.len() - 1)
+
+    # Return top N
+    if results.len() <= limit:
+        return results
+    var final_results: [SearchResult] = []
+    var count = 0
+    for r in results:
+        if count >= limit:
+            break
+        final_results.push(r)
+        count = count + 1
+    final_results
+
+# --- Reindex vault ---
+
+fn reindex_vault(vault_path: text) -> (i64, i64):
+    if vault_path == "":
+        return (0, 0)
+    val files = scan_vault(vault_path)
+    var total_files: i64 = 0
+    var total_links: i64 = 0
+
+    for file in files:
+        total_files = total_files + 1
+        val content = read_file(file) ?? ""
+        # Count wikilinks in content
+        var i = 0
+        while i < content.len() - 1:
+            val ch = safe_substr(content, i, i + 1)
+            val next_ch = safe_substr(content, i + 1, i + 2)
+            if ch == "[" and next_ch == "[":
+                total_links = total_links + 1
+                # Skip past this link
+                var j = i + 2
+                while j < content.len() - 1:
+                    val c1 = safe_substr(content, j, j + 1)
+                    val c2 = safe_substr(content, j + 1, j + 2)
+                    if c1 == "]" and c2 == "]":
+                        i = j + 2
+                        break
+                    j = j + 1
+                if j >= content.len() - 1:
+                    i = j
+            else:
+                i = i + 1
+
+    (total_files, total_links)

@@ -1,0 +1,8 @@
+# llm-process-gen: managed source=claude_lib_research_common_tools source_sha256=597e07db61bbeaac71c0da6fbf123a1cc0baddd381bf528258cf3c2c573a9b75 content_sha256=de4346013cb63c10503947f2814f959d0970bd2e47506762e83ee50265ccade5
+skill_tools |skill, source|
+    research_common, claude_lib
+
+tools |id, type, name, purpose|
+    simple_cli, cli, "bin/simple", "Run project-specific query, build, and test commands"
+    git, cli, "git", "Inspect local changes without reverting user work"
+    simple_mcp, mcp, "Simple MCP", "Query project symbols and local code context when available"

@@ -1,0 +1,17 @@
+# Database
+*.db
+*.db-wal
+*.db-shm
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Secrets
+*.pem
+*.key
+credentials.sdn
+
+# Build
+build/

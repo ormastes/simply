@@ -1,0 +1,58 @@
+# VHDL Example: Simple ALU (Arithmetic Logic Unit)
+#
+# Demonstrates:
+# - Combinational process with sensitivity list
+# - Multiple port directions
+# - Signed integer type mapping
+# - If/elsif/else generation
+#
+# Expected VHDL output: examples/09_embedded/vhdl/builder/golden/alu.vhd
+# Run: bin/simple run examples/09_embedded/vhdl/builder/alu.spl
+
+use compiler.backend.vhdl_type_mapper.VhdlTypeMapper
+use compiler.backend.vhdl.vhdl_builder.VhdlBuilder
+
+fn main():
+    val mapper = VhdlTypeMapper__create()
+    var builder = VhdlBuilder__create("alu")
+
+    builder.emit_library_header()
+
+    # Entity
+    builder.emit_entity_begin("alu")
+    builder.emit_port_begin()
+    builder.emit_port("a", "in", mapper.map_signed(32), false)
+    builder.emit_port("b", "in", mapper.map_signed(32), false)
+    builder.emit_port("op", "in", mapper.map_unsigned(2), false)
+    builder.emit_port("result", "out", mapper.map_signed(32), false)
+    builder.emit_port("zero", "out", mapper.bit_type(), true)
+    builder.emit_port_end()
+    builder.emit_entity_end("alu")
+
+    # Architecture
+    builder.emit_architecture_begin("alu", "rtl")
+    builder.emit_signal_decl("alu_result", mapper.map_signed(32), nil)
+    builder.emit_architecture_body_begin()
+
+    # Combinational ALU process
+    builder.emit_process_begin(Some("alu_proc"), ["a", "b", "op"])
+    builder.emit_process_body_begin()
+    builder.emit_if_begin("op = \"00\"")
+    builder.emit_signal_assign("alu_result", "a + b")
+    builder.emit_elsif("op = \"01\"")
+    builder.emit_signal_assign("alu_result", "a - b")
+    builder.emit_elsif("op = \"10\"")
+    builder.emit_signal_assign("alu_result", "a and b")
+    builder.emit_else()
+    builder.emit_signal_assign("alu_result", "a or b")
+    builder.emit_if_end()
+    builder.emit_process_end(Some("alu_proc"))
+
+    # Output assignments
+    builder.emit_signal_assign("result", "alu_result")
+    builder.emit_comment("Zero flag: '1' when result is all zeros")
+    builder.emit_signal_assign("zero", "'1' when alu_result = 0 else '0'")
+
+    builder.emit_architecture_end("rtl")
+
+    print builder.build()

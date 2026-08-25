@@ -1,0 +1,54 @@
+# @cover src/kernel/commit_queue.spl 80%
+"""
+# Commit Queue — per-tenant FIFO, atomic drain
+
+Multi-tenant writes share one pending queue. Draining a tenant stages its
+writes in FIFO order into one Tx and commits them atomically, leaving other
+tenants' writes untouched and in their original relative order.
+"""
+
+use std.spec
+use kernel.event_log.{new_event_log, event_count, events_for}
+use kernel.commit_queue.{PendingWrite, queue_new, enqueue, drain_tenant}
+
+describe "Commit queue — FIFO within tenant, atomic drain":
+    it "stages one tenant's writes in FIFO order":
+        var q = queue_new()
+        q = enqueue(q, PendingWrite { tenant_id: "t1", kind: "sale.write", entity: 1, payload: "a" })
+        q = enqueue(q, PendingWrite { tenant_id: "t1", kind: "sale.write", entity: 2, payload: "b" })
+        val result = drain_tenant(q, "t1", new_event_log())
+        expect(event_count(result.log)).to_equal(2)
+        val evs = events_for(result.log, 1)
+        expect(evs.length()).to_equal(1)
+        expect(evs[0].payload).to_equal("a")
+        val evs2 = events_for(result.log, 2)
+        expect(evs2[0].payload).to_equal("b")
+
+    it "commits all-or-nothing: the drained count matches the staged count":
+        var q = queue_new()
+        q = enqueue(q, PendingWrite { tenant_id: "t1", kind: "sale.write", entity: 1, payload: "a" })
+        q = enqueue(q, PendingWrite { tenant_id: "t1", kind: "sale.write", entity: 2, payload: "b" })
+        q = enqueue(q, PendingWrite { tenant_id: "t1", kind: "sale.write", entity: 3, payload: "c" })
+        val result = drain_tenant(q, "t1", new_event_log())
+        expect(event_count(result.log)).to_equal(3)
+        expect(result.queue.pending.length()).to_equal(0)
+
+    it "preserves other tenants' writes and their relative order":
+        var q = queue_new()
+        q = enqueue(q, PendingWrite { tenant_id: "t1", kind: "sale.write", entity: 1, payload: "t1a" })
+        q = enqueue(q, PendingWrite { tenant_id: "t2", kind: "sale.write", entity: 2, payload: "t2a" })
+        q = enqueue(q, PendingWrite { tenant_id: "t1", kind: "sale.write", entity: 3, payload: "t1b" })
+        q = enqueue(q, PendingWrite { tenant_id: "t2", kind: "sale.write", entity: 4, payload: "t2b" })
+        val result = drain_tenant(q, "t1", new_event_log())
+        expect(result.queue.pending.length()).to_equal(2)
+        expect(result.queue.pending[0].payload).to_equal("t2a")
+        expect(result.queue.pending[1].payload).to_equal("t2b")
+
+    it "is a no-op when draining an unknown tenant":
+        var q = queue_new()
+        q = enqueue(q, PendingWrite { tenant_id: "t1", kind: "sale.write", entity: 1, payload: "a" })
+        val base = new_event_log()
+        val result = drain_tenant(q, "ghost", base)
+        expect(event_count(result.log)).to_equal(0)
+        expect(result.queue.pending.length()).to_equal(1)
+        expect(result.queue.pending[0].payload).to_equal("a")

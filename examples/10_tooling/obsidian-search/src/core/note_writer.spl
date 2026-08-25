@@ -1,0 +1,184 @@
+# Note writer — create, edit, delete, and move notes in an Obsidian vault
+#
+# Provides core write operations for vault notes. Handles file I/O,
+# directory creation, and wikilink rewriting on move.
+
+use src.core.vault_scanner.{scan_vault, relative_path}
+use std.io_runtime.{read_file, write_file, file_delete, file_exists, process_run}
+
+# --- Path helpers ---
+
+fn parent_dir(path: text) -> text:
+    val idx = path.last_index_of("/")
+    match idx:
+        Some(i):
+            return path.substring(0, i)
+        nil:
+            return ""
+    ""
+
+fn file_stem(rel_path: text) -> text:
+    var name = rel_path
+    val slash_idx = rel_path.last_index_of("/")
+    match slash_idx:
+        Some(i):
+            name = rel_path.substring(i + 1, rel_path.len())
+        nil: pass_dn
+    val dot_idx = name.last_index_of(".")
+    match dot_idx:
+        Some(i):
+            return name.substring(0, i)
+        nil:
+            return name
+    name
+
+fn ensure_parent_dirs(full_path: text) -> bool:
+    val dir = parent_dir(full_path)
+    if dir == "":
+        return true
+    var stdout = ""
+    var stderr = ""
+    var rc: i64 = 0
+    (stdout, stderr, rc) = process_run("mkdir", ["-p", dir])
+    rc == 0
+
+fn join_path(vault_path: text, rel_path: text) -> text:
+    var base = vault_path
+    if base != "" and not base.ends_with("/"):
+        base = base + "/"
+    base + rel_path
+
+# --- Create note ---
+
+fn create_note(vault_path: text, rel_path: text, content: text) -> bool:
+    val full_path = join_path(vault_path, rel_path)
+    if file_exists(full_path):
+        return false
+    if not ensure_parent_dirs(full_path):
+        return false
+    write_file(full_path, content)
+
+# --- Edit note ---
+
+fn edit_note(vault_path: text, rel_path: text, content: text, mode: text) -> bool:
+    val full_path = join_path(vault_path, rel_path)
+    if not file_exists(full_path):
+        return false
+    val existing = read_file(full_path) ?? ""
+
+    if mode == "overwrite":
+        return write_file(full_path, content)
+
+    elif mode == "prepend":
+        val new_content = content + "\n" + existing
+        return write_file(full_path, new_content)
+
+    elif mode == "insert_after_heading":
+        val new_content = insert_after_heading(existing, content)
+        return write_file(full_path, new_content)
+
+    else:
+        # Default: append
+        val new_content = existing + "\n" + content
+        return write_file(full_path, new_content)
+
+    false
+
+fn insert_after_heading(existing: text, content: text) -> text:
+    # Content format: "## Heading\n---\n<actual content>"
+    # Find the heading separator
+    val sep_idx = content.index_of("\n---\n")
+    var heading_text = ""
+    var insert_text = ""
+    match sep_idx:
+        Some(i):
+            heading_text = content.substring(0, i)
+            insert_text = content.substring(i + 5, content.len())
+        nil:
+            # No separator; append to end
+            return existing + "\n" + content
+
+    # Find the heading in existing content
+    val lines = existing.split("\n")
+    var result: [text] = []
+    var found = false
+    var heading_found = false
+    for line in lines:
+        result.push(line)
+        if not found and line.trim() == heading_text.trim():
+            heading_found = true
+        elif heading_found and not found:
+            # Insert after the first non-empty line following the heading
+            result.push(insert_text)
+            found = true
+    if not found:
+        # Heading not found; append to end
+        result.push(insert_text)
+    result.join("\n")
+
+# --- Delete note ---
+
+fn delete_note(vault_path: text, rel_path: text) -> bool:
+    val full_path = join_path(vault_path, rel_path)
+    if not file_exists(full_path):
+        return false
+    file_delete(full_path)
+
+# --- Move note and update wikilinks ---
+
+fn move_note(vault_path: text, old_path: text, new_path: text) -> i64:
+    val old_full = join_path(vault_path, old_path)
+    val new_full = join_path(vault_path, new_path)
+    if not file_exists(old_full):
+        return -1
+    if file_exists(new_full):
+        return -2
+
+    # Read old content
+    val content = read_file(old_full) ?? ""
+
+    # Ensure target directory exists
+    if not ensure_parent_dirs(new_full):
+        return -3
+
+    # Write to new location
+    if not write_file(new_full, content):
+        return -4
+
+    # Delete old file
+    file_delete(old_full)
+
+    # Update wikilinks across vault
+    val old_name = file_stem(old_path)
+    val new_name = file_stem(new_path)
+    if old_name == new_name:
+        return 0
+
+    val updated_count = update_wikilinks(vault_path, old_name, new_name)
+    updated_count
+
+fn update_wikilinks(vault_path: text, old_name: text, new_name: text) -> i64:
+    val files = scan_vault(vault_path)
+    var updated: i64 = 0
+    for file in files:
+        val content = read_file(file) ?? ""
+        if content == "":
+            continue
+        val new_content = rewrite_links(content, old_name, new_name)
+        if new_content != content:
+            write_file(file, new_content)
+            updated = updated + 1
+    updated
+
+fn rewrite_links(content: text, old_name: text, new_name: text) -> text:
+    # Replace [[old_name]] with [[new_name]]
+    # Also handle [[old_name|alias]] -> [[new_name|alias]]
+    var result = content
+    val pattern_simple = "[[" + old_name + "]]"
+    val replace_simple = "[[" + new_name + "]]"
+    result = result.replace(pattern_simple, replace_simple)
+
+    val pattern_alias = "[[" + old_name + "|"
+    val replace_alias = "[[" + new_name + "|"
+    result = result.replace(pattern_alias, replace_alias)
+    result

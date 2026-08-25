@@ -1,0 +1,202 @@
+"""
+# Config
+
+Tests for config functionality.
+"""
+# Smux config parser tests — self-contained
+# Tests for _strip_quotes, _parse_int_or, _has_flag, load_config, SmuxConfig.defaults()
+
+import std.spec
+
+use examples.smux.src.app.{SmuxConfig}
+use examples.smux.src.quick_text.{QuickTextEntry}
+use examples.smux.main.{_strip_quotes, _parse_int_or, _has_flag, load_config}
+
+# ============================================================================
+# Test Group 1: _strip_quotes
+# ============================================================================
+
+describe "_strip_quotes":
+    """
+    ## _Strip_Quotes Tests
+
+    Validates _strip_quotes functionality.
+    """
+
+    context "when given a quoted string":
+        it "removes surrounding double quotes":
+            val result = _strip_quotes("\"hello world\"")
+            expect(result).to_equal("hello world")
+
+        it "removes quotes from single word":
+            val result = _strip_quotes("\"smux\"")
+            expect(result).to_equal("smux")
+
+        it "removes quotes with leading/trailing whitespace":
+            val result = _strip_quotes("  \"trimmed\"  ")
+            expect(result).to_equal("trimmed")
+
+    context "when given an unquoted string":
+        it "returns trimmed string unchanged":
+            val result = _strip_quotes("no quotes")
+            expect(result).to_equal("no quotes")
+
+        it "trims whitespace from unquoted string":
+            val result = _strip_quotes("  spaces  ")
+            expect(result).to_equal("spaces")
+
+        it "returns empty string as-is":
+            val result = _strip_quotes("")
+            expect(result).to_equal("")
+
+    context "when given edge cases":
+        it "handles single character string":
+            val result = _strip_quotes("x")
+            expect(result).to_equal("x")
+
+        it "handles string with only one quote":
+            val result = _strip_quotes("\"")
+            expect(result).to_equal("\"")
+
+
+# ============================================================================
+# Test Group 2: _parse_int_or
+# ============================================================================
+
+describe "_parse_int_or":
+    context "when given a valid integer string":
+        it "parses positive integer":
+            val result = _parse_int_or("42", 0)
+            expect(result).to_equal(42)
+
+        it "parses zero":
+            val result = _parse_int_or("0", 99)
+            expect(result).to_equal(0)
+
+        it "parses large number":
+            val result = _parse_int_or("30000", 0)
+            expect(result).to_equal(30000)
+
+    context "when given an invalid string":
+        it "returns fallback for non-numeric string":
+            val result = _parse_int_or("abc", 10)
+            expect(result).to_equal(10)
+
+        it "returns fallback for empty string":
+            val result = _parse_int_or("", 5)
+            expect(result).to_equal(5)
+
+
+# ============================================================================
+# Test Group 3: _has_flag
+# ============================================================================
+
+describe "_has_flag":
+    context "when flag is present":
+        it "returns true for matching flag":
+            var args: [text] = ["--help", "--version", "-v"]
+            val result = _has_flag(args, "--help")
+            expect(result).to_equal(true)
+
+        it "returns true for flag in middle":
+            var args: [text] = ["run", "--verbose", "file.spl"]
+            val result = _has_flag(args, "--verbose")
+            expect(result).to_equal(true)
+
+        it "returns true for flag at end":
+            var args: [text] = ["run", "file.spl", "--version"]
+            val result = _has_flag(args, "--version")
+            expect(result).to_equal(true)
+
+    context "when flag is absent":
+        it "returns false when flag not found":
+            var args: [text] = ["--help", "--version"]
+            val result = _has_flag(args, "--debug")
+            expect(result).to_equal(false)
+
+        it "returns false for empty args":
+            var args: [text] = []
+            val result = _has_flag(args, "--help")
+            expect(result).to_equal(false)
+
+        it "returns false for partial match":
+            var args: [text] = ["--help-all"]
+            val result = _has_flag(args, "--help")
+            expect(result).to_equal(false)
+
+
+# ============================================================================
+# Test Group 4: load_config
+# ============================================================================
+
+describe "load_config":
+    context "when path does not exist":
+        it "returns default config for empty path":
+            val config = load_config("")
+            expect(config.title).to_equal("smux")
+            expect(config.theme).to_equal("dark")
+
+        it "returns default config for non-existent file":
+            val config = load_config("/tmp/nonexistent_smux_config_12345.sdn")
+            expect(config.title).to_equal("smux")
+            expect(config.theme).to_equal("dark")
+            expect(config.mobile_keybar_mode).to_equal("auto")
+            expect(config.nerd_font).to_equal(true)
+            expect(config.hook_script).to_equal("hooks/check_done.spl")
+            expect(config.hook_timeout_ms).to_equal(30000)
+            expect(config.auto_continue).to_equal(true)
+            expect(config.notification_mode).to_equal("auto")
+            expect(config.tmux_hooks_enabled).to_equal(true)
+
+
+# ============================================================================
+# Test Group 5: SmuxConfig.defaults()
+# ============================================================================
+
+describe "SmuxConfig.defaults()":
+    context "when created with defaults":
+        it "has expected title":
+            val config = SmuxConfig.defaults()
+            expect(config.title).to_equal("smux")
+
+        it "has dark theme":
+            val config = SmuxConfig.defaults()
+            expect(config.theme).to_equal("dark")
+
+        it "has auto mobile keybar mode":
+            val config = SmuxConfig.defaults()
+            expect(config.mobile_keybar_mode).to_equal("auto")
+
+        it "has nerd font enabled":
+            val config = SmuxConfig.defaults()
+            expect(config.nerd_font).to_equal(true)
+
+        it "has default hook script":
+            val config = SmuxConfig.defaults()
+            expect(config.hook_script).to_equal("hooks/check_done.spl")
+
+        it "has 30000ms hook timeout":
+            val config = SmuxConfig.defaults()
+            expect(config.hook_timeout_ms).to_equal(30000)
+
+        it "has auto_continue enabled":
+            val config = SmuxConfig.defaults()
+            expect(config.auto_continue).to_equal(true)
+
+        it "has auto notification mode":
+            val config = SmuxConfig.defaults()
+            expect(config.notification_mode).to_equal("auto")
+
+        it "has tmux hooks enabled":
+            val config = SmuxConfig.defaults()
+            expect(config.tmux_hooks_enabled).to_equal(true)
+
+        it "has 3 default quick texts":
+            val config = SmuxConfig.defaults()
+            expect(config.quick_texts.len()).to_equal(3)
+
+        it "has Continue as first quick text":
+            val config = SmuxConfig.defaults()
+            expect(config.quick_texts[0].label).to_equal("Continue")
+            expect(config.quick_texts[0].snippet).to_equal("Please continue.")
+            expect(config.quick_texts[0].shortcut).to_equal("1")

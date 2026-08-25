@@ -1,0 +1,20 @@
+pub fn _rv32_flush_cmd_valid(op: i64, lba: i64, nblocks: i64, data: i64) -> i32:
+    if op != 0:
+        return 1
+    if lba != 0:
+        return 1
+    if nblocks != 0:
+        return 1
+    if data != 0:
+        return 1
+    0
+
+pub fn _rv32_flush_dirty_after(dirty_before: i64, valid_flush: i32) -> i64:
+    var dirty: i64 = dirty_before
+    if dirty < 0:
+        dirty = 1
+    if dirty > 1:
+        dirty = 1
+    if valid_flush == 0:
+        return 0
+    dirty

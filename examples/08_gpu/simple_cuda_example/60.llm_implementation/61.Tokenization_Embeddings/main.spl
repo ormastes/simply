@@ -1,0 +1,148 @@
+# 61. Tokenization and Embeddings
+#
+# The first stage of an LLM: token IDs -> dense vectors. Two pieces:
+#   1. an embedding-table gather:  out[t, :] = table[token[t], :]
+#   2. sinusoidal positional encoding added to each row.
+#
+# C/CUDA equivalent (61.Foundation_Tokenization_Embeddings):
+#   __global__ void embedding_lookup(const int* ids, const float* table,
+#                                    float* out, int seq_len, int dim) {
+#       int t = blockIdx.x * blockDim.x + threadIdx.x;
+#       if (t < seq_len)
+#           for (int d = 0; d < dim; d++)
+#               out[t * dim + d] = table[ids[t] * dim + d];
+#   }
+#
+# The CPU reference model always runs and is the checked result. The
+# `@gpu_kernel` demo follows module 12's std.gpu pattern; its output is
+# compared against the CPU model and reported honestly (on the Rust seed a
+# `<<<>>>` launch is a documented no-op, so the device buffer reads back
+# zeros and the GPU demo prints a mismatch rather than a fake PASS).
+
+use std.gpu.*
+
+# ============================================================================
+# CPU reference model (f64 math, f32 storage)
+# ============================================================================
+
+# Deterministic embedding table: table[i] = ((i % 100) * 0.01) - 0.5
+fn make_embedding_table(vocab_size: i64, embed_dim: i64) -> [f32]:
+    var table: [f32] = []
+    for i in 0..(vocab_size * embed_dim):
+        val v = ((i % 100) as f64) * 0.01 - 0.5
+        table.push(v as f32)
+    table
+
+# Gather: out[t * dim + d] = table[ids[t] * dim + d]
+fn embedding_lookup_cpu(token_ids: [i64], table: [f32], embed_dim: i64) -> [f32]:
+    var out: [f32] = []
+    for t in 0..token_ids.len():
+        val base = token_ids[t] * embed_dim
+        for d in 0..embed_dim:
+            out.push(table[base + d])
+    out
+
+# Sinusoidal positional encoding (Vaswani et al. 2017):
+#   pe[pos, 2i]   = sin(pos / 10000^(2i / dim))
+#   pe[pos, 2i+1] = cos(pos / 10000^(2i / dim))
+fn positional_encoding(max_len: i64, embed_dim: i64) -> [f32]:
+    var pe: [f32] = []
+    for pos in 0..max_len:
+        for d in 0..embed_dim:
+            val pair = (d / 2) as f64
+            val denom = (10000.0).pow(2.0 * pair / (embed_dim as f64))
+            val angle = (pos as f64) / denom
+            if d % 2 == 0:
+                pe.push(angle.sin() as f32)
+            else:
+                pe.push(angle.cos() as f32)
+    pe
+
+fn add_positions_cpu(embedded: [f32], pe: [f32]) -> [f32]:
+    var out: [f32] = []
+    for i in 0..embedded.len():
+        out.push(embedded[i] + pe[i])
+    out
+
+# Full pipeline: ids -> lookup -> + position
+fn embed_tokens_cpu(token_ids: [i64], vocab_size: i64, embed_dim: i64, max_len: i64) -> [f32]:
+    val table = make_embedding_table(vocab_size, embed_dim)
+    val pe = positional_encoding(max_len, embed_dim)
+    add_positions_cpu(embedding_lookup_cpu(token_ids, table, embed_dim), pe)
+
+fn arrays_close(a: [f32], b: [f32], tol: f32) -> bool:
+    if a.len() != b.len():
+        return false
+    for i in 0..a.len():
+        val diff = a[i] - b[i]
+        val ad = if diff < 0.0: 0.0 - diff else: diff
+        if ad > tol:
+            return false
+    true
+
+# ============================================================================
+# GPU kernel (std.gpu, module-12 pattern): one thread per token
+# ============================================================================
+
+@gpu_kernel
+fn embedding_lookup_kernel(ids: GpuPtr, table: GpuPtr, out: GpuPtr, seq_len: i64, embed_dim: i64):
+    val t = gpu_block_id_x() * gpu_block_dim_x() + gpu_local_id_x()
+    if t < seq_len:
+        val token = gpu_load_f32(ids, t) as i64
+        var d = 0
+        while d < embed_dim:
+            gpu_store_f32(out, t * embed_dim + d, gpu_load_f32(table, token * embed_dim + d))
+            d = d + 1
+
+fn run_gpu(token_ids: [i64], table: [f32], embed_dim: i64) -> Result<[f32], GpuError>:
+    val seq_len = token_ids.len()
+    gpu_init()?
+    gpu_set_device(0)?
+    # token ids are shipped as f32 so one typed upload path covers all buffers
+    var ids_f: [f32] = []
+    for id in token_ids:
+        ids_f.push(id as f32)
+    val d_ids = gpu_alloc(seq_len * 4)?
+    val d_table = gpu_alloc(table.len() * 4)?
+    val d_out = gpu_alloc(seq_len * embed_dim * 4)?
+    gpu_upload_f32(d_ids, ids_f)?
+    gpu_upload_f32(d_table, table)?
+    val block = 256
+    val grid = (seq_len + block - 1) / block
+    embedding_lookup_kernel<<<grid: grid, block: block>>>(d_ids, d_table, d_out, seq_len, embed_dim)
+    gpu_sync()?
+    val out = gpu_download_f32(d_out, seq_len * embed_dim)?
+    gpu_free(d_ids)?
+    gpu_free(d_table)?
+    gpu_free(d_out)?
+    Ok(out)
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn main():
+    val vocab_size = 100
+    val embed_dim = 8
+    val max_len = 16
+    val token_ids: [i64] = [15, 99, 5]
+
+    print "=== Tokenization and Embeddings ==="
+    print "Vocab {vocab_size}, dim {embed_dim}, {token_ids.len()} tokens"
+
+    val table = make_embedding_table(vocab_size, embed_dim)
+    val looked_up = embedding_lookup_cpu(token_ids, table, embed_dim)
+    val out = embed_tokens_cpu(token_ids, vocab_size, embed_dim, max_len)
+    print "CPU lookup shape: [{token_ids.len()}, {embed_dim}] ({out.len()} values)"
+    print "  token {token_ids[0]} -> row 0 first value {looked_up[0]}"
+    print "  pe[0,0] = 0, pe[0,1] = 1 -> out[0,1] - lookup[0,1] = {out[1] - looked_up[1]}"
+
+    match run_gpu(token_ids, table, embed_dim):
+        case Ok(gpu_out):
+            if arrays_close(gpu_out, looked_up, 0.0001):
+                print "GPU lookup: PASSED (matches CPU reference)"
+            else:
+                print "GPU lookup: MISMATCH vs CPU reference (launch is a no-op on this engine)"
+        case Err(e):
+            print "GPU lookup skipped: {e.to_text()}"
+    print "=== Done ==="

@@ -1,0 +1,102 @@
+"""
+durability_check — power-loss durability regression.
+
+Proves two production properties of the translation layer:
+
+  A. Power loss wipes ALL volatile DRAM state (write-back map cache + band valid
+     bitmap), and recovery rebuilds the L2P + band from persistent media (the
+     flash-resident map, the journal, the NAND OOB, the bad-block table). Committed
+     writes survive, post-checkpoint updates are recovered from the WAL, and trims
+     stay trimmed.
+
+  B. The journal never silently drops a record. Writing far more than the WAL ring
+     capacity (512) with no explicit checkpoint must not lose data across a power
+     cycle: the write path checkpoints (flush durable + truncate) when the ring is
+     full, so every acked write is recoverable.
+
+Run: bin/simple run examples/09_embedded/simpleos_nvme_fw/fw/durability_check.spl
+"""
+
+use nvme_types.*
+use ftl.*
+
+fn main():
+    var fail: i64 = 0
+
+    # ── A. volatile-loss + recovery ──────────────────────────────────────────
+    var ftl: Ftl = ftl_new()
+    ftl.write(10, 1010)
+    ftl.write(20, 1020)
+    ftl.checkpoint()                 # 10 and 20 are now durable in the flash-resident L2P
+    ftl.write(30, 1030)              # post-checkpoint: cache + WAL only, not yet in L2P
+    ftl.write(10, 9999)              # overwrite 10 (post-checkpoint)
+    ftl.trim(20)                     # trim 20 (post-checkpoint)
+
+    ftl.crash()                      # power loss: cache + band bitmap gone
+    # Evidence the volatile state was truly lost: only the checkpointed values remain.
+    fail = fail + expect_eq(ftl.read(10), 1010, "post-crash: only checkpointed 10 remains (overwrite was volatile)")
+    fail = fail + expect_eq(ftl.read(30), 0,    "post-crash: post-checkpoint write 30 not yet recovered")
+
+    ftl.recover()                    # rebuild L2P + band from journal + persistent media
+    fail = fail + expect_eq(ftl.read(10), 9999, "recover: post-checkpoint overwrite of 10 restored")
+    fail = fail + expect_eq(ftl.read(20), 0,    "recover: trim of 20 stays trimmed")
+    fail = fail + expect_eq(ftl.read(30), 1030, "recover: post-checkpoint write 30 restored")
+    # The band bitmap was rebuilt: exactly the live LBAs (10, 30) occupy pages.
+    val live_after: i64 = NUM_BLOCKS - ftl.free_blocks()
+    var live_ok: i64 = 0
+    if live_after >= 1:
+        live_ok = 1
+    fail = fail + expect_eq(live_ok, 1, "recover: band rebuilt (>=1 block holds live data)")
+
+    # ── B. journal overflow must not lose data ───────────────────────────────
+    var ftl2: Ftl = ftl_new()
+    var i: i64 = 0
+    while i < 600:                   # 600 > WAL cap (512), NO explicit checkpoint
+        ftl2.write(i, i + 7000)
+        i = i + 1
+    ftl2.crash()
+    ftl2.recover()
+    var miss: i64 = 0
+    i = 0
+    while i < 600:
+        if ftl2.read(i) != i + 7000:
+            miss = miss + 1
+        i = i + 1
+    fail = fail + expect_eq(miss, 0, "journal overflow: all 600 writes survive power cycle (no silent drop)")
+
+    # ── C. fully-stale-but-unerased block must not be reused as free after recovery ──
+    # A block that went fully stale through ordinary overwrite traffic but was never
+    # garbage-collected before the crash has ZERO live L2P references, yet its NAND pages
+    # are still physically programmed (unerased). Recovery must NOT collapse that into the
+    # erased BLK_FREE state: the allocator would hand the block to the next host write, the
+    # erase-before-program NAND would reject the program, and the firmware would permanently
+    # retire a physically healthy block and fail a legitimate write. Recovery instead marks
+    # such a block GC-eligible CLOSED so it is erased before reuse; genuinely-erased blocks
+    # stay FREE, so the next host write still lands (no write-cliff).
+    var ftl3: Ftl = ftl_new()
+    var b: i64 = 0
+    while b < PAGES_PER_BLOCK:           # fill block 0 with 64 distinct LBAs
+        ftl3.write(b, b + 8000)
+        b = b + 1
+    b = 0
+    while b < PAGES_PER_BLOCK:           # overwrite all 64 -> block 0 fully stale, unerased
+        ftl3.write(b, b + 9000)
+        b = b + 1
+    fail = fail + expect_eq(ftl3.block_valid_count(0), 0, "block 0 fully stale before crash (0 live pages)")
+
+    ftl3.crash()                         # power loss BEFORE any GC ever erases block 0
+    ftl3.recover()
+
+    # The next host write must succeed on a genuinely-free block, NOT reuse un-erased block 0.
+    fail = fail + expect_eq(ftl3.write(300, 0x33), SC_SUCCESS, "post-recovery write succeeds despite an un-erased fully-stale block")
+    fail = fail + expect_eq(ftl3.read(300), 0x33, "post-recovery write reads back")
+    fail = fail + expect_eq(ftl3.bad_blocks(), 0, "recovery did not retire a healthy fully-stale block")
+    var blk0_live: i64 = 0
+    if ftl3.band.block_state(0) != BLK_BAD:
+        blk0_live = 1
+    fail = fail + expect_eq(blk0_live, 1, "fully-stale block 0 not marked bad after recovery + fresh write")
+
+    if fail == 0:
+        print "DURABILITY OK"
+    else:
+        print "DURABILITY FAIL ({fail})"

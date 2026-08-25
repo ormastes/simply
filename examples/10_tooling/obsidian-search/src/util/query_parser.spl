@@ -1,0 +1,163 @@
+# Query parser — extracts operators and freetext from search queries
+#
+# Supported operators:
+#   tag:meeting  path:daily/  title:standup  alias:api
+#   heading:design  linkto:note  linkedfrom:note
+#   type:heading  modified:recent
+
+use src.util.json_helpers.{safe_substr}
+
+# --- Parsed query structure ---
+
+struct ParsedQuery:
+    freetext: text
+    tag_filters: [text]
+    path_filters: [text]
+    title_filters: [text]
+    alias_filters: [text]
+    heading_filters: [text]
+    linkto_filters: [text]
+    linkedfrom_filters: [text]
+    type_filters: [text]
+    modified_recent: bool
+
+fn empty_query() -> ParsedQuery:
+    ParsedQuery(
+        freetext: "",
+        tag_filters: [],
+        path_filters: [],
+        title_filters: [],
+        alias_filters: [],
+        heading_filters: [],
+        linkto_filters: [],
+        linkedfrom_filters: [],
+        type_filters: [],
+        modified_recent: false
+    )
+
+# --- Tokenize query into words ---
+
+fn tokenize_query(raw: text) -> [text]:
+    var tokens: [text] = []
+    var current: [text] = []
+    for ch in raw:
+        if ch == " " or ch == "\t":
+            if current.len() > 0:
+                tokens.push(current.join(""))
+                current = []
+        else:
+            current.push(ch)
+    if current.len() > 0:
+        tokens.push(current.join(""))
+    tokens
+
+# --- Check if token is an operator ---
+
+fn is_operator_token(token: text) -> bool:
+    if token.starts_with("tag:"):
+        return true
+    if token.starts_with("path:"):
+        return true
+    if token.starts_with("title:"):
+        return true
+    if token.starts_with("alias:"):
+        return true
+    if token.starts_with("heading:"):
+        return true
+    if token.starts_with("linkto:"):
+        return true
+    if token.starts_with("linkedfrom:"):
+        return true
+    if token.starts_with("type:"):
+        return true
+    if token.starts_with("modified:"):
+        return true
+    false
+
+# --- Extract operator value ---
+
+fn operator_value(token: text, prefix: text) -> text:
+    val prefix_len = prefix.len()
+    safe_substr(token, prefix_len, token.len())
+
+# --- Main parse function ---
+
+/**
+Parse a search query string into structured operators and freetext.
+Supported operators: `tag:`, `path:`, `title:`, `alias:`, `heading:`,
+`linkto:`, `linkedfrom:`, `type:`, `modified:recent`.
+
+```sdoctest
+>>> val q = parse_query("meeting notes tag:standup path:daily/")
+>>> q.freetext
+meeting notes
+>>> q.tag_filters
+[standup]
+>>> q.path_filters
+[daily/]
+```
+*/
+fn parse_query(raw: text) -> ParsedQuery:
+    var result = empty_query()
+    val tokens = tokenize_query(raw)
+    var freetext_parts: [text] = []
+
+    for token in tokens:
+        if token.starts_with("tag:"):
+            result.tag_filters.push(operator_value(token, "tag:"))
+        elif token.starts_with("path:"):
+            result.path_filters.push(operator_value(token, "path:"))
+        elif token.starts_with("title:"):
+            result.title_filters.push(operator_value(token, "title:"))
+        elif token.starts_with("alias:"):
+            result.alias_filters.push(operator_value(token, "alias:"))
+        elif token.starts_with("heading:"):
+            result.heading_filters.push(operator_value(token, "heading:"))
+        elif token.starts_with("linkto:"):
+            result.linkto_filters.push(operator_value(token, "linkto:"))
+        elif token.starts_with("linkedfrom:"):
+            result.linkedfrom_filters.push(operator_value(token, "linkedfrom:"))
+        elif token.starts_with("type:"):
+            result.type_filters.push(operator_value(token, "type:"))
+        elif token.starts_with("modified:"):
+            val val_str = operator_value(token, "modified:")
+            if val_str == "recent":
+                result.modified_recent = true
+        else:
+            freetext_parts.push(token)
+
+    result.freetext = freetext_parts.join(" ")
+    result
+
+/**
+Check whether a parsed query has any operator filters active.
+
+```sdoctest
+>>> val q1 = parse_query("plain search")
+>>> has_filters(q1)
+false
+>>> val q2 = parse_query("tag:meeting")
+>>> has_filters(q2)
+true
+```
+*/
+fn has_filters(q: ParsedQuery) -> bool:
+    if q.tag_filters.len() > 0:
+        return true
+    if q.path_filters.len() > 0:
+        return true
+    if q.title_filters.len() > 0:
+        return true
+    if q.alias_filters.len() > 0:
+        return true
+    if q.heading_filters.len() > 0:
+        return true
+    if q.linkto_filters.len() > 0:
+        return true
+    if q.linkedfrom_filters.len() > 0:
+        return true
+    if q.type_filters.len() > 0:
+        return true
+    if q.modified_recent:
+        return true
+    false

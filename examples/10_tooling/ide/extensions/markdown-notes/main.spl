@@ -1,0 +1,9 @@
+# Markdown Notes example extension entrypoint.
+#
+# Minimal command module for the embedded IDE extension example. The editor
+# extension host resolves this path but keeps runtime execution behind an
+# explicit sandbox/external-process policy.
+
+fn main() -> i64:
+    print "markdown-notes extension ready"
+    0

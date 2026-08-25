@@ -1,0 +1,72 @@
+# x86_64 nonce-bound filesystem listing and scheduler-owned real ELF execution.
+
+extern fn serial_println(msg: text)
+extern fn rt_debug_exit_success()
+extern fn rt_debug_exit_failure()
+extern fn rt_x86_64_nvfs_probe() -> i64
+extern fn rt_qemu_nonce_echo() -> i64
+extern fn rt_sosix_collector_nonce_echo() -> i64
+extern fn rt_x86_64_fs_ls_sys_apps() -> i64
+extern fn rt_x86_tss_init() -> i64
+extern fn _get_kernel_start() -> u64
+extern fn _get_kernel_end() -> u64
+
+use os.kernel.arch.x86_64.arch_init.{arch_x86_64_direct_boot_init}
+use os.kernel.memory.pmm.{pmm_init_identity_range, g_pmm}
+use os.kernel.memory.vmm.{vmm_init}
+use os.kernel.memory.vmm_address_space.{vmm_map_nvme_bar_high}
+use os.x86_64_fs_exec_provider_status.{x86_64_fs_exec_provider_blocked_marker}
+use os.services.vfs.vfs_boot_init.{vfs_boot_init, g_mount_table}
+use os.kernel.loader.x86_64_authenticated_media_fixture.{x86_64_authenticated_media_execute_v1}
+use os.kernel.scheduler.scheduler_types.{Scheduler}
+
+fn fail(reason: text):
+    serial_println(reason)
+    serial_println("TEST FAILED")
+    rt_debug_exit_failure()
+
+fn spl_start():
+    serial_println("")
+    serial_println("=== SimpleOS x86_64 fs-exec boot ===")
+    serial_println("SimpleOS x86_64 boot OK")
+    if rt_x86_64_nvfs_probe() != 1:
+        fail("[x86_64-nvfs] image read failed")
+        return
+    serial_println("[x86_64-nvfs] image read ok")
+    if rt_sosix_collector_nonce_echo() != 1:
+        fail("[collector-nonce] target media read failed")
+        return
+    serial_println("guest-entry")
+    if rt_qemu_nonce_echo() != 1:
+        fail("[qemu-nonce] target media read failed")
+        return
+    if rt_x86_64_fs_ls_sys_apps() != 1:
+        fail("[fs-ls] /SYS/APPS enumeration failed")
+        return
+
+    arch_x86_64_direct_boot_init()
+    if rt_x86_tss_init() != 0:
+        fail("[fs-program] TSS init failed")
+        return
+    # This lane boots with the canonical 2 GiB OVMF profile.  Its linked 1 GiB
+    # runtime heap places `_kernel_end` above 512 MiB, so the old 0x20000000
+    # bound made the PMM bitmap appear outside memory before filesystem exec.
+    if not pmm_init_identity_range(0x80000000, _get_kernel_start(), _get_kernel_end()):
+        fail("[fs-program] scheduler memory init failed")
+        return
+    vmm_init(g_pmm, 0)
+    vmm_map_nvme_bar_high()
+
+    if not vfs_boot_init():
+        fail("[fs-program] canonical MountTable bind failed")
+        return
+
+    serial_println("FS_PROGRAM_BEGIN path=/FSEXEC.ELF arch=x86_64")
+    val rc = x86_64_authenticated_media_execute_v1(Scheduler.new(), g_mount_table)
+    if rc != 37:
+        serial_println(x86_64_fs_exec_provider_blocked_marker(rc))
+        fail("[fs-program] execution failed rc={rc}")
+        return
+    serial_println("FS_PROGRAM_END rc=37 reaped=true")
+    serial_println("TEST PASSED")
+    rt_debug_exit_success()

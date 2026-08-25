@@ -1,0 +1,110 @@
+# x86_64 SSH + ring-3 filesystem-exec entry.
+#
+# Merges the SSH live daemon (ssh_live_entry.spl) with the ring-3 FS-exec machinery
+# (fs_exec_prod_ring3_entry.spl) so an SSH command can exec an on-disk ELF in
+# ring-3. Ordering rationale:
+#   - arch_x86_64_early_init + rt_x86_tss_init: SYSCALL/SYSRET MSRs, EFER.NXE, TSS.
+#   - simpleos_nvme_init + rt_net_init BEFORE vmm_init: NVMe + virtio-net come up
+#     under the boot page tables. virtio-net is PIO (port I/O) so it is not tied to
+#     a mapped MMIO BAR; its DMA rings live in low RAM (identity-mapped by vmm_init).
+#   - pmm/vmm + vmm_map_nvme_bar_high(): required for ring-3 create_user_address_space
+#     AND to keep the NVMe MMIO BAR reachable post-vmm (the FS-exec read path).
+#   - SshDaemon.start(): the accept loop. On an exec request that resolves to a FAT
+#     path, the session dispatch calls fs_exec_spawn_ring3(path) which reads the ELF
+#     and enters ring-3 (does not return on success — one-shot).
+#
+# QEMU forwards host port 2222 -> guest 22.
+
+use build.os.generated.ssh_live_build_marker.{ssh_live_build_marker}
+use os.apps.sshd.sshd.{SshDaemon}
+use os.kernel.arch.x86_64.arch_init.{arch_x86_64_early_init}
+use os.kernel.memory.pmm.{pmm_init_identity_range, g_pmm}
+use os.kernel.memory.vmm.{vmm_init}
+use os.kernel.memory.vmm_address_space.{vmm_map_nvme_bar_high}
+use os.kernel.boot.mmio.{mmio_disable_test_mode}
+
+extern fn serial_println(msg: text)
+extern fn rt_net_init() -> i64
+extern fn rt_net_stats() -> i64
+extern fn rt_embedded_host_rsa_pkcs8() -> [u8]
+extern fn rt_embedded_host_rsa_public_blob() -> [u8]
+extern fn rt_x86_tss_init() -> i64
+extern fn simpleos_nvme_init() -> i64
+extern fn simpleos_fat32_stream_open(path: text) -> i64
+extern fn simpleos_fat32_stream_read_at(file_off: u64, dst: u64, len: u64) -> i64
+extern fn simpleos_fat32_path_read_buffer_addr() -> u64
+extern fn simpleos_fat32_note_preload_size(sz: u64)
+
+fn _start():
+    serial_println("")
+    serial_println("=== SimpleOS SSH + ring-3 FS-exec Boot ===")
+    serial_println("[boot] Build marker:")
+    serial_println(ssh_live_build_marker())
+
+    # 0. Pin the MMIO layer to the real hardware path. Freestanding native-build
+    #    skips module-level initializers, so mmio.spl's `_mmio_test_mode = false`
+    #    default never runs and the flag reads garbage-true — which makes every
+    #    mmio_read*/write* return 0 (empty test table). The ring-3 ELF parse reads
+    #    the blob entirely through mmio_read*, so this must happen before any MMIO.
+    mmio_disable_test_mode()
+
+    # 1. Ring-3 machinery (SYSCALL MSRs + EFER.NXE via arch_init, TSS/rsp0).
+    arch_x86_64_early_init()
+    rt_x86_tss_init()
+    serial_println("[boot] arch-init + tss done")
+
+    # 2. NVMe + network up UNDER the boot page tables (before vmm switches cr3).
+    if simpleos_nvme_init() != 0:
+        serial_println("[FATAL] nvme init failed")
+        return
+    serial_println("[boot] nvme online")
+
+    # PRELOAD /FSEXEC.ELF into the static path-read buffer NOW (pre-net, pre-vmm),
+    # while the FAT/NVMe DMA state is pristine. The exec-time FAT read returns 0 in
+    # this merged SSH kernel (device/FS state clobbered after rt_net_init + vmm + SSH
+    # activity — bug x64_ssh_kernel_fat32_stream_open_zero), so the ring-3 spawn
+    # consumes THIS resident buffer instead of re-streaming. size=13888 also confirms
+    # the if-expr phi-merge codegen fix (5c7c1186) repaired the boot-time read path.
+    val _preload_size = simpleos_fat32_stream_open("/FSEXEC.ELF")
+    if _preload_size > 0:
+        val _preload_buf = simpleos_fat32_path_read_buffer_addr()
+        val _preload_n = simpleos_fat32_stream_read_at(0.to_u64(), _preload_buf, _preload_size.to_u64())
+        simpleos_fat32_note_preload_size(_preload_size.to_u64())
+        serial_println("[boot] fsexec preloaded size={_preload_size} read={_preload_n}")
+    else:
+        serial_println("[boot] fsexec preload FAILED rc={_preload_size}")
+
+    val net_init = rt_net_init()
+    serial_println("[boot] rt_net_init rc={net_init}")
+    if net_init < 0:
+        serial_println("[FATAL] SSH network init failed")
+        return
+    val _net_stats = rt_net_stats()
+
+    # 3. PMM + VMM + NVMe BAR high — required for ring-3 create_user_address_space
+    #    and for the FS-exec read path to reach NVMe post-vmm.
+    #    Kernel end = 0x18000000 (384 MiB bound for 128 MB base + ~118 MB RW extent).
+    if not pmm_init_identity_range(0x80000000, 0x100000, 0x18000000):
+        serial_println("[FATAL] pmm init failed")
+        return
+    vmm_init(g_pmm, 0)
+    vmm_map_nvme_bar_high()
+    serial_println("[boot] pmm+vmm online (+nvme bar high) — net must survive this")
+
+    # 4. Production SSH daemon. Its exec dispatch routes a resolved FAT path to
+    #    fs_exec_spawn_ring3 (ring-3 handoff; does not return on success).
+    var daemon = SshDaemon.new(22)
+    val rsa_pkcs8 = rt_embedded_host_rsa_pkcs8()
+    val rsa_public_blob = rt_embedded_host_rsa_public_blob()
+    if rsa_pkcs8.len() > 0 and rsa_public_blob.len() > 0:
+        serial_println("[boot] Live host key policy: Ed25519 enabled; RSA staged")
+    else:
+        serial_println("[boot] Live host key policy: Ed25519 only")
+
+    serial_println("[boot] Starting production SSH daemon on port 22")
+    serial_println("[ssh-live] production-daemon-starting port=22 hostfwd=2222")
+    match daemon.start():
+        Ok(_):
+            serial_println("[ssh-live] production-daemon-stopped")
+        Err(err):
+            serial_println("[FATAL] SSH daemon failed: {err}")

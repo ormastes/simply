@@ -1,0 +1,29 @@
+app:
+    title: "MenuBar StatusBar Demo"
+    theme: glass_dark
+
+layout:
+    type: vbox
+    children:
+        menu:
+            type: menubar
+            items:
+                0:
+                    label: "File"
+                1:
+                    label: "Edit"
+                2:
+                    label: "View"
+                3:
+                    label: "Help"
+        content:
+            type: panel
+            title: "Content"
+            children:
+                main_text:
+                    type: text
+                    content: "Main application area"
+        status:
+            type: statusbar
+            left: "{app.mode}"
+            right: "{app.title}"

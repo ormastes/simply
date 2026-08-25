@@ -1,0 +1,109 @@
+# Integration test — MCP tool dispatch
+
+use src.util.json_helpers.{js, jp, jo1, jo2, jo3, ja, extract_field, LB, RB}
+use src.core.indexer.{IndexDb, open_index_memory, close_index_db, create_schema, index_note, note_count}
+use src.mcp.handlers.{handle_tool_call}
+
+# Helper: build a tools/call request body
+fn make_tool_request(id: text, tool_name: text, args_json: text) -> text:
+    var body = LB()
+    body = body + jp("jsonrpc", js("2.0"))
+    body = body + "," + jp("id", id)
+    body = body + "," + jp("method", js("tools/call"))
+    body = body + "," + jp("params", jo2(
+        jp("name", js(tool_name)),
+        jp("arguments", args_json)
+    ))
+    body = body + RB()
+    body
+
+fn setup_test_db() -> IndexDb:
+    val db = open_index_memory()
+    create_schema(db)
+    index_note(db, "/v/a.md", "a.md", "---\ntitle: Alpha\ntags: [project]\n---\n# Alpha\n\n[[b]] content\n\n- [ ] Open task", 1000)
+    index_note(db, "/v/b.md", "b.md", "---\ntitle: Beta\ntags: [reference]\n---\n# Beta\n\nLinked from alpha.\n\n## Decision\nWe decided to use BM25.", 1000)
+    db
+
+describe "MCPTools":
+    """Integration: JSON request → tool dispatch → JSON response"""
+
+    context "search_vault":
+        """Full-text search tool"""
+
+        it "returns results for search query":
+            val db = setup_test_db()
+            val body = make_tool_request("1", "search_vault", jo1(jp("query", js("Alpha"))))
+            val response = handle_tool_call("1", body, db, "")
+            expect(response).to_contain("Alpha")
+            close_index_db(db)
+
+    context "read_note":
+        """Note reading tool"""
+
+        it "returns note content":
+            val db = setup_test_db()
+            val body = make_tool_request("2", "read_note", jo1(jp("path", js("a.md"))))
+            val response = handle_tool_call("2", body, db, "")
+            expect(response).to_contain("a.md")
+            close_index_db(db)
+
+    context "search_by_tag":
+        """Tag search tool"""
+
+        it "finds notes by tag":
+            val db = setup_test_db()
+            val body = make_tool_request("3", "search_by_tag", jo1(jp("tag", js("project"))))
+            val response = handle_tool_call("3", body, db, "")
+            expect(response).to_contain("Alpha")
+            close_index_db(db)
+
+    context "find_backlinks":
+        """Backlinks tool"""
+
+        it "finds backlinks":
+            val db = setup_test_db()
+            val body = make_tool_request("4", "find_backlinks", jo1(jp("note_path", js("b.md"))))
+            val response = handle_tool_call("4", body, db, "")
+            # a.md links to b, so response should contain results
+            expect(response).to_contain("result")
+            close_index_db(db)
+
+    context "search_tasks":
+        """Task search tool"""
+
+        it "finds tasks":
+            val db = setup_test_db()
+            val body = make_tool_request("5", "search_tasks", jo1(jp("query", js("Open"))))
+            val response = handle_tool_call("5", body, db, "")
+            expect(response).to_contain("Open task")
+            close_index_db(db)
+
+    context "search_decisions":
+        """Decision search tool"""
+
+        it "finds decision content":
+            val db = setup_test_db()
+            val body = make_tool_request("6", "search_decisions", jo1(jp("query", js("BM25"))))
+            val response = handle_tool_call("6", body, db, "")
+            expect(response).to_contain("BM25")
+            close_index_db(db)
+
+    context "find_related":
+        """Related notes tool"""
+
+        it "finds related notes":
+            val db = setup_test_db()
+            val body = make_tool_request("7", "find_related", jo1(jp("note_path", js("a.md"))))
+            val response = handle_tool_call("7", body, db, "")
+            expect(response).to_contain("result")
+            close_index_db(db)
+
+    context "unknown tool":
+        """Error handling for unknown tools"""
+
+        it "returns error for unknown tool":
+            val db = setup_test_db()
+            val body = make_tool_request("99", "nonexistent_tool", jo1(jp("x", js("y"))))
+            val response = handle_tool_call("99", body, db, "")
+            expect(response).to_contain("Unknown tool")
+            close_index_db(db)

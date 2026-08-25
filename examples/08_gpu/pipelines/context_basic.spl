@@ -1,0 +1,89 @@
+#!/usr/bin/env simple
+# GPU Context API - Basic Example
+#
+# Demonstrates device selection, host<->device transfer and stream
+# synchronisation with the std.cuda driver surface plus the std.io CUDA
+# helpers (CudaPtr staging), with no PyTorch dependency.
+
+use std.cuda.{cuda_available, cuda_init, cuda_device_count, cuda_get_device_name, cuda_device_get, cuda_ctx_create, cuda_stream_create, cuda_stream_sync, cuda_stream_destroy, cuda_sync}
+use std.io.cuda_sffi.{cuda_alloc, cuda_alloc_from_host, cuda_copy_from_device, cuda_memset, cuda_free}
+
+fn test_auto_detect() -> bool:
+    """Test backend detection."""
+    print "=== Test 1: Backend Detection ==="
+    if cuda_available():
+        print "Backend: CUDA ({cuda_device_count()} device(s))"
+        true
+    else:
+        print "Backend: CPU (no CUDA driver)"
+        false
+
+fn test_explicit_device():
+    """Select the last device explicitly."""
+    print "\n=== Test 2: Explicit Device Selection ==="
+    val last = cuda_device_count() - 1
+    val ctx = cuda_ctx_create(cuda_device_get(last))
+    print "Device {last}: {cuda_get_device_name(last)}"
+    print "Context created: {ctx > 0}"
+
+fn test_memory_allocation():
+    """Allocate and zero a device buffer."""
+    print "\n=== Test 3: Memory Allocation ==="
+    val count = 1024
+    print "Allocating {count} f32 elements..."
+    val arr = cuda_alloc(count * 4)
+    print "Array allocated: {arr.is_valid}"
+    print "Size: {arr.size} bytes"
+    print "Zeroed: {cuda_memset(arr, 0)}"
+    cuda_free(arr)
+
+fn test_upload_download():
+    """Round-trip bytes through device memory."""
+    print "\n=== Test 4: Upload/Download ==="
+    val host_data = [1, 2, 3, 4] as [u8]
+    print "Uploading data: {host_data}"
+    val gpu_buf = cuda_alloc_from_host(host_data)
+    print "Data uploaded to GPU: {gpu_buf.is_valid}"
+    val back = cuda_copy_from_device(gpu_buf, 4)
+    print "Downloaded data: {back}"
+    print "Round trip ok: {back == host_data}"
+    cuda_free(gpu_buf)
+
+fn test_stream_creation():
+    """Streams: the runtime exposes the default stream only."""
+    print "\n=== Test 5: Stream Creation ==="
+    val stream1 = cuda_stream_create()
+    val stream2 = cuda_stream_create()
+    print "Stream 1 valid: {stream1.is_valid}"
+    print "Stream 2 valid: {stream2.is_valid}"
+    print "Both are the default stream (handle {stream1.handle})"
+    cuda_stream_destroy(stream1)
+    cuda_stream_destroy(stream2)
+
+fn test_synchronization():
+    """Device-wide synchronisation."""
+    print "\n=== Test 6: Synchronization ==="
+    val stream = cuda_stream_create()
+    print "Stream synchronized: {cuda_stream_sync(stream)}"
+    print "Device synchronized: {cuda_sync() == 0}"
+
+fn main():
+    """Run all context API tests."""
+    print "GPU Context API - Basic Example\n"
+    print "================================\n"
+
+    if not test_auto_detect():
+        print "\nNo CUDA device: remaining tests skipped"
+        return
+    if cuda_init() != 0:
+        print "cuInit failed"
+        return
+
+    test_explicit_device()
+    test_memory_allocation()
+    test_upload_download()
+    test_stream_creation()
+    test_synchronization()
+
+    print "\n================================"
+    print "All tests complete"

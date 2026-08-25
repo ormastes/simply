@@ -1,0 +1,88 @@
+"""
+hil_queue_backpressure_check — legacy HIL queue corruption must not drop work.
+
+Run: bin/simple run examples/09_embedded/simpleos_nvme_fw/fw/hil_queue_backpressure_check.spl
+"""
+
+use nvme_types.*
+use hil.*
+
+fn main():
+    var fail: i64 = 0
+    var h: Hil = hil_new()
+
+    val saved_tail: i64 = h.q.cq_tail
+    h.q.cq_tail = h.q.depth
+    h.submit(cmd_make(1, OP_READ, 0, 1, 0))
+    fail = fail + expect_eq(h.tick(), 0, "HIL tick backs off on invalid CQ tail")
+    fail = fail + expect_eq(h.pending(), 1, "HIL command remains pending behind invalid tail")
+    h.q.cq_tail = saved_tail
+    fail = fail + expect_eq(h.run(), 1, "HIL command drains after tail repair")
+    val tc: NvmeCpl = h.reap()
+    fail = fail + expect_eq(tc.status, SC_SUCCESS, "tail-repaired HIL command completes")
+
+    val saved_head: i64 = h.q.cq_head
+    h.q.cq_head = h.q.depth
+    h.submit(cmd_make(2, OP_READ, 0, 1, 0))
+    fail = fail + expect_eq(h.run(), 0, "HIL run backs off on invalid CQ head")
+    fail = fail + expect_eq(h.pending(), 1, "HIL command remains pending behind invalid head")
+    h.q.cq_head = saved_head
+    fail = fail + expect_eq(h.run(), 1, "HIL command drains after head repair")
+    val hc: NvmeCpl = h.reap()
+    fail = fail + expect_eq(hc.status, SC_SUCCESS, "head-repaired HIL command completes")
+
+    val saved_sq_head: i64 = h.q.sq_head
+    h.q.sq_head = h.q.depth
+    h.submit(cmd_make(3, OP_READ, 0, 1, 0))
+    fail = fail + expect_eq(h.run(), 0, "HIL run backs off on invalid SQ head")
+    fail = fail + expect_eq(h.pending(), 1, "HIL command remains pending behind invalid SQ head")
+    h.q.sq_head = saved_sq_head
+    fail = fail + expect_eq(h.run(), 1, "HIL command drains after SQ head repair")
+    val sc: NvmeCpl = h.reap()
+    fail = fail + expect_eq(sc.status, SC_SUCCESS, "SQ-head-repaired HIL command completes")
+
+    h.submit(cmd_make(4, OP_READ, 0, 1, 0))
+    val bad_cid_slot: i64 = h.q.sq_head
+    val saved_cid: i64 = h.q.sq_cid[bad_cid_slot]
+    h.q.sq_cid[bad_cid_slot] = 70000
+    fail = fail + expect_eq(h.run(), 0, "HIL run backs off on invalid SQ head cid")
+    fail = fail + expect_eq(h.pending(), 1, "HIL command remains pending behind invalid SQ head cid")
+    h.q.sq_cid[bad_cid_slot] = saved_cid
+    fail = fail + expect_eq(h.run(), 1, "HIL command drains after SQ head cid repair")
+    val cc: NvmeCpl = h.reap()
+    fail = fail + expect_eq(cc.status, SC_SUCCESS, "SQ-cid-repaired HIL command completes")
+
+    h.submit(cmd_make(5, OP_READ, 0, 1, 0))
+    fail = fail + expect_eq(h.run(), 1, "HIL command posts completion before CQ cid corruption")
+    val bad_cq_cid_slot: i64 = h.q.cq_head
+    val saved_cq_cid: i64 = h.q.cq_cid[bad_cq_cid_slot]
+    h.q.cq_cid[bad_cq_cid_slot] = 70000
+    val bad_reap: NvmeCpl = h.reap()
+    fail = fail + expect_eq(bad_reap.status, SC_INVALID_FIELD, "HIL reap fails closed on invalid CQ head cid")
+    fail = fail + expect_eq(h.q.cq_pending(), 1, "HIL completion remains pending behind invalid CQ head cid")
+    h.q.cq_cid[bad_cq_cid_slot] = saved_cq_cid
+    val repaired_reap: NvmeCpl = h.reap()
+    fail = fail + expect_eq(repaired_reap.status, SC_SUCCESS, "HIL completion reaps after CQ cid repair")
+
+    h.submit(cmd_make(6, OP_READ, 0, 1, 0))
+    fail = fail + expect_eq(h.run(), 1, "HIL command posts completion before CQ status corruption")
+    val bad_cq_status_slot: i64 = h.q.cq_head
+    val saved_cq_status: i64 = h.q.cq_status[bad_cq_status_slot]
+    h.q.cq_status[bad_cq_status_slot] = 70000
+    val bad_status_reap: NvmeCpl = h.reap()
+    fail = fail + expect_eq(bad_status_reap.status, SC_INVALID_FIELD, "HIL reap fails closed on invalid CQ head status")
+    fail = fail + expect_eq(h.q.cq_pending(), 1, "HIL completion remains pending behind invalid CQ head status")
+    h.submit(cmd_make(7, OP_READ, 0, 1, 0))
+    fail = fail + expect_eq(h.run(), 0, "HIL run backs off on invalid CQ head status")
+    fail = fail + expect_eq(h.pending(), 1, "HIL command remains pending behind invalid CQ head status")
+    h.q.cq_status[bad_cq_status_slot] = saved_cq_status
+    val repaired_status_reap: NvmeCpl = h.reap()
+    fail = fail + expect_eq(repaired_status_reap.status, SC_SUCCESS, "HIL completion reaps after CQ status repair")
+    fail = fail + expect_eq(h.run(), 1, "HIL command drains after CQ status repair")
+    val status_blocked_reap: NvmeCpl = h.reap()
+    fail = fail + expect_eq(status_blocked_reap.status, SC_SUCCESS, "CQ-status-repaired HIL command completes")
+
+    if fail == 0:
+        print "HIL QUEUE BACKPRESSURE OK"
+    else:
+        print "HIL QUEUE BACKPRESSURE FAIL ({fail})"

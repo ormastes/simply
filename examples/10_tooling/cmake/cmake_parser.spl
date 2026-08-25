@@ -1,0 +1,161 @@
+## cmake_parser — Parse CMakeLists.txt format
+##
+## Tokenizes and parses a subset of the CMake language into a list
+## of CmakeCommand nodes for the generator to consume.
+
+use std.text
+use std.fs
+
+# --- Token types ---
+
+struct CmakeToken:
+    kind: text    # "ident", "lparen", "rparen", "string", "newline", "eof"
+    value: text
+
+# --- AST nodes ---
+
+struct CmakeCommand:
+    name: text
+    args: [text]
+    line_no: i64
+
+# --- Tokenizer ---
+
+fn tokenize(content: text) -> [CmakeToken]:
+    """Tokenize CMakeLists.txt content into a flat token list."""
+    var tokens: [CmakeToken] = []
+    var pos = 0
+    val len = content.len()
+
+    while pos < len:
+        val ch = content.char_at(pos)
+
+        # Skip whitespace (but not newlines)
+        if ch == " " or ch == "\t" or ch == "\r":
+            pos = pos + 1
+            continue
+
+        # Newline
+        if ch == "\n":
+            tokens.push(CmakeToken(kind: "newline", value: "\n"))
+            pos = pos + 1
+            continue
+
+        # Comment: skip to end of line
+        if ch == "#":
+            while pos < len and content.char_at(pos) != "\n":
+                pos = pos + 1
+            continue
+
+        # Left paren
+        if ch == "(":
+            tokens.push(CmakeToken(kind: "lparen", value: "("))
+            pos = pos + 1
+            continue
+
+        # Right paren
+        if ch == ")":
+            tokens.push(CmakeToken(kind: "rparen", value: ")"))
+            pos = pos + 1
+            continue
+
+        # Quoted string
+        if ch == "\"":
+            pos = pos + 1
+            var s = ""
+            while pos < len and content.char_at(pos) != "\"":
+                if content.char_at(pos) == "\\" and pos + 1 < len:
+                    pos = pos + 1
+                    s = s + content.char_at(pos)
+                else:
+                    s = s + content.char_at(pos)
+                pos = pos + 1
+            pos = pos + 1  # skip closing quote
+            tokens.push(CmakeToken(kind: "string", value: s))
+            continue
+
+        # Identifier or bare word (including dots, hyphens, slashes, etc.)
+        if is_ident_start(ch):
+            var word = ""
+            while pos < len and is_ident_char(content.char_at(pos)):
+                word = word + content.char_at(pos)
+                pos = pos + 1
+            tokens.push(CmakeToken(kind: "ident", value: word))
+            continue
+
+        # Unknown char — skip
+        pos = pos + 1
+
+    tokens.push(CmakeToken(kind: "eof", value: ""))
+    tokens
+
+fn is_ident_start(ch: text) -> bool:
+    val c = ch.char_code_at(0)
+    # A-Z a-z _ . / $ { } 0-9 - + *
+    (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95 or c == 46 or c == 47 or c == 36 or c == 123 or c == 125 or (c >= 48 and c <= 57) or c == 45 or c == 43 or c == 42
+
+fn is_ident_char(ch: text) -> bool:
+    val c = ch.char_code_at(0)
+    (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95 or c == 46 or c == 47 or c == 36 or c == 123 or c == 125 or (c >= 48 and c <= 57) or c == 45 or c == 43 or c == 42
+
+# --- Parser ---
+
+fn parse_cmake(content: text) -> [CmakeCommand]:
+    """Parse CMakeLists.txt content into a list of commands."""
+    val tokens = tokenize(content)
+    var commands: [CmakeCommand] = []
+    var pos = 0
+    var line_no = 1
+
+    while pos < tokens.len():
+        val tok = tokens[pos]
+
+        if tok.kind == "newline":
+            line_no = line_no + 1
+            pos = pos + 1
+            continue
+
+        if tok.kind == "eof":
+            break
+
+        # Expect command: IDENT ( args... )
+        if tok.kind == "ident":
+            val cmd_name = tok.value
+            pos = pos + 1
+
+            # Skip newlines between name and lparen
+            while pos < tokens.len() and tokens[pos].kind == "newline":
+                line_no = line_no + 1
+                pos = pos + 1
+
+            if pos < tokens.len() and tokens[pos].kind == "lparen":
+                pos = pos + 1  # skip (
+
+                var args: [text] = []
+                while pos < tokens.len():
+                    val inner = tokens[pos]
+                    if inner.kind == "rparen":
+                        pos = pos + 1
+                        break
+                    if inner.kind == "newline":
+                        line_no = line_no + 1
+                        pos = pos + 1
+                        continue
+                    args.push(inner.value)
+                    pos = pos + 1
+
+                commands.push(CmakeCommand(
+                    name: cmd_name.to_lower(),
+                    args: args,
+                    line_no: line_no,
+                ))
+            continue
+
+        pos = pos + 1
+
+    commands
+
+fn parse_cmake_file(path: text) -> [CmakeCommand]:
+    """Parse a CMakeLists.txt file from disk."""
+    val content = fs.read_text(path)
+    parse_cmake(content)

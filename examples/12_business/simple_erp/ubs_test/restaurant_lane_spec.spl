@@ -1,0 +1,136 @@
+# @cover src/lanes/restaurant.spl 80%
+"""
+# Restaurant Lane
+
+Table orders flow through the ONE shared gate: session -> rbac -> validation
+-> idempotency. This spec pins the accepted path plus each fail-closed reason,
+and the lane's own domain operations (order totals, the forward-only state
+machine, split-bill rounding, tip math).
+"""
+
+use std.spec
+use lanes.restaurant.{MenuItem, TableOrder, validate_menu_item, validate_table_order, order_total, send_to_kitchen, serve, close_order, split_bill, tip_amount, submit_order_write}
+use framework.guarded.{Tenant, Actor, Session}
+use std.nogc_sync_mut.enterprise_store.store.{EnterpriseStore, store_open}
+use std.io_runtime.{file_exists, file_delete, dir_create_all}
+
+# Each scenario opens its own durable store: the interpreter backend caches
+# open databases per path in-process, so every it-block gets a fresh path.
+fn fresh_store(name: text) -> EnterpriseStore:
+    dir_create_all("build/test-artifacts")
+    val db = "build/test-artifacts/erp_restaurant_lane_" + name + ".db"
+    if file_exists(db):
+        file_delete(db)
+    store_open(db)
+
+describe "Restaurant lane — guarded writes":
+    it "accepts a valid write through the gate":
+        val tenant = Tenant { id: "t1", name: "Demo" }
+        val user = Actor { id: 1, name: "Mina", role: "operator" }
+        val session = Session { token: "sess-1", user_id: 1, tenant_id: "t1", active: true }
+        var item_ids: [i64] = []
+        item_ids.push(1)
+        val order = TableOrder { id: 1, table_no: 5, item_ids: item_ids, status: "open", total: 1500 }
+        val store = fresh_store("s1")
+        val r = submit_order_write(session, tenant, user, order, "restaurant-1", store)
+        expect(r.ok).to_equal(true)
+        expect(r.reason).to_equal("accepted")
+        expect(r.ledger_key).to_equal("restaurant-1")
+
+    it "denies an inactive session":
+        val tenant = Tenant { id: "t1", name: "Demo" }
+        val user = Actor { id: 1, name: "Mina", role: "operator" }
+        val session = Session { token: "sess-1", user_id: 1, tenant_id: "t1", active: false }
+        var item_ids: [i64] = []
+        item_ids.push(1)
+        val order = TableOrder { id: 1, table_no: 5, item_ids: item_ids, status: "open", total: 1500 }
+        val store = fresh_store("s2")
+        val r = submit_order_write(session, tenant, user, order, "restaurant-1", store)
+        assert_false(r.ok)
+        expect(r.reason).to_equal("invalid-session")
+
+    it "forbids an auditor from writing":
+        val tenant = Tenant { id: "t1", name: "Demo" }
+        val user = Actor { id: 3, name: "Jae", role: "auditor" }
+        val session = Session { token: "sess-3", user_id: 3, tenant_id: "t1", active: true }
+        var item_ids: [i64] = []
+        item_ids.push(1)
+        val order = TableOrder { id: 1, table_no: 5, item_ids: item_ids, status: "open", total: 1500 }
+        val store = fresh_store("s3")
+        val r = submit_order_write(session, tenant, user, order, "restaurant-1", store)
+        assert_false(r.ok)
+        expect(r.reason).to_equal("forbidden")
+
+    it "rejects an invalid record":
+        val tenant = Tenant { id: "t1", name: "Demo" }
+        val user = Actor { id: 1, name: "Mina", role: "operator" }
+        val session = Session { token: "sess-1", user_id: 1, tenant_id: "t1", active: true }
+        var item_ids: [i64] = []
+        val order = TableOrder { id: 0, table_no: 0, item_ids: item_ids, status: "open", total: -5 }
+        val store = fresh_store("s4")
+        val r = submit_order_write(session, tenant, user, order, "restaurant-1", store)
+        assert_false(r.ok)
+        expect(r.reason).to_equal("invalid-record")
+
+    it "rejects a duplicate idempotency key":
+        val tenant = Tenant { id: "t1", name: "Demo" }
+        val user = Actor { id: 1, name: "Mina", role: "operator" }
+        val session = Session { token: "sess-1", user_id: 1, tenant_id: "t1", active: true }
+        var item_ids: [i64] = []
+        item_ids.push(1)
+        val order = TableOrder { id: 1, table_no: 5, item_ids: item_ids, status: "open", total: 1500 }
+        val store = fresh_store("s5")
+        submit_order_write(session, tenant, user, order, "restaurant-1", store)
+        val r = submit_order_write(session, tenant, user, order, "restaurant-1", store)
+        assert_false(r.ok)
+        expect(r.reason).to_equal("duplicate-key")
+
+describe "Restaurant lane — domain operations":
+    it "validates a well-formed menu item":
+        val item = MenuItem { id: 1, name: "Burger", price: 900, available: true }
+        assert_true(validate_menu_item(item))
+
+    it "rejects a malformed menu item":
+        val item = MenuItem { id: 0, name: "", price: -1, available: true }
+        assert_false(validate_menu_item(item))
+
+    it "sums only available items referenced by the order":
+        val burger = MenuItem { id: 1, name: "Burger", price: 900, available: true }
+        val fries = MenuItem { id: 2, name: "Fries", price: 300, available: true }
+        val soup = MenuItem { id: 3, name: "Soup", price: 500, available: false }
+        var items: [MenuItem] = []
+        items.push(burger)
+        items.push(fries)
+        items.push(soup)
+        var item_ids: [i64] = []
+        item_ids.push(1)
+        item_ids.push(2)
+        item_ids.push(3)
+        expect(order_total(items, item_ids)).to_equal(1200)
+
+    it "walks the forward-only state machine":
+        var item_ids: [i64] = []
+        item_ids.push(1)
+        val opened = TableOrder { id: 1, table_no: 5, item_ids: item_ids, status: "open", total: 1200 }
+        val kitchen = send_to_kitchen(opened)
+        expect(kitchen.status).to_equal("kitchen")
+        val served = serve(kitchen)
+        expect(served.status).to_equal("served")
+        val closed = close_order(served)
+        expect(closed.status).to_equal("closed")
+
+    it "rejects skipping a state in the machine":
+        var item_ids: [i64] = []
+        item_ids.push(1)
+        val opened = TableOrder { id: 1, table_no: 5, item_ids: item_ids, status: "open", total: 1200 }
+        val skipped = serve(opened)
+        expect(skipped.status).to_equal("open")
+        val closed_early = close_order(opened)
+        expect(closed_early.status).to_equal("open")
+
+    it "splits the bill rounding up":
+        expect(split_bill(1000, 3)).to_equal(334)
+        expect(split_bill(900, 3)).to_equal(300)
+
+    it "computes a tip at a whole-number percent":
+        expect(tip_amount(1000, 15)).to_equal(150)

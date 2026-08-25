@@ -1,0 +1,41 @@
+# Embedding Layer — from scratch
+# Chapter 2: "Build a Large Language Model From Scratch" (Rasbt)
+#
+# Converts integer token IDs into dense vectors.
+# Equivalent to one-hot encoding followed by matrix multiplication.
+
+use std.pure.tensor.{PureTensor, tensor_from_data, tensor_randn}
+
+class StudyEmbedding:
+    weight: PureTensor<f64>   # [num_embeddings, embedding_dim]
+    num_embeddings: i64       # Vocabulary size
+    embedding_dim: i64        # Vector dimension
+
+    static fn create(num_embeddings: i64, embedding_dim: i64) -> StudyEmbedding:
+        val w = tensor_randn([num_embeddings, embedding_dim])
+        StudyEmbedding(
+            weight: w,
+            num_embeddings: num_embeddings,
+            embedding_dim: embedding_dim
+        )
+
+    # Forward: look up embeddings for a sequence of token IDs
+    # indices: [i64] array of token IDs, length = seq_len
+    # output: PureTensor [seq_len, embedding_dim]
+    fn forward(indices: [i64]) -> PureTensor<f64>:
+        val seq_len = indices.len()
+        var data: [f64] = []
+        var i = 0
+        while i < seq_len:
+            val idx = indices[i]
+            var j = 0
+            while j < self.embedding_dim:
+                data.push(self.weight.get([idx, j]))
+                j = j + 1
+            i = i + 1
+        tensor_from_data(data, [seq_len, self.embedding_dim])
+
+fn study_embedding_create(vocab_size: i64, emb_dim: i64) -> StudyEmbedding:
+    StudyEmbedding.create(vocab_size, emb_dim)
+
+export StudyEmbedding, study_embedding_create

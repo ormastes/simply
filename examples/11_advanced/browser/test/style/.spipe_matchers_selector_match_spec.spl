@@ -1,0 +1,274 @@
+#![allow(REQC001)]
+#![allow(REQC004)]
+#![allow(unnamed_duplicate_typed_args)]
+"""
+# Selector Match
+
+Tests for selector match functionality.
+"""
+# Selector Matching Tests
+#
+# Category: Browser Platform Style
+# Status: Active
+#
+# Validates CSS selector matching against DOM nodes: type, class, id, universal,
+# attribute presence/equals/starts-with/ends-with/contains selectors, compound
+# selectors, pseudo-classes, and querySelectorAll.
+#
+# Run with: bin/simple test examples/browser/test/style/selector_match_spec.spl
+
+use std.spec
+use examples.browser.entity.dom.node_types.{DomNode, NodeKind, Element}
+use examples.browser.entity.dom.attribute_types.{Attr}
+use examples.browser.entity.dom.css_types.{SelectorPart, Selector}
+use examples.browser.feature.dom.document.{Document}
+use examples.browser.feature.dom.element.{ElementOps}
+use examples.browser.shared.logging.{Logger, LogLevel}
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+fn make_doc() -> Document:
+    val logger = Logger.new("test-selector", LogLevel.Error)
+    Document.new("about:blank", logger)
+
+# Match a single SelectorPart against a node in a document.
+# Returns true if the part matches the given element.
+fn match_part(doc: Document, node_id: i64, part: SelectorPart) -> bool:
+    match part:
+        SelectorPart.Universal:
+            return true
+        SelectorPart.Type(p):
+            val el = doc.node_store.get_element(node_id)
+            if val Some(e) = el:
+                return e.tag_name.to_lower() == p.name.to_lower()
+            return false
+        SelectorPart.Class(p):
+            return ElementOps.classList_contains(doc, node_id, p.name)
+        SelectorPart.Id(p):
+            val attr = ElementOps.getAttribute(doc, node_id, "id")
+            if val Some(v) = attr:
+                return v == p.name
+            return false
+        SelectorPart.Attribute(a):
+            val attr = ElementOps.getAttribute(doc, node_id, a.name)
+            if val Some(v) = attr:
+                if a.op == "":
+                    return true
+                if a.op == "=":
+                    return v == a.value
+                if a.op == "^=":
+                    return v.starts_with(a.value)
+                if a.op == "$=":
+                    return v.ends_with(a.value)
+                if a.op == "*=":
+                    return v.contains(a.value)
+                return false
+            return false
+        SelectorPart.PseudoClass(p):
+            if p.name == "first-child":
+                val parent_opt = doc.parentNode(node_id)
+                if val Some(pid) = parent_opt:
+                    val first = doc.firstChild(pid)
+                    if val Some(fid) = first:
+                        return fid == node_id
+                return false
+            if p.name == "last-child":
+                val parent_opt = doc.parentNode(node_id)
+                if val Some(pid) = parent_opt:
+                    val last = doc.lastChild(pid)
+                    if val Some(lid) = last:
+                        return lid == node_id
+                return false
+            return false
+        _:
+            return false
+
+# Match a full compound selector (all parts must match) against a node.
+fn match_selector(doc: Document, node_id: i64, selector: Selector) -> bool:
+    var i = 0
+    while i < selector.parts.len():
+        if not match_part(doc, node_id, selector.parts.get(i)):
+            return false
+        i = i + 1
+    true
+
+# Query all element nodes in the document that match a selector.
+fn query_all(doc: Document, selector: Selector) -> [i64]:
+    var result = [i64]()
+    var i = 0
+    while i < doc.node_store.elements.len():
+        val el = doc.node_store.elements.get(i)
+        if match_selector(doc, el.node_id, selector):
+            result.push(el.node_id)
+        i = i + 1
+    result
+
+# ============================================================================
+# Tests
+# ============================================================================
+
+describe "Selector Matching":
+    """
+    ## Selector Matching Tests
+
+    Validates Selector Matching functionality.
+    """
+
+    context "type selector":
+        it "matches type selector":
+            var doc = make_doc()
+            val div_id = doc.createElement("div")
+            doc.appendChild(doc.body_id, div_id)
+            val sel = Selector.create([SelectorPart.Type(name: "div")])
+            expect match_selector(doc, div_id, sel) == true
+
+        it "rejects wrong type selector":
+            var doc = make_doc()
+            val div_id = doc.createElement("div")
+            doc.appendChild(doc.body_id, div_id)
+            val sel = Selector.create([SelectorPart.Type(name: "span")])
+            expect match_selector(doc, div_id, sel) == false
+
+    context "class selector":
+        it "matches class selector":
+            var doc = make_doc()
+            val div_id = doc.createElement("div")
+            ElementOps.setAttribute(doc, div_id, "class", "highlight active")
+            doc.appendChild(doc.body_id, div_id)
+            val sel = Selector.create([SelectorPart.Class(name: "highlight")])
+            expect match_selector(doc, div_id, sel) == true
+
+    context "id selector":
+        it "matches id selector":
+            var doc = make_doc()
+            val div_id = doc.createElement("div")
+            ElementOps.setAttribute(doc, div_id, "id", "main")
+            doc.appendChild(doc.body_id, div_id)
+            val sel = Selector.create([SelectorPart.Id(name: "main")])
+            expect match_selector(doc, div_id, sel) == true
+
+    context "universal selector":
+        it "matches universal selector":
+            var doc = make_doc()
+            val div_id = doc.createElement("div")
+            doc.appendChild(doc.body_id, div_id)
+            val sel = Selector.create([SelectorPart.Universal])
+            expect match_selector(doc, div_id, sel) == true
+
+    context "attribute selectors":
+        it "matches attribute presence selector":
+            var doc = make_doc()
+            val input_id = doc.createElement("input")
+            ElementOps.setAttribute(doc, input_id, "disabled", "")
+            doc.appendChild(doc.body_id, input_id)
+            val sel = Selector.create([SelectorPart.Attribute(name: "disabled", op: "", value: "")])
+            expect match_selector(doc, input_id, sel) == true
+
+        it "matches attribute equals selector":
+            var doc = make_doc()
+            val input_id = doc.createElement("input")
+            ElementOps.setAttribute(doc, input_id, "type", "text")
+            doc.appendChild(doc.body_id, input_id)
+            val sel = Selector.create([SelectorPart.Attribute(name: "type", op: "=", value: "text")])
+            expect match_selector(doc, input_id, sel) == true
+
+        it "matches attribute starts-with selector":
+            var doc = make_doc()
+            val a_id = doc.createElement("a")
+            ElementOps.setAttribute(doc, a_id, "href", "https://example.com")
+            doc.appendChild(doc.body_id, a_id)
+            val sel = Selector.create([SelectorPart.Attribute(name: "href", op: "^=", value: "https")])
+            expect match_selector(doc, a_id, sel) == true
+
+        it "matches attribute ends-with selector":
+            var doc = make_doc()
+            val img_id = doc.createElement("img")
+            ElementOps.setAttribute(doc, img_id, "src", "photo.png")
+            doc.appendChild(doc.body_id, img_id)
+            val sel = Selector.create([SelectorPart.Attribute(name: "src", op: "$=", value: ".png")])
+            expect match_selector(doc, img_id, sel) == true
+
+        it "matches attribute contains selector":
+            var doc = make_doc()
+            val div_id = doc.createElement("div")
+            ElementOps.setAttribute(doc, div_id, "data-info", "some-value-here")
+            doc.appendChild(doc.body_id, div_id)
+            val sel = Selector.create([SelectorPart.Attribute(name: "data-info", op: "*=", value: "value")])
+            expect match_selector(doc, div_id, sel) == true
+
+    context "compound selectors":
+        it "matches compound selector (type + class)":
+            var doc = make_doc()
+            val div_id = doc.createElement("div")
+            ElementOps.setAttribute(doc, div_id, "class", "box")
+            doc.appendChild(doc.body_id, div_id)
+            # div.box
+            val sel = Selector.create([
+                SelectorPart.Type(name: "div"),
+                SelectorPart.Class(name: "box")
+            ])
+            expect match_selector(doc, div_id, sel) == true
+
+        it "matches compound selector (type + id + class)":
+            var doc = make_doc()
+            val div_id = doc.createElement("div")
+            ElementOps.setAttribute(doc, div_id, "id", "main")
+            ElementOps.setAttribute(doc, div_id, "class", "container")
+            doc.appendChild(doc.body_id, div_id)
+            # div#main.container
+            val sel = Selector.create([
+                SelectorPart.Type(name: "div"),
+                SelectorPart.Id(name: "main"),
+                SelectorPart.Class(name: "container")
+            ])
+            expect match_selector(doc, div_id, sel) == true
+
+    context "pseudo-class selectors":
+        it "matches first-child pseudo-class":
+            var doc = make_doc()
+            val first = doc.createElement("div")
+            val second = doc.createElement("span")
+            doc.appendChild(doc.body_id, first)
+            doc.appendChild(doc.body_id, second)
+            val sel = Selector.create([SelectorPart.PseudoClass(name: "first-child")])
+            expect match_selector(doc, first, sel) == true
+            expect match_selector(doc, second, sel) == false
+
+        it "matches last-child pseudo-class":
+            var doc = make_doc()
+            val first = doc.createElement("div")
+            val second = doc.createElement("span")
+            doc.appendChild(doc.body_id, first)
+            doc.appendChild(doc.body_id, second)
+            val sel = Selector.create([SelectorPart.PseudoClass(name: "last-child")])
+            expect match_selector(doc, first, sel) == false
+            expect match_selector(doc, second, sel) == true
+
+    context "querySelectorAll":
+        it "querySelectorAll returns all matches":
+            var doc = make_doc()
+            val d1 = doc.createElement("div")
+            val d2 = doc.createElement("div")
+            val s1 = doc.createElement("span")
+            ElementOps.setAttribute(doc, d1, "class", "item")
+            ElementOps.setAttribute(doc, d2, "class", "item")
+            doc.appendChild(doc.body_id, d1)
+            doc.appendChild(doc.body_id, d2)
+            doc.appendChild(doc.body_id, s1)
+            # Select all elements with class "item"
+            val sel = Selector.create([SelectorPart.Class(name: "item")])
+            val matches = query_all(doc, sel)
+            expect matches.len() == 2
+            var found_d1 = false
+            var found_d2 = false
+            var i = 0
+            while i < matches.len():
+                if matches.get(i) == d1:
+                    found_d1 = true
+                if matches.get(i) == d2:
+                    found_d2 = true
+                i = i + 1
+            expect found_d1 == true
+            expect found_d2 == true

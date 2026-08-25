@@ -1,0 +1,8 @@
+# llm-process-gen: managed source=gemini_design_tools source_sha256=597e07db61bbeaac71c0da6fbf123a1cc0baddd381bf528258cf3c2c573a9b75 content_sha256=e896d1ad02ba65603551740709531ec4b6b6aee276ed0f7cc37b40c344621c41
+skill_tools |skill, source|
+    design, gemini
+
+tools |id, type, name, purpose|
+    gemini_cli, cli, "Gemini command prompt", "Run or adapt the copied Gemini workflow prompt"
+    playwright, cli, "Playwright CLI", "Support browser research, visual testing, or UI review when requested"
+    simple_cli, cli, "bin/simple", "Run project checks referenced by the workflow"

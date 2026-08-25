@@ -1,0 +1,50 @@
+# Default LLM Done-Check Hook Script
+# Checks if the LLM agent has completed its work.
+# If in tmux, uses tmux command-prompt. Otherwise, prompts via stdin.
+# Output: DONE / NOT_DONE / YES / NO
+
+use std.io_runtime.{env_get, process_run}
+
+fn main():
+    val tmux_env = env_get("TMUX")
+    val in_tmux = tmux_env != "" and tmux_env != nil
+
+    if in_tmux:
+        check_via_tmux()
+    else:
+        check_via_stdin()
+
+fn check_via_tmux():
+    # Use tmux command-prompt to ask the user
+    val (stdout, stderr, code) = process_run("tmux", [
+        "command-prompt",
+        "-p", "Is the LLM done? (yes/no/continue):",
+        "run-shell 'echo %1'"
+    ])
+    if code != 0:
+        print "NOT_DONE"
+        return
+    val response = stdout.trim().to_lower()
+    match response:
+        "yes" | "y" | "done" | "d" =>
+            print "DONE"
+        "no" | "n" | "not done" =>
+            print "NOT_DONE"
+        "continue" | "c" =>
+            print "NOT_DONE"
+        _ =>
+            print "NOT_DONE"
+
+fn check_via_stdin():
+    print "Is the LLM done? (yes/no): "
+    val line = input("")
+    val response = line.trim().to_lower()
+    match response:
+        "yes" | "y" | "done" | "d" =>
+            print "DONE"
+        "no" | "n" =>
+            print "NOT_DONE"
+        _ =>
+            print "NOT_DONE"
+
+main()

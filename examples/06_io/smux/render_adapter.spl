@@ -1,0 +1,244 @@
+#![allow(unnamed_duplicate_typed_args)]
+# smux Render Adapter
+#
+# Bridges the smux terminal multiplexer to the shared UI render library.
+# Produces text output (pane layout, active pane content, status bar) and
+# HTML output (pane grid with CSS grid layout, dark theme).
+
+use app.ui.render.types.{RenderConfig, RenderResult}
+use app.ui.render.html.{html_page, html_grid, html_escape, html_card, html_badge, css_dark_theme, css_light_theme}
+use app.ui.render.css.{card_css, grid_css}
+use app.ui.render.layout.{LayoutRect, grid_layout, pad_to_width}
+use app.ui.render.border.{draw_border, border_single}
+use app.ui.render.fmt.{heading, separator}
+
+# =========================================================================
+# Public API
+# =========================================================================
+
+fn render_smux(config: RenderConfig) -> RenderResult:
+    """Render a smux terminal multiplexer view.
+
+    Text output: pane layout, active pane content, status bar.
+    HTML output: pane grid as HTML with CSS grid layout.
+    """
+    val panes = _demo_panes()
+    val active_idx = 0
+    val title = "smux"
+    val mode = "NORMAL"
+
+    val text_out = _render_text(config, panes, active_idx, title, mode)
+
+    if config.format == "html" or config.format == "both":
+        val html_out = _render_html(config, panes, active_idx, title, mode)
+        if config.format == "both":
+            return RenderResult.both(text_out, html_out)
+        return RenderResult.html(html_out)
+
+    return RenderResult.text(text_out)
+
+# =========================================================================
+# Pane Model
+# =========================================================================
+
+struct SmuxPane:
+    id: i32
+    name: text
+    content: [text]
+    active: bool
+
+fn _demo_panes() -> [SmuxPane]:
+    """Build demo pane data for rendering."""
+    var panes: [SmuxPane] = []
+    panes.push(SmuxPane(
+        id: 0,
+        name: "editor",
+        content: ["~ main.spl", "  fn main():", "    print \"hello\"", "~", "~"],
+        active: true
+    ))
+    panes.push(SmuxPane(
+        id: 1,
+        name: "terminal",
+        content: ["$ bin/simple test", "Running tests...", "112,448 passed, 0 failed", ""],
+        active: false
+    ))
+    panes.push(SmuxPane(
+        id: 2,
+        name: "logs",
+        content: ["[INFO] Build complete", "[INFO] Watching for changes..."],
+        active: false
+    ))
+    return panes
+
+# =========================================================================
+# Text Rendering
+# =========================================================================
+
+fn _render_text(config: RenderConfig, panes: [SmuxPane], active_idx: i32, title: text, mode: text) -> text:
+    """Render smux as plain text with box-drawn panes."""
+    val w = config.width
+    var lines: [text] = []
+
+    # Title bar
+    lines.push(heading(title, "=", w))
+    lines.push("")
+
+    # Pane layout
+    val border = border_single()
+    var pane_idx = 0
+    for pane in panes:
+        val marker = if pane.active: "*" else: " "
+        val pane_title = "[{marker}] {pane.name} (pane {pane.id})"
+
+        # Draw bordered pane
+        val pane_width = if w > 4: w - 2 else: w
+        val pane_height = pane.content.len() + 2
+        val area = LayoutRect.new(0, 0, pane_width, pane_height)
+        val border_lines = draw_border(area, border, pane_title)
+        for bl in border_lines:
+            lines.push("  {bl}")
+
+        # Fill pane content into the bordered area
+        var ci = 0
+        while ci < pane.content.len():
+            val padded = pad_to_width(pane.content[ci], pane_width - 2)
+            lines.push("  {border.vertical}{padded}{border.vertical}")
+            ci = ci + 1
+
+        # Bottom border
+        lines.push("")
+        pane_idx = pane_idx + 1
+
+    # Status bar
+    lines.push(separator("-", w))
+    val status = " [{mode}] Panes: {panes.len()} | Active: {panes[active_idx].name}"
+    lines.push(status)
+
+    # Quick text bar
+    lines.push(" Alt+1:Continue  Alt+2:Approve  Alt+3:Fix tests")
+
+    return lines.join("\n")
+
+# =========================================================================
+# HTML Rendering
+# =========================================================================
+
+fn _render_html(config: RenderConfig, panes: [SmuxPane], active_idx: i32, title: text, mode: text) -> text:
+    """Render smux as an HTML page with CSS grid pane layout."""
+    val theme_css = if config.theme == "light": css_light_theme() else: css_dark_theme()
+
+    var css = theme_css
+    css = "{css}{card_css()}"
+    css = "{css}{grid_css()}"
+    css = "{css}{_smux_css()}"
+
+    # Build pane cards
+    var pane_items: [text] = []
+    for pane in panes:
+        val active_class = if pane.active: " pane-active" else: ""
+        val badge = if pane.active: html_badge("active", "var(--green, #3fb950)") else: ""
+
+        var content_html = "<pre class=\"pane-content\">"
+        for line in pane.content:
+            content_html = "{content_html}{html_escape(line)}\n"
+        content_html = "{content_html}</pre>"
+
+        var card = "<div class=\"pane-card{active_class}\">\n"
+        card = "{card}  <div class=\"pane-header\">{html_escape(pane.name)} {badge}</div>\n"
+        card = "{card}  {content_html}\n"
+        card = "{card}</div>\n"
+        pane_items.push(card)
+
+    val grid = html_grid(2, "12px", pane_items)
+
+    # Status bar
+    var status_html = "<div class=\"smux-status\">\n"
+    status_html = "{status_html}  <span class=\"mode-badge\">{html_escape(mode)}</span>\n"
+    status_html = "{status_html}  <span>Panes: {panes.len()}</span>\n"
+    status_html = "{status_html}  <span>Active: {html_escape(panes[active_idx].name)}</span>\n"
+    status_html = "{status_html}</div>\n"
+
+    # Quick text bar
+    var qt_html = "<div class=\"quick-text-bar\">\n"
+    qt_html = "{qt_html}  <span class=\"qt-btn\">Alt+1: Continue</span>\n"
+    qt_html = "{qt_html}  <span class=\"qt-btn\">Alt+2: Approve</span>\n"
+    qt_html = "{qt_html}  <span class=\"qt-btn\">Alt+3: Fix tests</span>\n"
+    qt_html = "{qt_html}</div>\n"
+
+    var body = "<div class=\"container\">\n"
+    body = "{body}  <h1>{html_escape(title)}</h1>\n"
+    body = "{body}  {grid}\n"
+    body = "{body}  {status_html}\n"
+    body = "{body}  {qt_html}\n"
+    body = "{body}</div>\n"
+
+    return html_page(title, css, body)
+
+fn _smux_css() -> text:
+    """CSS specific to smux pane rendering."""
+    var s = ""
+    s = "{s}.pane-card {\n"
+    s = "{s}  background: var(--bg-card, #161b22);\n"
+    s = "{s}  border: 1px solid var(--border, #30363d);\n"
+    s = "{s}  border-radius: 6px;\n"
+    s = "{s}  padding: 0;\n"
+    s = "{s}  overflow: hidden;\n"
+    s = "{s}}\n"
+    s = "{s}.pane-active {\n"
+    s = "{s}  border-color: var(--blue, #58a6ff);\n"
+    s = "{s}  box-shadow: 0 0 0 1px var(--blue, #58a6ff);\n"
+    s = "{s}}\n"
+    s = "{s}.pane-header {\n"
+    s = "{s}  padding: 6px 12px;\n"
+    s = "{s}  font-size: 13px;\n"
+    s = "{s}  font-weight: 600;\n"
+    s = "{s}  color: var(--text-dim, #8b949e);\n"
+    s = "{s}  border-bottom: 1px solid var(--border, #30363d);\n"
+    s = "{s}  display: flex;\n"
+    s = "{s}  align-items: center;\n"
+    s = "{s}  gap: 8px;\n"
+    s = "{s}}\n"
+    s = "{s}.pane-content {\n"
+    s = "{s}  padding: 8px 12px;\n"
+    s = "{s}  font-family: 'SF Mono', 'Fira Code', monospace;\n"
+    s = "{s}  font-size: 13px;\n"
+    s = "{s}  line-height: 1.5;\n"
+    s = "{s}  margin: 0;\n"
+    s = "{s}  min-height: 80px;\n"
+    s = "{s}}\n"
+    s = "{s}.smux-status {\n"
+    s = "{s}  display: flex;\n"
+    s = "{s}  align-items: center;\n"
+    s = "{s}  gap: 16px;\n"
+    s = "{s}  padding: 8px 12px;\n"
+    s = "{s}  background: var(--bg-card, #161b22);\n"
+    s = "{s}  border: 1px solid var(--border, #30363d);\n"
+    s = "{s}  border-radius: 6px;\n"
+    s = "{s}  margin-top: 12px;\n"
+    s = "{s}  font-size: 13px;\n"
+    s = "{s}}\n"
+    s = "{s}.mode-badge {\n"
+    s = "{s}  background: var(--green, #3fb950);\n"
+    s = "{s}  color: #fff;\n"
+    s = "{s}  padding: 2px 8px;\n"
+    s = "{s}  border-radius: 4px;\n"
+    s = "{s}  font-size: 12px;\n"
+    s = "{s}  font-weight: 600;\n"
+    s = "{s}}\n"
+    s = "{s}.quick-text-bar {\n"
+    s = "{s}  display: flex;\n"
+    s = "{s}  gap: 8px;\n"
+    s = "{s}  margin-top: 8px;\n"
+    s = "{s}}\n"
+    s = "{s}.qt-btn {\n"
+    s = "{s}  background: var(--bg-card, #161b22);\n"
+    s = "{s}  border: 1px solid var(--border, #30363d);\n"
+    s = "{s}  border-radius: 4px;\n"
+    s = "{s}  padding: 4px 10px;\n"
+    s = "{s}  font-size: 12px;\n"
+    s = "{s}  cursor: pointer;\n"
+    s = "{s}}\n"
+    s = "{s}.qt-btn:hover {\n"
+    s = "{s}  background: var(--bg-card-hover, #1c2128);\n"
+    s = "{s}}\n"
+    return s

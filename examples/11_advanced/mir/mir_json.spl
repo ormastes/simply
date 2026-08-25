@@ -1,0 +1,67 @@
+#!/usr/bin/env simple
+# Simple MIR JSON Test - Bootstrap Compatible
+#
+# Tests JSON serialization functions without complex MIR construction.
+
+use compiler.mir_json.*
+use app.io
+
+fn main():
+    print "Testing MIR JSON Serialization (Simple)..."
+    print ""
+
+    # Test 1: Binary operations
+    print "=== Binary Operations ==="
+    print "Add: {serialize_binop(MirBinOp.Add)}"
+    print "Sub: {serialize_binop(MirBinOp.Sub)}"
+    print "Mul: {serialize_binop(MirBinOp.Mul)}"
+    print "Div: {serialize_binop(MirBinOp.Div)}"
+    print "Eq: {serialize_binop(MirBinOp.Eq)}"
+    print ""
+
+    # Test 2: Unary operations
+    print "=== Unary Operations ==="
+    print "Neg: {serialize_unaryop(MirUnaryOp.Neg)}"
+    print "Not: {serialize_unaryop(MirUnaryOp.Not)}"
+    print "BitNot: {serialize_unaryop(MirUnaryOp.BitNot)}"
+    print ""
+
+    # Test 3: Constant values
+    print "=== Constant Values ==="
+    val int_const = MirConstValue.Int(42)
+    print "Int(42): {serialize_const_value(int_const)}"
+
+    val bool_true = MirConstValue.Bool(true)
+    print "Bool(true): {serialize_const_value(bool_true)}"
+
+    val bool_false = MirConstValue.Bool(false)
+    print "Bool(false): {serialize_const_value(bool_false)}"
+
+    val str_const = MirConstValue.Str("hello")
+    print "Str(\"hello\"): {serialize_const_value(str_const)}"
+
+    val zero_const = MirConstValue.Zero
+    print "Zero: {serialize_const_value(zero_const)}"
+    print ""
+
+    # Test 4: JSON string escaping
+    print "=== JSON String Escaping ==="
+    print "Quotes: {escape_json_string("say \"hello\"")}"
+    print "Backslash: {escape_json_string("path\\to\\file")}"
+    print "Newline: {escape_json_string("line1\nline2")}"
+    print "Tab: {escape_json_string("col1\tcol2")}"
+    print ""
+
+    # Test 5: Types
+    print "=== Type Serialization ==="
+    val i64_type = MirType(kind: MirTypeKind.I64)
+    print "I64: {serialize_mir_type(i64_type)}"
+
+    val bool_type = MirType(kind: MirTypeKind.Bool)
+    print "Bool: {serialize_mir_type(bool_type)}"
+
+    val f64_type = MirType(kind: MirTypeKind.F64)
+    print "F64: {serialize_mir_type(f64_type)}"
+    print ""
+
+    print "✅ Simple JSON serialization tests completed!"

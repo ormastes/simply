@@ -1,0 +1,8 @@
+use logic_map_core.*
+
+fn rv32_map_crash_cases_selftest() -> i32:
+    if _rv32_map_l2p_after_crash(77) != 77:
+        return 1
+    if _rv32_map_l2p_after_crash(4096) != -1:
+        return 1
+    0

@@ -1,0 +1,42 @@
+# Sale Lane — checkout on the shared guarded-write framework
+#
+# Owns the Sale shape, totals, and its validation verdict. Writes go through
+# framework.gate_write with action "sale.write" so the
+# session -> rbac -> validation -> idempotency order is enforced once.
+
+use framework.guarded.{Tenant, Actor, Session, WriteResult, gate_write}
+use std.nogc_sync_mut.enterprise_store.store.{EnterpriseStore}
+
+struct Sale:
+    val id: i64
+    val channel: text
+    val subtotal: i64
+    val tax: i64
+    val paid: bool
+    val status: text
+    val audit_note: text
+
+# Domain validity: identity present, channel named, non-negative money, and an
+# audit note (every sale must be attributable).
+fn validate_sale(s: Sale) -> bool:
+    return (s.id > 0 and s.channel.len() > 0 and s.subtotal >= 0 and s.tax >= 0 and s.audit_note.len() > 0)
+
+# Gross owed on a sale.
+fn sale_total(s: Sale) -> i64:
+    return s.subtotal + s.tax
+
+# Settle a sale, moving it to "paid".
+fn mark_paid(s: Sale) -> Sale:
+    return Sale { id: s.id, channel: s.channel, subtotal: s.subtotal, tax: s.tax, paid: true, status: "paid", audit_note: s.audit_note }
+
+# Total still owed across unpaid sales.
+fn unpaid_total(list: [Sale]) -> i64:
+    var total = 0
+    for s in list:
+        if !s.paid:
+            total = total + sale_total(s)
+    return total
+
+# The lane's single write entry point.
+fn submit_sale_write(session: Session, tenant: Tenant, user: Actor, s: Sale, key: text, store: EnterpriseStore) -> WriteResult:
+    return gate_write(store, session, tenant, user, "sale.write", validate_sale(s), key)

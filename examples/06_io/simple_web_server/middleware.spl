@@ -1,0 +1,60 @@
+# Middleware — Full Standalone Web Server Example
+#
+# Handler-wrapping middleware built on the lightweight lib's
+# fn(HttpRequest) -> HttpResponse pattern.
+#
+# Reuses: std.nogc_sync_mut.http_server (lightweight lib)
+# Lib source: src/lib/nogc_sync_mut/http_server/
+# Design: doc/05_design/simple_web_server_example.md
+
+use std.nogc_sync_mut.http_server.types.{
+    HttpRequest, HttpResponse, HttpMethod, HttpStatus
+}
+
+extern fn rt_time_ms() -> i64
+
+fn with_logging(inner: fn(HttpRequest) -> HttpResponse) -> fn(HttpRequest) -> HttpResponse:
+    return \req:
+        val start = rt_time_ms()
+        val method_str = http_method_display(req.method)
+        val resp = inner(req)
+        val elapsed = rt_time_ms() - start
+        print "[{method_str}] {req.path} -> {resp.status_code()} ({elapsed}ms)"
+        return resp
+
+fn with_cors(origins: [text], inner: fn(HttpRequest) -> HttpResponse) -> fn(HttpRequest) -> HttpResponse:
+    return \req:
+        val origin = if origins.len() > 0:
+            origins[0]
+        else:
+            "*"
+
+        if is_options(req.method):
+            return HttpResponse.ok("")
+                .with_header("Access-Control-Allow-Origin", origin)
+                .with_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+                .with_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+                .with_header("Access-Control-Max-Age", "86400")
+
+        val resp = inner(req)
+        return resp.with_header("Access-Control-Allow-Origin", origin)
+
+fn with_server_header(inner: fn(HttpRequest) -> HttpResponse) -> fn(HttpRequest) -> HttpResponse:
+    return \req:
+        val resp = inner(req)
+        return resp.with_header("Server", "SimpleWebServer/1.0")
+
+fn is_options(m: HttpMethod) -> bool:
+    match m:
+        HttpMethod.Options: true
+        _: false
+
+fn http_method_display(m: HttpMethod) -> text:
+    match m:
+        HttpMethod.Get: "GET"
+        HttpMethod.Post: "POST"
+        HttpMethod.Put: "PUT"
+        HttpMethod.Delete: "DELETE"
+        HttpMethod.Patch: "PATCH"
+        HttpMethod.Head: "HEAD"
+        HttpMethod.Options: "OPTIONS"

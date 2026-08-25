@@ -1,0 +1,43 @@
+"""
+nvme_host — the host-side and device-side DMA ports for the NVMe emulator. Each
+port owns a pluggable Dma seam (nvme_memcpy). The realistic split is that DATA
+crosses the host<->device boundary through these DMA engines while commands pass
+in-process; NvmeEmu (nvme_device) wires both ports to the one shared-memory region.
+
+A port is a thin owner of a Dma so the fn-field copy seam (gotcha 2: lambda-wrapped)
+lives behind a named handle that NvmeEmu can re-plug via set_copy.
+"""
+
+use nvme_ct.*
+use nvme_memcpy.*
+
+struct HostPort:
+    dma: Dma
+
+fn host_port_new() -> HostPort:
+    HostPort(dma: dma_new())
+
+struct DevPort:
+    dma: Dma
+
+fn dev_port_new() -> DevPort:
+    DevPort(dma: dma_new())
+
+# Each port exposes a SINGLE-LEVEL hop to its Dma. Re-plugging the copy seam has
+# to mutate the Dma in place; a doubly-nested call (me.dev.dma.set_copy) does NOT
+# write back through two field hops in interpreter mode, so NvmeEmu delegates one
+# hop at a time (me.dev.set_copy -> me.dma.set_copy), matching the pattern that
+# makes nested owned-field mutation persist (gotcha 4).
+impl HostPort:
+    me set_copy(f: fn([i64], i64, i64) -> [i64]):
+        me.dma.set_copy(f)
+
+    me run(src: [i64], off: i64, n: i64) -> [i64]:
+        me.dma.run(src, off, n)
+
+impl DevPort:
+    me set_copy(f: fn([i64], i64, i64) -> [i64]):
+        me.dma.set_copy(f)
+
+    me run(src: [i64], off: i64, n: i64) -> [i64]:
+        me.dma.run(src, off, n)

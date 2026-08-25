@@ -1,0 +1,225 @@
+# 82. Attention Kernels - batched multi-head attention
+#
+# The original exercise (82.Attention_Kernels) builds the three kernels of a
+# transformer attention block:
+#   fused QKV projection   [batch*seq, d_model] x [d_model, 3*d_model] -> Q|K|V
+#   multi-head attention   per (batch, head): softmax(Q_h K_h^T / sqrt(d_head)) V_h
+#   output projection      concat(heads) x Wo
+#
+# Simple version keeps that structure over flat row-major [f32]:
+#   fused_qkv_projection   one gpu_gemm against the concatenated weight
+#   multi_head_attention   loops (batch, head, query) on the host; causal optional
+#   output_projection      gpu_gemm against Wo
+#   BatchedMultiHeadAttention  class holding the weights + forward()
+#
+# Status on this seed: the host functions are the verified path (gpu_gemm is
+# the std.gpu CPU fallback here, so results are exact); the @gpu_kernel
+# bodies are the device-side formulation with one thread per output element.
+
+use std.gpu.*
+
+val HEAD_TILE = 32  # query rows per block in the attention kernel
+
+# ============================================================================
+# Device-side formulations
+# ============================================================================
+
+@gpu_kernel
+fn fused_qkv_projection_kernel(input: GpuPtr, w_qkv: GpuPtr, qkv: GpuPtr,
+                               rows: i64, d_model: i64):
+    # output column space is 3*d_model: [Q | K | V]
+    val r = gpu_global_id_y()
+    val c = gpu_global_id_x()
+    if r < rows and c < 3 * d_model:
+        var sum = 0.0
+        var i = 0
+        while i < d_model:
+            sum = sum + gpu_load_f32(input, r * d_model + i) * gpu_load_f32(w_qkv, i * 3 * d_model + c)
+            i = i + 1
+        gpu_store_f32(qkv, r * 3 * d_model + c, sum)
+
+@gpu_kernel
+fn multi_head_attention_kernel(qkv: GpuPtr, output: GpuPtr,
+                               batch: i64, seq_len: i64, n_heads: i64, d_head: i64, causal: bool):
+    # grid: x = query row within (batch, head), y = batch * n_heads + head
+    val d_model = n_heads * d_head
+    val bh = gpu_global_id_y()
+    val b = bh / n_heads
+    val h = bh % n_heads
+    val i = gpu_global_id_x()
+    if b < batch and i < seq_len:
+        val limit = if causal: i + 1 else: seq_len
+        val q_base = (b * seq_len + i) * 3 * d_model + h * d_head
+        var m = -1.0e30
+        var l = 0.0
+        var d = 0
+        while d < d_head:
+            gpu_store_f32(output, (b * seq_len + i) * d_model + h * d_head + d, 0.0)
+            d = d + 1
+        var j = 0
+        while j < limit:
+            val k_base = (b * seq_len + j) * 3 * d_model + d_model + h * d_head
+            val v_base = (b * seq_len + j) * 3 * d_model + 2 * d_model + h * d_head
+            var s = 0.0
+            d = 0
+            while d < d_head:
+                s = s + gpu_load_f32(qkv, q_base + d) * gpu_load_f32(qkv, k_base + d)
+                d = d + 1
+            val score = s / ((d_head * 1.0).sqrt())
+            val m_new = if score > m: score else: m
+            val alpha = (m - m_new).exp()
+            val p = (score - m_new).exp()
+            l = l * alpha + p
+            d = 0
+            while d < d_head:
+                val o = (b * seq_len + i) * d_model + h * d_head + d
+                gpu_store_f32(output, o, gpu_load_f32(output, o) * alpha + p * gpu_load_f32(qkv, v_base + d))
+                d = d + 1
+            m = m_new
+            j = j + 1
+        d = 0
+        while d < d_head:
+            val o = (b * seq_len + i) * d_model + h * d_head + d
+            gpu_store_f32(output, o, gpu_load_f32(output, o) / l)
+            d = d + 1
+
+@gpu_kernel
+fn output_projection_kernel(head_outputs: GpuPtr, wo: GpuPtr, output: GpuPtr,
+                            rows: i64, d_model: i64):
+    val r = gpu_global_id_y()
+    val c = gpu_global_id_x()
+    if r < rows and c < d_model:
+        var sum = 0.0
+        var i = 0
+        while i < d_model:
+            sum = sum + gpu_load_f32(head_outputs, r * d_model + i) * gpu_load_f32(wo, i * d_model + c)
+            i = i + 1
+        gpu_store_f32(output, r * d_model + c, sum)
+
+# ============================================================================
+# Host implementations (verified path)
+# ============================================================================
+
+fn zeros(count: i64) -> [f32]:
+    [for i in 0..count: 0.0]
+
+# input: rows x d_model, w_qkv: d_model x 3*d_model -> rows x 3*d_model
+fn fused_qkv_projection(input: [f32], w_qkv: [f32], rows: i64, d_model: i64) -> Result<[f32], GpuError>:
+    gpu_gemm(input, w_qkv, rows, 3 * d_model, d_model)
+
+# qkv: (batch*seq_len) x 3*d_model -> (batch*seq_len) x d_model (heads concatenated)
+fn multi_head_attention(qkv: [f32], batch: i64, seq_len: i64, n_heads: i64, d_head: i64, causal: bool) -> [f32]:
+    val d_model = n_heads * d_head
+    val scale = 1.0 / ((d_head * 1.0).sqrt())
+    var output = zeros(batch * seq_len * d_model)
+    var b = 0
+    while b < batch:
+        var h = 0
+        while h < n_heads:
+            var i = 0
+            while i < seq_len:
+                val limit = if causal: i + 1 else: seq_len
+                val q_base = (b * seq_len + i) * 3 * d_model + h * d_head
+                var scores = zeros(limit)
+                var max_score = -1.0e30
+                var j = 0
+                while j < limit:
+                    val k_base = (b * seq_len + j) * 3 * d_model + d_model + h * d_head
+                    var s = 0.0
+                    var d = 0
+                    while d < d_head:
+                        s = s + qkv[q_base + d] * qkv[k_base + d]
+                        d = d + 1
+                    scores[j] = s * scale
+                    if scores[j] > max_score:
+                        max_score = scores[j]
+                    j = j + 1
+                var denom = 0.0
+                j = 0
+                while j < limit:
+                    scores[j] = (scores[j] - max_score).exp()
+                    denom = denom + scores[j]
+                    j = j + 1
+                j = 0
+                while j < limit:
+                    val v_base = (b * seq_len + j) * 3 * d_model + 2 * d_model + h * d_head
+                    val p = scores[j] / denom
+                    var d = 0
+                    while d < d_head:
+                        val o = (b * seq_len + i) * d_model + h * d_head + d
+                        output[o] = output[o] + p * qkv[v_base + d]
+                        d = d + 1
+                    j = j + 1
+                i = i + 1
+            h = h + 1
+        b = b + 1
+    output
+
+fn output_projection(head_outputs: [f32], wo: [f32], rows: i64, d_model: i64) -> Result<[f32], GpuError>:
+    gpu_gemm(head_outputs, wo, rows, d_model, d_model)
+
+# ============================================================================
+# Attention block (composition: weights + forward)
+# ============================================================================
+
+class BatchedMultiHeadAttention:
+    d_model: i64
+    n_heads: i64
+    d_head: i64
+    w_qkv: [f32]   # d_model x 3*d_model
+    wo: [f32]      # d_model x d_model
+
+    fn forward(input: [f32], batch: i64, seq_len: i64, causal: bool) -> Result<[f32], GpuError>:
+        val rows = batch * seq_len
+        val qkv = fused_qkv_projection(input, self.w_qkv, rows, self.d_model)?
+        val heads = multi_head_attention(qkv, batch, seq_len, self.n_heads, self.d_head, causal)
+        output_projection(heads, self.wo, rows, self.d_model)
+
+fn identity(n: i64) -> [f32]:
+    var data = zeros(n * n)
+    var i = 0
+    while i < n:
+        data[i * n + i] = 1.0
+        i = i + 1
+    data
+
+# W_qkv = [I | I | I] so Q = K = V = input; Wo = I. Makes results checkable by hand.
+fn make_identity_attention(d_model: i64, n_heads: i64) -> BatchedMultiHeadAttention:
+    var w_qkv = zeros(d_model * 3 * d_model)
+    var i = 0
+    while i < d_model:
+        w_qkv[i * 3 * d_model + i] = 1.0
+        w_qkv[i * 3 * d_model + d_model + i] = 1.0
+        w_qkv[i * 3 * d_model + 2 * d_model + i] = 1.0
+        i = i + 1
+    BatchedMultiHeadAttention(d_model: d_model, n_heads: n_heads, d_head: d_model / n_heads,
+                              w_qkv: w_qkv, wo: identity(d_model))
+
+fn attention_blocks(seq_len: i64) -> i64:
+    (seq_len + HEAD_TILE - 1) / HEAD_TILE
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn main():
+    val batch = 2
+    val seq_len = 3
+    val d_model = 4
+    val n_heads = 2
+    val attn = make_identity_attention(d_model, n_heads)
+    print "Multi-head attention: batch={batch} seq_len={seq_len} d_model={d_model} heads={n_heads} d_head={attn.d_head}"
+    print "  kernel grid: {attention_blocks(seq_len)} query block(s) x {batch * n_heads} (batch,head) pairs"
+
+    val input = [for i in 0..(batch * seq_len * d_model): ((i % 5) - 2) * 0.5]
+    match attn.forward(input, batch, seq_len, false):
+        case Ok(out):
+            print "  non-causal output: {out.len()} elements, out[0]={out[0]}"
+        case Err(e):
+            print "  error: {e.message}"
+    match attn.forward(input, batch, seq_len, true):
+        case Ok(out):
+            # with identity weights, causal position 0 attends only to itself -> equals its input row
+            print "  causal row 0 == input row 0: {out[0] == input[0] and out[3] == input[3]}"
+        case Err(e):
+            print "  error: {e.message}"

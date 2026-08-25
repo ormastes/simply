@@ -1,0 +1,48 @@
+# 11. Foundations - Device Query - Tests
+#
+# Hardware-independent checks for the device-query helpers: the packed
+# compute-capability format and the launch-geometry arithmetic the README
+# teaches. Real device enumeration is exercised by main.spl.
+
+use std.cuda.*
+
+fn split_capability(packed: i64) -> (i64, i64):
+    (packed / 10, packed % 10)
+
+fn blocks_for(total: i64, block_size: i64) -> i64:
+    (total + block_size - 1) / block_size
+
+describe "Foundations - device query helpers":
+
+    describe "compute capability packing":
+
+        it "splits sm_86 into (8, 6)":
+            val cap = split_capability(86)
+            expect(cap.0).to_equal(8)
+            expect(cap.1).to_equal(6)
+
+        it "splits sm_75 into (7, 5)":
+            val cap = split_capability(75)
+            expect(cap.0).to_equal(7)
+            expect(cap.1).to_equal(5)
+
+    describe "grid geometry":
+
+        it "rounds the block count up":
+            expect(blocks_for(1000, 256)).to_equal(4)
+            expect(blocks_for(1024, 256)).to_equal(4)
+            expect(blocks_for(1025, 256)).to_equal(5)
+
+        it "covers every element":
+            val total = 1000
+            val bs = 256
+            expect(blocks_for(total, bs) * bs >= total).to_equal(true)
+
+    describe "driver status words":
+
+        it "CUDA_SUCCESS is zero":
+            expect(CUDA_SUCCESS).to_equal(0)
+
+        it "the availability probe is a bool":
+            val available = cuda_available()
+            expect(available == true or available == false).to_equal(true)

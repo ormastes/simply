@@ -1,0 +1,55 @@
+use logic_band_geometry_core.*
+use logic_band_alloc_core.*
+
+fn _rv32_band_block_valid(block: i64) -> i32:
+    _rv32_band_block_valid_impl(block)
+
+fn _rv32_band_ppn_valid(ppn: i64) -> i32:
+    _rv32_band_ppn_valid_impl(ppn)
+
+fn _rv32_band_block_of(ppn: i64) -> i64:
+    _rv32_band_block_of_impl(ppn)
+
+fn _rv32_band_first_ppn(block: i64) -> i64:
+    _rv32_band_first_ppn_impl(block)
+
+fn _rv32_band_valid_count(raw: i64) -> i64:
+    _rv32_band_valid_count_impl(raw)
+
+fn _rv32_band_block_state(block: i64, state: i64) -> i64:
+    _rv32_band_block_state_impl(block, state)
+
+pub fn _rv32_band_alloc_page(active_blk: i64, active_wp: i64, free_count: i64) -> i64:
+    _rv32_band_alloc_page_impl(active_blk, active_wp, free_count)
+
+pub fn _rv32_band_host_can_open(free_count: i64, reserve: i64) -> i32:
+    _rv32_band_host_can_open_impl(free_count, reserve)
+
+pub fn _rv32_band_host_writable_pages(active_wp: i64, free_count: i64, reserve: i64) -> i64:
+    _rv32_band_host_writable_pages_impl(active_wp, free_count, reserve)
+
+pub fn _rv32_band_mark_valid_count(block_state: i64, was_valid: i32, count: i64) -> i64:
+    if block_state == 0:
+        return count
+    if block_state == 3:
+        return count
+    if was_valid != 0:
+        return count
+    _rv32_band_valid_count(count + 1)
+
+pub fn _rv32_band_mark_invalid_count(was_valid: i32, count: i64) -> i64:
+    if was_valid == 0:
+        return _rv32_band_valid_count(count)
+    _rv32_band_valid_count(count - 1)
+
+pub fn _rv32_band_free_state(block: i64) -> i64:
+    if _rv32_band_block_valid(block) == 0:
+        return 3
+    0
+
+pub fn _rv32_band_rebuild_state(ppn: i64, old_state: i64) -> i64:
+    if _rv32_band_ppn_valid(ppn) == 0:
+        return old_state
+    if old_state == 3:
+        return 3
+    2

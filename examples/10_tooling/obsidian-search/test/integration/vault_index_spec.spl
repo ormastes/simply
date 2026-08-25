@@ -1,0 +1,92 @@
+# Integration test — vault scanning → indexing → search
+
+use src.core.indexer.{IndexDb, open_index_memory, close_index_db, create_schema, index_note, note_count, link_count}
+use src.core.search_engine.{search_vault_query, search_by_tag, search_tasks, search_decisions}
+use src.core.graph.{find_backlinks, find_forward_links, find_related, compute_authority}
+
+fn index_sample_vault(db: IndexDb):
+    val index_md = "---\ntitle: Vault Index\naliases: [home, main]\ntags: [index, hub]\n---\n\n# Vault Index\n\n## Projects\n- [[project-alpha]]\n- [[api-design]]\n\n## Daily\n- [[2024-01-15]]\n\n## Meetings\n- [[standup-notes]]\n\n## Decisions\n- [[adr-001]]"
+    index_note(db, "/v/index.md", "index.md", index_md, 2000)
+
+    val alpha_md = "---\ntitle: Project Alpha\ntags: [project, active]\n---\n\n# Project Alpha\n\n## Overview\nMain project.\n\n## Tasks\n- [ ] Set up indexing\n- [x] Define scope\n\n## Links\n[[api-design]] [[adr-001]] [[standup-notes]] [[2024-01-15]]"
+    index_note(db, "/v/projects/project-alpha.md", "projects/project-alpha.md", alpha_md, 2000)
+
+    val daily_md = "---\ntitle: Daily Note 2024-01-15\ntags: [daily, journal]\n---\n\n# 2024-01-15\n\n## Morning\n- Reviewed [[project-alpha]]\n- Met with team in [[standup-notes]]\n\n## Tasks\n- [x] Review PR\n- [ ] Follow up"
+    index_note(db, "/v/daily/2024-01-15.md", "daily/2024-01-15.md", daily_md, 2000)
+
+    val api_md = "---\ntitle: API Design Guide\naliases: [api-guide]\ntags: [reference, api, design]\n---\n\n# API Design Guide\n\n## Decision\nSee [[adr-001]] for ranking decision.\n\n## Related\n- [[project-alpha]]\n- [[standup-notes]]"
+    index_note(db, "/v/reference/api-design.md", "reference/api-design.md", api_md, 2000)
+
+    val standup_md = "---\ntitle: Standup Notes\ntags: [meeting, standup, recurring]\n---\n\n# Standup Notes\n\n## 2024-01-15\n- [[project-alpha]]: indexing in progress\n- [[api-design]]: review completed\n\n## Action Items\n- [ ] Finalize ranking\n- [x] Set up test vault"
+    index_note(db, "/v/meetings/standup-notes.md", "meetings/standup-notes.md", standup_md, 2000)
+
+    val adr_md = "---\ntitle: ADR-001 Search Ranking\ntags: [decision, adr, architecture]\n---\n\n# ADR-001: Search Ranking Strategy\n\n## Status\nAccepted\n\n## Decision\nUse hybrid BM25 + graph ranking.\n\n## References\n- [[api-design]]\n- [[project-alpha]]"
+    index_note(db, "/v/decisions/adr-001.md", "decisions/adr-001.md", adr_md, 2000)
+
+describe "VaultIndex":
+    """Integration: index → search pipeline"""
+
+    context "indexing":
+        it "indexes all sample notes":
+            val db = open_index_memory()
+            create_schema(db)
+            index_sample_vault(db)
+            expect(note_count(db)).to_equal(6)
+            close_index_db(db)
+
+        it "stores links between notes":
+            val db = open_index_memory()
+            create_schema(db)
+            index_sample_vault(db)
+            expect(link_count(db)).to_be_greater_than(10)
+            close_index_db(db)
+
+    context "search":
+        it "finds notes by tag":
+            val db = open_index_memory()
+            create_schema(db)
+            index_sample_vault(db)
+            val results = search_by_tag(db, "meeting")
+            expect(results.len()).to_be_greater_than(0)
+            close_index_db(db)
+
+        it "finds tasks":
+            val db = open_index_memory()
+            create_schema(db)
+            index_sample_vault(db)
+            val results = search_tasks(db, "indexing", "")
+            expect(results.len()).to_be_greater_than(0)
+            close_index_db(db)
+
+        it "finds decision content":
+            val db = open_index_memory()
+            create_schema(db)
+            index_sample_vault(db)
+            val results = search_decisions(db, "ranking")
+            expect(results.len()).to_be_greater_than(0)
+            close_index_db(db)
+
+    context "graph":
+        it "finds backlinks to well-connected notes":
+            val db = open_index_memory()
+            create_schema(db)
+            index_sample_vault(db)
+            val results = find_backlinks(db, "projects/project-alpha.md")
+            expect(results.len()).to_be_greater_than(0)
+            close_index_db(db)
+
+        it "computes authority for linked notes":
+            val db = open_index_memory()
+            create_schema(db)
+            index_sample_vault(db)
+            val auth_alpha = compute_authority(db, "projects/project-alpha.md")
+            expect(auth_alpha).to_be_greater_than(0.0)
+            close_index_db(db)
+
+        it "finds related notes":
+            val db = open_index_memory()
+            create_schema(db)
+            index_sample_vault(db)
+            val results = find_related(db, "projects/project-alpha.md")
+            expect(results.len()).to_be_greater_than(0)
+            close_index_db(db)

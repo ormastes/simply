@@ -1,0 +1,868 @@
+# wm_graphics_2d_showcase_gui.spl — Simple WM host that launches the widget showcase
+# from the filesystem as a separate process, using the SAME source file as the
+# native showcase app.
+#
+# Launch:
+#   SIMPLE_GUI_RUN_SKIP_NUDGE=1 scripts/gui/macos-gui-run.shs \
+#     examples/06_io/ui/wm_graphics_2d_showcase_gui.spl
+
+use std.nogc_sync_mut.ui.gui_renderer.{GuiRenderer, GuiEvent, GUI_EVT_NONE, GUI_EVT_CLOSE, GUI_EVT_KEYBOARD, GUI_EVT_MOUSE_BUTTON, GUI_EVT_MOUSE_MOVED}
+use std.gpu.engine2d.engine.{Engine2D}
+use std.io_runtime.{env_get, file_exists, file_read, file_read_bytes, file_write, file_write_bytes, dir_create_all, getpid, time_now_unix_micros}
+use std.nogc_sync_mut.concurrent.thread.{thread_sleep}
+use std.common.image.ppm_decode.{decode_ppm_to_argb, encode_ppm_p6}
+use std.common.science_math.perf_sugar.{alloc_i64}
+use std.diag.{dbg_stage, dbg_deadline, dbg_deadline_clear, dbg_event_hop, dbg_events_on}
+# Direct defining-module imports, NOT the app.io.mod hub: the hub re-exports
+# cli_ops -> run_commands -> compiler.driver -> hir, dragging the ENTIRE
+# compiler (800+ transitive modules) into a GUI adapter and blowing the
+# interpreter module-count limit before main() (host-WM lane regression,
+# proven by RUST_LOG module trace 2026-07-18).
+use app.io.process_ops.{process_spawn_async, process_kill}
+use app.io.process_env_ops.{process_spawn_async_env}
+use app.io.env_ops.{host_os, cwd}
+use common.window_protocol.geometry.{Size}
+use common.ui.wm_chrome_theme.{wm_chrome_theme}
+use common.ui.wm_app_process_contract.{GRAPHICS_2D_SHOWCASE_APP_SOURCE, WM_EVENT_FILE_ENV, WM_FRAME_SEQ_FILE_ENV, wm_fs_bridge_decode, wm_graphics_2d_showcase_client_env, wm_graphics_2d_showcase_event_path, wm_graphics_2d_showcase_frame_seq_path, wm_fs_app_event, wm_fs_key_event, wm_fs_app_event_encode, wm_fs_app_event_seq_path, wm_fs_frame_checksum, wm_fs_frame_receipt_correlation, wm_fs_frame_receipt_decode, wm_fs_frame_receipt_path, wm_fs_frame_receipt_valid}
+use os.compositor.host_compositor_entry.{HostCompositor, HeadlessHostCompositorBackend, host_compositor_pointer_move, host_compositor_left_button_at, host_taskbar_dock_width, host_taskbar_item_width, host_taskbar_item_x}
+use os.userlib.ipc_protocol.{COMP_CREATE_WINDOW}
+
+val W: i32 = 808
+val H: i32 = 632
+val CHILD_EVENT_REFRESH_TIMEOUT_US: i64 = 5000000
+val LOCATOR: u32 = 0xFFFF00FFu32
+val MUTED: u32 = 0xFF94A3B8u32
+
+struct WmLoopState:
+    comp: HostCompositor
+    mouse_x: i32
+    mouse_y: i32
+    child_pointer_down: bool
+    child_drag_forwarding: bool
+    child_event_seq: i64
+    child_refresh_pending: bool
+    child_refresh_deadline: i64
+    dirty: bool
+    running: bool
+
+struct ChildFrame:
+    ok: bool
+    pixels: [u32]
+    w: i32
+    h: i32
+    reason: text
+
+struct ChildFrameValidation:
+    status: text
+    frame: ChildFrame
+    event_seq: i64
+    frame_seq: i64
+
+struct ChildLocalHit:
+    ok: bool
+    x: i32
+    y: i32
+
+fn argb(color: u32) -> i64:
+    color.to_i64()
+
+fn rgb(color: u32) -> i64:
+    color.to_i64() & 0xFFFFFF
+
+fn sleep_ms(ms: i64):
+    thread_sleep(ms)
+
+fn read_frame_seq(seq_path: text) -> i64:
+    if seq_path == "" or not file_exists(seq_path):
+        return 0
+    file_read(seq_path).trim().to_i64() ?? 0
+
+fn write_wm_trace(trace_path: text, phase: text):
+    if trace_path != "":
+        file_write(trace_path, "phase={phase}\n")
+
+# Aggregated-batch shape equivalent to the old WinitInput, built by draining
+# GuiEvent.poll_event() below — keeps apply_wm_input()'s body unchanged.
+struct GuiInputBatch:
+    close: bool
+    key_native_ids: [i64]
+    keycodes: [i64]
+    key_pressed: [bool]
+    mouse_x: f64
+    mouse_y: f64
+    mouse_native_id: i64
+    click_buttons: [i64]
+    click_pressed: [bool]
+    click_x: [f64]
+    click_y: [f64]
+
+fn should_close(input: GuiInputBatch) -> bool:
+    if input.close:
+        return true
+    var i = 0
+    while i < input.keycodes.len():
+        val k = input.keycodes[i]
+        if input.key_pressed[i] and (k == 27 or k == 113 or k == 81):
+            return true
+        i = i + 1
+    false
+
+# Wait up to wait_ms for the first GuiEvent (poll + short sleep, since
+# GuiRenderer.poll_event() never blocks), then non-blockingly drain any
+# remaining queued events — matches winit_wait_input's "block for first event,
+# poll-drain the rest" semantics.
+fn poll_gui_input(gui: GuiRenderer, wait_ms: i64) -> GuiInputBatch:
+    var close = false
+    var key_native_ids: [i64] = []
+    var keycodes: [i64] = []
+    var key_pressed: [bool] = []
+    var mx = 0.0
+    var my = 0.0
+    var mouse_native_id: i64 = 0
+    var click_buttons: [i64] = []
+    var click_pressed: [bool] = []
+    var click_x: [f64] = []
+    var click_y: [f64] = []
+    val deadline = time_now_unix_micros() + wait_ms * 1000
+    var ev = gui.poll_event()
+    while ev.kind == GUI_EVT_NONE and time_now_unix_micros() < deadline:
+        sleep_ms(4)
+        ev = gui.poll_event()
+    while ev.kind != GUI_EVT_NONE:
+        if ev.kind == GUI_EVT_CLOSE:
+            close = true
+        elif ev.kind == GUI_EVT_KEYBOARD:
+            key_native_ids.push(ev.native_id)
+            keycodes.push(ev.keycode)
+            key_pressed.push(ev.pressed)
+        elif ev.kind == GUI_EVT_MOUSE_MOVED:
+            mx = ev.x
+            my = ev.y
+            mouse_native_id = ev.native_id
+        elif ev.kind == GUI_EVT_MOUSE_BUTTON:
+            click_buttons.push(ev.btn)
+            click_pressed.push(ev.pressed)
+            click_x.push(mx)
+            click_y.push(my)
+        ev = gui.poll_event()
+    GuiInputBatch(close: close, key_native_ids: key_native_ids, keycodes: keycodes, key_pressed: key_pressed, mouse_x: mx, mouse_y: my, mouse_native_id: mouse_native_id, click_buttons: click_buttons, click_pressed: click_pressed, click_x: click_x, click_y: click_y)
+
+fn wait_for_bridge(path: text, timeout_ms: i64) -> text:
+    val deadline = time_now_unix_micros() + timeout_ms * 1000
+    while time_now_unix_micros() < deadline:
+        if file_exists(path):
+            val body = file_read(path)
+            if body.contains("kind=create_window"):
+                return body
+        sleep_ms(50)
+    ""
+
+fn path_join(root: text, rel: text) -> text:
+    if root.ends_with("/") or root.ends_with("\\"):
+        return root + rel
+    root + "/" + rel
+
+fn resolve_repo_root() -> text:
+    val explicit = env_get("SIMPLE_REPO_ROOT") ?? ""
+    if explicit != "":
+        return explicit
+    val lib = env_get("SIMPLE_LIB") ?? ""
+    if lib.ends_with("/src") or lib.ends_with("\\src"):
+        return lib.substring(0, lib.len() - 4)
+    val here = cwd()
+    if here != "":
+        return here
+    "."
+
+# wm-chrome compositing goes through the shared Engine2D pipeline (the same
+# HAL every migrated showcase host renders through): draw_rect_filled for
+# every chrome rectangle, draw_image for the child app's already-rendered
+# frame, read_pixels() for the single readback that feeds gui.present_rgba /
+# the headless PPM encoder. Only Engine2D creation + GuiRenderer stay as
+# direct HAL calls; no hand-rolled [u32] framebuffer writes remain.
+fn showcase_wm_backend_key() -> text:
+    val raw = (env_get("SIMPLE_GUI_BACKEND") ?? "").trim()
+    if raw == "":
+        return "cpu_simd"
+    raw
+
+fn draw_taskbar(mut b: Engine2D, comp: HostCompositor) -> Engine2D:
+    val theme = wm_chrome_theme()
+    val count = comp.windows.len().to_i32()
+    if count <= 0:
+        return b
+    val dock_w = host_taskbar_dock_width(W, count)
+    val dock_x = (W - dock_w) / 2
+    val dock_y = H - 62
+    b.draw_rect_filled(dock_x, dock_y, dock_w, 44, theme.taskbar)
+    val item_w = host_taskbar_item_width(W, count)
+    var i = 0
+    while i < count:
+        val win = comp.windows[i]
+        val ix = host_taskbar_item_x(W, count, i)
+        var color = theme.title_unfocused
+        if win.focused and not win.minimized:
+            color = theme.accent
+        elif win.minimized:
+            color = theme.host_window_body
+        b.draw_rect_filled(ix + 2, dock_y + 6, item_w - 4, 32, theme.command_lane)
+        b.draw_rect_filled(ix + 4, dock_y + 8, item_w - 8, 28, color)
+        b.draw_rect_filled(ix + 12, dock_y + 14, 12, 12, theme.text_primary)
+        if win.focused and not win.minimized:
+            b.draw_rect_filled(ix + 8, dock_y + 35, item_w - 16, 2, theme.text_primary)
+        i = i + 1
+    b
+
+fn compose_scene(mut b: Engine2D, comp: HostCompositor, trace_path: text) -> Engine2D:
+    write_wm_trace(trace_path, "compose_theme_start")
+    val theme = wm_chrome_theme()
+    write_wm_trace(trace_path, "compose_bg_start")
+    b.clear(theme.compositor_bg)
+    b.draw_rect_filled(0, 0, W, H, theme.compositor_bg)
+    write_wm_trace(trace_path, "compose_windows_start")
+    b.draw_rect_filled(0, 0, W, 38, theme.command_lane)
+    var i = 0
+    while i < comp.windows.len():
+        val win = comp.windows[i]
+        if not win.minimized:
+            b.draw_rect_filled(win.x + 7, win.y + 7, win.w, win.h, theme.window_shadow)
+            b.draw_rect_filled(win.x, win.y, win.w, win.h, theme.host_window_body)
+            val title_color = if win.focused: theme.accent else: theme.title_unfocused
+            b.draw_rect_filled(win.x, win.y, win.w, 24, title_color)
+            b.draw_rect_filled(win.x + win.w - 24, win.y, 24, 24, theme.close_button)
+            b.draw_rect_filled(win.x + win.w - 17, win.y + 7, 10, 10, theme.text_primary)
+            b.draw_rect_filled(win.x + 4, win.y + 28, win.w - 8, win.h - 32, theme.compositor_bg)
+        i = i + 1
+    write_wm_trace(trace_path, "compose_taskbar_start")
+    b = draw_taskbar(b, comp)
+    write_wm_trace(trace_path, "compose_locator_start")
+    b.draw_rect_filled(0, 0, W, 3, LOCATOR)
+    b.draw_rect_filled(0, H - 3, W, 3, LOCATOR)
+    b.draw_rect_filled(0, 0, 3, H, LOCATOR)
+    b.draw_rect_filled(W - 3, 0, 3, H, LOCATOR)
+    b
+
+fn load_child_frame(frame_path: text) -> ChildFrame:
+    if frame_path == "" or not file_exists(frame_path):
+        return ChildFrame(ok: false, pixels: [], w: 0, h: 0, reason: "missing")
+    var ok = false
+    var pixels: [u32] = []
+    var frame_w = 0
+    var frame_h = 0
+    var reason = ""
+    val bytes = file_read_bytes(frame_path)
+    if bytes.len() == 0:
+        reason = "empty"
+    else:
+        val decoded = decode_ppm_to_argb(bytes)
+        match decoded:
+            Ok(img):
+                if img.pixels.len() > 0 and img.width > 0 and img.height > 0:
+                    ok = true
+                    pixels = img.pixels
+                    frame_w = img.width
+                    frame_h = img.height
+                else:
+                    reason = "decoded-empty"
+            Err(msg):
+                reason = msg
+    if not ok and reason == "":
+        reason = "decode-no-result"
+    ChildFrame(ok: ok, pixels: pixels, w: frame_w, h: frame_h, reason: reason)
+
+fn validate_child_frame_receipt(frame_path: text, requested_backend: text, announced_frame_seq: i64, expected_event_seq: i64, expected_pixel_count: i64) -> ChildFrameValidation:
+    val empty = ChildFrame(ok: false, pixels: [], w: 0, h: 0, reason: "unvalidated")
+    val receipt_path = wm_fs_frame_receipt_path(frame_path)
+    if not file_exists(receipt_path):
+        return ChildFrameValidation(status: "pending", frame: empty, event_seq: -1, frame_seq: announced_frame_seq)
+    val receipt = wm_fs_frame_receipt_decode(file_read(receipt_path))
+    val correlation = wm_fs_frame_receipt_correlation(receipt.event_seq, receipt.frame_seq, expected_event_seq, announced_frame_seq)
+    if correlation == "pending":
+        return ChildFrameValidation(status: "pending", frame: empty, event_seq: receipt.event_seq, frame_seq: receipt.frame_seq)
+    if correlation == "invalid":
+        print "[wm-graphics-2d] frame_receipt_invalid reason=event-seq receipt_event_seq={receipt.event_seq} expected_event_seq={expected_event_seq} frame_seq={receipt.frame_seq}"
+        return ChildFrameValidation(status: "invalid", frame: empty, event_seq: receipt.event_seq, frame_seq: receipt.frame_seq)
+    if not wm_fs_frame_receipt_valid(receipt, expected_event_seq, announced_frame_seq, requested_backend, expected_pixel_count):
+        print "[wm-graphics-2d] frame_receipt_invalid reason=contract event_seq={receipt.event_seq} frame_seq={receipt.frame_seq} backend={receipt.backend} readback_source={receipt.readback_source} backend_handle={receipt.backend_handle} device_identity={receipt.device_identity} pixel_count={receipt.pixel_count} checksum={receipt.checksum}"
+        return ChildFrameValidation(status: "invalid", frame: empty, event_seq: receipt.event_seq, frame_seq: receipt.frame_seq)
+    val child = load_child_frame(frame_path)
+    if not child.ok:
+        return ChildFrameValidation(status: "pending", frame: empty, event_seq: receipt.event_seq, frame_seq: receipt.frame_seq)
+    if wm_fs_frame_checksum(child.pixels) != receipt.checksum:
+        return ChildFrameValidation(status: "pending", frame: empty, event_seq: receipt.event_seq, frame_seq: receipt.frame_seq)
+    if dbg_events_on() and receipt.event_seq > 0:
+        dbg_event_hop("wm-{receipt.event_seq}", "host_frame_receipt_valid", "frame_seq={receipt.frame_seq} backend={receipt.backend} readback={receipt.readback_source} handle={receipt.backend_handle} device={receipt.device_identity} checksum={receipt.checksum}")
+    print "[wm-graphics-2d] frame_receipt_valid event_seq={receipt.event_seq} frame_seq={receipt.frame_seq} backend={receipt.backend} readback_source={receipt.readback_source} backend_handle={receipt.backend_handle} device_identity={receipt.device_identity} pixel_count={receipt.pixel_count} checksum={receipt.checksum}"
+    ChildFrameValidation(status: "valid", frame: child, event_seq: receipt.event_seq, frame_seq: receipt.frame_seq)
+
+fn blit_child_frame(mut b: Engine2D, comp: HostCompositor, child_pixels: [u32], child_w: i32, child_h: i32) -> Engine2D:
+    if child_pixels.len() == 0 or child_w <= 0 or child_h <= 0:
+        return b
+    var i = 0
+    while i < comp.windows.len():
+        val win = comp.windows[i]
+        if not win.minimized:
+            b.draw_image(win.x + 4, win.y + 28, child_w, child_h, child_pixels)
+        i = i + 1
+    b
+
+fn pack_pixels(pixels: [u32]) -> [i64]:
+    var packed = alloc_i64(pixels.len().to_i64())
+    var i = 0
+    while i < pixels.len():
+        packed[i] = pixels[i].to_i64() & 0xFFFFFF
+        i = i + 1
+    packed
+
+fn render_and_present(gui: GuiRenderer, mut b: Engine2D, comp: HostCompositor, frame_w: i32, frame_h: i32, child: ChildFrame, state: text, trace_path: text) -> (Engine2D, bool):
+    write_wm_trace(trace_path, "render_compose_start")
+    b = compose_scene(b, comp, trace_path)
+    write_wm_trace(trace_path, "render_compose_done")
+    if child.ok:
+        b = blit_child_frame(b, comp, child.pixels, child.w, child.h)
+    else:
+        print "[wm-graphics-2d] child_frame_not_validated reason={child.reason}"
+    b.present()
+    val present_pixels = b.read_pixels()
+    if present_pixels.len() < W * H:
+        print "[wm-graphics-2d] present state={state} FAIL compose_short={present_pixels.len()} want={W * H}"
+        return (b, false)
+    write_wm_trace(trace_path, "render_pack_start")
+    val packed = pack_pixels(present_pixels)
+    write_wm_trace(trace_path, "render_pack_done")
+    write_wm_trace(trace_path, "render_gui_present_start")
+    gui.present_rgba(W.to_i64(), H.to_i64(), packed)
+    write_wm_trace(trace_path, "render_gui_present_done")
+    if state != "hold":
+        print "[wm-graphics-2d] present state={state} dims={W}x{H} child_frame=from-filesystem renderer=wm-pixel-compositor requested_child={frame_w}x{frame_h}"
+    (b, true)
+
+fn child_local_at(comp: HostCompositor, fx: i32, fy: i32, frame_w: i32, frame_h: i32, require_inside: bool) -> ChildLocalHit:
+    var i = comp.windows.len() - 1
+    while i >= 0:
+        val win = comp.windows[i]
+        if not win.minimized:
+            val lx = fx - (win.x + 4)
+            val ly = fy - (win.y + 28)
+            val inside = lx >= 0 and ly >= 0 and lx < frame_w and ly < frame_h
+            if inside or not require_inside:
+                return ChildLocalHit(ok: true, x: lx, y: ly)
+        i = i - 1
+    ChildLocalHit(ok: false, x: 0, y: 0)
+
+fn write_child_pointer_event(event_path: text, seq: i64, kind: text, x: i32, y: i32, button: i64, pressed: bool) -> i64:
+    if event_path == "":
+        return seq
+    val next_seq = seq + 1
+    val ev = wm_fs_app_event(next_seq, kind, x, y, button, pressed)
+    val encoded = wm_fs_app_event_encode(ev)
+    val seq_path = wm_fs_app_event_seq_path(event_path, next_seq)
+    if dbg_events_on():
+        dbg_event_hop("wm-{next_seq}", "fs_event_write_start", "kind={kind} path={seq_path}")
+    if file_write(seq_path, encoded) and file_write(event_path, encoded):
+        if dbg_events_on():
+            dbg_event_hop("wm-{next_seq}", "fs_event_write_done", "kind={kind} x={x} y={y} pressed={pressed}")
+        print "[wm-graphics-2d] child_event kind={kind} seq={next_seq} x={x} y={y} pressed={pressed}"
+        return next_seq
+    if dbg_events_on():
+        dbg_event_hop("wm-{next_seq}", "fs_event_write_failed", "kind={kind} path={seq_path}")
+    print "[wm-graphics-2d] child_event_write_failed path={event_path}"
+    seq
+
+fn write_child_key_event(event_path: text, seq: i64, keycode: i64, pressed: bool) -> i64:
+    if event_path == "":
+        return seq
+    val next_seq = seq + 1
+    val ev = wm_fs_key_event(next_seq, keycode, pressed)
+    val encoded = wm_fs_app_event_encode(ev)
+    val seq_path = wm_fs_app_event_seq_path(event_path, next_seq)
+    if dbg_events_on():
+        dbg_event_hop("wm-{next_seq}", "fs_key_event_write_start", "keycode={keycode} pressed={pressed} path={seq_path}")
+    if file_write(seq_path, encoded) and file_write(event_path, encoded):
+        if dbg_events_on():
+            dbg_event_hop("wm-{next_seq}", "fs_key_event_write_done", "keycode={keycode} pressed={pressed}")
+        print "[wm-graphics-2d] child_event kind=key seq={next_seq} keycode={keycode} pressed={pressed}"
+        return next_seq
+    if dbg_events_on():
+        dbg_event_hop("wm-{next_seq}", "fs_key_event_write_failed", "keycode={keycode} pressed={pressed} path={seq_path}")
+    print "[wm-graphics-2d] child_key_event_write_failed path={event_path}"
+    seq
+
+fn apply_wm_input(state: WmLoopState, input: GuiInputBatch, event_path: text, frame_w: i32, frame_h: i32) -> WmLoopState:
+    var out = state.comp
+    var mx = state.mouse_x
+    var my = state.mouse_y
+    var child_down = state.child_pointer_down
+    var child_drag_forwarding = state.child_drag_forwarding
+    var child_seq = state.child_event_seq
+    var child_refresh_pending = state.child_refresh_pending
+    var child_refresh_deadline = state.child_refresh_deadline
+    var dirty = false
+    var running = state.running
+    if should_close(input):
+        running = false
+    var ki = 0
+    while ki < input.keycodes.len():
+        val key_native_id = input.key_native_ids[ki]
+        val keycode = input.keycodes[ki]
+        val pressed = input.key_pressed[ki]
+        val before_key_seq = child_seq
+        if dbg_events_on():
+            dbg_event_hop("wm-{before_key_seq + 1}", "host_key_event", "native_id={key_native_id} keycode={keycode} pressed={pressed}")
+        child_seq = write_child_key_event(
+            event_path, child_seq, keycode, pressed)
+        if child_seq > before_key_seq:
+            child_refresh_pending = true
+            child_refresh_deadline = 0
+        ki = ki + 1
+    if input.mouse_native_id != 0:
+        mx = input.mouse_x.to_i32()
+        my = input.mouse_y.to_i32()
+        val was_dragging = state.comp.dragging or state.comp.resizing
+        out = host_compositor_pointer_move(out, mx, my)
+        dirty = was_dragging or out.dragging or out.resizing
+        if child_down and child_drag_forwarding:
+            val loc = child_local_at(out, mx, my, frame_w, frame_h, false)
+            if loc.ok:
+                val before_move_seq = child_seq
+                child_seq = write_child_pointer_event(event_path, child_seq, "move", loc.x, loc.y, 0, true)
+                if child_seq > before_move_seq:
+                    child_refresh_pending = true
+                    child_refresh_deadline = 0
+    var ci = 0
+    while ci < input.click_buttons.len():
+        val btn = input.click_buttons[ci]
+        val pressed = input.click_pressed[ci]
+        if btn == 0:
+            var fx = input.click_x[ci].to_i32()
+            var fy = input.click_y[ci].to_i32()
+            if fx == 0 and fy == 0:
+                fx = mx
+                fy = my
+            else:
+                mx = fx
+                my = fy
+            if pressed:
+                val loc_down = child_local_at(out, fx, fy, frame_w, frame_h, true)
+                if dbg_events_on():
+                    dbg_event_hop("wm-{child_seq + 1}", "host_pointer_hit_test", "host_x={fx} host_y={fy} inside={loc_down.ok} child_x={loc_down.x} child_y={loc_down.y}")
+                if loc_down.ok:
+                    child_drag_forwarding = true
+                    val before_down_seq = child_seq
+                    child_seq = write_child_pointer_event(event_path, child_seq, "down", loc_down.x, loc_down.y, btn, true)
+                    if child_seq > before_down_seq:
+                        child_refresh_pending = true
+                        child_refresh_deadline = 0
+                    child_down = true
+            elif not pressed:
+                val loc_up = child_local_at(out, fx, fy, frame_w, frame_h, false)
+                if loc_up.ok:
+                    val before_up_seq = child_seq
+                    child_seq = write_child_pointer_event(event_path, child_seq, "up", loc_up.x, loc_up.y, btn, false)
+                    if child_seq > before_up_seq:
+                        child_refresh_pending = true
+                        child_refresh_deadline = 0
+                child_down = false
+                child_drag_forwarding = false
+            out = host_compositor_left_button_at(out, pressed, fx, fy)
+            dirty = true
+            print "[wm-graphics-2d] input left_button pressed={pressed} x={fx} y={fy} windows={out.windows.len()} dragging={out.dragging}"
+        ci = ci + 1
+    if out.windows.len() == 0:
+        running = false
+    WmLoopState(comp: out, mouse_x: mx, mouse_y: my, child_pointer_down: child_down, child_drag_forwarding: child_drag_forwarding, child_event_seq: child_seq, child_refresh_pending: child_refresh_pending, child_refresh_deadline: child_refresh_deadline, dirty: dirty, running: running)
+
+fn wm_graphics_2d_child_frame_scale() -> text:
+    val requested_scale = env_get("SHOWCASE_PPM_SCALE") ?? ""
+    if requested_scale != "":
+        return requested_scale
+    # Fit the 4K design surface inside the 808x632 WM host and avoid rewriting
+    # a roughly 24 MiB PPM after every input edge.
+    "8"
+
+fn launch_showcase_child(bridge_path: text, frame_path: text, repo_root: text) -> i64:
+    var env = wm_graphics_2d_showcase_client_env(bridge_path, frame_path)
+    val lib = env_get("SIMPLE_LIB") ?? ""
+    if lib != "":
+        env["SIMPLE_LIB"] = lib
+    else:
+        env["SIMPLE_LIB"] = path_join(repo_root, "src")
+    env["SHOWCASE_PPM_SCALE"] = wm_graphics_2d_child_frame_scale()
+    # Forward the host's resolution rung so an interpreter-lane run can pick a
+    # budget-fitting size (child otherwise resolves the 4K default).
+    val requested_res = env_get("SHOWCASE_RESOLUTION") ?? ""
+    if requested_res != "":
+        env["SHOWCASE_RESOLUTION"] = requested_res
+    val requested_backend = env_get("SIMPLE_GUI_BACKEND") ?? ""
+    if requested_backend != "":
+        env["SIMPLE_GUI_BACKEND"] = requested_backend
+    val simple_diag = env_get("SIMPLE_DIAG") ?? ""
+    if simple_diag != "":
+        env["SIMPLE_DIAG"] = simple_diag
+    val simple_diag_file = env_get("SIMPLE_DIAG_FILE") ?? ""
+    if simple_diag_file != "":
+        env["SIMPLE_DIAG_FILE"] = simple_diag_file
+    env["SIMPLE_TIMEOUT_SECONDS"] = "0"
+    env["SIMPLE_EXECUTION_LIMIT"] = "0"
+    val simple_lib = env["SIMPLE_LIB"]
+    val showcase_scale = env["SHOWCASE_PPM_SCALE"]
+    val showcase_res = requested_res
+    # A clean/debug worktree may intentionally contain source only. Allow its
+    # admitted child driver to be supplied explicitly instead of requiring a
+    # copied deployment under that worktree's bin/ directory.
+    val configured_simple_bin = (
+        env_get("SIMPLE_WM_CHILD_SIMPLE_BINARY") ?? "").trim()
+    val simple_bin = if configured_simple_bin == "":
+        path_join(repo_root, "bin/simple")
+    else:
+        configured_simple_bin
+    val showcase_source_path = path_join(repo_root, GRAPHICS_2D_SHOWCASE_APP_SOURCE)
+    val event_path = wm_graphics_2d_showcase_event_path(frame_path)
+    val seq_path = wm_graphics_2d_showcase_frame_seq_path(frame_path)
+    if host_os().lower().contains("windows"):
+        return process_spawn_async_env(simple_bin, ["run", showcase_source_path], env)
+    process_spawn_async("env", [
+        "SIMPLE_WM_APP_MODE=client",
+        "SIMPLE_WM_BRIDGE_FILE={bridge_path}",
+        "SIMPLE_WM_FRAME_FILE={frame_path}",
+        "{WM_EVENT_FILE_ENV}={event_path}",
+        "{WM_FRAME_SEQ_FILE_ENV}={seq_path}",
+        "SIMPLE_WM_CLIENT_HOLD=1",
+        "SHOWCASE_PPM_SCALE={showcase_scale}",
+        "SHOWCASE_RESOLUTION={showcase_res}",
+        "SIMPLE_GUI_BACKEND={requested_backend}",
+        "SIMPLE_DIAG={simple_diag}",
+        "SIMPLE_DIAG_FILE={simple_diag_file}",
+        "SIMPLE_TIMEOUT_SECONDS=0",
+        "SIMPLE_EXECUTION_LIMIT=0",
+        "SIMPLE_LIB={simple_lib}",
+        simple_bin,
+        "run",
+        showcase_source_path
+    ])
+
+fn cleanup(child_pid: i64, gui: GuiRenderer):
+    if child_pid > 0:
+        process_kill(child_pid)
+    gui.close()
+
+# ---------------------------------------------------------------------------
+# Headless host-WM capture lane (SIMPLE_WM_HEADLESS_CAPTURE=1)
+#
+# The window-only path above needs the single physical-window capture lane
+# (GuiRenderer.create + present_rgba), which collides with concurrent
+# live-evidence loops on shared hardware. This lane composes the SAME
+# wm-pixel-compositor scene (compose_pixels + real showcase child content via
+# blit_child_frame_pixels — no synthetic/fake pixels) and writes it straight
+# to a PPM via encode_ppm_p6 (the same encoder the child showcase itself uses
+# for its own frame file, per docs/09_report showcase-matrix evidence),
+# instead of presenting to a GUI window. Honest-fail gates (varied/nonzero/
+# checksum) mirror web_render_file_gui.spl's blank-or-uniform check — a
+# scene that fails to render reports status=fail, never a fabricated PASS.
+# ---------------------------------------------------------------------------
+
+struct HeadlessCaptureMetrics:
+    varied: bool
+    nonzero: i64
+    checksum: i64
+
+fn headless_capture_metrics(pixels: [u32]) -> HeadlessCaptureMetrics:
+    if pixels.len() == 0:
+        return HeadlessCaptureMetrics(varied: false, nonzero: 0, checksum: 0)
+    val first = pixels[0]
+    var varied = false
+    var nonzero: i64 = 0
+    var checksum: i64 = 0
+    var i = 0
+    while i < pixels.len():
+        val p = pixels[i]
+        if p != first:
+            varied = true
+        if (p & 0x00FFFFFFu32) != 0u32:
+            nonzero = nonzero + 1
+        checksum = (checksum + (p.to_i64() & 0xFFFFFFFF) * ((i % 251) + 1)) % 2147483647
+        i = i + 1
+    HeadlessCaptureMetrics(varied: varied, nonzero: nonzero, checksum: checksum)
+
+fn env_i64(key: text, default_value: i64) -> i64:
+    val raw = env_get(key) ?? ""
+    if raw == "":
+        return default_value
+    raw.to_i64() ?? default_value
+
+fn wait_for_first_child_frame(frame_path: text, timeout_ms: i64) -> ChildFrame:
+    val deadline = time_now_unix_micros() + timeout_ms * 1000
+    var child = load_child_frame(frame_path)
+    while not child.ok and time_now_unix_micros() < deadline:
+        sleep_ms(100)
+        child = load_child_frame(frame_path)
+    child
+
+fn headless_status(prefix: text, key: text, value: text):
+    print "{prefix}_{key}={value}"
+
+fn run_headless_capture(repo_root: text) -> i64:
+    val prefix = "wm_graphics_2d_showcase_host_headless"
+    val tmp_root = path_join(repo_root, "build/tmp")
+    # Check the return: a directory-layer failure here otherwise surfaces much
+    # later as the generic `ppm-write-failed`, which absorbed at least two
+    # distinct failures and stalled a root-cause hunt. See
+    # doc/08_tracking/bug/wm_widget_headless_default_ppm_path_write_fails_2026-07-25.md
+    if not dir_create_all(tmp_root):
+        headless_status(prefix, "status", "fail")
+        headless_status(prefix, "reason", "tmp-root-create-failed")
+        headless_status(prefix, "tmp_root", tmp_root)
+        return 1
+    val stamp = "{getpid()}_{time_now_unix_micros()}"
+    val bridge_path = path_join(tmp_root, "wm_graphics_2d_showcase_headless_{stamp}.bridge")
+    val frame_path = path_join(tmp_root, "wm_graphics_2d_showcase_headless_{stamp}.ppm")
+    val trace_path = frame_path + ".trace"
+    val showcase_source_path = path_join(repo_root, GRAPHICS_2D_SHOWCASE_APP_SOURCE)
+    write_wm_trace(trace_path, "headless_start")
+    print "[wm-graphics-2d] headless_capture repo_root={repo_root} child_source_fs={showcase_source_path}"
+    val child_pid = launch_showcase_child(bridge_path, frame_path, repo_root)
+    if child_pid <= 0:
+        headless_status(prefix, "status", "fail")
+        headless_status(prefix, "reason", "child-spawn-failed")
+        return 1
+    val bridge_timeout_ms = env_i64("SIMPLE_WM_HEADLESS_CAPTURE_BRIDGE_TIMEOUT_MS", 300000)
+    val bridge_body = wait_for_bridge(bridge_path, bridge_timeout_ms)
+    if bridge_body == "":
+        headless_status(prefix, "status", "fail")
+        headless_status(prefix, "reason", "child-bridge-timeout")
+        process_kill(child_pid)
+        return 1
+    val req = wm_fs_bridge_decode(bridge_body)
+    val backend = HeadlessHostCompositorBackend.new(W, H)
+    var comp = HostCompositor.new(backend, Size.wh(W, H))
+    comp.apply_bridge_request(1, 701, COMP_CREATE_WINDOW.to_i64(), 0, req.title, 54, 70, req.window_w, req.window_h, req.content, req.pid, req.app_id)
+    if comp.windows.len() != 1:
+        headless_status(prefix, "status", "fail")
+        headless_status(prefix, "reason", "compositor-window-count")
+        process_kill(child_pid)
+        return 1
+    val frame_timeout_ms = env_i64("SIMPLE_WM_HEADLESS_CAPTURE_FRAME_TIMEOUT_MS", 180000)
+    val child = wait_for_first_child_frame(frame_path, frame_timeout_ms)
+    if not child.ok:
+        headless_status(prefix, "status", "fail")
+        headless_status(prefix, "reason", "child-frame-timeout:{child.reason}")
+        process_kill(child_pid)
+        return 1
+    var b = Engine2D.create_with_backend_fast(W, H, showcase_wm_backend_key())
+    b = compose_scene(b, comp, trace_path)
+    b = blit_child_frame(b, comp, child.pixels, child.w, child.h)
+    b.present()
+    val present_pixels = b.read_pixels()
+    process_kill(child_pid)
+    if present_pixels.len() < W * H:
+        headless_status(prefix, "status", "fail")
+        headless_status(prefix, "reason", "compose-short")
+        return 1
+    val metrics = headless_capture_metrics(present_pixels)
+    # NOT `env_get(...) ?? fallback`: std.io_runtime's env_get returns plain
+    # `text` (io_runtime.spl:174), not `text?`, so it yields "" — never nil —
+    # for an unset variable and `??` never fires. That silently produced an
+    # EMPTY ppm_path and a bogus `ppm-write-failed`. A sibling env_get
+    # (src/config.spl:764) DOES return `text?`, which is why the idiom looks
+    # right. See doc/08_tracking/bug/env_get_nil_coalesce_dead_fallback_2026-07-25.md
+    val ppm_override = env_get("SIMPLE_WM_HEADLESS_CAPTURE_PPM")
+    val ppm_path = if ppm_override != "":
+        ppm_override
+    else:
+        path_join(tmp_root, "wm_graphics_2d_showcase_headless_capture.ppm")
+    val ppm_bytes = encode_ppm_p6(W.to_u32(), H.to_u32(), present_pixels)
+    if not file_write_bytes(ppm_path, ppm_bytes):
+        headless_status(prefix, "status", "fail")
+        headless_status(prefix, "reason", "ppm-write-failed")
+        # Report WHAT failed, not just that something did: this branch used to
+        # emit the reason alone, so the actual path and payload size at failure
+        # time had to be reconstructed from outside the process.
+        headless_status(prefix, "failed_ppm_path", ppm_path)
+        headless_status(prefix, "failed_ppm_bytes", "{ppm_bytes.len()}")
+        return 1
+    # Gate the CHILD frame separately from the composite. `metrics` above is
+    # computed on present_pixels, which already contains WM chrome (titlebar,
+    # borders, taskbar, desktop) — that chrome alone makes `varied` true, so a
+    # totally blank child app can still score status=pass reason=ok. The sibling
+    # web cell proved exactly that false green (composite 10 distinct colours,
+    # child frame 1). This cell's child measures non-blank, but the composite
+    # gate cannot see through the chrome either way, so it must not be the only
+    # check on the showcase content the lane exists to prove. See
+    # doc/08_tracking/bug/web_render_budget_interpreter_gap_2026-07-25.md
+    val child_metrics = headless_capture_metrics(child.pixels)
+    if not child_metrics.varied or child_metrics.nonzero == 0:
+        headless_status(prefix, "status", "fail")
+        headless_status(prefix, "reason", "child-frame-uniform")
+        headless_status(prefix, "child_pixels", child.pixels.len().to_text())
+        headless_status(prefix, "child_nonzero", child_metrics.nonzero.to_text())
+        headless_status(prefix, "child_checksum", child_metrics.checksum.to_text())
+        headless_status(prefix, "ppm_path", ppm_path)
+        return 1
+    if not metrics.varied or metrics.nonzero == 0 or metrics.checksum == 0:
+        headless_status(prefix, "status", "fail")
+        headless_status(prefix, "reason", "blank-or-uniform")
+        headless_status(prefix, "pixels", present_pixels.len().to_text())
+        headless_status(prefix, "nonzero", metrics.nonzero.to_text())
+        headless_status(prefix, "checksum", metrics.checksum.to_text())
+        headless_status(prefix, "ppm_path", ppm_path)
+        return 1
+    headless_status(prefix, "status", "pass")
+    headless_status(prefix, "reason", "ok")
+    headless_status(prefix, "width", W.to_text())
+    headless_status(prefix, "height", H.to_text())
+    headless_status(prefix, "pixels", present_pixels.len().to_text())
+    headless_status(prefix, "nonzero", metrics.nonzero.to_text())
+    headless_status(prefix, "checksum", metrics.checksum.to_text())
+    # Emit the child numbers on the PASS line too: a pass reported only in
+    # composite terms reads identically whether the showcase content rendered
+    # or the WM chrome carried it alone.
+    headless_status(prefix, "child_pixels", child.pixels.len().to_text())
+    headless_status(prefix, "child_nonzero", child_metrics.nonzero.to_text())
+    headless_status(prefix, "child_checksum", child_metrics.checksum.to_text())
+    headless_status(prefix, "ppm_path", ppm_path)
+    headless_status(prefix, "child_source", showcase_source_path)
+    headless_status(prefix, "provenance", "host-wm-headless-compose")
+    0
+
+fn main() -> i64:
+    print "WM Graphics 2D Showcase GUI - launching same source from filesystem"
+    dbg_stage("wm_host", "launch_start")
+    if (env_get("SIMPLE_WM_HEADLESS_CAPTURE") ?? "") == "1":
+        return run_headless_capture(resolve_repo_root())
+    if (env_get("SIMPLE_GUI") ?? "") != "1":
+        print "[wm-graphics-2d] error=no-gui-requested (launch via macos-gui-run.shs)"
+        return 2
+
+    val repo_root = resolve_repo_root()
+    val configured_backend = (env_get("SIMPLE_GUI_BACKEND") ?? "").trim()
+    val requested_backend = if configured_backend == "": "cpu_simd" else: configured_backend
+    val tmp_root = path_join(repo_root, "build/tmp")
+    dir_create_all(tmp_root)
+    val stamp = "{getpid()}_{time_now_unix_micros()}"
+    val bridge_path = path_join(tmp_root, "wm_graphics_2d_showcase_{stamp}.bridge")
+    val frame_path = path_join(tmp_root, "wm_graphics_2d_showcase_{stamp}.ppm")
+    val trace_path = frame_path + ".trace"
+    val event_path = wm_graphics_2d_showcase_event_path(frame_path)
+    val seq_path = wm_graphics_2d_showcase_frame_seq_path(frame_path)
+    val showcase_source_path = path_join(repo_root, GRAPHICS_2D_SHOWCASE_APP_SOURCE)
+    write_wm_trace(trace_path, "start")
+    print "[wm-graphics-2d] repo_root={repo_root} child_source_fs={showcase_source_path}"
+    val child_pid = launch_showcase_child(bridge_path, frame_path, repo_root)
+    if child_pid <= 0:
+        print "[wm-graphics-2d] error=child-spawn-failed source={GRAPHICS_2D_SHOWCASE_APP_SOURCE}"
+        dbg_stage("wm_host", "child_spawn_failed")
+        return 1
+    dbg_stage("wm_host", "child_spawned")
+    dbg_deadline("wm-child-first-frame", 300000)
+    write_wm_trace(trace_path, "child_spawned")
+
+    val bridge_body = wait_for_bridge(bridge_path, 300000)
+    if bridge_body == "":
+        print "[wm-graphics-2d] error=child-bridge-timeout source={GRAPHICS_2D_SHOWCASE_APP_SOURCE} pid={child_pid}"
+        dbg_stage("wm_host", "child_bridge_timeout")
+        process_kill(child_pid)
+        return 1
+    dbg_stage("wm_host", "child_bridge_ready")
+    write_wm_trace(trace_path, "bridge_ready")
+    val req = wm_fs_bridge_decode(bridge_body)
+    var frame_w = req.window_w - 8
+    var frame_h = req.window_h - 32
+    if frame_w <= 0:
+        frame_w = 1
+    if frame_h <= 0:
+        frame_h = 1
+    write_wm_trace(trace_path, "frame_ready")
+    val child_event_path = if req.event_path != "": req.event_path else: event_path
+    val child_seq_path = if req.frame_seq_path != "": req.frame_seq_path else: seq_path
+    var last_frame_seq = read_frame_seq(child_seq_path)
+    var validated_child = ChildFrame(ok: false, pixels: [], w: 0, h: 0, reason: "initial-frame-pending")
+    if last_frame_seq > 0:
+        val initial_validation = validate_child_frame_receipt(frame_path, requested_backend, last_frame_seq, 0, frame_w * frame_h)
+        if initial_validation.status == "invalid":
+            print "[wm-graphics-2d] error=initial-frame-receipt-invalid"
+            process_kill(child_pid)
+            return 1
+        if initial_validation.status == "valid":
+            validated_child = initial_validation.frame
+        else:
+            last_frame_seq = 0
+
+    write_wm_trace(trace_path, "before_gui_create")
+    val gui_opt = GuiRenderer.create("auto", W, H, req.title)
+    if not gui_opt.?:
+        print "[wm-graphics-2d] error=no-gui-runtime"
+        process_kill(child_pid)
+        return 1
+    val gui = gui_opt ?? GuiRenderer.empty()
+    write_wm_trace(trace_path, "after_gui_create")
+    write_wm_trace(trace_path, "after_pixel_compositor_create")
+
+    val backend = HeadlessHostCompositorBackend.new(W, H)
+    var comp = HostCompositor.new(backend, Size.wh(W, H))
+    comp.apply_bridge_request(1, 701, COMP_CREATE_WINDOW.to_i64(), 0, req.title, 54, 70, req.window_w, req.window_h, req.content, req.pid, req.app_id)
+    print "[wm-graphics-2d] launched source={req.source_path} child_pid={child_pid} bridge_pid={req.pid} app_id={req.app_id} windows={comp.windows.len()} taskbar_items={comp.windows.len()}"
+    if comp.windows.len() != 1:
+        cleanup(child_pid, gui)
+        return 1
+    var b = Engine2D.create_with_backend_fast(W, H, showcase_wm_backend_key())
+    write_wm_trace(trace_path, "before_first_present")
+    val (b1, ok1) = render_and_present(gui, b, comp, frame_w, frame_h, validated_child, "launched", trace_path)
+    b = b1
+    if not ok1:
+        cleanup(child_pid, gui)
+        return 1
+    write_wm_trace(trace_path, "loop_start")
+
+    val initial_frame_pending = last_frame_seq <= 0
+    if not initial_frame_pending:
+        dbg_deadline_clear("wm-child-first-frame")
+    val initial_frame_deadline = if initial_frame_pending: time_now_unix_micros() + 300000000 else: 0
+    var state = WmLoopState(comp: comp, mouse_x: 0, mouse_y: 0, child_pointer_down: false, child_drag_forwarding: false, child_event_seq: 0, child_refresh_pending: initial_frame_pending, child_refresh_deadline: initial_frame_deadline, dirty: false, running: true)
+    var frames = 0
+    while state.running and frames < 2000000:
+        val wait_ms = if state.child_refresh_pending: 20 else: 80
+        val input = poll_gui_input(gui, wait_ms)
+        val before_event_seq = state.child_event_seq
+        state = apply_wm_input(state, input, child_event_path, frame_w, frame_h)
+        if state.child_event_seq > before_event_seq:
+            dbg_deadline("wm-child-event-refresh", 5000)
+        val now = time_now_unix_micros()
+        if state.child_refresh_pending and state.child_refresh_deadline == 0:
+            state.child_refresh_deadline = now + CHILD_EVENT_REFRESH_TIMEOUT_US
+        var current_frame_seq = last_frame_seq
+        if state.child_refresh_pending:
+            current_frame_seq = read_frame_seq(child_seq_path)
+        if state.child_refresh_pending and current_frame_seq > last_frame_seq:
+            val validation = validate_child_frame_receipt(frame_path, requested_backend, current_frame_seq, state.child_event_seq, frame_w * frame_h)
+            if validation.status == "invalid":
+                print "[wm-graphics-2d] error=frame-receipt-invalid frame_seq={current_frame_seq} event_seq={state.child_event_seq}"
+                cleanup(child_pid, gui)
+                return 1
+            if validation.status == "valid":
+                validated_child = validation.frame
+                last_frame_seq = current_frame_seq
+                dbg_deadline_clear("wm-child-first-frame")
+                dbg_deadline_clear("wm-child-event-refresh")
+                state.dirty = true
+                state.child_refresh_pending = false
+                state.child_refresh_deadline = 0
+                write_wm_trace(trace_path, "frame_refresh:{last_frame_seq}")
+                print "[wm-graphics-2d] child_frame_refresh seq={last_frame_seq} size={frame_w}x{frame_h}"
+        if state.child_refresh_pending and state.child_refresh_deadline > 0 and now > state.child_refresh_deadline:
+            print "[wm-graphics-2d] child_frame_refresh_timeout last_seq={last_frame_seq} event_seq={state.child_event_seq}"
+            dbg_stage("wm_host", "child_frame_refresh_timeout")
+            write_wm_trace(trace_path, "refresh_timeout:{state.child_event_seq}")
+            cleanup(child_pid, gui)
+            return 1
+        if state.dirty:
+            val (b2, ok2) = render_and_present(gui, b, state.comp, frame_w, frame_h, validated_child, "hold", trace_path)
+            b = b2
+            if not ok2:
+                cleanup(child_pid, gui)
+                return 1
+            state.dirty = false
+            sleep_ms(16)
+        frames = frames + 1
+
+    cleanup(child_pid, gui)
+    return 0

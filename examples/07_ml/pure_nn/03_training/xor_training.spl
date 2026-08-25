@@ -1,0 +1,23 @@
+#!/usr/bin/env simple
+# XOR training concept demo - runtime compatible.
+
+fn main():
+    print "=== XOR Problem - Pure Simple Deep Learning ==="
+    val inputs = [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]]
+
+    var i = 0
+    while i < inputs.len():
+        val a = inputs[i][0]
+        val b = inputs[i][1]
+        var label = 0.0
+        if (a == 1.0 and b == 0.0) or (a == 0.0 and b == 1.0):
+            label = 1.0
+        print "[{a}, {b}] -> {label}"
+        i = i + 1
+
+    print ""
+    print "XOR requires a hidden non-linear layer in a learned model."
+    print "For executable training, run:"
+    print "examples/07_ml/pure_nn/runtime_compatible/xor_training_runtime.spl"
+
+main()

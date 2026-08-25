@@ -1,0 +1,238 @@
+use std.web_framework.controller.{ControllerContext, HttpResponseData, ViewData}
+use std.web_framework.template.{render_page}
+use std.web_framework.response.{render_redirect, render_error}
+use std.web_framework.session.{session_get}
+use std.web_framework.flash.{flash_add}
+use std.web_framework.csrf.{csrf_token_for_session, verify_csrf_token}
+use std.web_framework.pagination.{Page}
+use std.database.{DbValue}
+use std.time.{now_iso8601}
+
+use models.todo.{
+    Todo, TodoCodec, create_todo_repository, todo_validator,
+    find_todos_for_user, count_todos_for_user,
+    find_todo_by_id, verify_todo_ownership
+}
+
+val TODOS_PER_PAGE = 10
+
+fn current_user_id(ctx: ControllerContext) -> Result<i64, text>:
+    val user_id_str = session_get(ctx, "user_id")
+    if user_id_str.?:
+        Result.ok(user_id_str.unwrap().parse_i64()?)
+    else:
+        Result.err("Not authenticated")
+
+fn action_index(ctx: ControllerContext) -> HttpResponseData:
+    val user_id = current_user_id(ctx)?
+
+    val page_num = ctx.query_param("page").unwrap_or("1").parse_i64().unwrap_or(1)
+    val page_num = if page_num < 1: 1 else: page_num
+
+    val repo = create_todo_repository(ctx.db())
+    val page = find_todos_for_user(repo, user_id, page_num, TODOS_PER_PAGE)
+    val counts = count_todos_for_user(repo, user_id)
+    val csrf = csrf_token_for_session(ctx)
+
+    val username = session_get(ctx, "username").unwrap_or("User")
+
+    # Build todo list data for template
+    val todo_list = List<Dict<text, text>>.new()
+    for todo in page.items:
+        val item = Dict<text, text>.new()
+        item.set("id", "{todo.id}")
+        item.set("title", todo.title)
+        item.set("description", todo.description)
+        item.set("completed", if todo.completed: "true" else: "false")
+        item.set("completed_class", if todo.completed: "completed" else: "")
+        item.set("checked", if todo.completed: "checked" else: "")
+        item.set("created_at", todo.created_at)
+        todo_list.push(item)
+
+    val data = ViewData.new()
+        .set("title", "My Todos")
+        .set("username", username)
+        .set("csrf_token", csrf)
+        .set("todos", todo_list)
+        .set("total_count", "{counts.get(\"total\")}")
+        .set("completed_count", "{counts.get(\"completed\")}")
+        .set("pending_count", "{counts.get(\"pending\")}")
+        .set("current_page", "{page.current_page}")
+        .set("total_pages", "{page.total_pages}")
+        .set("has_previous", if page.current_page > 1: "true" else: "false")
+        .set("has_next", if page.current_page < page.total_pages: "true" else: "false")
+        .set("previous_page", "{page.current_page - 1}")
+        .set("next_page", "{page.current_page + 1}")
+        .set("has_todos", if counts.get("total") > 0: "true" else: "false")
+
+    render_page(ctx, "todos/index", data.to_dict())
+
+fn action_new_form(ctx: ControllerContext) -> HttpResponseData:
+    val _user_id = current_user_id(ctx)?
+    val csrf = csrf_token_for_session(ctx)
+    val data = ViewData.new()
+        .set("title", "New Todo")
+        .set("csrf_token", csrf)
+    render_page(ctx, "todos/new", data.to_dict())
+
+fn action_create(ctx: ControllerContext) -> HttpResponseData:
+    val user_id = current_user_id(ctx)?
+
+    val csrf = ctx.form_value("csrf_token")
+    if not verify_csrf_token(ctx, csrf):
+        flash_add(ctx, "error", "Invalid form submission. Please try again.")
+        return render_redirect(ctx, "/todos/new")
+
+    val title = ctx.form_value("title").trim()
+    val description = ctx.form_value("description").trim()
+
+    # Validate
+    val validator = todo_validator()
+    val fields = Dict<text, text>.new()
+    fields.set("title", title)
+    fields.set("description", description)
+    val result = validator.validate(fields)
+    if not result.is_valid:
+        flash_add(ctx, "error", result.first_error())
+        return render_redirect(ctx, "/todos/new")
+
+    val now = now_iso8601()
+    val repo = create_todo_repository(ctx.db())
+    val todo = Todo(
+        id: 0,
+        title: title,
+        description: description,
+        completed: false,
+        user_id: user_id,
+        created_at: now,
+        updated_at: now
+    )
+    repo.insert(todo)?
+
+    flash_add(ctx, "success", "Todo created successfully!")
+    render_redirect(ctx, "/todos")
+
+fn action_edit(ctx: ControllerContext) -> HttpResponseData:
+    val user_id = current_user_id(ctx)?
+    val todo_id = ctx.path_param("id").parse_i64()?
+
+    val repo = create_todo_repository(ctx.db())
+    val maybe_todo = find_todo_by_id(repo, todo_id)
+    if not maybe_todo.?:
+        flash_add(ctx, "error", "Todo not found.")
+        return render_redirect(ctx, "/todos")
+
+    val todo = maybe_todo.unwrap()
+    verify_todo_ownership(todo, user_id)?
+
+    val csrf = csrf_token_for_session(ctx)
+    val data = ViewData.new()
+        .set("title", "Edit Todo")
+        .set("csrf_token", csrf)
+        .set("todo_id", "{todo.id}")
+        .set("todo_title", todo.title)
+        .set("todo_description", todo.description)
+    render_page(ctx, "todos/edit", data.to_dict())
+
+fn action_update(ctx: ControllerContext) -> HttpResponseData:
+    val user_id = current_user_id(ctx)?
+    val todo_id = ctx.path_param("id").parse_i64()?
+
+    val csrf = ctx.form_value("csrf_token")
+    if not verify_csrf_token(ctx, csrf):
+        flash_add(ctx, "error", "Invalid form submission. Please try again.")
+        return render_redirect(ctx, "/todos/{todo_id}/edit")
+
+    val repo = create_todo_repository(ctx.db())
+    val maybe_todo = find_todo_by_id(repo, todo_id)
+    if not maybe_todo.?:
+        flash_add(ctx, "error", "Todo not found.")
+        return render_redirect(ctx, "/todos")
+
+    val todo = maybe_todo.unwrap()
+    verify_todo_ownership(todo, user_id)?
+
+    val title = ctx.form_value("title").trim()
+    val description = ctx.form_value("description").trim()
+
+    # Validate
+    val validator = todo_validator()
+    val fields = Dict<text, text>.new()
+    fields.set("title", title)
+    fields.set("description", description)
+    val result = validator.validate(fields)
+    if not result.is_valid:
+        flash_add(ctx, "error", result.first_error())
+        return render_redirect(ctx, "/todos/{todo_id}/edit")
+
+    val now = now_iso8601()
+    val updated_todo = Todo(
+        id: todo.id,
+        title: title,
+        description: description,
+        completed: todo.completed,
+        user_id: todo.user_id,
+        created_at: todo.created_at,
+        updated_at: now
+    )
+    repo.update(updated_todo)?
+
+    flash_add(ctx, "success", "Todo updated successfully!")
+    render_redirect(ctx, "/todos")
+
+fn action_toggle(ctx: ControllerContext) -> HttpResponseData:
+    val user_id = current_user_id(ctx)?
+    val todo_id = ctx.path_param("id").parse_i64()?
+
+    val csrf = ctx.form_value("csrf_token")
+    if not verify_csrf_token(ctx, csrf):
+        flash_add(ctx, "error", "Invalid form submission.")
+        return render_redirect(ctx, "/todos")
+
+    val repo = create_todo_repository(ctx.db())
+    val maybe_todo = find_todo_by_id(repo, todo_id)
+    if not maybe_todo.?:
+        flash_add(ctx, "error", "Todo not found.")
+        return render_redirect(ctx, "/todos")
+
+    val todo = maybe_todo.unwrap()
+    verify_todo_ownership(todo, user_id)?
+
+    val now = now_iso8601()
+    val toggled = Todo(
+        id: todo.id,
+        title: todo.title,
+        description: todo.description,
+        completed: not todo.completed,
+        user_id: todo.user_id,
+        created_at: todo.created_at,
+        updated_at: now
+    )
+    repo.update(toggled)?
+
+    val status = if toggled.completed: "completed" else: "reopened"
+    flash_add(ctx, "success", "Todo marked as {status}.")
+    render_redirect(ctx, "/todos")
+
+fn action_destroy(ctx: ControllerContext) -> HttpResponseData:
+    val user_id = current_user_id(ctx)?
+    val todo_id = ctx.path_param("id").parse_i64()?
+
+    val csrf = ctx.form_value("csrf_token")
+    if not verify_csrf_token(ctx, csrf):
+        flash_add(ctx, "error", "Invalid form submission.")
+        return render_redirect(ctx, "/todos")
+
+    val repo = create_todo_repository(ctx.db())
+    val maybe_todo = find_todo_by_id(repo, todo_id)
+    if not maybe_todo.?:
+        flash_add(ctx, "error", "Todo not found.")
+        return render_redirect(ctx, "/todos")
+
+    val todo = maybe_todo.unwrap()
+    verify_todo_ownership(todo, user_id)?
+
+    repo.delete(todo_id)?
+
+    flash_add(ctx, "success", "Todo deleted.")
+    render_redirect(ctx, "/todos")

@@ -1,0 +1,93 @@
+# Exercise 21: Synchronization and Atomics - Tests
+#
+# Runs the PTX kernels from main.spl on the real CUDA device and checks the
+# downloaded values against CPU references. When no device is present every
+# GPU example is reported as a skip (not a silent pass).
+
+use self.main.{
+    PTX, run_atomic_count, run_atomic_minmax, run_histogram,
+    run_cas_max, run_block_reduce_sum, make_ramp, cpu_histogram
+}
+use gpu_test_helpers.{gpu_setup, gpu_teardown, gpu_load_ptx, gpu_unload, close_enough}
+
+describe "Sync and Atomics":
+
+    describe "CPU references":
+
+        it "make_ramp spans -500 .. 6493 for n = 1000":
+            val data = make_ramp(1000)
+            expect(data.len()).to_equal(1000)
+            expect(data[0]).to_equal(-500)
+            expect(data[999]).to_equal(6493)
+
+        it "cpu_histogram bins negative values into non-negative bins":
+            val hist = cpu_histogram([-1, 9, 19, 0], 10)
+            expect(hist[9]).to_equal(3)
+            expect(hist[0]).to_equal(1)
+
+    describe "device kernels":
+
+        it "atomic counter counts every thread across 40 blocks":
+            val ctx = gpu_setup(0)
+            if ctx == 0:
+                skip("device kernels", "no CUDA device")
+            val module = gpu_load_ptx(PTX)
+            expect(module > 0).to_equal(true)
+            expect(run_atomic_count(module, 10000).unwrap()).to_equal(10000)
+            expect(run_atomic_count(module, 1).unwrap()).to_equal(1)
+            gpu_unload(module)
+            gpu_teardown(ctx)
+
+        it "atomic min/max find the extremes of the ramp":
+            val ctx = gpu_setup(0)
+            if ctx == 0:
+                skip("device kernels", "no CUDA device")
+            val module = gpu_load_ptx(PTX)
+            val mm = run_atomic_minmax(module, make_ramp(1000)).unwrap()
+            expect(mm[0]).to_equal(-500)
+            expect(mm[1]).to_equal(6493)
+            gpu_unload(module)
+            gpu_teardown(ctx)
+
+        it "histogram matches the CPU reference bin for bin":
+            val ctx = gpu_setup(0)
+            if ctx == 0:
+                skip("device kernels", "no CUDA device")
+            val module = gpu_load_ptx(PTX)
+            var data: [i64] = []
+            for i in 0..1000:
+                data.push(i * 3 - 700)
+            val hist = run_histogram(module, data, 10).unwrap()
+            val ref = cpu_histogram(data, 10)
+            expect(hist.len()).to_equal(10)
+            for b in 0..10:
+                expect(hist[b]).to_equal(ref[b])
+            gpu_unload(module)
+            gpu_teardown(ctx)
+
+        it "CAS set-if-greater converges to the maximum":
+            val ctx = gpu_setup(0)
+            if ctx == 0:
+                skip("device kernels", "no CUDA device")
+            val module = gpu_load_ptx(PTX)
+            expect(run_cas_max(module, make_ramp(1000)).unwrap()).to_equal(6493)
+            expect(run_cas_max(module, [-5, -3, -9]).unwrap()).to_equal(-3)
+            gpu_unload(module)
+            gpu_teardown(ctx)
+
+        it "block reduce sums 1024 ones and a non-multiple of the block size":
+            val ctx = gpu_setup(0)
+            if ctx == 0:
+                skip("device kernels", "no CUDA device")
+            val module = gpu_load_ptx(PTX)
+            var ones: [f32] = []
+            for i in 0..1024:
+                ones.push(1.0)
+            expect(close_enough(run_block_reduce_sum(module, ones).unwrap(), 1024.0, 0.01)).to_equal(true)
+            var ramp: [f32] = []
+            for i in 0..300:
+                ramp.push(i as f32)
+            # 0 + 1 + ... + 299 = 44850
+            expect(close_enough(run_block_reduce_sum(module, ramp).unwrap(), 44850.0, 0.5)).to_equal(true)
+            gpu_unload(module)
+            gpu_teardown(ctx)

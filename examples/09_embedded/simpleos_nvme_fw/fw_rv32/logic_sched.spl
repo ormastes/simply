@@ -1,0 +1,4 @@
+use logic_sched_cases.*
+
+fn rv32_sched_selftest() -> i32:
+    rv32_sched_cases_selftest()

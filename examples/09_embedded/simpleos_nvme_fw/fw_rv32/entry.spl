@@ -1,0 +1,1014 @@
+# NVMe firmware — bare-metal RV32 on-device self-test (gap-closure P9).
+#
+# Array-free, scalar re-expression of the firmware's core RAIN parity reconstruct,
+# SECDED payload-window ECC floor, fixed scheduler floor, fixed power/thermal floor, fixed map-cache floor, fixed band floor, fixed journal-ring floor, fixed HIL command/queue floor, fixed queue-phase floor, fixed read-zero-trim-flush floor, fixed admin/format/fw-log floor, fixed reactor floor, fixed policy/target floor, fixed DRAM/durability floor, fixed wear/scrub floor, fixed media-retire floor, fixed power-cycle floor, fixed backpressure/abort floor, fixed feature-guard floor, fixed namespace-guard floor, fixed target-profile floor, and fixed task-pool fail-closed floor so it can run inside the bare-metal rv32 boot path with
+# NO heap and NO arrays — matching the constraint documented in
+# src/os/kernel/arch/riscv32/boot.spl ("keep this module freestanding and minimal ... without
+# pulling runtime formatting, arrays, or boot metadata into the first-stage entry object").
+# UART output uses rt_riscv_uart_put exactly like boot.spl's `_line_*` helpers — one byte at a
+# time, no string runtime.
+#
+# Integration: call `nvme_fw_rv32_selftest()` from the rv32 boot chain (boot.spl `boot_main`,
+# after `riscv_noalloc_log_init`), then build with the proven recipe (fw_rv32/build.shs) and boot
+# (fw_rv32/boot.shs). It prints `ALL RV32 NVME FW CHECKS PASS` on success.
+#
+# BUILD STATUS (2026-06-30): toolchain FIXED + freestanding runtime COMPLETED. `native-build
+# --target riscv32-unknown-none` routes to the in-process Rust LLVM handler (no silent 255), and the
+# shared freestanding runtime (src/os/kernel/arch/riscv64/boot/freestanding_runtime.c, autodiscovered
+# via the rv32 boot bridge baremetal_stubs.c) now provides every rt_* the rv32 kernel emits —
+# rt_native_eq/neq + rt_riscv_uart_put were always there; rt_string_char_at/rt_value_as_int/
+# rt_array_pop were added (commit 5ac934cd285). The rv32 boot.spl kernel links with 0 undefined
+# runtime symbols, and the OS fs-exec rv32 ELF boots under qemu (-bios none) printing
+# "SimpleOS RV32 boot OK". This `entry.spl` is the standalone *logic reference* (host-verified,
+# XOR/ECC/scheduler/power-thermal/map-cache/band/journal-ring/HIL/queue-phase/read-zero-trim-flush/admin-format-fw-log/reactor/policy-target/DRAM-durability/wear-scrub/media-retire/power-cycle/backpressure-abort/feature-guard/namespace-guard/task-pool checks reproduce fail=0); a standalone native-build of it alone won't link (its dir has no
+# boot/ for C autodiscovery) — the bootable path is the OS build, which links the shared runtime.
+# Tracked in doc/08_tracking/bug/native_build_rv32_baremetal_silent_255_2026-06-30.md. Full 22-module
+# no-alloc port of ../fw/ is the larger ceiling.
+
+extern fn rt_riscv_uart_put(byte: u64)
+extern fn rt_rv32_nand_ram_load(word: u32) -> u32
+extern fn rt_rv32_nand_ram_store(word: u32, value: u32)
+extern fn rt_rv32_nvme_mmio_load(offset: u32) -> u32
+extern fn rt_rv32_nvme_mmio_store(offset: u32, value: u32)
+use logic.{nvme_fw_rv32_logic_selftest}
+use logic_nand_read_level.*
+
+# Fixed RV32 mailbox ABI.  STATUS00 bit 0 is a host-published pending bit;
+# COMPLETE is a write-one acknowledgement.  DMA_CMD bit 31 is busy, bit 30 is
+# endpoint error, command 1 reads host memory and command 2 writes host memory.
+val NVME_MMIO_STATUS: u32 = 0x00
+val NVME_MMIO_SQID: u32 = 0x04
+val NVME_MMIO_SQE_BASE: u32 = 0x08
+val NVME_MMIO_RESULT: u32 = 0x48
+val NVME_MMIO_STATUS_FIELD: u32 = 0x4C
+val NVME_MMIO_COMPLETE: u32 = 0x50
+val NVME_MMIO_DMA_ADDR_LO: u32 = 0x54
+val NVME_MMIO_DMA_ADDR_HI: u32 = 0x58
+val NVME_MMIO_DMA_WDATA: u32 = 0x5C
+val NVME_MMIO_DMA_RDATA: u32 = 0x60
+val NVME_MMIO_DMA_CMD: u32 = 0x64
+val NVME_DMA_BUSY: u32 = 0x80000000
+val NVME_DMA_ERROR: u32 = 0x40000000
+val NVME_DMA_READ: u32 = 1
+val NVME_DMA_WRITE: u32 = 2
+val NVME_DMA_WAIT_LIMIT: u32 = 1024
+val NVME_FW_MAX_BYTES: u32 = 256
+val NVME_FW_NAND_BYTES: u32 = 4
+val NVME_SERVICE_COOKIE: u32 = 0x52563332
+val NVME_SC_SUCCESS: u32 = 0x0000
+val NVME_SC_INVALID_OPCODE: u32 = 0x0001
+val NVME_SC_INVALID_FIELD: u32 = 0x0002
+val NVME_SC_INVALID_NAMESPACE: u32 = 0x000B
+
+fn _nvme_sqe(dw: u32) -> u32:
+    rt_rv32_nvme_mmio_load(NVME_MMIO_SQE_BASE + (dw * 4))
+
+fn _nvme_finish(status: u32, result: u32):
+    rt_rv32_nvme_mmio_store(NVME_MMIO_RESULT, result)
+    rt_rv32_nvme_mmio_store(NVME_MMIO_STATUS_FIELD, status)
+    rt_rv32_nvme_mmio_store(NVME_MMIO_COMPLETE, 1)
+
+fn _nvme_dma_wait() -> i64:
+    var spins: u32 = 0
+    while spins < NVME_DMA_WAIT_LIMIT:
+        val command = rt_rv32_nvme_mmio_load(NVME_MMIO_DMA_CMD)
+        if (command & NVME_DMA_BUSY) == 0:
+            if (command & NVME_DMA_ERROR) != 0:
+                return 1
+            return 0
+        spins = spins + 1
+    1
+
+fn _nvme_dma_read_word(address_lo: u32, address_hi: u32) -> u32:
+    rt_rv32_nvme_mmio_store(NVME_MMIO_DMA_ADDR_LO, address_lo)
+    rt_rv32_nvme_mmio_store(NVME_MMIO_DMA_ADDR_HI, address_hi)
+    rt_rv32_nvme_mmio_store(NVME_MMIO_DMA_CMD, NVME_DMA_READ)
+    if _nvme_dma_wait() != 0:
+        return 0
+    rt_rv32_nvme_mmio_load(NVME_MMIO_DMA_RDATA)
+
+fn _nvme_dma_write_word(address_lo: u32, address_hi: u32, data: u32) -> i64:
+    rt_rv32_nvme_mmio_store(NVME_MMIO_DMA_ADDR_LO, address_lo)
+    rt_rv32_nvme_mmio_store(NVME_MMIO_DMA_ADDR_HI, address_hi)
+    rt_rv32_nvme_mmio_store(NVME_MMIO_DMA_WDATA, data)
+    rt_rv32_nvme_mmio_store(NVME_MMIO_DMA_CMD, NVME_DMA_WRITE)
+    _nvme_dma_wait()
+
+fn _nvme_identify_word(word: u32) -> u32:
+    if word == 0:
+        return 0x00010001
+    if word == 19:
+        return 0x00000400
+    0
+
+fn _nvme_identify(prp_lo: u32, prp_hi: u32) -> i64:
+    var word: u32 = 0
+    while word < (NVME_FW_MAX_BYTES / 4):
+        val offset = word * 4
+        val address_lo = prp_lo + offset
+        var address_hi = prp_hi
+        if address_lo < prp_lo:
+            address_hi = address_hi + 1
+        if _nvme_dma_write_word(address_lo, address_hi, _nvme_identify_word(word)) != 0:
+            return 1
+        word = word + 1
+    0
+
+fn _nvme_prp_one_page_valid(prp_lo: u32, prp_hi: u32, bytes: u32) -> i64:
+    if prp_lo == 0 or prp_hi != 0:
+        return 0
+    if bytes == 0 or bytes > NVME_FW_MAX_BYTES:
+        return 0
+    if (prp_lo & 3) != 0:
+        return 0
+    if (prp_lo & 0xFFF) + bytes > 4096:
+        return 0
+    1
+
+fn _nvme_admin_queue_ensure() -> i64:
+    if _nand_ram_load(14) == 1:
+        return 0
+    _nand_ram_create_admin_queue(0, 16)
+
+fn _nvme_io_complete() -> i64:
+    if _nand_ram_complete_io() != 0:
+        return 1
+    if _nand_ram_reap_completion() != 0:
+        return 1
+    0
+
+fn _nvme_process_pending() -> i64:
+    val sqid = rt_rv32_nvme_mmio_load(NVME_MMIO_SQID)
+    val dw0 = _nvme_sqe(0)
+    val dw1 = _nvme_sqe(1)
+    val dw2 = _nvme_sqe(2)
+    val dw3 = _nvme_sqe(3)
+    val dw4 = _nvme_sqe(4)
+    val dw5 = _nvme_sqe(5)
+    val dw6 = _nvme_sqe(6)
+    val dw7 = _nvme_sqe(7)
+    val dw8 = _nvme_sqe(8)
+    val dw9 = _nvme_sqe(9)
+    val dw10 = _nvme_sqe(10)
+    val dw11 = _nvme_sqe(11)
+    val dw12 = _nvme_sqe(12)
+    val dw13 = _nvme_sqe(13)
+    val dw14 = _nvme_sqe(14)
+    val dw15 = _nvme_sqe(15)
+    val opcode = dw0 & 0xFF
+    val cid = dw0 >> 16
+    val prp2_nonzero = dw8 != 0 or dw9 != 0
+    var status: u32 = NVME_SC_SUCCESS
+    var result: u32 = 0
+
+    # Reserved command words and the unsupported fused/PSDT flags are rejected
+    # before any DMA or NAND operation, so malformed input cannot partially write media.
+    if sqid > 1 or (dw0 & 0xFF00) != 0 or dw2 != 0 or dw3 != 0 or dw4 != 0 or dw5 != 0 or prp2_nonzero:
+        status = NVME_SC_INVALID_FIELD
+    elif opcode == 0x06:
+        if sqid != 0 or (dw1 != 0 and dw1 != 1) or dw10 != 1 or dw11 != 0 or dw12 != 0 or dw13 != 0 or dw14 != 0 or dw15 != 0:
+            if dw1 != 0 and dw1 != 1:
+                status = NVME_SC_INVALID_NAMESPACE
+            else:
+                status = NVME_SC_INVALID_FIELD
+        elif _nvme_prp_one_page_valid(dw6, dw7, NVME_FW_MAX_BYTES) == 0:
+            status = NVME_SC_INVALID_FIELD
+        elif _nvme_identify(dw6, dw7) != 0:
+            status = NVME_SC_INVALID_FIELD
+    elif (opcode == 0x05 or opcode == 0x01) and sqid == 0:
+        val qid = dw10 & 0xFFFF
+        val depth_minus_one = dw10 >> 16
+        val depth = depth_minus_one + 1
+        if dw1 != 0 or qid != 1 or depth < 2 or depth > 16 or dw12 != 0 or dw13 != 0 or dw14 != 0 or dw15 != 0:
+            if dw1 != 0:
+                status = NVME_SC_INVALID_NAMESPACE
+            else:
+                status = NVME_SC_INVALID_FIELD
+        elif _nvme_prp_one_page_valid(dw6, dw7, 4) == 0 or (dw6 & 0xFFF) != 0:
+            status = NVME_SC_INVALID_FIELD
+        elif opcode == 0x05 and (dw11 & 0xFFFFFFFC) != 0:
+            status = NVME_SC_INVALID_FIELD
+        elif opcode == 0x01 and ((dw11 >> 16) != 1 or (dw11 & 0x0000FFF8) != 0):
+            status = NVME_SC_INVALID_FIELD
+        elif opcode == 0x05:
+            if _nvme_admin_queue_ensure() != 0:
+                status = NVME_SC_INVALID_FIELD
+            else:
+                _nand_ram_store(48, 1)
+        elif _nvme_admin_queue_ensure() != 0 or _nand_ram_load(48) != 1:
+            status = NVME_SC_INVALID_FIELD
+        elif qid == 1 and _nand_ram_create_io_queue(1, depth as i64) != 0:
+            status = NVME_SC_INVALID_FIELD
+    elif opcode == 0x00 or opcode == 0x01 or opcode == 0x02:
+        if sqid != 1 or dw1 != 1:
+            status = NVME_SC_INVALID_NAMESPACE
+        elif dw10 != 0 or dw11 != 0 or dw12 != 0 or dw13 != 0 or dw14 != 0 or dw15 != 0:
+            status = NVME_SC_INVALID_FIELD
+        elif opcode == 0x00:
+            if dw6 != 0 or dw7 != 0 or _nand_ram_submit_io() != 0 or _nvme_io_complete() != 0:
+                status = NVME_SC_INVALID_FIELD
+        elif _nvme_prp_one_page_valid(dw6, dw7, NVME_FW_NAND_BYTES) == 0:
+            status = NVME_SC_INVALID_FIELD
+        elif _nand_ram_submit_io() != 0:
+            status = NVME_SC_INVALID_FIELD
+        elif opcode == 0x01:
+            val data = _nvme_dma_read_word(dw6, dw7)
+            if (rt_rv32_nvme_mmio_load(NVME_MMIO_DMA_CMD) & (NVME_DMA_BUSY | NVME_DMA_ERROR)) != 0:
+                status = NVME_SC_INVALID_FIELD
+            elif _nand_ram_erase() != 0 or _nand_ram_program(data) != 0:
+                status = NVME_SC_INVALID_FIELD
+            elif _nvme_io_complete() != 0:
+                status = NVME_SC_INVALID_FIELD
+        else:
+            val data = _nand_ram_read()
+            if _nand_ram_load(9) != 0 or _nvme_dma_write_word(dw6, dw7, data) != 0:
+                status = NVME_SC_INVALID_FIELD
+            elif _nvme_io_complete() != 0:
+                status = NVME_SC_INVALID_FIELD
+    else:
+        status = NVME_SC_INVALID_OPCODE
+
+    # CID is parsed from the real DW0 layout.  The mailbox exposes only RESULT,
+    # so keep the completion result zero and leave phase/CID decoration to the endpoint.
+    result = 0
+    _nvme_finish(status, result)
+    1
+
+@export("C", name: "nvme_fw_rv32_service_once")
+fn nvme_fw_rv32_service_once() -> i64:
+    if _nand_ram_load(47) != NVME_SERVICE_COOKIE:
+        if _nand_ram_startup() != 0:
+            if (rt_rv32_nvme_mmio_load(NVME_MMIO_STATUS) & 1) != 0:
+                _nvme_finish(NVME_SC_INVALID_FIELD, 0)
+            return 0
+        _nand_ram_store(47, NVME_SERVICE_COOKIE)
+    if (rt_rv32_nvme_mmio_load(NVME_MMIO_STATUS) & 1) == 0:
+        return 0
+    _nvme_process_pending()
+
+fn nvme_fw_rv32_service_poll() -> i64:
+    var count: i64 = 0
+    while count < 8:
+        if nvme_fw_rv32_service_once() == 0:
+            return count
+        count = count + 1
+    count
+
+@export("C", name: "rt_rv32_boot_optional_nvme_fw_service")
+fn rt_rv32_boot_optional_nvme_fw_service() -> i64:
+    nvme_fw_rv32_service_poll()
+
+fn _uart_put(byte: i64):
+    rt_riscv_uart_put(byte as u64)
+
+# Emit a NUL-terminated-style fixed byte sequence one byte at a time (no arrays, no string
+# runtime, no `;` statement separators — native-build's parser rejects those).
+fn _emit_pass():
+    # "ALL RV32 NVME FW CHECKS PASS\n"
+    _uart_put(65)
+    _uart_put(76)
+    _uart_put(76)
+    _uart_put(32)
+    _uart_put(82)
+    _uart_put(86)
+    _uart_put(51)
+    _uart_put(50)
+    _uart_put(32)
+    _uart_put(78)
+    _uart_put(86)
+    _uart_put(77)
+    _uart_put(69)
+    _uart_put(32)
+    _uart_put(70)
+    _uart_put(87)
+    _uart_put(32)
+    _uart_put(67)
+    _uart_put(72)
+    _uart_put(69)
+    _uart_put(67)
+    _uart_put(75)
+    _uart_put(83)
+    _uart_put(32)
+    _uart_put(80)
+    _uart_put(65)
+    _uart_put(83)
+    _uart_put(83)
+    _uart_put(10)
+
+fn _emit_fail():
+    # "RV32 NVME FW FAIL\n"
+    _uart_put(82)
+    _uart_put(86)
+    _uart_put(51)
+    _uart_put(50)
+    _uart_put(32)
+    _uart_put(78)
+    _uart_put(86)
+    _uart_put(77)
+    _uart_put(69)
+    _uart_put(32)
+    _uart_put(70)
+    _uart_put(87)
+    _uart_put(32)
+    _uart_put(70)
+    _uart_put(65)
+    _uart_put(73)
+    _uart_put(76)
+    _uart_put(10)
+
+fn _emit_begin():
+    # "RV32 NVME FW BEGIN\n"
+    _uart_put(82)
+    _uart_put(86)
+    _uart_put(51)
+    _uart_put(50)
+    _uart_put(32)
+    _uart_put(78)
+    _uart_put(86)
+    _uart_put(77)
+    _uart_put(69)
+    _uart_put(32)
+    _uart_put(70)
+    _uart_put(87)
+    _uart_put(32)
+    _uart_put(66)
+    _uart_put(69)
+    _uart_put(71)
+    _uart_put(73)
+    _uart_put(78)
+    _uart_put(10)
+
+fn _emit_fail_mask(mask: i64):
+    if (mask & 1) != 0:
+        _uart_put(82)   # R
+    if (mask & 2) != 0:
+        _uart_put(69)   # E
+    if (mask & 4) != 0:
+        _uart_put(74)   # J
+    if (mask & 8) != 0:
+        _uart_put(77)   # M
+    if (mask & 16) != 0:
+        _uart_put(66)   # B
+    if (mask & 32) != 0:
+        _uart_put(83)   # S
+    if (mask & 64) != 0:
+        _uart_put(80)   # P
+    if (mask & 128) != 0:
+        _uart_put(72)   # H
+    if (mask & 256) != 0:
+        _uart_put(81)   # Q
+    if (mask & 512) != 0:
+        _uart_put(73)   # I
+    if (mask & 1024) != 0:
+        _uart_put(70)   # F
+    if (mask & 2048) != 0:
+        _uart_put(65)   # A
+    if (mask & 4096) != 0:
+        _uart_put(67)   # C
+    if (mask & 8192) != 0:
+        _uart_put(84)   # T
+    if (mask & 16384) != 0:
+        _uart_put(68)   # D
+    if (mask & 32768) != 0:
+        _uart_put(87)   # W
+    if (mask & 65536) != 0:
+        _uart_put(76)   # L
+    if (mask & 131072) != 0:
+        _uart_put(89)   # Y
+    if (mask & 262144) != 0:
+        _uart_put(75)   # K
+    if (mask & 524288) != 0:
+        _uart_put(71)   # G
+    if (mask & 1048576) != 0:
+        _uart_put(78)   # N
+    if (mask & 2097152) != 0:
+        _uart_put(79)   # O
+    if (mask & 4194304) != 0:
+        _uart_put(88)   # X
+    if (mask & 8388608) != 0:
+        _uart_put(86)   # V
+    _uart_put(10)
+
+fn _nand_ram_load(word: u32) -> u32:
+    rt_rv32_nand_ram_load(word)
+
+fn _nand_ram_store(word: u32, value: u32):
+    rt_rv32_nand_ram_store(word, value)
+
+fn _emit_nand_prefix():
+    _uart_put(78)
+    _uart_put(65)
+    _uart_put(78)
+    _uart_put(68)
+    _uart_put(32)
+
+fn _emit_nand_pass_suffix():
+    _uart_put(32)
+    _uart_put(80)
+    _uart_put(65)
+    _uart_put(83)
+    _uart_put(83)
+    _uart_put(10)
+
+fn _emit_nand_digit(value: u32):
+    _uart_put(48 + value as i64)
+
+fn _emit_nand_evidence():
+    # "NAND EVIDENCE D1 U1 F5 C3 T1 M1 Q3 X2 S1 PASS\n"
+    _emit_nand_prefix()
+    _uart_put(69)
+    _uart_put(86)
+    _uart_put(73)
+    _uart_put(68)
+    _uart_put(69)
+    _uart_put(78)
+    _uart_put(67)
+    _uart_put(69)
+    _uart_put(32)
+    _uart_put(68)
+    _emit_nand_digit(_nand_ram_load(35))
+    _uart_put(32)
+    _uart_put(85)
+    _emit_nand_digit(_nand_ram_load(36))
+    _uart_put(32)
+    _uart_put(70)
+    _emit_nand_digit(_nand_ram_load(7))
+    _uart_put(32)
+    _uart_put(67)
+    _emit_nand_digit(_nand_ram_load(8))
+    _uart_put(32)
+    _uart_put(84)
+    _emit_nand_digit(_nand_ram_load(23))
+    _uart_put(32)
+    _uart_put(77)
+    _emit_nand_digit(_nand_ram_load(24))
+    _uart_put(32)
+    _uart_put(81)
+    _emit_nand_digit(_nand_ram_load(20))
+    _uart_put(32)
+    _uart_put(88)
+    _emit_nand_digit(_nand_ram_load(46))
+    _uart_put(32)
+    _uart_put(83)
+    _emit_nand_digit(_nand_ram_load(31))
+    _emit_nand_pass_suffix()
+
+fn _emit_nand_stage(stage: i64):
+    _emit_nand_prefix()
+    if stage == 1:
+        _uart_put(83)
+        _uart_put(84)
+        _uart_put(65)
+        _uart_put(82)
+        _uart_put(84)
+        _uart_put(85)
+        _uart_put(80)
+    if stage == 2:
+        _uart_put(65)
+        _uart_put(68)
+        _uart_put(77)
+        _uart_put(73)
+        _uart_put(78)
+        _uart_put(81)
+    if stage == 3:
+        _uart_put(73)
+        _uart_put(79)
+        _uart_put(81)
+    if stage == 4:
+        _uart_put(69)
+        _uart_put(82)
+        _uart_put(65)
+        _uart_put(83)
+        _uart_put(69)
+    if stage == 5:
+        _uart_put(80)
+        _uart_put(82)
+        _uart_put(79)
+        _uart_put(71)
+        _uart_put(82)
+        _uart_put(65)
+        _uart_put(77)
+    if stage == 6:
+        _uart_put(82)
+        _uart_put(69)
+        _uart_put(65)
+        _uart_put(68)
+    if stage == 7:
+        _uart_put(80)
+        _uart_put(82)
+        _uart_put(69)
+        _uart_put(86)
+        _uart_put(69)
+        _uart_put(78)
+        _uart_put(84)
+    if stage == 8:
+        _uart_put(82)
+        _uart_put(69)
+        _uart_put(67)
+        _uart_put(79)
+        _uart_put(86)
+        _uart_put(69)
+        _uart_put(82)
+        _uart_put(89)
+    _emit_nand_pass_suffix()
+
+fn _nand_ram_startup() -> i64:
+    _nand_ram_store(0, 0x4E414E44)
+    _nand_ram_store(1, rv32_nand_lifecycle_next(0, 1) as u32)
+    _nand_ram_store(2, 0)
+    _nand_ram_store(3, 0xFFFFFFFF)
+    _nand_ram_store(4, rv32_nand_level_erased() as u32)
+    _nand_ram_store(5, rv32_nand_reference_default() as u32)
+    _nand_ram_store(6, 0)
+    _nand_ram_store(7, 0)
+    _nand_ram_store(8, 0)
+    _nand_ram_store(9, 0)
+    _nand_ram_store(10, 0xFFFFFFFF)
+    _nand_ram_store(11, 0)
+    _nand_ram_store(12, 0xFFFFFFFF)
+    _nand_ram_store(13, 0)
+    _nand_ram_store(14, 0)
+    _nand_ram_store(15, 0)
+    _nand_ram_store(16, 0)
+    _nand_ram_store(17, 0)
+    _nand_ram_store(18, 0)
+    _nand_ram_store(19, 0)
+    _nand_ram_store(20, 0)
+    _nand_ram_store(21, 0)
+    _nand_ram_store(22, rv32_nand_level_erased() as u32)
+    _nand_ram_store(23, 0)
+    _nand_ram_store(24, 0)
+    _nand_ram_store(25, 0)
+    _nand_ram_store(26, 0)
+    _nand_ram_store(27, 0)
+    _nand_ram_store(28, 0)
+    _nand_ram_store(29, 1)
+    _nand_ram_store(30, 0)
+    _nand_ram_store(31, 1)
+    _nand_ram_store(32, 0)
+    _nand_ram_store(33, 0xFFFFFFFF)
+    _nand_ram_store(34, 0)
+    _nand_ram_store(35, 0)
+    _nand_ram_store(36, 0)
+    _nand_ram_store(37, rv32_nand_ecc_compute(0xFFFFFFFF) as u32)
+    _nand_ram_store(38, rv32_nand_ecc_compute(0xFFFFFFFF) as u32)
+    _nand_ram_store(39, 0)
+    _nand_ram_store(40, 0xFFFFFFFF)
+    _nand_ram_store(41, rv32_nand_level_erased() as u32)
+    _nand_ram_store(42, rv32_nand_ecc_compute(0xFFFFFFFF) as u32)
+    _nand_ram_store(43, 0)
+    _nand_ram_store(44, 0)
+    _nand_ram_store(45, 0)
+    _nand_ram_store(46, 0)
+    _nand_ram_store(48, 0)
+    _nand_ram_store(64, 0xDEADBEEF)
+    if _nand_ram_load(64) != 0:
+        return 1
+    if _nand_ram_load(0) != 0x4E414E44:
+        return 1
+    if _nand_ram_load(1) != 1:
+        return 1
+    0
+
+fn _nand_ram_advance(event: i64) -> i64:
+    val next = rv32_nand_lifecycle_next(_nand_ram_load(1) as i64, event)
+    if next < 0:
+        _nand_ram_store(9, 1)
+        return 1
+    _nand_ram_store(1, next as u32)
+    _nand_ram_store(9, 0)
+    0
+
+fn _nand_ram_create_admin_queue(qid: i64, depth: i64) -> i64:
+    if rv32_nand_admin_queue_valid(qid, depth) == 0:
+        _nand_ram_store(9, 1)
+        return 1
+    if _nand_ram_advance(2) != 0:
+        return 1
+    val queue_state = rv32_nand_queue_next(_nand_ram_load(14) as i64, 1)
+    if queue_state < 0:
+        return 1
+    _nand_ram_store(10, qid as u32)
+    _nand_ram_store(11, depth as u32)
+    _nand_ram_store(14, queue_state as u32)
+    0
+
+fn _nand_ram_create_io_queue(qid: i64, depth: i64) -> i64:
+    if rv32_nand_io_queue_valid(qid, depth) == 0:
+        _nand_ram_store(9, 1)
+        return 1
+    if _nand_ram_load(1) == 2:
+        if _nand_ram_advance(3) != 0:
+            return 1
+    elif _nand_ram_load(1) != 3:
+        return 1
+    val queue_state = rv32_nand_queue_next(_nand_ram_load(15) as i64, 1)
+    if queue_state < 0:
+        return 1
+    _nand_ram_store(12, qid as u32)
+    _nand_ram_store(13, depth as u32)
+    _nand_ram_store(15, queue_state as u32)
+    0
+
+fn _nand_ram_submit_io() -> i64:
+    if _nand_ram_load(15) != 1:
+        return 1
+    val depth = _nand_ram_load(13)
+    val next = (_nand_ram_load(16) + 1) % depth
+    if next == _nand_ram_load(17):
+        _nand_ram_store(9, 5)
+        _nand_ram_store(46, _nand_ram_load(46) + 1)
+        return 5
+    _nand_ram_store(16, next)
+    0
+
+fn _nand_ram_complete_io() -> i64:
+    if _nand_ram_load(17) == _nand_ram_load(16):
+        return 1
+    val depth = _nand_ram_load(13)
+    val next_cq = (_nand_ram_load(18) + 1) % depth
+    if next_cq == _nand_ram_load(19):
+        _nand_ram_store(9, 5)
+        _nand_ram_store(46, _nand_ram_load(46) + 1)
+        return 5
+    _nand_ram_store(17, (_nand_ram_load(17) + 1) % depth)
+    _nand_ram_store(18, next_cq)
+    _nand_ram_store(20, _nand_ram_load(20) + 1)
+    0
+
+fn _nand_ram_reap_completion() -> i64:
+    if _nand_ram_load(19) == _nand_ram_load(18):
+        return 1
+    _nand_ram_store(19, (_nand_ram_load(19) + 1) % _nand_ram_load(13))
+    0
+
+fn _nand_ram_delete_io_queue() -> i64:
+    if _nand_ram_load(15) != 1:
+        return 1
+    if _nand_ram_load(16) != _nand_ram_load(17) or _nand_ram_load(18) != _nand_ram_load(19):
+        return 1
+    val deleting = rv32_nand_queue_next(_nand_ram_load(15) as i64, 2)
+    if deleting < 0:
+        return 1
+    _nand_ram_store(15, deleting as u32)
+    val absent = rv32_nand_queue_next(_nand_ram_load(15) as i64, 3)
+    if absent < 0:
+        return 1
+    _nand_ram_store(15, absent as u32)
+    _nand_ram_store(12, 0xFFFFFFFF)
+    _nand_ram_store(13, 0)
+    0
+
+fn _nand_ram_erase() -> i64:
+    val status = rv32_nand_media_status(_nand_ram_load(1) as i64, _nand_ram_load(2) as i64, 1)
+    _nand_ram_store(9, status as u32)
+    if status != 0:
+        return status
+    _nand_ram_store(2, 0)
+    _nand_ram_store(3, 0xFFFFFFFF)
+    _nand_ram_store(4, rv32_nand_level_erased() as u32)
+    _nand_ram_store(6, 0)
+    _nand_ram_store(28, 0)
+    _nand_ram_store(32, 0)
+    _nand_ram_store(37, rv32_nand_ecc_compute(0xFFFFFFFF) as u32)
+    _nand_ram_store(44, 0)
+    0
+
+fn _nand_ram_program(data: u32) -> i64:
+    val status = rv32_nand_media_status(_nand_ram_load(1) as i64, _nand_ram_load(2) as i64, 2)
+    _nand_ram_store(9, status as u32)
+    if status != 0:
+        return status
+    _nand_ram_store(2, 1)
+    _nand_ram_store(3, data)
+    _nand_ram_store(4, rv32_nand_level_programmed() as u32)
+    _nand_ram_store(6, 0)
+    _nand_ram_store(28, 0)
+    _nand_ram_store(32, 1)
+    _nand_ram_store(37, rv32_nand_ecc_compute(data as i64) as u32)
+    _nand_ram_store(44, 0)
+    0
+
+fn _nand_ram_read_raw(read_reference: i64) -> u32:
+    val status = rv32_nand_media_status(_nand_ram_load(1) as i64, _nand_ram_load(2) as i64, 3)
+    _nand_ram_store(9, status as u32)
+    if status != 0:
+        return 0xFFFFFFFF
+    _nand_ram_store(5, read_reference as u32)
+    _nand_ram_store(6, _nand_ram_load(6) + 1)
+    _nand_ram_store(21, _nand_ram_load(21) + 1)
+    _nand_ram_store(22, rv32_nand_disturb_level(_nand_ram_load(22) as i64, _nand_ram_load(21) as i64, _nand_ram_load(34) as i32) as u32)
+    val data = _nand_ram_load(3) as i64
+    val error_bits = rv32_nand_error_bits(_nand_ram_load(32) as i32, _nand_ram_load(4) as i64, read_reference)
+    val sensed = rv32_nand_sense_data(data, _nand_ram_load(32) as i32, _nand_ram_load(4) as i64, read_reference)
+    _nand_ram_store(28, error_bits as u32)
+    if rv32_nand_ecc_correctable(error_bits, _nand_ram_load(29) as i64) == 0:
+        _nand_ram_store(9, 3)
+    else:
+        _nand_ram_store(9, 0)
+    sensed as u32
+
+fn _nand_ram_remap(corrected_data: u32, programmed: i32, recovered: i32) -> i64:
+    _nand_ram_store(23, _nand_ram_load(23) + 1)
+    _nand_ram_store(24, _nand_ram_load(24) + 1)
+    _nand_ram_store(39, 1)
+    _nand_ram_store(40, corrected_data)
+    _nand_ram_store(41, rv32_nand_nominal_level(programmed) as u32)
+    _nand_ram_store(42, rv32_nand_ecc_compute(corrected_data as i64) as u32)
+    _nand_ram_store(43, programmed as u32)
+    val remap_errors = rv32_nand_error_bits(programmed, _nand_ram_load(41) as i64, rv32_nand_reference_default())
+    val remap_sensed = rv32_nand_sense_data(_nand_ram_load(40) as i64, programmed, _nand_ram_load(41) as i64, rv32_nand_reference_default())
+    val remap_status = rv32_nand_ecc_decode_status(remap_sensed, _nand_ram_load(42) as i64, remap_errors, _nand_ram_load(29) as i64)
+    val remap_data = rv32_nand_ecc_decode_data(remap_sensed, _nand_ram_load(42) as i64)
+    if remap_status == 0 or remap_data != corrected_data as i64:
+        _nand_ram_store(9, 4)
+        _nand_ram_store(30, 4)
+        return 4
+    _nand_ram_store(2, 1)
+    _nand_ram_store(3, _nand_ram_load(40))
+    _nand_ram_store(4, _nand_ram_load(41))
+    _nand_ram_store(32, _nand_ram_load(43))
+    _nand_ram_store(37, _nand_ram_load(42))
+    _nand_ram_store(44, 1)
+    _nand_ram_store(6, 0)
+    _nand_ram_store(21, 0)
+    _nand_ram_store(7, _nand_ram_load(7) + 1)
+    if recovered != 0:
+        _nand_ram_store(8, _nand_ram_load(8) + 1)
+    _nand_ram_store(9, 0)
+    _nand_ram_store(30, 3)
+    0
+
+fn _nand_ram_fcr(corrected_data: u32, recovered: i32) -> i64:
+    val correctable = rv32_nand_ecc_correctable(_nand_ram_load(28) as i64, _nand_ram_load(29) as i64)
+    var matches: i32 = 0
+    if rv32_nand_ecc_compute(corrected_data as i64) == _nand_ram_load(37) as i64:
+        matches = 1
+    if rv32_nand_refresh_allowed(correctable, matches) == 0:
+        return 3
+    val programmed = _nand_ram_load(32) as i32
+    _nand_ram_store(30, 1)
+    _nand_ram_store(2, 0)
+    _nand_ram_store(4, rv32_nand_level_erased() as u32)
+    if _nand_ram_load(25) != 0:
+        _nand_ram_store(25, 0)
+        return _nand_ram_remap(corrected_data, programmed, recovered)
+    _nand_ram_store(2, 1)
+    _nand_ram_store(3, corrected_data)
+    _nand_ram_store(4, rv32_nand_nominal_level(programmed) as u32)
+    _nand_ram_store(37, rv32_nand_ecc_compute(corrected_data as i64) as u32)
+    _nand_ram_store(30, 2)
+    val verify_errors = rv32_nand_error_bits(programmed, _nand_ram_load(4) as i64, rv32_nand_reference_default())
+    val verify_data = rv32_nand_sense_data(_nand_ram_load(3) as i64, programmed, _nand_ram_load(4) as i64, rv32_nand_reference_default())
+    val verify_status = rv32_nand_ecc_decode_status(verify_data, _nand_ram_load(37) as i64, verify_errors, _nand_ram_load(29) as i64)
+    val verified_data = rv32_nand_ecc_decode_data(verify_data, _nand_ram_load(37) as i64)
+    if verify_status == 0 or verified_data != corrected_data as i64:
+        return _nand_ram_remap(corrected_data, programmed, recovered)
+    _nand_ram_store(5, rv32_nand_reference_default() as u32)
+    _nand_ram_store(6, 0)
+    _nand_ram_store(7, _nand_ram_load(7) + 1)
+    if recovered != 0:
+        _nand_ram_store(8, _nand_ram_load(8) + 1)
+    _nand_ram_store(9, 0)
+    _nand_ram_store(30, 3)
+    0
+
+fn _nand_ram_recover_direction(direction: i32, recovered: i32) -> i64:
+    var index: i64 = 0
+    while index < 4:
+        val reference = rv32_nand_retry_reference(direction, index)
+        val sensed = _nand_ram_read_raw(reference)
+        val decode_status = rv32_nand_ecc_decode_status(sensed as i64, _nand_ram_load(37) as i64, _nand_ram_load(28) as i64, _nand_ram_load(29) as i64)
+        val corrected = rv32_nand_ecc_decode_data(sensed as i64, _nand_ram_load(37) as i64)
+        var matches: i32 = 0
+        if rv32_nand_ecc_compute(corrected) == _nand_ram_load(37) as i64:
+            matches = 1
+        if rv32_nand_refresh_allowed(decode_status, matches) != 0:
+            _nand_ram_store(26, direction as u32)
+            _nand_ram_store(27, index as u32)
+            if direction < 0:
+                _nand_ram_store(35, index as u32)
+            else:
+                _nand_ram_store(36, index as u32)
+            _nand_ram_store(45, corrected as u32)
+            return _nand_ram_fcr(corrected as u32, recovered)
+        index = index + 1
+    _nand_ram_store(9, 3)
+    3
+
+fn _nand_ram_prevent_neighbor() -> i64:
+    val programmed = _nand_ram_load(34) as i32
+    val data = _nand_ram_load(33) as i64
+    val errors = rv32_nand_error_bits(programmed, _nand_ram_load(22) as i64, rv32_nand_reference_default())
+    val sensed = rv32_nand_sense_data(data, programmed, _nand_ram_load(22) as i64, rv32_nand_reference_default())
+    val decode_status = rv32_nand_ecc_decode_status(sensed, _nand_ram_load(38) as i64, errors, _nand_ram_load(29) as i64)
+    val corrected = rv32_nand_ecc_decode_data(sensed, _nand_ram_load(38) as i64)
+    var matches: i32 = 0
+    if rv32_nand_ecc_compute(corrected) == _nand_ram_load(38) as i64:
+        matches = 1
+    if rv32_nand_refresh_allowed(decode_status, matches) == 0:
+        return 3
+    _nand_ram_store(22, rv32_nand_nominal_level(programmed) as u32)
+    val verify_errors = rv32_nand_error_bits(programmed, _nand_ram_load(22) as i64, rv32_nand_reference_default())
+    val verify_data = rv32_nand_sense_data(corrected, programmed, _nand_ram_load(22) as i64, rv32_nand_reference_default())
+    val verify_status = rv32_nand_ecc_decode_status(verify_data, _nand_ram_load(38) as i64, verify_errors, _nand_ram_load(29) as i64)
+    val verified_data = rv32_nand_ecc_decode_data(verify_data, _nand_ram_load(38) as i64)
+    if verify_status == 0 or rv32_nand_ecc_compute(verified_data) != _nand_ram_load(38) as i64:
+        _nand_ram_store(9, 4)
+        return 4
+    _nand_ram_store(7, _nand_ram_load(7) + 1)
+    0
+
+fn _nand_ram_read() -> u32:
+    val sensed = _nand_ram_read_raw(rv32_nand_reference_default())
+    val decode_status = rv32_nand_ecc_decode_status(sensed as i64, _nand_ram_load(37) as i64, _nand_ram_load(28) as i64, _nand_ram_load(29) as i64)
+    val corrected = rv32_nand_ecc_decode_data(sensed as i64, _nand_ram_load(37) as i64)
+    if decode_status != 0 and rv32_nand_ecc_compute(corrected) == _nand_ram_load(37) as i64:
+        _nand_ram_store(45, corrected as u32)
+        if _nand_ram_load(21) >= rv32_nand_prevention_read_limit() as u32:
+            if _nand_ram_prevent_neighbor() != 0:
+                _nand_ram_store(9, 3)
+                return 0xFFFFFFFF
+        _nand_ram_store(9, 0)
+        return corrected as u32
+    if _nand_ram_recover_direction(-1, 1) != 0:
+        if _nand_ram_recover_direction(1, 1) != 0:
+            _nand_ram_store(9, 3)
+            return 0xFFFFFFFF
+    if _nand_ram_load(21) >= rv32_nand_prevention_read_limit() as u32:
+        if _nand_ram_prevent_neighbor() != 0:
+            _nand_ram_store(9, 3)
+            return 0xFFFFFFFF
+    _nand_ram_load(45)
+
+fn _nand_ram_queue_selftest() -> i32:
+    if _nand_ram_delete_io_queue() != 0 or _nand_ram_submit_io() == 0:
+        return 1
+    if _nand_ram_create_io_queue(1, 4) != 0:
+        return 1
+    var i: i64 = 0
+    while i < 3:
+        if _nand_ram_submit_io() != 0:
+            return 1
+        i = i + 1
+    if _nand_ram_submit_io() != 5:
+        return 1
+    i = 0
+    while i < 3:
+        if _nand_ram_complete_io() != 0 or _nand_ram_reap_completion() != 0:
+            return 1
+        i = i + 1
+    i = 0
+    while i < 3:
+        if _nand_ram_submit_io() != 0 or _nand_ram_complete_io() != 0:
+            return 1
+        i = i + 1
+    if _nand_ram_submit_io() != 0 or _nand_ram_complete_io() != 5:
+        return 1
+    if _nand_ram_reap_completion() != 0 or _nand_ram_complete_io() != 0:
+        return 1
+    i = 0
+    while i < 3:
+        if _nand_ram_reap_completion() != 0:
+            return 1
+        i = i + 1
+    if _nand_ram_reap_completion() == 0:
+        return 1
+    if _nand_ram_load(16) != _nand_ram_load(17) or _nand_ram_load(18) != _nand_ram_load(19):
+        return 1
+    if _nand_ram_load(46) != 2:
+        return 1
+    if _nand_ram_delete_io_queue() != 0 or _nand_ram_create_io_queue(1, 16) != 0:
+        return 1
+    _nand_ram_store(20, 0)
+    0
+
+fn _nand_ram_selftest() -> i32:
+    if _nand_ram_startup() != 0:
+        return 1
+    _emit_nand_stage(1)
+    if _nand_ram_create_admin_queue(0, 16) != 0:
+        return 1
+    if _nand_ram_load(10) != 0 or _nand_ram_load(11) != 16 or _nand_ram_load(14) != 1:
+        return 1
+    _emit_nand_stage(2)
+    if _nand_ram_create_io_queue(1, 16) != 0:
+        return 1
+    if _nand_ram_load(12) != 1 or _nand_ram_load(13) != 16 or _nand_ram_load(15) != 1:
+        return 1
+    if _nand_ram_queue_selftest() != 0:
+        return 1
+    _emit_nand_stage(3)
+    if _nand_ram_submit_io() != 0:
+        return 1
+    if _nand_ram_erase() != 0 or _nand_ram_load(2) != 0 or _nand_ram_complete_io() != 0:
+        return 1
+    if _nand_ram_reap_completion() != 0:
+        return 1
+    _emit_nand_stage(4)
+    val data: u32 = 0x13579BDE
+    if _nand_ram_submit_io() != 0:
+        return 1
+    if _nand_ram_program(data) != 0:
+        return 1
+    if _nand_ram_program(data) != 2:
+        return 1
+    if _nand_ram_complete_io() != 0:
+        return 1
+    if _nand_ram_reap_completion() != 0:
+        return 1
+    _emit_nand_stage(5)
+    if _nand_ram_submit_io() != 0:
+        return 1
+    if _nand_ram_read() != data or _nand_ram_complete_io() != 0:
+        return 1
+    if _nand_ram_reap_completion() != 0:
+        return 1
+    _emit_nand_stage(6)
+
+    _nand_ram_store(3, data ^ 1)
+    if _nand_ram_read() != data:
+        return 1
+    _nand_ram_store(3, data ^ 3)
+    if _nand_ram_read() != 0xFFFFFFFF or _nand_ram_load(9) != 3:
+        return 1
+    _nand_ram_store(3, data)
+    _nand_ram_store(4, rv32_nand_level_programmed() as u32)
+    _nand_ram_store(32, 1)
+    _nand_ram_store(21, 0)
+    _nand_ram_store(22, 124)
+    _nand_ram_store(33, data | 1)
+    _nand_ram_store(34, 0)
+    _nand_ram_store(38, rv32_nand_ecc_compute((data | 1) as i64) as u32)
+    _nand_ram_read()
+    _nand_ram_read()
+    _nand_ram_read()
+    _nand_ram_read()
+    if _nand_ram_load(21) != rv32_nand_prevention_read_limit() as u32:
+        return 1
+    if _nand_ram_load(22) != rv32_nand_level_erased() as u32 or _nand_ram_load(7) != 1:
+        return 1
+    _emit_nand_stage(7)
+    _nand_ram_store(21, 0)
+    _nand_ram_store(22, rv32_nand_level_programmed() as u32)
+    _nand_ram_store(33, data)
+    _nand_ram_store(34, 1)
+    _nand_ram_store(38, rv32_nand_ecc_compute(data as i64) as u32)
+    _nand_ram_store(4, 116)
+    if _nand_ram_read() != data:
+        return 1
+    if _nand_ram_load(27) != 1 or _nand_ram_load(7) != 2 or _nand_ram_load(8) != 1:
+        return 1
+    _nand_ram_store(3, data | 1)
+    _nand_ram_store(37, rv32_nand_ecc_compute((data | 1) as i64) as u32)
+    _nand_ram_store(32, 0)
+    _nand_ram_store(4, 140)
+    _nand_ram_store(21, 0)
+    if _nand_ram_read() != (data | 1):
+        return 1
+    if _nand_ram_load(27) != 1 or _nand_ram_load(7) != 4 or _nand_ram_load(8) != 2:
+        return 1
+    _nand_ram_store(3, data)
+    _nand_ram_store(37, rv32_nand_ecc_compute(data as i64) as u32)
+    _nand_ram_store(32, 1)
+    _nand_ram_store(4, 116)
+    _nand_ram_store(21, 0)
+    _nand_ram_store(25, 1)
+    if _nand_ram_read() != data:
+        return 1
+    if _nand_ram_load(23) != 1 or _nand_ram_load(24) != 1 or _nand_ram_load(9) != 0:
+        return 1
+    if _nand_ram_load(44) != 1 or _nand_ram_load(40) != data or _nand_ram_load(3) != data:
+        return 1
+    if _nand_ram_read() != data:
+        return 1
+    if _nand_ram_load(20) != 3 or _nand_ram_load(31) != 1:
+        return 1
+    if _nand_ram_load(7) != 5 or _nand_ram_load(8) != 3 or _nand_ram_load(46) != 2:
+        return 1
+    if _nand_ram_load(35) != 1 or _nand_ram_load(36) != 1:
+        return 1
+    _emit_nand_evidence()
+    _emit_nand_stage(8)
+    0
+
+fn nvme_fw_rv32_selftest() -> i64:
+    _emit_begin()
+    val raw_fail = nvme_fw_rv32_logic_selftest()
+    val nand_ram_fail = _nand_ram_selftest()
+    var fail = raw_fail
+    if nand_ram_fail != 0:
+        fail = fail | 8388608
+    if fail == 0:
+        _emit_pass()
+    else:
+        _emit_fail_mask(fail)
+        _emit_fail()
+    fail
+
+@export("C", name: "rt_rv32_boot_optional_nvme_fw_selftest")
+fn rt_rv32_boot_optional_nvme_fw_selftest() -> i64:
+    nvme_fw_rv32_selftest()
+
+fn main() -> i64:
+    nvme_fw_rv32_selftest()

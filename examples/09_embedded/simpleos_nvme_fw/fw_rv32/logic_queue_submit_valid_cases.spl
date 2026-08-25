@@ -1,0 +1,8 @@
+use logic_queue_phase_core.*
+
+fn rv32_queue_submit_valid_cases_selftest() -> i32:
+    if _rv32_queue_submit_valid(1, 0, 0, 64) != 0:
+        return 1
+    if _rv32_queue_submit_valid(65535, 63, 63, 64) != 0:
+        return 1
+    0

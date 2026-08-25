@@ -1,0 +1,322 @@
+"""
+# Dashboard Ui
+
+Tests for dashboard ui functionality.
+"""
+#![allow(unnamed_duplicate_typed_args)]
+# Interactive dashboard UI tests — self-contained
+
+use std.ui.{column, row, panel, label, text_widget, table_widget,
+             progress, statusbar, divider, build_tree_with_title, UITree,
+             input, button, text_field}
+use common.ui.widget.{UIState, UIEvent}
+use common.ui.state.{init_state, update_state, update_tree}
+
+# ============================================================================
+# State variables
+# ============================================================================
+var BK_AGENT_IDS: [text] = []
+var BK_AGENT_CAPS: [text] = []
+var BK_AGENT_MAX_CONCURRENT: [i64] = []
+var BK_AGENT_PRIORITIES: [i64] = []
+var BK_AGENT_LOADS: [i64] = []
+var BK_AGENT_STATUSES: [text] = []
+var BK_AGENT_COUNT = 0
+
+var BK_TASK_IDS: [text] = []
+var BK_TASK_CONTENTS: [text] = []
+var BK_TASK_CAPS: [text] = []
+var BK_TASK_URGENCIES: [i64] = []
+var BK_TASK_STATUSES: [text] = []
+var BK_TASK_AGENTS: [text] = []
+var BK_TASK_RESULTS: [text] = []
+var BK_TASK_ERRORS: [text] = []
+var BK_TASK_COUNT = 0
+var BK_NEXT_TASK_ID = 1
+var BK_COMPLETED = 0
+
+var INPUT_TASK_CONTENT = ""
+var INPUT_TASK_CAPS = "code"
+var INPUT_AGENT_ID = ""
+var INPUT_AGENT_CAPS = ""
+var STATUS_MSG = ""
+
+# ============================================================================
+# Broker functions (minimal subset for testing)
+# ============================================================================
+
+fn worker_register(id: text, capabilities: text, max_concurrent: i64, priority: i64):
+    BK_AGENT_IDS = BK_AGENT_IDS + [id]
+    BK_AGENT_CAPS = BK_AGENT_CAPS + [capabilities]
+    BK_AGENT_MAX_CONCURRENT = BK_AGENT_MAX_CONCURRENT + [max_concurrent]
+    BK_AGENT_PRIORITIES = BK_AGENT_PRIORITIES + [priority]
+    BK_AGENT_LOADS = BK_AGENT_LOADS + [0]
+    BK_AGENT_STATUSES = BK_AGENT_STATUSES + ["idle"]
+    BK_AGENT_COUNT = BK_AGENT_COUNT + 1
+
+fn _handle_submit(content: text, caps: text) -> text:
+    var tmp_nid = BK_NEXT_TASK_ID
+    val id = "task-" + tmp_nid.to_text()
+    BK_NEXT_TASK_ID = BK_NEXT_TASK_ID + 1
+    BK_TASK_IDS = BK_TASK_IDS + [id]
+    BK_TASK_CONTENTS = BK_TASK_CONTENTS + [content]
+    BK_TASK_CAPS = BK_TASK_CAPS + [caps]
+    BK_TASK_URGENCIES = BK_TASK_URGENCIES + [5]
+    BK_TASK_STATUSES = BK_TASK_STATUSES + ["pending"]
+    BK_TASK_AGENTS = BK_TASK_AGENTS + [""]
+    BK_TASK_RESULTS = BK_TASK_RESULTS + [""]
+    BK_TASK_ERRORS = BK_TASK_ERRORS + [""]
+    BK_TASK_COUNT = BK_TASK_COUNT + 1
+    "Submitted: " + id
+
+fn broker_register_agent(id: text, caps: text) -> text:
+    worker_register(id, caps, 3, 5)
+    "Registered agent: " + id
+
+# ============================================================================
+# Dashboard functions under test
+# ============================================================================
+
+fn dashboard_interactive_ui() -> UITree:
+    var agent_count_text = BK_AGENT_COUNT.to_text()
+    var task_count_text = BK_TASK_COUNT.to_text()
+    var completed_text = BK_COMPLETED.to_text()
+
+    val stats = row("stats", [
+        label("stat_agents", "Agents: " + agent_count_text),
+        label("stat_tasks", "Tasks: " + task_count_text),
+        label("stat_done", "Completed: " + completed_text)
+    ])
+
+    var agent_rows: [[text]] = []
+    var ai = 0
+    while ai < BK_AGENT_COUNT:
+        var ld = BK_AGENT_LOADS[ai]
+        var mx = BK_AGENT_MAX_CONCURRENT[ai]
+        agent_rows = agent_rows + [[
+            BK_AGENT_IDS[ai],
+            BK_AGENT_STATUSES[ai],
+            ld.to_text() + "/" + mx.to_text(),
+            BK_AGENT_CAPS[ai]
+        ]]
+        ai = ai + 1
+
+    val agents_table = table_widget("agents_table",
+        ["ID", "Status", "Load", "Capabilities"],
+        agent_rows
+    )
+
+    var task_rows: [[text]] = []
+    var tj = 0
+    while tj < BK_TASK_COUNT:
+        val agent = BK_TASK_AGENTS[tj]
+        var agent_col = if agent != "": agent else: "-"
+        task_rows = task_rows + [[
+            BK_TASK_IDS[tj],
+            BK_TASK_STATUSES[tj],
+            agent_col,
+            BK_TASK_CONTENTS[tj]
+        ]]
+        tj = tj + 1
+
+    val tasks_table = table_widget("tasks_table",
+        ["ID", "Status", "Agent", "Content"],
+        task_rows
+    )
+
+    val task_form = panel("task_form", "Submit Task", [
+        row("task_inputs", [
+            text_field("task_content_input", INPUT_TASK_CONTENT, "Task description"),
+            text_field("task_caps_input", INPUT_TASK_CAPS, "Capabilities"),
+            button("submit_task_btn", "Submit", "submit_task")
+        ])
+    ])
+
+    val agent_form = panel("agent_form", "Register Agent", [
+        row("agent_inputs", [
+            text_field("agent_id_input", INPUT_AGENT_ID, "Agent ID"),
+            text_field("agent_caps_input", INPUT_AGENT_CAPS, "Capabilities"),
+            button("register_btn", "Register", "register_agent")
+        ])
+    ])
+
+    val actions = row("action_buttons", [
+        button("process_btn", "Process Pending", "process_pending"),
+        button("refresh_btn", "Refresh", "refresh")
+    ])
+
+    val status_text = if STATUS_MSG != "": STATUS_MSG else: "Ready"
+
+    val root = column("dashboard", [
+        stats,
+        divider("div1"),
+        task_form,
+        agent_form,
+        actions,
+        divider("div2"),
+        panel("agents_panel", "Agent Pool", [agents_table]),
+        divider("div3"),
+        panel("tasks_panel", "Task Queue", [tasks_table]),
+        statusbar("status_bar", "mate-broker", status_text)
+    ])
+
+    build_tree_with_title(root, "Mate Broker Dashboard", "dark")
+
+fn _handle_ui_action(state: UIState, name: text):
+    if name == "submit_task":
+        val widget = state.tree.find_widget("task_content_input")
+        var content = ""
+        if widget != nil:
+            content = widget.get_prop("value")
+        if content != "":
+            STATUS_MSG = _handle_submit(content, "code")
+            INPUT_TASK_CONTENT = ""
+        else:
+            STATUS_MSG = "Error: Task content cannot be empty"
+    elif name == "process_pending":
+        STATUS_MSG = "No pending tasks."
+    elif name == "register_agent":
+        val widget = state.tree.find_widget("agent_id_input")
+        var agent_id = ""
+        if widget != nil:
+            agent_id = widget.get_prop("value")
+        if agent_id != "":
+            STATUS_MSG = broker_register_agent(agent_id, "code")
+            INPUT_AGENT_ID = ""
+        else:
+            STATUS_MSG = "Error: Agent ID cannot be empty"
+    elif name == "refresh":
+        STATUS_MSG = "Dashboard refreshed"
+
+# ============================================================================
+# Test setup helper
+# ============================================================================
+
+fn _setup():
+    BK_AGENT_IDS = []
+    BK_AGENT_CAPS = []
+    BK_AGENT_MAX_CONCURRENT = []
+    BK_AGENT_PRIORITIES = []
+    BK_AGENT_LOADS = []
+    BK_AGENT_STATUSES = []
+    BK_AGENT_COUNT = 0
+    BK_TASK_IDS = []
+    BK_TASK_CONTENTS = []
+    BK_TASK_CAPS = []
+    BK_TASK_URGENCIES = []
+    BK_TASK_STATUSES = []
+    BK_TASK_AGENTS = []
+    BK_TASK_RESULTS = []
+    BK_TASK_ERRORS = []
+    BK_TASK_COUNT = 0
+    BK_NEXT_TASK_ID = 1
+    BK_COMPLETED = 0
+    INPUT_TASK_CONTENT = ""
+    INPUT_TASK_CAPS = "code"
+    INPUT_AGENT_ID = ""
+    INPUT_AGENT_CAPS = ""
+    STATUS_MSG = ""
+
+# ============================================================================
+# Tests
+# ============================================================================
+
+describe "Interactive Dashboard UI":
+    """
+    ## Interactive Dashboard Ui Tests
+
+    Validates Interactive Dashboard UI functionality.
+    """
+
+    it "builds a valid UITree":
+        _setup()
+        worker_register("coder", "code", 3, 10)
+        val tree = dashboard_interactive_ui()
+        expect(tree.title_text()).to_equal("Mate Broker Dashboard")
+        expect(tree.theme_name()).to_equal("dark")
+
+    it "contains agent stats":
+        _setup()
+        worker_register("coder", "code", 3, 10)
+        worker_register("reviewer", "review", 2, 8)
+        val tree = dashboard_interactive_ui()
+        val stat = tree.find_widget("stat_agents")
+        expect(stat != nil).to_equal(true)
+
+    it "contains interactive widgets":
+        _setup()
+        val tree = dashboard_interactive_ui()
+        val submit_btn = tree.find_widget("submit_task_btn")
+        expect(submit_btn != nil).to_equal(true)
+        val process_btn = tree.find_widget("process_btn")
+        expect(process_btn != nil).to_equal(true)
+        val register_btn = tree.find_widget("register_btn")
+        expect(register_btn != nil).to_equal(true)
+
+    it "contains input fields":
+        _setup()
+        val tree = dashboard_interactive_ui()
+        val task_input = tree.find_widget("task_content_input")
+        expect(task_input != nil).to_equal(true)
+        val agent_input = tree.find_widget("agent_id_input")
+        expect(agent_input != nil).to_equal(true)
+
+    it "shows status message":
+        _setup()
+        STATUS_MSG = "Task submitted"
+        val tree = dashboard_interactive_ui()
+        val status = tree.find_widget("status_bar")
+        expect(status != nil).to_equal(true)
+
+    it "creates valid UIState from tree":
+        _setup()
+        worker_register("coder", "code", 3, 10)
+        val tree = dashboard_interactive_ui()
+        val state = init_state(tree)
+        expect(state.mode_name()).to_equal("normal")
+
+describe "Dashboard Action Handling":
+    it "handles refresh action":
+        _setup()
+        val tree = dashboard_interactive_ui()
+        val state = init_state(tree)
+        _handle_ui_action(state, "refresh")
+        expect(STATUS_MSG).to_equal("Dashboard refreshed")
+
+    it "handles process_pending with no tasks":
+        _setup()
+        val tree = dashboard_interactive_ui()
+        val state = init_state(tree)
+        _handle_ui_action(state, "process_pending")
+        expect(STATUS_MSG).to_contain("No pending")
+
+    it "rejects empty task submission":
+        _setup()
+        val tree = dashboard_interactive_ui()
+        val state = init_state(tree)
+        _handle_ui_action(state, "submit_task")
+        expect(STATUS_MSG).to_contain("Error")
+
+    it "rejects empty agent registration":
+        _setup()
+        val tree = dashboard_interactive_ui()
+        val state = init_state(tree)
+        _handle_ui_action(state, "register_agent")
+        expect(STATUS_MSG).to_contain("Error")
+
+describe "Broker Wrappers":
+    it "registers agent via wrapper":
+        _setup()
+        val result = broker_register_agent("test-agent", "code,review")
+        expect(result).to_contain("test-agent")
+        expect(BK_AGENT_COUNT).to_equal(1)
+        expect(BK_AGENT_IDS[0]).to_equal("test-agent")
+
+    it "reflects registered agents in dashboard":
+        _setup()
+        broker_register_agent("a1", "code")
+        broker_register_agent("a2", "review")
+        val tree = dashboard_interactive_ui()
+        val agents_table = tree.find_widget("agents_table")
+        expect(agents_table != nil).to_equal(true)
+        expect(BK_AGENT_COUNT).to_equal(2)

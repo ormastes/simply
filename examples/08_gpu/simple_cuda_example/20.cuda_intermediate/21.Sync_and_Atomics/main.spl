@@ -1,0 +1,366 @@
+# Exercise 21: Synchronization and Atomics
+#
+# Demonstrates, on a real CUDA device:
+# - atom.add for counters and histograms
+# - atom.min / atom.max for reductions
+# - atom.cas for compare-and-swap ("set if greater")
+# - bar.sync (block barrier) + shared memory for a two-phase reduction
+#
+# Kernels are hand-written PTX loaded through `std.cuda` — the only path in
+# the Rust seed that really executes on the GPU (see lib/gpu_test_helpers.spl).
+# Each entry mirrors the CUDA kernel of the same name in
+# cuda_exercise/20.cuda_intermediate/21.Sync_and_Atomics.
+
+use ..gpu_test_helpers.{
+    gpu_setup, gpu_teardown,
+    gpu_upload_i32s, gpu_download_i32s, gpu_upload_f32s, gpu_download_f32s,
+    gpu_alloc_zeroed_words, gpu_free_ptr,
+    gpu_load_ptx, gpu_unload, gpu_run_1d, grid_for
+}
+
+val BLOCK_SIZE = 256
+
+# ----------------------------------------------------------------------------
+# PTX kernels
+# ----------------------------------------------------------------------------
+# Every kernel starts with the CUDA idiom
+#     idx = blockIdx.x * blockDim.x + threadIdx.x;  if (idx >= n) return;
+# in PTX:  mad.lo.u32 %r4, %ctaid.x, %ntid.x, %tid.x ; setp.ge ; @p bra
+val PTX = """
+.version 7.0
+.target sm_75
+.address_size 64
+
+// __global__ void atomic_count(int* counter, int n) { atomicAdd(counter, 1); }
+.visible .entry atomic_count_kernel(.param .u64 counter, .param .u64 n)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [counter];
+    ld.param.u64 %rd2, [n];
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r4, %r1, %r2, %r3;
+    cvt.u64.u32 %rd3, %r4;
+    setp.ge.u64 %p1, %rd3, %rd2;
+    @%p1 bra DONE;
+    atom.global.add.u32 %r5, [%rd1], 1;
+DONE:
+    ret;
+}
+
+// __global__ void atomic_minmax(const int* data, int* mn, int* mx, int n)
+.visible .entry atomic_minmax_kernel(.param .u64 data, .param .u64 mn, .param .u64 mx, .param .u64 n)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<10>;
+    ld.param.u64 %rd1, [data];
+    ld.param.u64 %rd2, [mn];
+    ld.param.u64 %rd3, [mx];
+    ld.param.u64 %rd4, [n];
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r4, %r1, %r2, %r3;
+    cvt.u64.u32 %rd5, %r4;
+    setp.ge.u64 %p1, %rd5, %rd4;
+    @%p1 bra DONE;
+    shl.b64 %rd6, %rd5, 2;
+    add.u64 %rd7, %rd1, %rd6;
+    ld.global.s32 %r5, [%rd7];
+    atom.global.min.s32 %r6, [%rd2], %r5;
+    atom.global.max.s32 %r7, [%rd3], %r5;
+DONE:
+    ret;
+}
+
+// __global__ void histogram(const int* data, int* hist, int n, int bins)
+//   bin = data[i] % bins; if (bin < 0) bin += bins; atomicAdd(&hist[bin], 1);
+.visible .entry histogram_kernel(.param .u64 data, .param .u64 hist, .param .u64 n, .param .u64 bins)
+{
+    .reg .pred %p<3>;
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<12>;
+    ld.param.u64 %rd1, [data];
+    ld.param.u64 %rd2, [hist];
+    ld.param.u64 %rd3, [n];
+    ld.param.u64 %rd4, [bins];
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r4, %r1, %r2, %r3;
+    cvt.u64.u32 %rd5, %r4;
+    setp.ge.u64 %p1, %rd5, %rd3;
+    @%p1 bra DONE;
+    shl.b64 %rd6, %rd5, 2;
+    add.u64 %rd7, %rd1, %rd6;
+    ld.global.s32 %r5, [%rd7];
+    cvt.u32.u64 %r6, %rd4;
+    rem.s32 %r7, %r5, %r6;
+    setp.lt.s32 %p2, %r7, 0;
+    @%p2 add.s32 %r7, %r7, %r6;
+    cvt.u64.u32 %rd8, %r7;
+    shl.b64 %rd9, %rd8, 2;
+    add.u64 %rd10, %rd2, %rd9;
+    atom.global.add.u32 %r8, [%rd10], 1;
+DONE:
+    ret;
+}
+
+// __global__ void cas_set_if_greater(int* target, const int* data, int n)
+//   int v = data[i]; int old = *target;
+//   while (v > old) { int prev = atomicCAS(target, old, v); if (prev == old) break; old = prev; }
+.visible .entry cas_set_if_greater_kernel(.param .u64 target, .param .u64 data, .param .u64 n)
+{
+    .reg .pred %p<4>;
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<10>;
+    ld.param.u64 %rd1, [target];
+    ld.param.u64 %rd2, [data];
+    ld.param.u64 %rd3, [n];
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r4, %r1, %r2, %r3;
+    cvt.u64.u32 %rd4, %r4;
+    setp.ge.u64 %p1, %rd4, %rd3;
+    @%p1 bra DONE;
+    shl.b64 %rd5, %rd4, 2;
+    add.u64 %rd6, %rd2, %rd5;
+    ld.global.s32 %r5, [%rd6];
+    ld.global.s32 %r6, [%rd1];
+CAS_LOOP:
+    setp.le.s32 %p2, %r5, %r6;
+    @%p2 bra DONE;
+    atom.global.cas.b32 %r7, [%rd1], %r6, %r5;
+    setp.eq.s32 %p3, %r7, %r6;
+    @%p3 bra DONE;
+    mov.b32 %r6, %r7;
+    bra CAS_LOOP;
+DONE:
+    ret;
+}
+
+// __global__ void block_reduce_sum(const float* data, float* result, int n)
+//   __shared__ float sh[256]; sh[tid] = i < n ? data[i] : 0; __syncthreads();
+//   for (s = blockDim.x/2; s > 0; s >>= 1) { if (tid < s) sh[tid] += sh[tid+s]; __syncthreads(); }
+//   if (tid == 0) atomicAdd(result, sh[0]);
+.visible .entry block_reduce_sum_kernel(.param .u64 data, .param .u64 result, .param .u64 n)
+{
+    .reg .pred %p<4>;
+    .reg .b32 %r<16>;
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<16>;
+    .shared .align 4 .b8 sh[1024];
+    ld.param.u64 %rd1, [data];
+    ld.param.u64 %rd2, [result];
+    ld.param.u64 %rd3, [n];
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r4, %r1, %r2, %r3;
+    cvt.u64.u32 %rd4, %r4;
+    mov.f32 %f1, 0f00000000;
+    setp.ge.u64 %p1, %rd4, %rd3;
+    @%p1 bra STORE_SH;
+    shl.b64 %rd5, %rd4, 2;
+    add.u64 %rd6, %rd1, %rd5;
+    ld.global.f32 %f1, [%rd6];
+STORE_SH:
+    mov.u64 %rd7, sh;
+    cvt.u64.u32 %rd8, %r3;
+    shl.b64 %rd9, %rd8, 2;
+    add.u64 %rd10, %rd7, %rd9;
+    st.shared.f32 [%rd10], %f1;
+    bar.sync 0;
+    shr.u32 %r5, %r2, 1;
+LOOP:
+    setp.eq.u32 %p2, %r5, 0;
+    @%p2 bra AFTER;
+    setp.ge.u32 %p3, %r3, %r5;
+    @%p3 bra SKIP;
+    cvt.u64.u32 %rd11, %r5;
+    shl.b64 %rd12, %rd11, 2;
+    add.u64 %rd13, %rd10, %rd12;
+    ld.shared.f32 %f2, [%rd10];
+    ld.shared.f32 %f3, [%rd13];
+    add.f32 %f4, %f2, %f3;
+    st.shared.f32 [%rd10], %f4;
+SKIP:
+    bar.sync 0;
+    shr.u32 %r5, %r5, 1;
+    bra LOOP;
+AFTER:
+    setp.ne.u32 %p3, %r3, 0;
+    @%p3 bra DONE;
+    ld.shared.f32 %f5, [%rd7];
+    atom.global.add.f32 %f6, [%rd2], %f5;
+DONE:
+    ret;
+}
+"""
+
+# ----------------------------------------------------------------------------
+# Host-side patterns. Each returns Err(text) when the device path fails.
+# ----------------------------------------------------------------------------
+
+# Pattern 1: every thread atomically increments one counter.
+fn run_atomic_count(module: i64, n: i64) -> Result<i64, text>:
+    val counter = gpu_alloc_zeroed_words(1)
+    if counter == 0:
+        return Err("alloc failed")
+    val ok = gpu_run_1d(module, "atomic_count_kernel", grid_for(n, BLOCK_SIZE), BLOCK_SIZE, [counter, n])
+    val out = gpu_download_i32s(counter, 1)
+    gpu_free_ptr(counter)
+    if not ok or out.len() != 1:
+        return Err("atomic_count launch failed")
+    Ok(out[0])
+
+# Pattern 2: global min/max via atomics. Returns [min, max].
+fn run_atomic_minmax(module: i64, data: [i64]) -> Result<[i64], text>:
+    val n = data.len()
+    val data_dev = gpu_upload_i32s(data)
+    val min_dev = gpu_upload_i32s([2147483647])
+    val max_dev = gpu_upload_i32s([-2147483648])
+    if data_dev == 0 or min_dev == 0 or max_dev == 0:
+        return Err("alloc failed")
+    val ok = gpu_run_1d(module, "atomic_minmax_kernel", grid_for(n, BLOCK_SIZE), BLOCK_SIZE, [data_dev, min_dev, max_dev, n])
+    val mn = gpu_download_i32s(min_dev, 1)
+    val mx = gpu_download_i32s(max_dev, 1)
+    gpu_free_ptr(data_dev)
+    gpu_free_ptr(min_dev)
+    gpu_free_ptr(max_dev)
+    if not ok or mn.len() != 1 or mx.len() != 1:
+        return Err("atomic_minmax launch failed")
+    Ok([mn[0], mx[0]])
+
+# Pattern 3: histogram with one atomic add per element.
+fn run_histogram(module: i64, data: [i64], num_bins: i64) -> Result<[i64], text>:
+    val n = data.len()
+    val data_dev = gpu_upload_i32s(data)
+    val hist_dev = gpu_alloc_zeroed_words(num_bins)
+    if data_dev == 0 or hist_dev == 0:
+        return Err("alloc failed")
+    val ok = gpu_run_1d(module, "histogram_kernel", grid_for(n, BLOCK_SIZE), BLOCK_SIZE, [data_dev, hist_dev, n, num_bins])
+    val hist = gpu_download_i32s(hist_dev, num_bins)
+    gpu_free_ptr(data_dev)
+    gpu_free_ptr(hist_dev)
+    if not ok or hist.len() != num_bins:
+        return Err("histogram launch failed")
+    Ok(hist)
+
+# Pattern 4: compare-and-swap loop implementing "set if greater" (a max).
+fn run_cas_max(module: i64, data: [i64]) -> Result<i64, text>:
+    val n = data.len()
+    val data_dev = gpu_upload_i32s(data)
+    val target_dev = gpu_upload_i32s([-2147483648])
+    if data_dev == 0 or target_dev == 0:
+        return Err("alloc failed")
+    val ok = gpu_run_1d(module, "cas_set_if_greater_kernel", grid_for(n, BLOCK_SIZE), BLOCK_SIZE, [target_dev, data_dev, n])
+    val out = gpu_download_i32s(target_dev, 1)
+    gpu_free_ptr(data_dev)
+    gpu_free_ptr(target_dev)
+    if not ok or out.len() != 1:
+        return Err("cas launch failed")
+    Ok(out[0])
+
+# Pattern 5: shared-memory block reduction + one atomic add per block.
+fn run_block_reduce_sum(module: i64, data: [f32]) -> Result<f32, text>:
+    val n = data.len()
+    val data_dev = gpu_upload_f32s(data)
+    val result_dev = gpu_alloc_zeroed_words(1)
+    if data_dev == 0 or result_dev == 0:
+        return Err("alloc failed")
+    val ok = gpu_run_1d(module, "block_reduce_sum_kernel", grid_for(n, BLOCK_SIZE), BLOCK_SIZE, [data_dev, result_dev, n])
+    val out = gpu_download_f32s(result_dev, 1)
+    gpu_free_ptr(data_dev)
+    gpu_free_ptr(result_dev)
+    if not ok or out.len() != 1:
+        return Err("block_reduce launch failed")
+    Ok(out[0])
+
+# ----------------------------------------------------------------------------
+# CPU references (used by spec.spl and by main for self-checking)
+# ----------------------------------------------------------------------------
+
+fn make_ramp(n: i64) -> [i64]:
+    var data: [i64] = []
+    for i in 0..n:
+        data.push(i * 7 - 500)
+    data
+
+fn cpu_histogram(data: [i64], num_bins: i64) -> [i64]:
+    var hist: [i64] = []
+    for b in 0..num_bins:
+        hist.push(0)
+    for v in data:
+        var bin = v % num_bins
+        if bin < 0:
+            bin = bin + num_bins
+        hist[bin] = hist[bin] + 1
+    hist
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+
+fn main():
+    val ctx = gpu_setup(0)
+    if ctx == 0:
+        print "No CUDA device available; nothing to run."
+        return
+    val module = gpu_load_ptx(PTX)
+    if module == 0:
+        gpu_teardown(ctx)
+        return
+
+    print "=== Atomic Counter ==="
+    match run_atomic_count(module, 10000):
+        case Ok(count):
+            print "  Count: {count} (expected 10000)"
+        case Err(e):
+            print "  error: {e}"
+
+    print "=== Atomic Min/Max ==="
+    val data = make_ramp(1000)
+    match run_atomic_minmax(module, data):
+        case Ok(mm):
+            print "  Min: {mm[0]} (expected -500), Max: {mm[1]} (expected 6493)"
+        case Err(e):
+            print "  error: {e}"
+
+    print "=== Histogram ==="
+    var hist_data: [i64] = []
+    for i in 0..1000:
+        hist_data.push(i % 10)
+    match run_histogram(module, hist_data, 10):
+        case Ok(hist):
+            print "  Bin counts (should each be 100):"
+            for bin in 0..10:
+                print "    bin[{bin}] = {hist[bin]}"
+        case Err(e):
+            print "  error: {e}"
+
+    print "=== CAS Set-If-Greater ==="
+    match run_cas_max(module, data):
+        case Ok(m):
+            print "  Max via CAS: {m} (expected 6493)"
+        case Err(e):
+            print "  error: {e}"
+
+    print "=== Block Reduce Sum ==="
+    var ones: [f32] = []
+    for i in 0..1024:
+        ones.push(1.0)
+    match run_block_reduce_sum(module, ones):
+        case Ok(total):
+            print "  Sum: {total} (expected 1024.0)"
+        case Err(e):
+            print "  error: {e}"
+
+    gpu_unload(module)
+    gpu_teardown(ctx)
+    print "All sync and atomics demos complete."

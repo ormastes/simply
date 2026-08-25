@@ -1,0 +1,7 @@
+mcp:
+  server:
+    name: "obsidian-search"
+    version: "0.1.0"
+    command: "simple"
+    args: ["run", "src/main.spl"]
+    protocol: "stdio"

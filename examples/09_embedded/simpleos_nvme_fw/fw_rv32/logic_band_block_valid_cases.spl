@@ -1,0 +1,10 @@
+use logic_band_geometry_core.*
+
+fn rv32_band_block_valid_cases_selftest() -> i32:
+    if _rv32_band_block_valid_impl(0) != 1:
+        return 1
+    if _rv32_band_block_valid_impl(63) != 1:
+        return 1
+    if _rv32_band_block_valid_impl(64) != 0:
+        return 1
+    0

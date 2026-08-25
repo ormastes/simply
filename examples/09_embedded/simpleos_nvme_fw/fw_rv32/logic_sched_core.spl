@@ -1,0 +1,24 @@
+pub fn _rv32_sched_channel_of(block: i64) -> i64:
+    if block < 0:
+        return 0
+    block % 8
+
+pub fn _rv32_sched_depth_clamped(depth: i64) -> i64:
+    if depth < 0:
+        return 0
+    depth
+
+pub fn _rv32_sched_balanced_steps(ops: i64) -> i64:
+    if ops <= 0:
+        return 0
+    (ops + 7) / 8
+
+pub fn _rv32_sched_same_channel_steps(ops: i64) -> i64:
+    if ops <= 0:
+        return 0
+    ops
+
+pub fn _rv32_sched_completed(done: i64) -> i64:
+    if done < 0:
+        return 0
+    done

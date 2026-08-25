@@ -1,0 +1,8 @@
+# TRACE32 MCP diagnostics owner.
+
+use std.log.{error}
+
+fn t32_stderr(message: text):
+    error("t32-mcp", message)
+
+export t32_stderr

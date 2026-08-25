@@ -1,0 +1,197 @@
+#![allow(unnamed_duplicate_typed_args)]
+# Nerd Font & Special Character Support
+# Unicode constants, box-drawing, and Nerd Font icon lookup.
+
+use std.io_runtime.{env_get}
+
+# ============================================================================
+# Box-Drawing Characters
+# ============================================================================
+
+struct BoxChars:
+    top_left: text
+    top_right: text
+    bottom_left: text
+    bottom_right: text
+    horizontal: text
+    vertical: text
+    tee_left: text
+    tee_right: text
+    tee_top: text
+    tee_bottom: text
+    cross: text
+
+fn unicode_box() -> BoxChars:
+    BoxChars(
+        top_left: "\u{250c}",
+        top_right: "\u{2510}",
+        bottom_left: "\u{2514}",
+        bottom_right: "\u{2518}",
+        horizontal: "\u{2500}",
+        vertical: "\u{2502}",
+        tee_left: "\u{2524}",
+        tee_right: "\u{251c}",
+        tee_top: "\u{2534}",
+        tee_bottom: "\u{252c}",
+        cross: "\u{253c}"
+    )
+
+fn ascii_box() -> BoxChars:
+    BoxChars(
+        top_left: "+",
+        top_right: "+",
+        bottom_left: "+",
+        bottom_right: "+",
+        horizontal: "-",
+        vertical: "|",
+        tee_left: "+",
+        tee_right: "+",
+        tee_top: "+",
+        tee_bottom: "+",
+        cross: "+"
+    )
+
+fn rounded_box() -> BoxChars:
+    BoxChars(
+        top_left: "\u{256d}",
+        top_right: "\u{256e}",
+        bottom_left: "\u{2570}",
+        bottom_right: "\u{256f}",
+        horizontal: "\u{2500}",
+        vertical: "\u{2502}",
+        tee_left: "\u{2524}",
+        tee_right: "\u{251c}",
+        tee_top: "\u{2534}",
+        tee_bottom: "\u{252c}",
+        cross: "\u{253c}"
+    )
+
+# ============================================================================
+# Nerd Font Icons
+# ============================================================================
+
+fn icon(name: text) -> text:
+    match name:
+        # File types
+        "file" => "\u{f15b}"
+        "folder" => "\u{f07b}"
+        "folder_open" => "\u{f07c}"
+        "code" => "\u{f121}"
+        "terminal" => "\u{f120}"
+        "gear" => "\u{f013}"
+        "cog" => "\u{f013}"
+        # Git
+        "git_branch" => "\u{e0a0}"
+        "git_commit" => "\u{f417}"
+        "git_merge" => "\u{e727}"
+        # Status
+        "check" => "\u{f00c}"
+        "cross" => "\u{f00d}"
+        "warning" => "\u{f071}"
+        "info" => "\u{f05a}"
+        "question" => "\u{f128}"
+        "spinner" => "\u{f110}"
+        # Arrows
+        "arrow_right" => "\u{f061}"
+        "arrow_left" => "\u{f060}"
+        "arrow_up" => "\u{f062}"
+        "arrow_down" => "\u{f063}"
+        "chevron_right" => "\u{f054}"
+        "chevron_left" => "\u{f053}"
+        # UI
+        "search" => "\u{f002}"
+        "bell" => "\u{f0f3}"
+        "clock" => "\u{f017}"
+        "send" => "\u{f1d8}"
+        "robot" => "\u{f544}"
+        "brain" => "\u{f5dc}"
+        # Fallback
+        _ => "?"
+
+fn icon_or_ascii(name: text, ascii_fallback: text, use_nerd: bool) -> text:
+    if use_nerd:
+        return icon(name)
+    return ascii_fallback
+
+# ============================================================================
+# Spinner Frames (for loading indicators)
+# ============================================================================
+
+fn spinner_frames() -> [text]:
+    return ["\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}", "\u{2807}", "\u{280f}"]
+
+fn ascii_spinner_frames() -> [text]:
+    return ["|", "/", "-", "\\"]
+
+# ============================================================================
+# Box Rendering
+# ============================================================================
+
+fn render_box(x: i32, y: i32, w: i32, h: i32, use_nerd: bool) -> [text]:
+    val bc = if use_nerd: rounded_box() else: ascii_box()
+    var result: [text] = []
+
+    # Top border
+    var top = bc.top_left
+    var i = 0
+    while i < w - 2:
+        top = "{top}{bc.horizontal}"
+        i = i + 1
+    top = "{top}{bc.top_right}"
+    result.push(top)
+
+    # Middle rows
+    i = 0
+    while i < h - 2:
+        var mid = bc.vertical
+        var j = 0
+        while j < w - 2:
+            mid = "{mid} "
+            j = j + 1
+        mid = "{mid}{bc.vertical}"
+        result.push(mid)
+        i = i + 1
+
+    # Bottom border
+    var bottom = bc.bottom_left
+    i = 0
+    while i < w - 2:
+        bottom = "{bottom}{bc.horizontal}"
+        i = i + 1
+    bottom = "{bottom}{bc.bottom_right}"
+    result.push(bottom)
+
+    return result
+
+fn render_box_with_title(x: i32, y: i32, w: i32, h: i32, title: text, use_nerd: bool) -> [text]:
+    var box_lines = render_box(x, y, w, h, use_nerd)
+    if box_lines.len() > 0 and title.len() > 0:
+        val bc = if use_nerd: rounded_box() else: ascii_box()
+        # Replace top with title
+        var top = bc.top_left
+        top = "{top}{bc.horizontal} {title} "
+        var remaining = w - 4 - title.len()
+        var i = 0
+        while i < remaining:
+            top = "{top}{bc.horizontal}"
+            i = i + 1
+        top = "{top}{bc.top_right}"
+        box_lines[0] = top
+    return box_lines
+
+# ============================================================================
+# Detection
+# ============================================================================
+
+fn has_nerd_font() -> bool:
+    val nf = env_get("NERD_FONT")
+    if nf == "1" or nf == "true":
+        return true
+    # Check for known Nerd Font terminal emulators
+    val term_program = env_get("TERM_PROGRAM")
+    if term_program == "iTerm.app" or term_program == "WezTerm":
+        return true
+    val kitty = env_get("KITTY_PID")
+    if kitty != "" and kitty != nil:
+        return true
+    return false

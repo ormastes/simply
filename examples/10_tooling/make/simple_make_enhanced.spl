@@ -1,0 +1,209 @@
+## simple_make_enhanced — Enhanced Make for SimpleOS
+##
+## A full-featured make implementation with conditionals, built-in functions,
+## parallel builds, VPATH, and colored output. Goes beyond the minimal
+## simple_make in src/os/port/build_tools/.
+##
+## Usage:
+##   bin/simple run examples/make/simple_make_enhanced.spl
+##   bin/simple run examples/make/simple_make_enhanced.spl -- -j 4 all
+##   bin/simple run examples/make/simple_make_enhanced.spl -- -f build.mk --dry-run
+##   bin/simple run examples/make/simple_make_enhanced.spl -- --help
+
+use std.fs
+use std.process
+use std.text
+use std.cli
+
+# Import project modules
+use make_parser
+use make_executor
+
+# --- CLI ---
+
+struct MakeCliArgs:
+    build_file: text
+    targets: [text]
+    jobs: i64
+    dry_run: bool
+    verbose: bool
+    color: bool
+    show_help: bool
+    definitions: [MakeVar]   # -DVAR=VALUE from command line
+
+fn parse_cli_args(args: [text]) -> MakeCliArgs:
+    """Parse command-line arguments."""
+    var build_file = "Makefile"
+    var targets: [text] = []
+    var jobs = 1
+    var dry_run = false
+    var verbose = false
+    var color = true
+    var show_help = false
+    var definitions: [MakeVar] = []
+
+    var i = 0
+    while i < args.len():
+        val arg = args[i]
+
+        if arg == "-f":
+            i = i + 1
+            if i < args.len():
+                build_file = args[i]
+
+        else if arg == "-j":
+            i = i + 1
+            if i < args.len():
+                jobs = args[i].parse_int()
+
+        else if arg == "-n" or arg == "--dry-run":
+            dry_run = true
+
+        else if arg == "-v" or arg == "--verbose":
+            verbose = true
+
+        else if arg == "--no-color":
+            color = false
+
+        else if arg == "--help" or arg == "-h":
+            show_help = true
+
+        else if arg.contains("=") and not arg.starts_with("-"):
+            # VAR=VALUE on command line
+            val eq_pos = arg.index_of("=")
+            val name = arg.slice(0, eq_pos)
+            val value = arg.slice(eq_pos + 1, arg.len())
+            definitions.push(MakeVar(name: name, value: value, flavor: "simple"))
+
+        else if not arg.starts_with("-"):
+            targets.push(arg)
+
+        i = i + 1
+
+    MakeCliArgs(
+        build_file: build_file,
+        targets: targets,
+        jobs: jobs,
+        dry_run: dry_run,
+        verbose: verbose,
+        color: color,
+        show_help: show_help,
+        definitions: definitions,
+    )
+
+fn print_help():
+    print "simple_make_enhanced -- Enhanced Make for SimpleOS"
+    print ""
+    print "Usage:"
+    print "  simple_make_enhanced [options] [VAR=VALUE...] [targets...]"
+    print ""
+    print "Options:"
+    print "  -f FILE       Use FILE as the Makefile (default: Makefile)"
+    print "  -j N          Run N jobs in parallel (default: 1)"
+    print "  -n, --dry-run Print commands without executing them"
+    print "  -v, --verbose Show extra build information"
+    print "  --no-color    Disable colored output"
+    print "  --help, -h    Show this help"
+    print ""
+    print "Features beyond simple_make:"
+    print "  .PHONY targets"
+    print "  include FILE"
+    print "  ifeq/ifneq/ifdef/ifndef conditionals"
+    print "  $(shell CMD), $(wildcard PATTERN)"
+    print "  $(patsubst FROM,TO,TEXT), $(foreach VAR,LIST,TEXT)"
+    print "  $(filter PATTERN,TEXT), $(filter-out PATTERN,TEXT)"
+    print "  $(notdir TEXT), $(basename TEXT), $(dir TEXT)"
+    print "  $(addsuffix SUFFIX,TEXT), $(addprefix PREFIX,TEXT)"
+    print "  $(subst FROM,TO,TEXT), $(sort TEXT)"
+    print "  VPATH / vpath for source search paths"
+    print "  := (simple), += (append), ?= (conditional) assignment"
+    print "  @ (silent) and - (ignore error) command prefixes"
+    print "  | (order-only) prerequisites"
+    print "  Line continuations with backslash"
+    print "  Colored progress output"
+
+# --- Main ---
+
+fn main():
+    val args = cli.args()
+    val cli_args = parse_cli_args(args)
+
+    if cli_args.show_help:
+        print_help()
+        return
+
+    # Check for build file alternatives
+    var build_file = cli_args.build_file
+    if build_file == "Makefile":
+        if not fs.exists("Makefile"):
+            if fs.exists("makefile"):
+                build_file = "makefile"
+            else if fs.exists("GNUmakefile"):
+                build_file = "GNUmakefile"
+
+    if not fs.exists(build_file):
+        print "[make] No '{build_file}' found in current directory"
+        process.exit(1)
+
+    # Parse Makefile
+    val makefile = parse_makefile(build_file)
+
+    # Apply command-line variable definitions (override file definitions)
+    for d in cli_args.definitions:
+        makefile.vars.push(d)
+
+    # Determine targets
+    var targets = cli_args.targets
+    if targets.len() == 0:
+        if makefile.default_target.len() > 0:
+            targets = [makefile.default_target]
+        else:
+            print "[make] No target specified and no default target found"
+            process.exit(1)
+
+    # Report
+    val opts = BuildOptions(
+        jobs: cli_args.jobs,
+        dry_run: cli_args.dry_run,
+        verbose: cli_args.verbose,
+        color: cli_args.color,
+    )
+
+    if cli_args.verbose:
+        print "[make] Build file: {build_file}"
+        print "[make] Targets: {targets.join(" ")}"
+        print "[make] Rules: {makefile.rules.len()}"
+        print "[make] Variables: {makefile.vars.len()}"
+        if makefile.vpaths.len() > 0:
+            print "[make] VPATHs: {makefile.vpaths.len()}"
+        if cli_args.jobs > 1:
+            print "[make] Parallel jobs: {cli_args.jobs}"
+        if cli_args.dry_run:
+            print "[make] Dry-run mode"
+
+    # Count targets for progress
+    var visited: [text] = []
+    var total = 0
+    for t in targets:
+        total = total + count_buildable_targets(makefile, t, visited)
+
+    # Build
+    val state = BuildState(
+        makefile: makefile,
+        options: opts,
+        built: [],
+        in_progress: [],
+        total_targets: total,
+        completed_targets: 0,
+        failed: false,
+    )
+
+    print_colored(cli_args.color, COLOR_BOLD,
+                  "[make] Building '{targets.join(" ")}' from '{build_file}'...")
+
+    val ok = build_targets_parallel(state, targets)
+
+    print_summary(state)
+
+    if not ok:
+        process.exit(1)

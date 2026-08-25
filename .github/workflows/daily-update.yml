@@ -1,0 +1,23 @@
+name: daily-update
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  push:
+    paths: [data/registry.sdn, scripts/update_site.sh, docs/glass.css]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  regenerate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Regenerate site
+        run: sh scripts/update_site.sh
+      - name: Commit if changed
+        run: |
+          git config user.name "simply-bot"
+          git config user.email "ormastespq@gmail.com"
+          git add docs/index.html
+          git diff --cached --quiet || git commit -m "chore(site): daily regenerate"
+          git push

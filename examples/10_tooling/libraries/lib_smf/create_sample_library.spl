@@ -1,0 +1,84 @@
+#![allow(unnamed_duplicate_typed_args)]
+#!/usr/bin/env simple
+# Example: Create a sample library archive
+#
+# This example shows how to bundle multiple SMF modules into a library.
+# Note: This must be run in compiled mode, not interpreter mode.
+
+use compiler.linker.lib_smf_writer.{LibSmfBuilder}
+use app.io.{file_write, file_exists, file_delete}
+
+fn create_sample_smf(name: text, code: text) -> [u8]:
+    """Create a minimal SMF file with some dummy content."""
+    var data: [u8] = []
+
+    # SMF Header (simplified - just magic and version)
+    data.push(83)  # 'S'
+    data.push(77)  # 'M'
+    data.push(70)  # 'F'
+    data.push(0)   # null terminator
+
+    data.push(1)   # version major
+    data.push(1)   # version minor
+
+    # Pad to minimum header size (128 bytes)
+    while data.len() < 128:
+        data.push(0)
+
+    # Add some unique content based on module name and code
+    for char in name:
+        data.push(char as u8)
+
+    for char in code:
+        data.push(char as u8)
+
+    data
+
+fn main():
+    print "========================================="
+    print "Creating Sample Library Archive"
+    print "========================================="
+    print ""
+
+    # Create library builder
+    var builder = LibSmfBuilder.new()
+    builder.set_verbose(true)
+
+    # Add sample modules
+    print "Adding modules..."
+    val mod1_smf = create_sample_smf("math/add", "fn add(a, b): a + b")
+    val mod2_smf = create_sample_smf("math/sub", "fn sub(a, b): a - b")
+    val mod3_smf = create_sample_smf("math/mul", "fn mul(a, b): a * b")
+
+    var result1 = builder.add_module_data("math/add", mod1_smf)
+    var result2 = builder.add_module_data("math/sub", mod2_smf)
+    var result3 = builder.add_module_data("math/mul", mod3_smf)
+
+    if result1.is_err() or result2.is_err() or result3.is_err():
+        print "Error adding modules!"
+        exit(1)
+
+    print ""
+    print "Library contains {builder.module_count()} modules:"
+    for name in builder.module_names():
+        print "  - {name}"
+
+    # Write library
+    print ""
+    val output_path = "libmath.lsm"
+    print "Writing library to: {output_path}"
+
+    val write_result = builder.write(output_path)
+    if write_result.is_err():
+        print "Error writing library: {write_result.unwrap_err()}"
+        exit(1)
+
+    print ""
+    print "========================================="
+    print "Library created successfully!"
+    print "========================================="
+    print ""
+    print "You can now use this library with:"
+    print "  var loader = create_loader_with_stdlib()"
+    print "  loader.add_library(\"libmath.lsm\")"
+    print "  loader.load_module(\"math/add\")"

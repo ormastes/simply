@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Acme Cloud - Sample Rendering Page</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, "Helvetica Neue", Arial, sans-serif;
+    color: #1f2933; background: #f5f7fa; line-height: 1.5;
+  }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px 32px; background: #0b1f3a; color: #fff;
+    box-shadow: 0 2px 8px rgba(0,0,0,.25);
+  }
+  header .brand { font-size: 20px; font-weight: 700; letter-spacing: .5px; }
+  nav a { color: #cdd9ec; text-decoration: none; margin-left: 24px; font-size: 14px; }
+  nav a:hover { color: #fff; }
+  .hero {
+    padding: 64px 32px; text-align: center;
+    background: linear-gradient(135deg, #1e3a8a 0%, #6d28d9 100%); color: #fff;
+  }
+  .hero h1 { font-size: 40px; margin-bottom: 12px; }
+  .hero p { font-size: 18px; opacity: .9; margin-bottom: 24px; }
+  .btn {
+    display: inline-block; padding: 12px 28px; border-radius: 8px;
+    background: #f59e0b; color: #1f2933; font-weight: 600; text-decoration: none;
+    box-shadow: 0 4px 12px rgba(245,158,11,.4);
+  }
+  .btn.secondary { background: rgba(255,255,255,.15); color: #fff; margin-left: 12px; }
+  .features { display: flex; gap: 24px; padding: 48px 32px; flex-wrap: wrap; justify-content: center; }
+  .card {
+    flex: 1 1 260px; max-width: 320px; background: #fff; border-radius: 12px;
+    padding: 24px; box-shadow: 0 6px 18px rgba(15,31,58,.08);
+  }
+  .card .icon { width: 44px; height: 44px; border-radius: 10px; margin-bottom: 14px; }
+  .card:nth-child(1) .icon { background: #2563eb; }
+  .card:nth-child(2) .icon { background: #16a34a; }
+  .card:nth-child(3) .icon { background: #dc2626; }
+  .card h3 { font-size: 18px; margin-bottom: 8px; }
+  .card p { font-size: 14px; color: #52606d; }
+  section.data { padding: 16px 32px 48px; }
+  section.data h2 { font-size: 24px; margin-bottom: 16px; }
+  table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 10px; overflow: hidden; box-shadow: 0 4px 12px rgba(15,31,58,.06); }
+  th, td { padding: 12px 16px; text-align: left; border-bottom: 1px solid #e4e7eb; font-size: 14px; }
+  th { background: #f0f4f8; color: #3e4c59; font-weight: 600; }
+  tr:last-child td { border-bottom: none; }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+  .badge.ok { background: #d1fae5; color: #065f46; }
+  .badge.warn { background: #fef3c7; color: #92400e; }
+  footer { padding: 24px 32px; background: #0b1f3a; color: #9fb3c8; font-size: 13px; text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">Acme Cloud</div>
+  <nav>
+    <a href="#">Product</a><a href="#">Pricing</a><a href="#">Docs</a><a href="#">Sign in</a>
+  </nav>
+</header>
+
+<div class="hero">
+  <h1>Ship faster with Acme Cloud</h1>
+  <p>Deploy, scale, and monitor your apps from a single dashboard.</p>
+  <a class="btn" href="#">Get started</a><a class="btn secondary" href="#">View demo</a>
+</div>
+
+<div class="features">
+  <div class="card"><div class="icon"></div><h3>Instant Deploys</h3><p>Push to main and we build, test, and roll out in seconds with zero downtime.</p></div>
+  <div class="card"><div class="icon"></div><h3>Auto Scaling</h3><p>Traffic spikes are handled automatically - pay only for what you use.</p></div>
+  <div class="card"><div class="icon"></div><h3>Live Metrics</h3><p>Latency, throughput, and error rates streamed to your dashboard in real time.</p></div>
+</div>
+
+<section class="data">
+  <h2>Recent deployments</h2>
+  <table>
+    <thead><tr><th>Service</th><th>Region</th><th>Commit</th><th>Status</th></tr></thead>
+    <tbody>
+      <tr><td>api-gateway</td><td>us-east-1</td><td>a74a746</td><td><span class="badge ok">Healthy</span></td></tr>
+      <tr><td>web-frontend</td><td>eu-west-2</td><td>eae2800</td><td><span class="badge ok">Healthy</span></td></tr>
+      <tr><td>worker-queue</td><td>ap-south-1</td><td>3597aab</td><td><span class="badge warn">Degraded</span></td></tr>
+    </tbody>
+  </table>
+</section>
+
+<footer>(c) 2026 Acme Cloud, Inc. - Sample page for renderer comparison (Tauri/WebKit vs pure-Simple web renderer).</footer>
+</body>
+</html>

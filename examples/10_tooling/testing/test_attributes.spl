@@ -1,0 +1,73 @@
+#!/usr/bin/env simple
+# Test Attributes Example
+#
+# Demonstrates test attribute usage for timeout, retry, tags, and skipping.
+
+use std.spec.{describe, it, expect}
+use std.testing.attributes.{timeout, retry, tag, skip_test, flaky}
+
+describe "Test Attributes Demo":
+    # Basic test with default settings
+    it "runs with default settings":
+        expect(1 + 1).to_equal(2)
+
+    # Test with timeout
+    timeout(5000):
+        it "completes within 5 seconds":
+            # Simulate slow operation
+            val result = expensive_computation()
+            expect(result).to_be_greater_than(0)
+
+    # Test with retry (for flaky tests)
+    retry(3):
+        it "retries up to 3 times on failure":
+            # Simulate sometimes-failing test
+            val success = random_success()
+            expect(success).to_equal(true)
+
+    # Test with tags
+    tag(["slow", "integration"]):
+        it "is tagged as slow integration test":
+            val db_result = query_database()
+            expect(db_result).to_contain("data")
+
+    # Test with multiple attributes
+    timeout(10000):
+    retry(2):
+    tag(["slow", "flaky", "external"]):
+        it "uses multiple attributes":
+            val api_response = call_external_api()
+            expect(api_response.status).to_equal(200)
+
+    # Flaky test marker
+    flaky():
+        it "is marked as flaky (auto-retry 3x)":
+            # Tests that involve timing, external services, etc.
+            expect(timing_sensitive_test()).to_equal(true)
+
+    # Skip test
+    skip_test("Not implemented yet"):
+        it "will be skipped with reason":
+            expect(future_feature()).to_equal(42)
+
+# Helper functions (simulated)
+fn expensive_computation() -> i64:
+    42
+
+fn random_success() -> bool:
+    true
+
+fn query_database() -> text:
+    "data"
+
+fn call_external_api() -> ApiResponse:
+    ApiResponse(status: 200)
+
+fn timing_sensitive_test() -> bool:
+    true
+
+fn future_feature() -> i64:
+    0
+
+struct ApiResponse:
+    status: i64

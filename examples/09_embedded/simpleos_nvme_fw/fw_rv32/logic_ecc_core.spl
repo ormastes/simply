@@ -1,0 +1,12 @@
+use logic_ecc_compute.*
+use logic_ecc_correction.*
+use logic_ecc_check.*
+
+pub fn _rv32_ecc_compute(data: i64, lba: i64, seq: i64) -> i64:
+    _rv32_ecc_compute_impl(data, lba, seq)
+
+pub fn _rv32_ecc_check(data: i64, lba: i64, seq: i64, stored: i64, injected_flips: i64) -> i64:
+    _rv32_ecc_check_with_recomputed(data, stored, injected_flips, _rv32_ecc_compute(data, lba, seq))
+
+pub fn _rv32_ecc_correct(data: i64, lba: i64, seq: i64, stored: i64) -> i64:
+    _rv32_ecc_correct_with_recomputed(data, stored, _rv32_ecc_compute(data, lba, seq))

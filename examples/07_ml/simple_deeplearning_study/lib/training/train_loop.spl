@@ -1,0 +1,57 @@
+# Training Loop — from scratch
+# Chapter 5: "Build a Large Language Model From Scratch" (Rasbt)
+#
+# Simple training loop with cross-entropy loss.
+# Uses manual gradient-free optimization for educational demonstration.
+# (Full autograd would require std.pure.autograd which needs compiled mode)
+
+use std.pure.tensor.{PureTensor, tensor_from_data}
+use examples.simple_deeplearning_study.lib.util.math_helpers.{dl_exp, dl_log}
+use examples.simple_deeplearning_study.lib.prim.softmax.{study_softmax_2d}
+use examples.simple_deeplearning_study.lib.gpt.gpt_model.{StudyGPT}
+
+# Cross-entropy loss for language modeling
+# logits: [seq_len, vocab_size] - model output
+# targets: [i64] - target token IDs, length = seq_len
+fn cross_entropy_loss(logits: PureTensor<f64>, targets: [i64]) -> f64:
+    val seq_len = logits.shape[0]
+    val vocab_size = logits.shape[1]
+
+    # Apply softmax to get probabilities
+    val probs = study_softmax_2d(logits)
+
+    # Compute -log(p[target]) for each position
+    var total_loss = 0.0
+    var i = 0
+    while i < seq_len:
+        val target_id = targets[i]
+        val prob = probs.get([i, target_id])
+        # Clamp for numerical stability
+        var clamped = prob
+        if clamped < 0.0000001:
+            clamped = 0.0000001
+        total_loss = total_loss - dl_log(clamped)
+        i = i + 1
+
+    total_loss / (seq_len as f64)
+
+class TrainingResult:
+    epoch: i64
+    loss: f64
+
+# Simple evaluation: compute average loss over batches
+fn evaluate_loss(model: StudyGPT, eval_inputs: [[i64]], eval_targets: [[i64]]) -> f64:
+    var total = 0.0
+    var count = 0
+    var i = 0
+    while i < eval_inputs.len():
+        val logits = model.forward(eval_inputs[i])
+        val loss = cross_entropy_loss(logits, eval_targets[i])
+        total = total + loss
+        count = count + 1
+        i = i + 1
+    if count == 0:
+        return 0.0
+    total / (count as f64)
+
+export cross_entropy_loss, TrainingResult, evaluate_loss

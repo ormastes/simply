@@ -1,0 +1,12 @@
+use logic_map_core.*
+
+fn rv32_map_flush_l2p_cases_selftest() -> i32:
+    if _rv32_map_l2p_after_flush(10, 100, 1) != 100:
+        return 1
+    if _rv32_map_l2p_after_flush(10, 100, 0) != -1:
+        return 1
+    if _rv32_map_l2p_after_flush(10, 100, 7) != 100:
+        return 1
+    if _rv32_map_l2p_after_flush(3072, 100, 1) != -1:  # 3072 == LBA_COUNT, first out-of-range lba
+        return 1
+    0

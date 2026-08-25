@@ -1,0 +1,5 @@
+#define APP_TITLE "Hello World"
+#define APP_ID "/sys/apps/hello_world"
+#define APP_CONTENT "Hello World!\n\nThis window is owned by a launched app process.\nClose the window to exit."
+#define APP_MARKER "SIMPLEOS_DISK_HELLO_ELF"
+#include "remote_window_runtime.c"

@@ -1,0 +1,79 @@
+# Server Configuration — Full Standalone Web Server Example
+#
+# Reuses: std.nogc_sync_mut.http_server (lightweight lib)
+# Lib source: src/lib/nogc_sync_mut/http_server/
+# Design: doc/05_design/simple_web_server_example.md
+
+extern fn rt_cli_get_args() -> [text]
+
+class ServerConfig:
+    host: text
+    port: i32
+    static_root: text
+    tls_enabled: bool
+    tls_cert: text
+    tls_key: text
+    cors_origins: [text]
+    log_requests: bool
+    plaintext_development: bool
+
+    static fn default() -> ServerConfig:
+        ServerConfig(
+            host: "0.0.0.0",
+            port: 8080,
+            static_root: "./public",
+            tls_enabled: false,
+            tls_cert: "",
+            tls_key: "",
+            cors_origins: ["*"],
+            log_requests: true,
+            plaintext_development: false
+        )
+
+fn parse_args() -> ServerConfig:
+    var config = ServerConfig.default()
+    val args = rt_cli_get_args()
+
+    var i = 0
+    while i < args.len():
+        val arg = args[i]
+        if arg.starts_with("--port="):
+            config.port = parse_int_arg(arg.slice(7, arg.len()), 8080)
+        elif arg.starts_with("--host="):
+            config.host = arg.slice(7, arg.len())
+        elif arg.starts_with("--static="):
+            config.static_root = arg.slice(9, arg.len())
+        elif arg.starts_with("--tls-cert="):
+            config.tls_cert = arg.slice(11, arg.len())
+            config.tls_enabled = true
+        elif arg.starts_with("--tls-key="):
+            config.tls_key = arg.slice(10, arg.len())
+        elif arg == "--no-log":
+            config.log_requests = false
+        elif arg == "--plaintext-development":
+            config.plaintext_development = true
+        elif arg.starts_with("--cors="):
+            config.cors_origins = arg.slice(7, arg.len()).split(",")
+        i = i + 1
+
+    return config
+
+fn parse_int_arg(s: text, default: i32) -> i32:
+    val trimmed = s.trim()
+    val n = trimmed.len()
+    if n == 0:
+        return default
+    val zero = "0".to_i64()
+    var result: i64 = 0
+    var i = 0
+    if trimmed.char_at(0) == "-":
+        i = 1
+    while i < n:
+        val digit = trimmed.char_at(i).to_i64() - zero
+        if digit < 0 or digit > 9:
+            return default
+        result = result * 10 + digit
+        i = i + 1
+    if trimmed.char_at(0) == "-":
+        result = 0 - result
+    return result.to_i32()

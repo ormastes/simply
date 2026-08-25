@@ -1,0 +1,52 @@
+# 19. Memory API - Tests
+#
+# Hardware-independent: byte-size arithmetic, host data helpers, and the
+# GpuPtr handle semantics (null pointer, free of null is a no-op).
+# Device transfers are exercised by main.spl.
+
+use std.gpu.*
+use self.main.{bytes_for_f32, ramp, filled, blocks_for}
+
+describe "Memory API":
+
+    describe "sizes are in bytes":
+
+        it "an f32 is 4 bytes":
+            expect(bytes_for_f32(1)).to_equal(4)
+            expect(bytes_for_f32(1024)).to_equal(4096)
+
+        it "zero elements is zero bytes":
+            expect(bytes_for_f32(0)).to_equal(0)
+
+    describe "host data helpers":
+
+        it "ramp counts from zero":
+            val r = ramp(4)
+            expect(r.len()).to_equal(4)
+            expect(r[0]).to_equal(0.0)
+            expect(r[3]).to_equal(3.0)
+
+        it "filled repeats one value":
+            val f = filled(3, 42.0)
+            expect(f[0]).to_equal(42.0)
+            expect(f[2]).to_equal(42.0)
+
+        it "the scale kernel's expected output is 2x the ramp":
+            val r = ramp(8)
+            expect(r[5] * 2.0).to_equal(10.0)
+
+    describe "launch geometry":
+
+        it "1024 elements fit in 4 blocks of 256":
+            expect(blocks_for(1024, 256)).to_equal(4)
+
+    describe "GpuPtr handle":
+
+        it "the null pointer is invalid and empty":
+            val p = GpuPtr.null()
+            expect(p.is_valid).to_equal(false)
+            expect(p.size).to_equal(0)
+            expect(p.is_null()).to_equal(true)
+
+        it "freeing the null pointer is a no-op Ok":
+            expect(gpu_free(GpuPtr.null()).is_ok()).to_equal(true)

@@ -1,0 +1,508 @@
+# x86_64 [u8] ABI Round-Trip Corruption Probe
+#
+# Minimal freestanding --entry-closure probe isolating the documented
+# [u8] corruption bug: a RuntimeArray built C-side by
+# _tls_runtime_array_from_bytes (boot/baremetal_stubs.c) reads back
+# corrupt on the Simple side after round-tripping through x64 freestanding
+# native-build codegen (extern C fn returns [u8] -> Simple local -> passed
+# back into C rt_bytes_u8_at / probed raw via rt_abi_probe_raw).
+#
+# No OS deps (no nvme/net/vmm) -- direct port I/O serial + isa-debug-exit,
+# modeled on class_fault_probe_entry.spl.
+#
+# Expected (uncorrupted): bytes 0x41..0x48 ("ABCDEFGH"), len=8,
+# raw bits per element = ENCODE_INT(byte) = (byte << 3) | 0.
+#
+# IMPORTANT: this file uses NO `text` literal iteration (`for ch in s`) and
+# NO module-level `val` globals. Both were found, in earlier probe runs, to
+# be independently broken on this native-build config:
+#   - module `val` u64 globals got treated as unresolved extern symbols
+#     (SIMPLE_TRACE_STUBS=1 showed abi_probe_entry__SERIAL_DATA etc stubbed
+#     to 0) -- literals are inlined at each call site instead.
+#   - `for ch in s` over a `text` literal depends on rt_array_get_text /
+#     rt_array_data_ptr_text / rt_string_builder_* -- ALL of which showed up
+#     in the SAME unresolved-symbol trace (stubbed), and produced visibly
+#     scrambled output (an arithmetic-step garbage pattern) in an earlier
+#     probe run, while pure-arithmetic serial_dec_i64/serial_hex_u64 output
+#     interleaved in the SAME run came through byte-exact. All string labels
+#     below are therefore spelled out as explicit serial_put(<ascii-code>)
+#     sequences so this probe's own instrumentation cannot be confounded by
+#     that separate (and out-of-scope) text-iteration bug.
+
+extern fn rt_port_inb(port: u64) -> u64
+extern fn rt_port_outb(port: u64, value: u64)
+
+extern fn rt_abi_probe_bytes() -> [u8]
+extern fn rt_abi_probe_raw(arr: [u8], idx: i64) -> u64
+extern fn rt_abi_probe_handle(arr: [u8]) -> u64
+extern fn rt_abi_probe_len(arr: [u8]) -> u64
+extern fn rt_abi_probe_items_ptr(arr: [u8]) -> u64
+extern fn rt_bytes_u8_at(arr: [u8], idx: i64) -> i64
+
+# P6 helpers: reassignment-store hazard (out = rt_push_byte(out, x))
+extern fn rt_bytes_alloc_packed_empty() -> [u8]
+extern fn rt_push_byte(arr: [u8], b: i64) -> [u8]
+
+# P13 helpers: text/string char-decode + starts_with (x64 freestanding text bug)
+extern fn rt_string_from_byte_array(arr: [u8]) -> text
+extern fn rt_string_len(str: text) -> i64
+extern fn rt_string_char_at(str: text, idx: i64) -> u64        # raw tagged bits of 1-char string
+extern fn rt_string_char_code_at(str: text, idx: i64) -> i64   # actual code point
+extern fn rt_string_starts_with(str: text, prefix: text) -> i64
+extern fn rt_string_eq(a: text, b: text) -> i64
+extern fn rt_abi_probe_str_hdr_type(str: text) -> u64
+extern fn rt_abi_probe_str_handle(str: text) -> u64
+
+fn serial_wait_ready():
+    var guard: i64 = 100000
+    while guard > 0:
+        if (rt_port_inb(0x3FD) & 0x20) != 0:
+            return
+        guard = guard - 1
+
+fn serial_put(ch: u64):
+    serial_wait_ready()
+    rt_port_outb(0x3F8, ch)
+
+fn serial_newline():
+    serial_put(13)
+    serial_put(10)
+
+fn serial_hex_nib(nib: u64):
+    if nib < 10:
+        serial_put(48 + nib)
+    else:
+        serial_put(87 + nib)
+
+fn serial_hex_u64(v: u64):
+    serial_put(48)
+    serial_put(120)
+    var shift: i64 = 60
+    var started: bool = false
+    while shift >= 0:
+        val nib = (v >> (shift as u64)) & 0xF
+        if nib != 0 or started or shift == 0:
+            started = true
+            serial_hex_nib(nib)
+        shift = shift - 4
+
+fn serial_dec_i64(v: i64):
+    if v < 0:
+        serial_put(45)
+        serial_dec_i64(0 - v)
+        return
+    if v >= 10:
+        serial_dec_i64(v / 10)
+    val digit = v % 10
+    serial_put((48 + digit) as u64)
+
+# Single-letter field markers instead of word labels (avoids text iteration).
+fn mark(c: u64):
+    serial_put(c)
+    serial_put(61)  # '='
+
+# Simple-side [u8] builder (mirrors sshd's non-extern branch of an if-expr).
+fn _mk_bytes_simple() -> [u8]:
+    var b = rt_bytes_alloc_packed_empty()
+    b = rt_push_byte(b, 0x41)
+    b = rt_push_byte(b, 0x42)
+    b = rt_push_byte(b, 0x43)
+    b = rt_push_byte(b, 0x44)
+    b = rt_push_byte(b, 0x45)
+    b = rt_push_byte(b, 0x46)
+    b = rt_push_byte(b, 0x47)
+    b = rt_push_byte(b, 0x48)
+    b
+
+# P12 helper: a struct with a [u8] field, to test an extern-`[u8]` return stored
+# directly into a typed struct field (the sshd `server_version_bytes` shape).
+struct Holder:
+    data: [u8]
+
+fn spl_start():
+    serial_put(80)
+    serial_put(49)
+    serial_newline()  # "P1"
+
+    var arr = rt_abi_probe_bytes()
+    serial_put(80)
+    serial_put(50)
+    serial_put(32)
+    mark(72)  # 'H'=
+    serial_hex_u64(rt_abi_probe_handle(arr))
+    serial_newline()  # "P2 H=0x..."
+
+    val len_c = rt_abi_probe_len(arr)
+    serial_put(80)
+    serial_put(51)
+    serial_put(32)
+    mark(76)  # 'L'=
+    serial_hex_u64(len_c)
+    serial_put(32)
+    mark(108)  # 'l'=
+    serial_dec_i64(arr.len())
+    serial_newline()  # "P3 L=0x... l=..."
+
+    serial_put(80)
+    serial_put(52)
+    serial_put(32)
+    mark(73)  # 'I'=
+    serial_hex_u64(rt_abi_probe_items_ptr(arr))
+    serial_newline()  # "P4 I=0x..."
+
+    var i: i64 = 0
+    while i < 8:
+        serial_put(80)
+        serial_put(53)
+        serial_put(91)  # '['
+        serial_dec_i64(i)
+        serial_put(93)  # ']'
+        serial_put(32)
+        mark(115)  # 's'= (Simple arr[i])
+        serial_dec_i64(arr[i] as i64)
+        serial_put(32)
+        mark(99)  # 'c'= (C rt_bytes_u8_at)
+        serial_dec_i64(rt_bytes_u8_at(arr, i))
+        serial_put(32)
+        mark(114)  # 'r'= (raw bits)
+        serial_hex_u64(rt_abi_probe_raw(arr, i))
+        serial_newline()
+        i = i + 1
+
+    # ---- P6: reassignment-store hazard ----
+    # Build a fresh packed [u8] Simple-side, push a known byte via the extern
+    # `-> [u8]` return-assign pattern, and compare the STORED handle against the
+    # in-place-mutated source handle (rt_push_byte mutates in place AND returns
+    # the same handle). Discriminates store-mangle vs read-misdispatch.
+    serial_put(80)
+    serial_put(54)
+    serial_newline()  # "P6"
+
+    var b6 = rt_bytes_alloc_packed_empty()
+    val b6h_before = rt_abi_probe_handle(b6)
+    var out6 = rt_push_byte(b6, 0x53)  # 'S'
+    val b6h_after = rt_abi_probe_handle(b6)  # b6 mutated in place -> true handle
+    val out6h = rt_abi_probe_handle(out6)    # handle as stored into [u8] local
+
+    serial_put(80)
+    serial_put(54)
+    serial_put(32)
+    mark(66)  # 'B'= b6 handle before push
+    serial_hex_u64(b6h_before)
+    serial_newline()
+
+    serial_put(80)
+    serial_put(54)
+    serial_put(32)
+    mark(65)  # 'A'= b6 handle after in-place push (real returned handle)
+    serial_hex_u64(b6h_after)
+    serial_newline()
+
+    serial_put(80)
+    serial_put(54)
+    serial_put(32)
+    mark(79)  # 'O'= out6 handle (return-assigned into [u8] local)
+    serial_hex_u64(out6h)
+    serial_newline()
+
+    serial_put(80)
+    serial_put(54)
+    serial_put(32)
+    mark(115)  # 's'= out6[0] trusted Simple read (expect 83='S')
+    serial_dec_i64(out6[0] as i64)
+    serial_put(32)
+    mark(99)  # 'c'= C rt_bytes_u8_at(out6,0)
+    serial_dec_i64(rt_bytes_u8_at(out6, 0))
+    serial_put(32)
+    mark(114)  # 'r'= raw slot bits
+    serial_hex_u64(rt_abi_probe_raw(out6, 0))
+    serial_newline()
+
+    serial_put(80)
+    serial_put(54)
+    serial_put(32)
+    mark(76)  # 'L'= out6 len (expect 1)
+    serial_dec_i64(out6.len())
+    serial_newline()
+
+    # ---- P7: multi-push reassignment (sshd banner pattern) ----
+    # Push 40 known bytes (0x41+i) via repeated `out = rt_push_byte(out,x)`,
+    # crossing the cap-0->128 growth, then read every index back Simple vs C.
+    var out7 = rt_bytes_alloc_packed_empty()
+    var p: i64 = 0
+    while p < 300:
+        out7 = rt_push_byte(out7, 0x41 + (p % 60))
+        p = p + 1
+    serial_put(80)
+    serial_put(55)
+    serial_put(32)
+    mark(76)  # 'L'= len (expect 40)
+    serial_dec_i64(out7.len())
+    serial_put(32)
+    mark(72)  # 'H'= handle
+    serial_hex_u64(rt_abi_probe_handle(out7))
+    serial_newline()
+    # Only print indices where Simple read != C read or != expected (keep serial
+    # short); print a MISMATCH line, else stay silent. Emit final OK count.
+    var q: i64 = 0
+    var bad: i64 = 0
+    while q < 300:
+        val s_read = out7[q] as i64
+        val c_read = rt_bytes_u8_at(out7, q)
+        val want = 0x41 + (q % 60)
+        if s_read != c_read or s_read != want:
+            bad = bad + 1
+            serial_put(80)
+            serial_put(55)
+            serial_put(91)
+            serial_dec_i64(q)
+            serial_put(93)
+            serial_put(32)
+            mark(115)
+            serial_dec_i64(s_read)
+            serial_put(32)
+            mark(99)
+            serial_dec_i64(c_read)
+            serial_put(32)
+            mark(119)  # 'w'= want
+            serial_dec_i64(want)
+            serial_newline()
+        q = q + 1
+    serial_put(80)
+    serial_put(55)
+    serial_put(32)
+    mark(98)  # 'b'= bad count
+    serial_dec_i64(bad)
+    serial_newline()
+
+    # ---- P8: extern [u8] return through an if-EXPRESSION phi-merge into a val ----
+    # Mirrors sshd `val exchange_hash = if live: rt_..() else: ssh_..()`. use_c is
+    # runtime (not const-foldable) so both phi inputs are live.
+    val use_c = rt_abi_probe_len(rt_abi_probe_bytes()) == 8
+    val x8 = if use_c: rt_abi_probe_bytes() else: rt_bytes_alloc_packed_empty()
+    serial_put(80)
+    serial_put(56)  # "P8"
+    serial_put(32)
+    mark(72)  # 'H'= handle
+    serial_hex_u64(rt_abi_probe_handle(x8))
+    serial_put(32)
+    mark(76)  # 'L'= len
+    serial_dec_i64(x8.len())
+    serial_put(32)
+    mark(115)  # 's'= x8[0] trusted Simple (expect 65)
+    serial_dec_i64(x8[0] as i64)
+    serial_put(32)
+    mark(99)  # 'c'= C read
+    serial_dec_i64(rt_bytes_u8_at(x8, 0))
+    serial_put(32)
+    mark(114)  # 'r'= raw slot bits (expect 0x4847464544434241 packed)
+    serial_hex_u64(rt_abi_probe_raw(x8, 0))
+    serial_newline()
+
+    # ---- P9: if-expr with ONE extern branch + ONE Simple-fn branch (exact sshd shape) ----
+    val y9 = if use_c: rt_abi_probe_bytes() else: _mk_bytes_simple()
+    val z9 = if use_c: _mk_bytes_simple() else: rt_abi_probe_bytes()
+    serial_put(80)
+    serial_put(57)  # "P9"
+    serial_put(32)
+    mark(72)  # 'H'= y9 handle
+    serial_hex_u64(rt_abi_probe_handle(y9))
+    serial_put(32)
+    mark(76)  # 'L'= y9 len
+    serial_dec_i64(y9.len())
+    serial_put(32)
+    mark(121)  # 'y'= y9[0] trusted (extern branch taken; expect 65)
+    serial_dec_i64(y9[0] as i64)
+    serial_put(32)
+    mark(99)
+    serial_dec_i64(rt_bytes_u8_at(y9, 0))
+    serial_put(32)
+    mark(114)  # 'r'= y9 raw[0]
+    serial_hex_u64(rt_abi_probe_raw(y9, 0))
+    serial_put(32)
+    mark(122)  # 'z'= z9[0] (Simple-fn branch taken; expect 65)
+    serial_dec_i64(z9[0] as i64)
+    serial_newline()
+
+    # ---- P10: if-STATEMENT into a pre-declared var (avoids if-expr phi-merge) ----
+    # Candidate site-level fix for the sshd exchange_hash corruption.
+    var w10 = rt_bytes_alloc_packed_empty()
+    if use_c:
+        w10 = rt_abi_probe_bytes()
+    else:
+        w10 = _mk_bytes_simple()
+    serial_put(80)
+    serial_put(49)
+    serial_put(48)  # "P10"
+    serial_put(32)
+    mark(72)
+    serial_hex_u64(rt_abi_probe_handle(w10))
+    serial_put(32)
+    mark(76)
+    serial_dec_i64(w10.len())
+    serial_put(32)
+    mark(119)  # 'w'= w10[0] (expect 65)
+    serial_dec_i64(w10[0] as i64)
+    serial_put(32)
+    mark(99)
+    serial_dec_i64(rt_bytes_u8_at(w10, 0))
+    serial_newline()
+
+    # ---- P11: chained method call — arr.len().to_i64() (documented broken) ----
+    # `x.len().to_i64()` is a method call on a method-call result. On x64
+    # freestanding this mis-lowered to garbage (sshd version-exchange bug);
+    # the workaround was to bind `val n = x.len()` first. Extern-`[u8]` receiver.
+    var a11 = rt_abi_probe_bytes()
+    val ch11 = a11.len().to_i64()          # expect 8
+    val ch11b = a11.len().to_i64() - 2     # expect 6 (exact sshd `len-2` shape)
+    serial_put(80)
+    serial_put(49)
+    serial_put(49)  # "P11"
+    serial_put(32)
+    mark(76)  # 'L'= chained len (expect 8)
+    serial_dec_i64(ch11)
+    serial_put(32)
+    mark(116)  # 't'= chained len-2 (expect 6)
+    serial_dec_i64(ch11b)
+    serial_newline()
+
+    # ---- P12: extern `[u8]` return stored directly into typed destinations ----
+    # Stores an extern-`[u8]` return straight into a typed `[u8]` local and a
+    # typed struct field WITHOUT the `_copy_bytes_stable` workaround, then reads
+    # both back Simple-side (trusted packed reader) and C-side.
+    var d12: [u8] = rt_abi_probe_bytes()
+    var h12 = Holder(data: rt_abi_probe_bytes())
+    serial_put(80)
+    serial_put(49)
+    serial_put(50)  # "P12"
+    serial_put(32)
+    mark(76)  # 'L'= d12 local len (expect 8)
+    serial_dec_i64(d12.len())
+    serial_put(32)
+    mark(115)  # 's'= d12[0] Simple (expect 65)
+    serial_dec_i64(d12[0] as i64)
+    serial_put(32)
+    mark(99)  # 'c'= d12 C read (expect 65)
+    serial_dec_i64(rt_bytes_u8_at(d12, 0))
+    serial_put(32)
+    mark(102)  # 'f'= struct field len (expect 8)
+    serial_dec_i64(h12.data.len())
+    serial_put(32)
+    mark(103)  # 'g'= struct field [0] (expect 65)
+    serial_dec_i64(h12.data[0] as i64)
+    serial_newline()
+
+    # ---- P13: text char-decode + starts_with (x64 freestanding text bug) ----
+    # Build "ABCDEFGH" text via rt_string_from_byte_array (the sshd wire-text
+    # construction path), plus a "ABC" prefix two ways (from_byte_array vs text
+    # literal) to discriminate literal-header breakage.
+    val tbytes = _mk_bytes_simple()               # packed "ABCDEFGH"
+    val t = rt_string_from_byte_array(tbytes)      # text from bytes
+
+    var pbytes = rt_bytes_alloc_packed_empty()
+    pbytes = rt_push_byte(pbytes, 0x41)  # 'A'
+    pbytes = rt_push_byte(pbytes, 0x42)  # 'B'
+    pbytes = rt_push_byte(pbytes, 0x43)  # 'C'
+    val pfba = rt_string_from_byte_array(pbytes)   # "ABC" from bytes
+    val plit: text = "ABC"                          # "ABC" literal
+    val tlit: text = "ABCDEFGH"                     # "ABCDEFGH" literal
+
+    # P13a: headers + lengths (HEAP_STRING == 1 means strict decode accepts it)
+    serial_put(80)
+    serial_put(49)
+    serial_put(51)
+    serial_put(97)  # "P13a"
+    serial_put(32)
+    mark(76)  # 'L'= len via extern rt_string_len (expect 8)
+    serial_dec_i64(rt_string_len(t))
+    serial_put(32)
+    mark(116)  # 't'= t hdr.type (expect 1)
+    serial_hex_u64(rt_abi_probe_str_hdr_type(t))
+    serial_put(32)
+    mark(102)  # 'f'= pfba hdr.type (expect 1)
+    serial_hex_u64(rt_abi_probe_str_hdr_type(pfba))
+    serial_put(32)
+    mark(108)  # 'l'= plit hdr.type (SUSPECT — literal header)
+    serial_hex_u64(rt_abi_probe_str_hdr_type(plit))
+    serial_newline()
+
+    # P13b: char_at raw bits (reproduce c0=c1=0x1200000001 fingerprint) + char_code_at
+    serial_put(80)
+    serial_put(49)
+    serial_put(51)
+    serial_put(98)  # "P13b"
+    serial_put(32)
+    mark(48)  # '0'= char_at(0) raw (bug: identical mangled tag)
+    serial_hex_u64(rt_string_char_at(t, 0))
+    serial_put(32)
+    mark(49)  # '1'= char_at(1) raw
+    serial_hex_u64(rt_string_char_at(t, 1))
+    serial_newline()
+
+    var ci: i64 = 0
+    while ci < 8:
+        serial_put(80)
+        serial_put(49)
+        serial_put(51)
+        serial_put(99)  # "P13c"
+        serial_put(91)  # '['
+        serial_dec_i64(ci)
+        serial_put(93)  # ']'
+        serial_put(32)
+        mark(99)  # 'c'= char_code_at (expect 65..72)
+        serial_dec_i64(rt_string_char_code_at(t, ci))
+        serial_newline()
+        ci = ci + 1
+
+    # P13d: starts_with — extern direct, all four receiver/prefix construction pairs
+    serial_put(80)
+    serial_put(49)
+    serial_put(51)
+    serial_put(100)  # "P13d"
+    serial_put(32)
+    mark(65)  # 'A'= sw(t, pfba)  extern recv + fba prefix  (expect 1)
+    serial_dec_i64(rt_string_starts_with(t, pfba))
+    serial_put(32)
+    mark(66)  # 'B'= sw(t, plit)  extern recv + literal prefix (SUSPECT; expect 1)
+    serial_dec_i64(rt_string_starts_with(t, plit))
+    serial_put(32)
+    mark(67)  # 'C'= sw(tlit, pfba)  literal recv + fba prefix (expect 1)
+    serial_dec_i64(rt_string_starts_with(tlit, pfba))
+    serial_put(32)
+    mark(68)  # 'D'= sw(tlit, plit)  literal recv + literal prefix (expect 1)
+    serial_dec_i64(rt_string_starts_with(tlit, plit))
+    serial_put(32)
+    mark(69)  # 'E'= eq(t, tlit) control (expect 1)
+    serial_dec_i64(rt_string_eq(t, tlit))
+    serial_newline()
+
+    # P13e: Simple-method dispatch (exact sshd `command.trim().starts_with("/")` shape)
+    val m_sw = t.starts_with(plit)                 # non-chained method
+    val m_cc = t.char_code_at(0)                   # non-chained method
+    val m_sw_chain = t.trim().starts_with(plit)    # CHAINED (sshd shape; documented-broken)
+    serial_put(80)
+    serial_put(49)
+    serial_put(51)
+    serial_put(101)  # "P13e"
+    serial_put(32)
+    mark(115)  # 's'= t.starts_with("ABC") method form (expect 1)
+    if m_sw:
+        serial_dec_i64(1)
+    else:
+        serial_dec_i64(0)
+    serial_put(32)
+    mark(99)  # 'c'= t.char_code_at(0) method form (expect 65)
+    serial_dec_i64(m_cc)
+    serial_put(32)
+    mark(120)  # 'x'= t.trim().starts_with("ABC") chained (SUSPECT; expect 1)
+    if m_sw_chain:
+        serial_dec_i64(1)
+    else:
+        serial_dec_i64(0)
+    serial_newline()
+
+    serial_put(80)
+    serial_put(68)
+    serial_newline()  # "PD" (done)
+
+    rt_port_outb(0xF4, 0)

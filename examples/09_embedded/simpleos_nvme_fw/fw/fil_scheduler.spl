@@ -1,0 +1,183 @@
+"""
+fil_scheduler — multi-channel NAND request scheduler (gap-closure P2).
+
+Models the flash interface's parallelism the way a real firmware's low-level scheduler does
+(cf. Cosmos+ `low_level_scheduler.c`, 8ch×8way): block-ops are dispatched across NUM_CHANNELS
+independent channels, each channel serializes its own ops (one at a time = per-channel mutual
+exclusion) while independent channels advance together. The result is the parallel completion
+time of a batch (= the deepest channel queue), i.e. the 8× speedup a striped write batch enjoys
+over a serial one.
+
+This is an ADDITIVE timing/scheduling model: the channel of a block is a *derived view*
+(`block mod NUM_CHANNELS`), so the FTL's page geometry and data path are unchanged — the
+allocator/recovery/GC proofs and the full self-test suite are untouched. In a synchronous
+interpreter "parallelism" is necessarily a step-counting model (the same approach FEMU takes for
+channel timing); the properties proven here are the per-channel serialization and the parallel
+step count, tested directly.
+"""
+
+use nvme_types.*
+
+val NUM_CHANNELS: i64 = 8
+val SCHED_COUNTER_MAX: i64 = 1000000000000000000
+
+# The channel a block lives on — a derived view over the existing geometry (no PPN change).
+fn channel_of(blk: i64) -> i64:
+    if blk < 0:
+        return 0
+    blk % NUM_CHANNELS
+
+# Local fill (FIL tier must not import the FTL-tier ftl_fill).
+fn sched_fill(n: i64, v: i64) -> [i64]:
+    var a: [i64] = []
+    var i: i64 = 0
+    while i < n:
+        a.push(v)
+        i = i + 1
+    a
+
+fn sched_counter_next(v: i64) -> i64:
+    if v < 0:
+        return 1
+    if v >= SCHED_COUNTER_MAX:
+        return SCHED_COUNTER_MAX
+    v + 1
+
+struct ChannelSched:
+    pending: [i64]      # per-channel queued op count
+    done:    i64        # total completed ops
+    steps:   i64        # parallel steps taken to drain
+
+fn channel_sched_new() -> ChannelSched:
+    ChannelSched(pending: sched_fill(NUM_CHANNELS, 0), done: 0, steps: 0)
+
+impl ChannelSched:
+    me channel_ready(ch: i64) -> bool:
+        ch >= 0 and ch < NUM_CHANNELS and ch < me.pending.len()
+
+    # Queue one block-op onto the channel its block maps to.
+    me submit(blk: i64):
+        if blk < 0:
+            return
+        val ch: i64 = channel_of(blk)
+        if not me.channel_ready(ch):
+            return
+        if me.pending[ch] < 0:
+            me.pending[ch] = 0
+        me.pending[ch] = sched_counter_next(me.pending[ch])
+
+    me queue_depth(ch: i64) -> i64:
+        if not me.channel_ready(ch):
+            return 0
+        if me.pending[ch] < 0:
+            return 0
+        me.pending[ch]
+
+    me total_pending() -> i64:
+        var t: i64 = 0
+        var ch: i64 = 0
+        while ch < NUM_CHANNELS:
+            t = t + me.queue_depth(ch)
+            ch = ch + 1
+        t
+
+    # Drain all channels in parallel steps: each step, every channel with pending work
+    # dispatches exactly ONE op (per-channel serialization = mutual exclusion); independent
+    # channels advance together. Returns the parallel step count = the deepest channel queue.
+    #
+    # The loop-termination guard must never be tighter than the deepest channel a legal
+    # `pending` value can reach, or a saturated queue (see SCHED_COUNTER_MAX, which `submit`
+    # itself lets `pending[ch]` grow to) would silently stop draining mid-batch: `run` would
+    # return as if finished while ops sat un-dispatched (fail-open). Bound the guard by the
+    # same named ceiling `pending` counters saturate at, so it can never under-cap a workload
+    # the type itself calls legal.
+    me run() -> i64:
+        if me.done < 0:
+            me.done = 0
+        if me.steps < 0:
+            me.steps = 0
+        var guard: i64 = 0
+        while me.total_pending() > 0 and guard < SCHED_COUNTER_MAX:
+            var dispatched: i64 = 0
+            var ch: i64 = 0
+            while ch < NUM_CHANNELS:
+                if me.channel_ready(ch) and me.pending[ch] > 0:
+                    me.pending[ch] = me.pending[ch] - 1
+                    me.done = sched_counter_next(me.done)
+                    dispatched = dispatched + 1
+                ch = ch + 1
+            if dispatched > 0:
+                me.steps = sched_counter_next(me.steps)
+            guard = guard + 1
+        me.steps
+
+    me completed() -> i64:
+        if me.done < 0:
+            return 0
+        me.done
+
+# ── Self-test ─────────────────────────────────────────────────────────────────
+fn fil_scheduler_selftest() -> i64:
+    var fail: i64 = 0
+
+    # channel_of is block mod NUM_CHANNELS (derived view; geometry unchanged).
+    fail = fail + expect_eq(channel_of(0), 0, "sched: channel_of(0)")
+    fail = fail + expect_eq(channel_of(8), 0, "sched: channel_of(8) wraps to channel 0")
+    fail = fail + expect_eq(channel_of(5), 5, "sched: channel_of(5)")
+    fail = fail + expect_eq(channel_of(-1), 0, "sched: negative channel_of fails closed")
+
+    # Balanced batch: 16 ops across 8 channels (2 each) drain in 2 parallel steps.
+    var s1: ChannelSched = channel_sched_new()
+    var b: i64 = 0
+    while b < 16:
+        s1.submit(b)
+        b = b + 1
+    fail = fail + expect_eq(s1.total_pending(), 16, "sched: 16 ops queued")
+    val steps1: i64 = s1.run()
+    fail = fail + expect_eq(steps1, 2, "sched: balanced 16-over-8 drains in 2 parallel steps")
+    fail = fail + expect_eq(s1.completed(), 16, "sched: all 16 ops completed")
+
+    # Adversarial: 8 ops ALL on channel 0 (blocks 0,8,…,56) serialize -> 8 steps, no parallelism.
+    var s2: ChannelSched = channel_sched_new()
+    var k: i64 = 0
+    while k < 8:
+        val blk: i64 = k * 8
+        s2.submit(blk)
+        k = k + 1
+    fail = fail + expect_eq(s2.queue_depth(0), 8, "sched: 8 ops all land on channel 0")
+    s2.submit(-1)
+    fail = fail + expect_eq(s2.total_pending(), 8, "sched: negative block submit is inert")
+    fail = fail + expect_eq(s2.queue_depth(NUM_CHANNELS), 0, "sched: invalid channel depth fails closed")
+    s2.pending[1] = -3
+    fail = fail + expect_eq(s2.queue_depth(1), 0, "sched: negative channel depth clamps to zero")
+    s2.submit(1)
+    fail = fail + expect_eq(s2.queue_depth(1), 1, "sched: submit recovers negative channel depth")
+    fail = fail + expect_eq(s2.total_pending(), 9, "sched: recovered negative pending contributes to total")
+    s2.done = -4
+    fail = fail + expect_eq(s2.completed(), 0, "sched: negative completed count clamps to zero")
+    s2.steps = -5
+    val steps2: i64 = s2.run()
+    fail = fail + expect_eq(s2.completed(), 9, "sched: run recovers negative completed count")
+    fail = fail + expect_eq(steps2, 8, "sched: same-channel batch serializes (no parallelism)")
+    fail = fail + expect_eq(s2.completed(), 9, "sched: all 9 ops completed")
+
+    var s3: ChannelSched = channel_sched_new()
+    s3.pending[0] = SCHED_COUNTER_MAX
+    s3.submit(0)
+    fail = fail + expect_eq(s3.queue_depth(0), SCHED_COUNTER_MAX, "sched: pending counter saturates")
+
+    var st: ChannelSched = channel_sched_new()
+    st.pending = []
+    st.submit(0)
+    fail = fail + expect_eq(st.total_pending(), 0, "sched: truncated pending array reports no work")
+    fail = fail + expect_eq(st.run(), 0, "sched: truncated pending array run is inert")
+    fail = fail + expect_eq(st.queue_depth(0), 0, "sched: truncated pending array channel depth fails closed")
+
+    var s4: ChannelSched = channel_sched_new()
+    s4.pending[0] = 1
+    s4.done = SCHED_COUNTER_MAX
+    s4.steps = SCHED_COUNTER_MAX
+    fail = fail + expect_eq(s4.run(), SCHED_COUNTER_MAX, "sched: step counter saturates")
+    fail = fail + expect_eq(s4.completed(), SCHED_COUNTER_MAX, "sched: completed counter saturates")
+
+    fail

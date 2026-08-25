@@ -1,0 +1,8 @@
+use logic_sections_primary.*
+use logic_sections_secondary.*
+
+fn nvme_fw_rv32_logic_selftest() -> i32:
+    var fail: i32 = 0
+    fail = fail + nvme_fw_rv32_primary_sections()
+    fail = fail + nvme_fw_rv32_secondary_sections()
+    fail

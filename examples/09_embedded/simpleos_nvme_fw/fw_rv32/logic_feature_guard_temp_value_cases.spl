@@ -1,0 +1,8 @@
+use logic_feature_guard_core.*
+
+fn rv32_feature_guard_temp_value_cases_selftest() -> i32:
+    if _rv32_feature_value_valid(4, 340) != 0:
+        return 1
+    if _rv32_feature_value_valid(4, 313) == 0:
+        return 1
+    0

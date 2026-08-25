@@ -1,0 +1,135 @@
+"""
+rel_ladder — Algorithm 1: the pure hard-decision recovery-ladder STATE MACHINE.
+
+Contract: doc/05_design/hardware/nand_recovery/recovery_algorithms_design.md §2
+(implements architecture reliability_engine_architecture.md §3, the NAND_ECC_FAIL
+sequence). This is the L4 lane (design §9): it owns exactly the phase constants,
+`rel_ladder_state_new`, the `RelLadderStep` named-struct return, and the pure
+decision fn `rel_ladder_step` — the escalation the ladder drives, and nothing else.
+
+PURE-POLICY LEAF (design §0 / guide "rel_* implementation wave"): imports ONLY
+nvme_types.* + nd_types.* + rel_types.* + rel_vref.* — never fil/ftl. No handle is
+held; the machine returns a RelAction verdict per step and the MOUNTING layer
+(design §2 `fil_read_with_ladder`, lane L8 — NOT this module) owns the Fil handle,
+drives the reads, and feeds the sense outcomes back. RAIN reconstruct and
+Quarantine are actuated by the FTL caller of `fil.read` on an Uncorrectable verdict;
+the ladder only RETURNS verdicts (design §2 rung 4).
+
+The escalation walked (design §2 rungs):
+  0. Hard read at offset 0 -> SECDED decode. Done by the caller's fil.read; the
+     ladder is ENTERED only on NAND_ECC_FAIL, i.e. the first obs fed in is already
+     a failing sense.
+  1. Calibrated-seed-first: try the block's cached ROR offset (rel_vref_lookup,
+     passed in as `seed`) if any — architecture diagram `ecc_fail_ladder` senses
+     the seed before the sweep. `seed == 0` means "no calibration"; the machine
+     then falls straight to the fixed table starting at index 0 (the seed
+     duplicate is skipped: when a real seed exists it is tried FIRST and
+     `table_idx` stays 0 so the subsequent walk covers the whole table; when no
+     seed exists the seed rung itself emits `rel_vref_table_at(0)` and advances
+     `table_idx` to 1 so table[0] is not sensed twice).
+  2. Bounded Vref retry-table walk: the fixed 7-entry table (rel_vref §3), one
+     offset per step — the step budget (`rel_vref_table_len()` = 7).
+  3. First offset that decodes -> emit CalibrateBlock (persist the winner; the
+     winning offset rides in `state.best_offset`, the verdict arg carries the
+     block per design §2) then the read is good. A decode at offset 0 (only the
+     never-entered clean case) is a plain Accept.
+  4. Table exhausted -> Uncorrectable. The pure ladder stops here.
+
+Reconciliations recorded for the L8 mount agent (so nothing surprises it):
+- **No `ppn` in the constructor / state.** The task prose floated
+  `rel_ladder_state_new(blk, ppn?)`, but the LANDED RelLadderState (rel_types.spl,
+  L1-owned, not editable here) has NO ppn field and the design §2 constructor takes
+  no ppn. The mount holds ppn in its own read loop (design §2
+  `fil_read_with_ladder(m, ppn, blk)`), not in the machine state — so an ignored
+  ppn param would be dead code (code-style.md). Constructor is `rel_ladder_state_new(blk)`.
+- **`blk` is `NdBlock`, not raw i64.** rel_types.spl declares `RelLadderState.blk:
+  NdBlock` and landed `rel_vref_lookup` takes `NdBlock`; the mount threads one
+  `blk` into BOTH `rel_ladder_state_new` and `rel_vref_lookup`, so it must be
+  NdBlock here too (the design's literal `blk: i64` predates the typed-dims
+  landing). Verdicts convert at the flat boundary: `rel_action(kind, s.blk.idx)`
+  (rel_types.spl:47-50 TYPED-DIMS note).
+- **Decoded predicate = `code != NAND_ECC_FAIL`.** The design pseudocode writes
+  `obs.code == ECC_OK`, but nvme_types has no ECC_OK constant — its coarse decode
+  codes are NAND_OK(0) / NAND_ECC_FIXED(1) / NAND_ECC_FAIL(2). A NAND_ECC_FIXED
+  sense (a bit was corrected, data is GOOD) MUST count as decoded, else the ladder
+  would burn a rung on an already-recovered read. So "decoded" is the binary
+  decoded/uncorrectable split `code != NAND_ECC_FAIL` (equivalently the coarse
+  `corrected < 2`), exactly the two-value model the design's ECC_OK|NAND_ECC_FAIL
+  comment (§1.2) intends.
+
+Language landmines honored (design §0): Rel prefix on the public struct;
+RelLadderStep is a named struct (no cross-module tuple decay); phase/kind codes are
+fn-returning literals (freestanding-safe, no module-level init); RelLadderState is a
+value type — `rel_ladder_step` copies `st` into `var s` and RETURNS the updated
+state in the RelLadderStep, never mutating the caller's value in place.
+"""
+
+use nvme_types.*
+use nd_types.*
+use rel_types.*
+use rel_vref.*
+
+# ── Phase constants (design §2; owned by THIS lane per rel_types.spl:117) ──────
+fn rel_phase_seed() -> i64:
+    0              # about to try the calibrated seed (or fall to the table)
+
+fn rel_phase_table() -> i64:
+    1              # walking the fixed 7-entry retry table
+
+fn rel_phase_done() -> i64:
+    2              # a sense decoded -> Accept / CalibrateBlock, ladder complete
+
+fn rel_phase_fail() -> i64:
+    3              # table exhausted -> Uncorrectable, ladder complete
+
+# ── State constructor (design §2). blk is NdBlock (see header reconciliation). ─
+fn rel_ladder_state_new(blk: NdBlock) -> RelLadderState:
+    RelLadderState(blk: blk, depth: 0, table_idx: 0,
+                   best_offset: 0, best_corrected: 0, phase: rel_phase_seed())
+
+# ── Named-struct return (design §2, no anonymous-tuple decay across the mount) ─
+struct RelLadderStep:
+    state:  RelLadderState
+    action: RelAction
+
+# A sense "decoded" iff its coarse ECC code is not the uncorrectable bucket. See
+# the header "Decoded predicate" reconciliation: NAND_ECC_FIXED (corrected==1) is
+# decoded — the data is good — so only NAND_ECC_FAIL (corrected==2) is a miss.
+fn rel_read_decoded(obs: RelReadObs) -> bool:
+    obs.code != NAND_ECC_FAIL
+
+# ── Decision function (design §2 pseudocode, verbatim logic) ──────────────────
+# Pure: given the current state, the latest sense `obs`, and the block's cached
+# ROR `seed` (rel_vref_lookup; 0 == no seed), return the next state + the verdict.
+fn rel_ladder_step(st: RelLadderState, obs: RelReadObs, seed: i64) -> RelLadderStep:
+    var s = st
+    # rung 3: any sense that decoded ends the ladder.
+    if rel_read_decoded(obs):
+        s.best_offset = obs.offset
+        s.best_corrected = obs.corrected
+        s.phase = rel_phase_done()
+        if obs.offset != 0:
+            # CalibrateBlock: persist the winning offset (rides in state.best_offset);
+            # verdict arg carries the block index (flat boundary, design §2).
+            return RelLadderStep(state: s, action: rel_action(rel_act_calibrate(), s.blk.idx))
+        # decoded at the default reference (only the never-entered clean read).
+        return RelLadderStep(state: s, action: rel_action(rel_act_accept(), 0))
+    # still failing -> escalate one rung (observability retry-depth).
+    s.depth = st.depth + 1
+    # rung 1: calibrated-seed-first.
+    if st.phase == rel_phase_seed():
+        s.phase = rel_phase_table()
+        if seed != 0:
+            s.table_idx = 0                    # seed != table[0]: keep the full walk ahead
+            return RelLadderStep(state: s, action: rel_action(rel_act_retry(), seed))
+        s.table_idx = 1                        # no seed: table[0] is the seed rung, skip its duplicate
+        return RelLadderStep(state: s, action: rel_action(rel_act_retry(), rel_vref_table_at(0)))
+    # rung 2: fixed retry-table walk (one entry per step == the step budget).
+    if st.table_idx < rel_vref_table_len():
+        val k: i64 = rel_vref_table_at(st.table_idx)
+        s.table_idx = st.table_idx + 1
+        return RelLadderStep(state: s, action: rel_action(rel_act_retry(), k))
+    # rung 4: table exhausted -> Uncorrectable. The FTL caller escalates to
+    # RAIN reconstruct / Quarantine; the pure ladder just returns the verdict.
+    s.phase = rel_phase_fail()
+    return RelLadderStep(state: s, action: rel_action(rel_act_uncorrectable(), s.blk.idx))

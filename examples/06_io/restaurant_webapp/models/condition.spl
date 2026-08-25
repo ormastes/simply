@@ -1,0 +1,68 @@
+use std.database.{DbCodec, DbValue, DbRow, TableSchema, Column, ColumnType, Database}
+use std.web_framework.model.{Repository}
+
+class MenuCondition:
+    id: i64
+    item_id: i64
+    condition_type: text
+    condition_value: text
+    created_at: text
+
+class MenuConditionCodec:
+    fn table_name() -> text:
+        "menu_conditions"
+
+    fn columns() -> List<text>:
+        ["item_id", "condition_type", "condition_value", "created_at"]
+
+    fn encode(c: MenuCondition) -> List<DbValue>:
+        [
+            DbValue.integer(c.item_id),
+            DbValue.text(c.condition_type),
+            DbValue.text(c.condition_value),
+            DbValue.text(c.created_at)
+        ]
+
+    fn decode(row: DbRow) -> MenuCondition:
+        MenuCondition(
+            id: row.get_i64("id"),
+            item_id: row.get_i64("item_id"),
+            condition_type: row.get_text("condition_type"),
+            condition_value: row.get_text("condition_value"),
+            created_at: row.get_text("created_at")
+        )
+
+    fn schema() -> TableSchema:
+        TableSchema(
+            name: "menu_conditions",
+            columns: [
+                Column(name: "id", col_type: ColumnType.integer, primary_key: true, auto_increment: true),
+                Column(name: "item_id", col_type: ColumnType.integer, nullable: false),
+                Column(name: "condition_type", col_type: ColumnType.text, nullable: false),
+                Column(name: "condition_value", col_type: ColumnType.text, nullable: false),
+                Column(name: "created_at", col_type: ColumnType.text, nullable: false)
+            ]
+        )
+
+fn create_condition_repository(db: Database) -> Repository<MenuCondition>:
+    Repository<MenuCondition>(db: db, codec: MenuConditionCodec())
+
+fn find_conditions_for_item(repo: Repository<MenuCondition>, item_id: i64) -> List<MenuCondition>:
+    repo.find_where("item_id = ?", [DbValue.integer(item_id)])
+
+fn evaluate_condition(cond: MenuCondition, current_time: text, current_day: text) -> bool:
+    if cond.condition_type == "time_after":
+        return current_time >= cond.condition_value
+    if cond.condition_type == "time_before":
+        return current_time <= cond.condition_value
+    if cond.condition_type == "day_of_week":
+        val days = cond.condition_value.split(",")
+        for day in days:
+            if day.trim() == current_day:
+                return true
+        return false
+    if cond.condition_type == "always_available":
+        return true
+    if cond.condition_type == "seasonal":
+        return false
+    true

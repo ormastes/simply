@@ -1,0 +1,90 @@
+app:
+    title: "Scroll Textarea Demo"
+    theme: glass_dark
+
+layout:
+    type: vbox
+    children:
+        content:
+            type: panel
+            title: "Scroll & Textarea Demo"
+            children:
+                scroller:
+                    type: scroll
+                    max_height: 8
+                    scroll_offset: 0
+                    children:
+                        line_0:
+                            type: text
+                            content: "Line 1: scroll content item"
+                        line_1:
+                            type: text
+                            content: "Line 2: scroll content item"
+                        line_2:
+                            type: text
+                            content: "Line 3: scroll content item"
+                        line_3:
+                            type: text
+                            content: "Line 4: scroll content item"
+                        line_4:
+                            type: text
+                            content: "Line 5: scroll content item"
+                        line_5:
+                            type: text
+                            content: "Line 6: scroll content item"
+                        line_6:
+                            type: text
+                            content: "Line 7: scroll content item"
+                        line_7:
+                            type: text
+                            content: "Line 8: scroll content item"
+                        line_8:
+                            type: text
+                            content: "Line 9: scroll content item"
+                        line_9:
+                            type: text
+                            content: "Line 10: scroll content item"
+                        line_10:
+                            type: text
+                            content: "Line 11: scroll content item"
+                        line_11:
+                            type: text
+                            content: "Line 12: scroll content item"
+                        line_12:
+                            type: text
+                            content: "Line 13: scroll content item"
+                        line_13:
+                            type: text
+                            content: "Line 14: scroll content item"
+                        line_14:
+                            type: text
+                            content: "Line 15: scroll content item"
+                        line_15:
+                            type: text
+                            content: "Line 16: scroll content item"
+                        line_16:
+                            type: text
+                            content: "Line 17: scroll content item"
+                        line_17:
+                            type: text
+                            content: "Line 18: scroll content item"
+                        line_18:
+                            type: text
+                            content: "Line 19: scroll content item"
+                        line_19:
+                            type: text
+                            content: "Line 20: scroll content item"
+                ta_code:
+                    type: textarea
+                    value: "fn main():\n    val x = 42\n    print x\n    return 0"
+                    placeholder: "Enter code..."
+                    rows: 6
+                ta_empty:
+                    type: textarea
+                    value: ""
+                    placeholder: "Type something here..."
+                    rows: 4
+        status:
+            type: statusbar
+            left: "{app.mode}"
+            right: "{app.title}"

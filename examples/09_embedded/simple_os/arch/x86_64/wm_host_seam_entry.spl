@@ -1,0 +1,168 @@
+# x86_64 entry — the WM host seam running on real SimpleOS hardware.
+#
+# This entry exists to discharge one claim and nothing else:
+#
+#     if Simple 2D (surface + event delivery) runs on SimpleOS,
+#     then the WM runs on SimpleOS.
+#
+# It does that by running `wm_host_2d_frame` — the portable WM frame step from
+# src/lib/nogc_async_mut/wm/host.spl, which contains no platform branch and is
+# not modified or copied here — over `WmHost2dSimpleOs`, which is backed by the
+# hardware BGA scanout and the PS/2 controller.
+#
+# Every marker below reports a value that a broken path cannot produce:
+#   [seam] scanout      real framebuffer address / geometry from bga_init
+#   [seam] backing      the backend's own statement of what is under it
+#   [seam] frame        the portable frame report, verbatim
+#   [seam] pixel        ARGB read back OUT of the framebuffer at three points
+#   [seam] event        one real PS/2 byte, delivered through the seam
+#
+# The pixel markers are readbacks (`FramebufferDriver.read_pixel` ->
+# `mmio_read32`), not echoes of what was requested, so a write that never
+# landed prints the wrong number rather than a cheerful one.
+
+use nogc_async_mut.wm.host.{wm_host_2d_frame, wm_host_2d_for, wm_host_2d_for_backed, WmHostFrameReport}
+use std.common.window_protocol.geometry.{Size}
+use os.services.wm.wm_host_2d_simpleos.{WmHost2dSimpleOs, wm_host_2d_simpleos, ps2_event_source_init}
+use os.drivers.framebuffer.fb_driver.{FramebufferDriver}
+use os.drivers.framebuffer.bga_init.{ScanoutEvidence, bga_init_scanout, scanout_evidence_is_valid, scanout_stride_pixels}
+
+extern fn serial_println(msg: text)
+extern fn rt_gui_set_fb(addr: u64, width: u64)
+extern fn rt_port_outb(port: u16, value: u8)
+
+fn _probe_argb() -> u32:
+    # Must match WmHost2dSimpleOs.probe_argb. Chosen so the QMP screendump can
+    # be validated by exact colour, not merely by "not black".
+    0xFF2D7DD2
+
+fn _input_poll_iters() -> u64:
+    # I/O-port-delay spin, sized to give the harness real wall-clock time to
+    # inject keystrokes over QMP after it sees the awaiting-input marker.
+    4000000
+
+fn _events_wanted() -> i64:
+    # The harness injects 5 keys over QMP; each produces a make and a break
+    # code, so 10 real PS/2 bytes is the full expected traffic. Stopping at
+    # exactly that count is what lets the loop end without a wall-clock guess.
+    10
+
+fn _settle_iters() -> u64:
+    # Hold the finished frame on screen long enough for a QMP screendump.
+    12000000
+
+fn _settle():
+    var iter: u64 = 0
+    while iter < _settle_iters():
+        rt_port_outb(0x80, 0)
+        iter = iter + 1
+
+fn _report_frame(tag: text, r: WmHostFrameReport):
+    serial_println("[seam] frame {tag} steps={r.steps}")
+    serial_println("[seam] frame {tag} surface_ok={r.surface_ok} state={r.surface_state} w={r.surface_width} h={r.surface_height} present_ok={r.present_ok} drained={r.events_drained} released_ok={r.released_ok}")
+
+fn spl_start():
+    serial_println("SimpleOS x86_64 WM host-seam evidence")
+    serial_println("[BOOT] COM1 serial ready")
+
+    serial_println("[BOOT] Initializing BGA framebuffer...")
+    val scanout = bga_init_scanout(1024, 768, 32)
+    serial_println("[seam] scanout address={scanout.address} width={scanout.width} height={scanout.height} stride={scanout.stride} format={scanout.pixel_format}")
+    if not scanout_evidence_is_valid(scanout):
+        serial_println("[seam] scanout-invalid")
+        serial_println("SEAM FAILED")
+        return
+    rt_gui_set_fb(scanout.address, scanout.width.to_u64())
+    serial_println("[seam] framebuffer bound")
+
+    # --- The unbacked routing still refuses, and says so ---------------------
+    val refused = wm_host_2d_frame(wm_host_2d_for("simpleos"), Size.wh(320, 240))
+    serial_println("[seam] unbacked surface_ok={refused.surface_ok} state={refused.surface_state}")
+
+    # --- The backed routing: real framebuffer, real PS/2 ---------------------
+    val stride_px = scanout_stride_pixels(scanout)
+    val fb = FramebufferDriver.from_scanout_raw(
+        scanout.address,
+        scanout.width,
+        scanout.height,
+        scanout.stride,
+        32
+    )
+    val host = wm_host_2d_simpleos(fb)
+    serial_println("[seam] backing kind={host.backing_kind()} scanout={host.scanout_address()} stride_px={stride_px}")
+    if not host.is_backed():
+        serial_println("[seam] backing-none")
+        serial_println("SEAM FAILED")
+        return
+
+    val routed = wm_host_2d_for_backed("simpleos", host, host.backing_kind())
+
+    # The portable WM frame, unmodified, over the SimpleOS seam.
+    val r = wm_host_2d_frame(routed, Size.wh(scanout.width.to_i32(), scanout.height.to_i32()))
+    _report_frame("1", r)
+
+    # --- Pixel evidence: read the framebuffer back --------------------------
+    val expected = _probe_argb()
+    val px_tl = fb.read_pixel(0, 0)
+    val px_mid = fb.read_pixel(scanout.width / 2, scanout.height / 2)
+    val px_br = fb.read_pixel(scanout.width - 1, scanout.height - 1)
+    serial_println("[seam] pixel expected={expected} tl={px_tl} mid={px_mid} br={px_br}")
+    serial_println("[seam] pixel host_verified={host.last_verified_pixel()} presents={host.presents()}")
+
+    var pixels_ok = true
+    if px_tl != expected:
+        pixels_ok = false
+    if px_mid != expected:
+        pixels_ok = false
+    if px_br != expected:
+        pixels_ok = false
+    if pixels_ok:
+        serial_println("[seam] pixel-verdict pass value={expected}")
+    else:
+        serial_println("[seam] pixel-verdict fail")
+
+    # --- Event evidence: real PS/2 bytes through the seam -------------------
+    # UEFI leaves the i8042 keyboard port disabled on handoff; re-enable it.
+    val ps2_ready = ps2_event_source_init()
+    serial_println("[seam] event-source ps2_ack={ps2_ready}")
+    serial_println("[seam] awaiting-input")
+    var seen: i64 = 0
+    var first_state = "none"
+    var iter: u64 = 0
+    var polling = true
+    while polling:
+        if iter >= _input_poll_iters():
+            polling = false
+        else:
+            val poll = host.event_poll()
+            if poll.ok:
+                seen = seen + 1
+                if seen == 1:
+                    first_state = poll.state
+                serial_println("[seam] event n={seen} state={poll.state} code={poll.event.key_code.code} x={poll.event.point.x}")
+            if seen >= _events_wanted():
+                polling = false
+            rt_port_outb(0x80, 0)
+            iter = iter + 1
+    serial_println("[seam] event-total count={seen} first={first_state} iters={iter}")
+
+    var verdict_ok = true
+    if not r.surface_ok:
+        verdict_ok = false
+    if not r.present_ok:
+        verdict_ok = false
+    if not r.released_ok:
+        verdict_ok = false
+    if not pixels_ok:
+        verdict_ok = false
+    if seen <= 0:
+        verdict_ok = false
+
+    if verdict_ok:
+        serial_println("[seam] contract simple-2d-runs=true wm-runs=true")
+        serial_println("SEAM PASSED")
+    else:
+        serial_println("[seam] contract unproven")
+        serial_println("SEAM FAILED")
+
+    _settle()

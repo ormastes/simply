@@ -1,0 +1,68 @@
+"""
+gc_safety_check — GC data-loss guard + write-cliff (liveness) regression.
+
+Drives the FTL to the host-write boundary, where the over-provisioning / GC reserve
+is the only free space left, and the cheapest GC victim still holds live pages. Proves:
+
+  * the host write path never consumes the GC scratch reserve (free stops at GC_RESERVE),
+    and is refused cleanly (SC_NS_NOT_READY) rather than crashing or half-applying;
+  * garbage collection, using the reserve as scratch, relocates the victim's live pages
+    and reclaims it WITHOUT losing committed data (the data-loss guard);
+  * there is no write-cliff: once GC reclaims stale space, host writes succeed again.
+
+Construction (geometry: 64 blocks x 64 pages, 3072 surfaced LBAs, GC_RESERVE held back):
+  1. write all 3072 LBAs once (blocks 0..47 live);
+  2. overwrite every 3rd LBA (ascending) to spread staleness until a host write is
+     refused — block 0 becomes the cheapest victim and still holds LBA 1 (never a
+     multiple of 3, so never overwritten).
+
+Run: bin/simple run examples/09_embedded/simpleos_nvme_fw/fw/gc_safety_check.spl
+"""
+
+use nvme_types.*
+use ftl.*
+
+fn main():
+    var ftl: Ftl = ftl_new()
+    var fail: i64 = 0
+
+    # 1. Fill every surfaced LBA with a known value (lba + 1000).
+    var x: i64 = 0
+    while x < LBA_COUNT:
+        ftl.write(x, x + 1000)
+        x = x + 1
+
+    # 2. Overwrite every 3rd LBA until the host write path is refused at the reserve.
+    var k: i64 = 0
+    var rc: i64 = SC_SUCCESS
+    while k < LBA_COUNT and rc == SC_SUCCESS:
+        rc = ftl.write(k, k + 5000)
+        if rc == SC_SUCCESS:
+            k = k + 3
+
+    print "free at boundary = {ftl.free_blocks()} (want GC_RESERVE={GC_RESERVE}); last rc = {rc}"
+    fail = fail + expect_eq(ftl.free_blocks(), GC_RESERVE, "host writes stop at the GC reserve (scratch held back)")
+    fail = fail + expect_eq(rc, SC_NS_NOT_READY, "host write refused cleanly at the reserve boundary (no crash)")
+
+    # 3. LBA 1 is a live page in the cheapest victim block (block 0).
+    fail = fail + expect_eq(ftl.read(1), 1001, "LBA1 live at the boundary")
+
+    # 4. At the boundary (no GC yet) a fresh host write is refused — the cliff state.
+    fail = fail + expect_eq(ftl.write(7, 77), SC_NS_NOT_READY, "write refused before GC (device at the reserve)")
+
+    # 5. GC, using the reserve as scratch, reclaims a victim and preserves its live data.
+    val victim: i64 = ftl.gc_once()
+    var reclaimed: i64 = 0
+    if victim != UNMAP:
+        reclaimed = 1
+    fail = fail + expect_eq(reclaimed, 1, "GC reclaims a victim using the reserve (forward progress)")
+    fail = fail + expect_eq(ftl.read(1), 1001, "LBA1 survives GC under pressure (no data loss)")
+
+    # 6. No write-cliff: after GC reclaimed stale space, host writes succeed again.
+    fail = fail + expect_eq(ftl.write(7, 77), SC_SUCCESS, "host write succeeds after GC reclaimed space (no cliff)")
+    fail = fail + expect_eq(ftl.read(7), 77, "post-GC host write reads back")
+
+    if fail == 0:
+        print "GC SAFETY OK"
+    else:
+        print "GC SAFETY FAIL ({fail})"

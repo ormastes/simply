@@ -1,0 +1,41 @@
+pub fn _rv32_queue_len_pending(length: i64, depth: i64) -> i64:
+    if depth <= 0:
+        return 0
+    if length < 0:
+        return 0
+    if length > depth:
+        return depth
+    length
+
+pub fn _rv32_queue_submit_valid(cid: i64, length: i64, tail: i64, depth: i64) -> i32:
+    if depth <= 0:
+        return 1
+    if cid < 0:
+        return 1
+    if cid > 65535:
+        return 1
+    if length < 0:
+        return 1
+    if length >= depth:
+        return 1
+    if tail < 0:
+        return 1
+    if tail >= depth:
+        return 1
+    0
+
+pub fn _rv32_queue_fetch_valid(length: i64, head: i64, depth: i64) -> i32:
+    if depth <= 0:
+        return 1
+    if length <= 0:
+        return 1
+    if head < 0:
+        return 1
+    if head >= depth:
+        return 1
+    0
+
+pub fn _rv32_queue_next(index: i64, depth: i64) -> i64:
+    if depth <= 0:
+        return 0
+    (index + 1) % depth

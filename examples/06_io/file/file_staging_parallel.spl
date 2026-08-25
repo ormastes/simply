@@ -1,0 +1,463 @@
+# Parallel File Staging Example - Mold-Inspired Inter-Process I/O
+#
+# This example demonstrates how to use shared memory mapping and worker
+# processes to achieve high-performance parallel file processing, similar
+# to how the mold linker stages object files across multiple processes.
+#
+# Key Features:
+# - Shared memory mapping (MAP_SHARED) for inter-process file access
+# - Fork-based worker processes that inherit parent's mmap regions
+# - Varargs staging for batch file operations
+# - Zero-copy file access across processes
+
+import std.io.fs
+import std.io.term
+import std.core.array
+import std.core.result
+import std.units.time
+import std.units.size
+
+# ==============================================================================
+# Example 1: Basic Shared Memory Mapping
+# ==============================================================================
+
+pub async fn example_basic_shared_mmap():
+    """
+    Demonstrate basic shared memory mapping for a single file.
+    The mmap is created with MAP_SHARED, allowing other processes to access it.
+    """
+
+    println("=== Example 1: Basic Shared Memory Mapping ===")
+
+    # Open file and create shared mmap
+    val file = await File::open_read("test_data.bin"_filepath)?
+    await file.stage_mmap_shared()?
+
+    println("✓ File staged with shared memory mapping")
+    println("  Mode: {:?}", file.stage_mode())
+    println("  Shared: {}", file.is_staged())
+
+    # Read from mmap (zero-copy)
+    var buffer = Bytes::with_capacity(4096)
+    val n = await file.read(&mut buffer)?
+    println("✓ Read {} bytes via zero-copy mmap", n)
+
+    await file.close()?
+    println()
+
+
+# ==============================================================================
+# Example 2: Varargs Staging - Stage Multiple Files Together
+# ==============================================================================
+
+pub async fn example_varargs_staging():
+    """
+    Stage multiple files together with a single call.
+    All files will use the same staging strategy (MmapShared).
+    """
+
+    println("=== Example 2: Varargs Staging ===")
+
+    # Stage all files with shared mmap
+    await stage(
+        StageMode::MmapShared,
+        "file1.dat"_filepath,
+        "file2.dat"_filepath,
+        "file3.dat"_filepath,
+        "file4.dat"_filepath,
+        "file5.dat"_filepath
+    )?
+
+    println("✓ Staged 5 files with shared memory mapping")
+    println("  All files now accessible via zero-copy mmap")
+    println("  MAP_SHARED allows access from worker processes")
+    println()
+
+
+# ==============================================================================
+# Example 3: Worker Process with Inherited Mmap
+# ==============================================================================
+
+# Worker function that runs in child process
+fn worker_process_reader() -> i64:
+    """
+    This function runs in a child process spawned via fork().
+    It inherits the parent's mmap regions and can access staged files
+    without additional I/O.
+    """
+
+    println("  [Worker] Running in child process PID: {}", process_id())
+
+    # Open file (uses already-staged mmap from parent)
+    val file = File::open_read("shared_data.bin"_filepath) catch {
+        println("  [Worker] ERROR: Failed to open file")
+        return 1
+    }
+
+    # Read data (zero-copy from inherited mmap)
+    var buffer = Bytes::with_capacity(1024)
+    val n = file.read(&mut buffer) catch {
+        println("  [Worker] ERROR: Failed to read")
+        return 1
+    }
+
+    println("  [Worker] ✓ Read {} bytes via inherited mmap", n)
+    println("  [Worker] First 16 bytes: {:?}", buffer.slice(0, 16.min(n)))
+
+    file.close() catch {
+        return 1
+    }
+
+    return 0  # Success
+
+
+pub async fn example_worker_inheritance():
+    """
+    Spawn a worker process that inherits the parent's mmap regions.
+    This demonstrates the core mold-linker pattern.
+    """
+
+    println("=== Example 3: Worker Process with Inherited Mmap ===")
+
+    # Stage file in parent process with SHARED mapping
+    val file = await File::open_read("shared_data.bin"_filepath)?
+    await file.stage_mmap_shared()?
+    println("✓ Parent: Staged file with shared mmap")
+
+    # Spawn worker - inherits mmap region
+    val worker = await spawn_worker_with_staging(
+        ["shared_data.bin"_filepath],
+        StageMode::MmapShared,
+        worker_process_reader
+    )?
+
+    println("✓ Parent: Spawned worker PID {}", worker.pid)
+
+    # Wait for worker to complete
+    val exit_code = await worker.join()?
+    println("✓ Parent: Worker exited with code {}", exit_code)
+
+    await file.close()?
+    println()
+
+
+# ==============================================================================
+# Example 4: Parallel Processing with Multiple Workers
+# ==============================================================================
+
+# Worker functions for parallel processing
+fn worker_chunk_0() -> i64:
+    println("  [Worker 0] Processing chunk 0...")
+    # Process first chunk of files
+    return 0
+
+fn worker_chunk_1() -> i64:
+    println("  [Worker 1] Processing chunk 1...")
+    # Process second chunk of files
+    return 0
+
+fn worker_chunk_2() -> i64:
+    println("  [Worker 2] Processing chunk 2...")
+    # Process third chunk of files
+    return 0
+
+fn worker_chunk_3() -> i64:
+    println("  [Worker 3] Processing chunk 3...")
+    # Process fourth chunk of files
+    return 0
+
+
+pub async fn example_parallel_processing():
+    """
+    Stage many files and spawn multiple worker processes to process them
+    in parallel. This is how mold achieves 2-4x speedup: all workers can
+    access the same staged files without additional I/O.
+    """
+
+    println("=== Example 4: Parallel Processing with Multiple Workers ===")
+
+    # All files to process
+    val files = [
+        "input_00.dat"_filepath, "input_01.dat"_filepath,
+        "input_02.dat"_filepath, "input_03.dat"_filepath,
+        "input_04.dat"_filepath, "input_05.dat"_filepath,
+        "input_06.dat"_filepath, "input_07.dat"_filepath,
+        "input_08.dat"_filepath, "input_09.dat"_filepath,
+        "input_10.dat"_filepath, "input_11.dat"_filepath,
+    ]
+
+    println("Files to process: {}", files.len())
+
+    # Stage all files with shared mmap
+    val start = Time::now()
+    await stage_files(StageMode::MmapShared, files)?
+    val staging_time = Time::now() - start
+    println("✓ Staged {} files in {}", files.len(), staging_time)
+
+    # Spawn 4 workers
+    val workers = await spawn_workers_with_staging(
+        files,
+        StageMode::MmapShared,
+        [worker_chunk_0, worker_chunk_1, worker_chunk_2, worker_chunk_3]
+    )?
+
+    println("✓ Spawned {} workers", workers.len())
+
+    # Wait for all workers
+    for (i, worker) in workers.enumerate():
+        if await worker.is_alive():
+            println("  Worker {} (PID {}) is running...", i, worker.pid)
+
+    var all_success = true
+    for (i, worker) in workers.enumerate():
+        val exit_code = await worker.join()?
+        if exit_code != 0:
+            println("  ✗ Worker {} failed with code {}", i, exit_code)
+            all_success = false
+        else:
+            println("  ✓ Worker {} completed successfully", i)
+
+    if all_success:
+        println("✓ All workers completed successfully")
+    else:
+        println("✗ Some workers failed")
+
+    println()
+
+
+# ==============================================================================
+# Example 5: Compiler Use Case - Stage Source Files
+# ==============================================================================
+
+fn worker_parse_module() -> i64:
+    """
+    Worker that parses a module's source files.
+    In a real compiler, this would invoke the parser on staged sources.
+    """
+
+    println("  [Parser Worker] Parsing module...")
+
+    # All source files are already in memory via inherited mmap
+    # No I/O blocking during parsing!
+
+    # Simulate parsing work
+    val source_files = [
+        "main.spl"_filepath,
+        "utils.spl"_filepath,
+        "types.spl"_filepath,
+        "parser.spl"_filepath,
+    ]
+
+    for path in source_files:
+        val file = File::open_read(path) catch {
+            return 1
+        }
+
+        # Read entire source (zero-copy from mmap)
+        var buffer = Bytes::with_capacity(65536)
+        val n = file.read(&mut buffer) catch {
+            return 1
+        }
+
+        println("  [Parser Worker]   Parsed {} ({} bytes)", path, n)
+
+        file.close() catch {
+            return 1
+        }
+
+    println("  [Parser Worker] ✓ Module parsed successfully")
+    return 0
+
+
+pub async fn example_compiler_use_case():
+    """
+    Demonstrate how a compiler can use file staging to speed up compilation.
+
+    Pattern:
+    1. Stage all source files with shared mmap
+    2. Spawn parser workers (each parses a module)
+    3. Workers access sources via zero-copy inherited mmap
+    4. No I/O blocking during parsing phase
+
+    Expected speedup: 2-4x (similar to mold linker)
+    """
+
+    println("=== Example 5: Compiler Use Case ===")
+
+    # All source files in project
+    val source_files = [
+        "main.spl"_filepath,
+        "utils.spl"_filepath,
+        "types.spl"_filepath,
+        "parser.spl"_filepath,
+        "codegen.spl"_filepath,
+        "runtime.spl"_filepath,
+    ]
+
+    println("Project has {} source files", source_files.len())
+
+    # Stage all sources with shared mmap
+    println("Staging all sources...")
+    val start = Time::now()
+    await stage_files(StageMode::MmapShared, source_files)?
+    val staging_time = Time::now() - start
+    println("✓ Staged in {} (one-time cost)", staging_time)
+
+    # Spawn parser workers
+    println("Spawning parser workers...")
+    val worker = await spawn_worker_with_staging(
+        source_files,
+        StageMode::MmapShared,
+        worker_parse_module
+    )?
+
+    println("✓ Worker spawned (PID {})", worker.pid)
+    println("  All sources accessible via inherited mmap")
+    println("  No I/O blocking during parsing!")
+
+    # Wait for parsing to complete
+    val exit_code = await worker.join()?
+
+    if exit_code == 0:
+        println("✓ Compilation successful")
+    else:
+        println("✗ Compilation failed with code {}", exit_code)
+
+    println()
+    println("Performance benefit:")
+    println("  Traditional: Each worker does own I/O (N×IO_TIME)")
+    println("  With staging: One-time staging (1×IO_TIME + CPU_PARALLEL)")
+    println("  Expected speedup: 2-4x (mold-style)")
+    println()
+
+
+# ==============================================================================
+# Example 6: Build System Use Case - Parallel Dependency Processing
+# ==============================================================================
+
+pub async fn example_build_system():
+    """
+    Build system that stages all dependencies and spawns workers to
+    process them in parallel.
+    """
+
+    println("=== Example 6: Build System Use Case ===")
+
+    # All object files to link
+    val obj_files = [
+        "main.o"_filepath,
+        "utils.o"_filepath,
+        "lib_core.o"_filepath,
+        "lib_std.o"_filepath,
+        "lib_collections.o"_filepath,
+    ]
+
+    println("Linking {} object files", obj_files.len())
+
+    # Stage all objects with shared mmap (mold-style)
+    println("Staging objects...")
+    await stage_files(StageMode::MmapShared, obj_files)?
+    println("✓ All objects staged in shared memory")
+
+    # In a real build system, spawn linker workers here
+    println("✓ Ready for parallel linking")
+    println("  Each worker can access objects via zero-copy mmap")
+    println("  Mold achieves 4x speedup with this approach")
+    println()
+
+
+# ==============================================================================
+# Example 7: Performance Comparison
+# ==============================================================================
+
+pub async fn example_performance_comparison():
+    """
+    Compare performance of different staging strategies.
+    """
+
+    println("=== Example 7: Performance Comparison ===")
+
+    val test_file = "large_file.bin"_filepath
+
+    # Traditional (no staging)
+    println("Traditional read (no staging):")
+    val start = Time::now()
+    val file1 = await File::open_read(test_file)?
+    var buf1 = Bytes::with_capacity(4096)
+    for i in 0..1000:
+        await file1.seek(SeekFrom::Start(i * 4096))?
+        await file1.read(&mut buf1)?
+    await file1.close()?
+    val traditional_time = Time::now() - start
+    println("  Time: {} (1000 random reads)", traditional_time)
+
+    # With mmap
+    println("Memory-mapped (MmapShared):")
+    val start = Time::now()
+    val file2 = await File::open_read(test_file)?
+    await file2.stage_mmap_shared()?
+    var buf2 = Bytes::with_capacity(4096)
+    for i in 0..1000:
+        await file2.seek(SeekFrom::Start(i * 4096))?
+        await file2.read(&mut buf2)?
+    await file2.close()?
+    val mmap_time = Time::now() - start
+    println("  Time: {} (1000 random reads via mmap)", mmap_time)
+
+    # Calculate speedup
+    val speedup = traditional_time / mmap_time
+    println()
+    println("Speedup: {:.2}x", speedup)
+    println("Expected: 5-10x for random access patterns")
+    println()
+
+
+# ==============================================================================
+# Example 8: Helper Functions
+# ==============================================================================
+
+async fn stage_files(mode: StageMode, files: Array<FilePath>) -> Result<(), IoError>:
+    """Helper to stage multiple files."""
+    for path in files:
+        val file = await File::open_read(path)?
+        match mode:
+            case StageMode::MmapShared:
+                await file.stage_mmap_shared()?
+            case StageMode::Mmap:
+                await file.stage_mmap()?
+            case StageMode::Prefetch:
+                await file.stage_prefetch()?
+            case StageMode::Adaptive:
+                await file.stage_auto()?
+            case StageMode::None:
+                pass  # No staging
+    return Ok(())
+
+fn process_id() -> i64:
+    """Get current process ID (placeholder - needs native impl)."""
+    return 12345
+
+
+# ==============================================================================
+# Main Entry Point
+# ==============================================================================
+
+pub async fn main():
+    println("╔══════════════════════════════════════════════════════════╗")
+    println("║  Mold-Inspired Parallel File Staging Examples           ║")
+    println("║  Inter-Process Shared Memory & Zero-Copy I/O            ║")
+    println("╚══════════════════════════════════════════════════════════╝")
+    println()
+
+    # Run all examples
+    await example_basic_shared_mmap()
+    await example_varargs_staging()
+    await example_worker_inheritance()
+    await example_parallel_processing()
+    await example_compiler_use_case()
+    await example_build_system()
+    await example_performance_comparison()
+
+    println("╔══════════════════════════════════════════════════════════╗")
+    println("║  All Examples Complete                                   ║")
+    println("╚══════════════════════════════════════════════════════════╝")

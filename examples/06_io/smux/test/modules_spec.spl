@@ -1,0 +1,667 @@
+#![allow(unnamed_duplicate_typed_args)]
+# Smux modules specification — self-contained pure-function tests
+# Covers: quick_text, mobile_keys, nerd_font, platform, notification
+
+# ============================================================================
+# QuickTextEntry / QuickTextPanel (from src/quick_text.spl)
+# ============================================================================
+
+struct QuickTextEntry:
+    label: text
+    snippet: text
+    shortcut: text
+
+class QuickTextPanel:
+    entries: [QuickTextEntry]
+    visible: bool
+    selected_index: i32
+
+    static fn create() -> QuickTextPanel:
+        QuickTextPanel(entries: [], visible: false, selected_index: -1)
+
+    me add_entry(label: text, snippet: text, shortcut: text):
+        self.entries.push(QuickTextEntry(label: label, snippet: snippet, shortcut: shortcut))
+
+    me toggle():
+        self.visible = not self.visible
+
+    me show():
+        self.visible = true
+
+    me hide():
+        self.visible = false
+
+    fn is_visible() -> bool:
+        self.visible
+
+    fn get_snippet(index: i32) -> text:
+        if index < 0 or index >= self.entries.len() as i32:
+            return ""
+        return self.entries[index].snippet
+
+    fn render(screen_width: i32, use_nerd: bool) -> text:
+        if not self.visible:
+            return ""
+        if self.entries.len() == 0:
+            return ""
+        val esc = "\u{001b}"
+        var line = ""
+        var total_width = 0
+        var i = 0
+        while i < self.entries.len():
+            val entry = self.entries[i]
+            val btn_text = " Alt+{entry.shortcut}:{entry.label} "
+            if total_width + btn_text.len() + 1 > screen_width:
+                break
+            if i > 0:
+                line = "{line} "
+                total_width = total_width + 1
+            line = "{line}{esc}[44m{esc}[37m{btn_text}{esc}[0m"
+            total_width = total_width + btn_text.len()
+            i = i + 1
+        return line
+
+    fn hit_test(x: i32) -> i32:
+        var offset = 0
+        var i = 0
+        while i < self.entries.len():
+            val entry = self.entries[i]
+            val btn_width = entry.label.len() + entry.shortcut.len() + 7
+            if i > 0:
+                offset = offset + 1
+            if x >= offset and x < offset + btn_width:
+                return i as i32
+            offset = offset + btn_width
+            i = i + 1
+        return -1
+
+    fn height() -> i32:
+        if self.visible and self.entries.len() > 0:
+            return 1
+        return 0
+
+# ============================================================================
+# KeyButton / MobileKeybar (from src/mobile_keys.spl)
+# ============================================================================
+
+struct KeyButton:
+    label: text
+    key_value: text
+    width: i32
+
+class MobileKeybar:
+    buttons: [KeyButton]
+    visible: bool
+    selected_index: i32
+
+    static fn create() -> MobileKeybar:
+        var btns: [KeyButton] = []
+        btns.push(KeyButton(label: "Tab", key_value: "tab", width: 5))
+        btns.push(KeyButton(label: "Esc", key_value: "escape", width: 5))
+        btns.push(KeyButton(label: "Ctrl", key_value: "ctrl", width: 6))
+        btns.push(KeyButton(label: "|", key_value: "|", width: 3))
+        btns.push(KeyButton(label: "/", key_value: "/", width: 3))
+        btns.push(KeyButton(label: "\u{2190}", key_value: "left", width: 3))
+        btns.push(KeyButton(label: "\u{2191}", key_value: "up", width: 3))
+        btns.push(KeyButton(label: "\u{2193}", key_value: "down", width: 3))
+        btns.push(KeyButton(label: "\u{2192}", key_value: "right", width: 3))
+        MobileKeybar(buttons: btns, visible: false, selected_index: -1)
+
+    me show():
+        self.visible = true
+
+    me hide():
+        self.visible = false
+
+    fn is_visible() -> bool:
+        self.visible
+
+    fn render(screen_width: i32) -> text:
+        if not self.visible:
+            return ""
+        val esc = "\u{001b}"
+        var line = "{esc}[7m"
+        var total_width = 0
+        var i = 0
+        while i < self.buttons.len():
+            val btn = self.buttons[i]
+            if total_width + btn.width + 1 > screen_width:
+                break
+            if i > 0:
+                line = "{line}{esc}[0m|{esc}[7m"
+                total_width = total_width + 1
+            var padded = btn.label
+            while padded.len() < btn.width:
+                padded = " {padded}"
+                if padded.len() < btn.width:
+                    padded = "{padded} "
+            line = "{line}{padded}"
+            total_width = total_width + btn.width
+            i = i + 1
+        while total_width < screen_width:
+            line = "{line} "
+            total_width = total_width + 1
+        line = "{line}{esc}[0m"
+        return line
+
+    fn hit_test(x: i32) -> text:
+        var offset = 0
+        var i = 0
+        while i < self.buttons.len():
+            val btn = self.buttons[i]
+            if i > 0:
+                offset = offset + 1
+            if x >= offset and x < offset + btn.width:
+                return btn.key_value
+            offset = offset + btn.width
+            i = i + 1
+        return ""
+
+    fn height() -> i32:
+        if self.visible:
+            return 1
+        return 0
+
+fn should_show_keybar(platform_name: text, config_mode: text) -> bool:
+    if config_mode == "always":
+        return true
+    if config_mode == "never":
+        return false
+    return platform_name == "android" or platform_name == "ios"
+
+# ============================================================================
+# Nerd Font helpers (from src/nerd_font.spl)
+# ============================================================================
+
+struct BoxChars:
+    top_left: text
+    top_right: text
+    bottom_left: text
+    bottom_right: text
+    horizontal: text
+    vertical: text
+    tee_left: text
+    tee_right: text
+    tee_top: text
+    tee_bottom: text
+    cross: text
+
+fn ascii_box() -> BoxChars:
+    BoxChars(
+        top_left: "+",
+        top_right: "+",
+        bottom_left: "+",
+        bottom_right: "+",
+        horizontal: "-",
+        vertical: "|",
+        tee_left: "+",
+        tee_right: "+",
+        tee_top: "+",
+        tee_bottom: "+",
+        cross: "+"
+    )
+
+fn rounded_box() -> BoxChars:
+    BoxChars(
+        top_left: "\u{256d}",
+        top_right: "\u{256e}",
+        bottom_left: "\u{2570}",
+        bottom_right: "\u{256f}",
+        horizontal: "\u{2500}",
+        vertical: "\u{2502}",
+        tee_left: "\u{2524}",
+        tee_right: "\u{251c}",
+        tee_top: "\u{2534}",
+        tee_bottom: "\u{252c}",
+        cross: "\u{253c}"
+    )
+
+fn icon(name: text) -> text:
+    match name:
+        "file" => "\u{f15b}"
+        "folder" => "\u{f07b}"
+        "terminal" => "\u{f120}"
+        "gear" => "\u{f013}"
+        "check" => "\u{f00c}"
+        "cross" => "\u{f00d}"
+        "warning" => "\u{f071}"
+        "search" => "\u{f002}"
+        "bell" => "\u{f0f3}"
+        "robot" => "\u{f544}"
+        _ => "?"
+
+fn icon_or_ascii(name: text, ascii_fallback: text, use_nerd: bool) -> text:
+    if use_nerd:
+        return icon(name)
+    return ascii_fallback
+
+fn render_box(x: i32, y: i32, w: i32, h: i32, use_nerd: bool) -> [text]:
+    val bc = if use_nerd: rounded_box() else: ascii_box()
+    var result: [text] = []
+
+    var top = bc.top_left
+    var i = 0
+    while i < w - 2:
+        top = "{top}{bc.horizontal}"
+        i = i + 1
+    top = "{top}{bc.top_right}"
+    result.push(top)
+
+    i = 0
+    while i < h - 2:
+        var mid = bc.vertical
+        var j = 0
+        while j < w - 2:
+            mid = "{mid} "
+            j = j + 1
+        mid = "{mid}{bc.vertical}"
+        result.push(mid)
+        i = i + 1
+
+    var bottom = bc.bottom_left
+    i = 0
+    while i < w - 2:
+        bottom = "{bottom}{bc.horizontal}"
+        i = i + 1
+    bottom = "{bottom}{bc.bottom_right}"
+    result.push(bottom)
+
+    return result
+
+# ============================================================================
+# Platform enum (from src/platform.spl)
+# ============================================================================
+
+enum Platform:
+    Linux
+    MacOS
+    Windows
+    Android
+    IOS
+    Unknown
+
+    fn name() -> text:
+        match self:
+            Platform.Linux => "linux"
+            Platform.MacOS => "macos"
+            Platform.Windows => "windows"
+            Platform.Android => "android"
+            Platform.IOS => "ios"
+            Platform.Unknown => "unknown"
+
+    fn is_mobile() -> bool:
+        match self:
+            Platform.Android => true
+            Platform.IOS => true
+            _ => false
+
+    fn is_desktop() -> bool:
+        match self:
+            Platform.Linux => true
+            Platform.MacOS => true
+            Platform.Windows => true
+            _ => false
+
+# ============================================================================
+# Notification struct (from src/notification.spl)
+# ============================================================================
+
+struct Notification:
+    title: text
+    body: text
+    urgency: text
+
+    static fn simple(body: text) -> Notification:
+        Notification(title: "smux", body: body, urgency: "normal")
+
+    static fn with_title(title: text, body: text) -> Notification:
+        Notification(title: title, body: body, urgency: "normal")
+
+# ############################################################################
+# Tests
+# ############################################################################
+
+# ============================================================================
+# 1. QuickTextPanel
+# ============================================================================
+
+describe "QuickTextPanel":
+    """
+    ## Quick Text Panel
+
+    Tests for creation, entry management, visibility toggling,
+    snippet retrieval, hit testing, and height calculation.
+    """
+
+    it "creates an empty panel":
+        val panel = QuickTextPanel.create()
+        expect(panel.is_visible()).to_equal(false)
+        expect(panel.entries.len()).to_equal(0)
+        expect(panel.selected_index).to_equal(-1)
+
+    it "adds entries":
+        var panel = QuickTextPanel.create()
+        panel.add_entry("Go", "go ahead", "1")
+        panel.add_entry("Stop", "please stop", "2")
+        expect(panel.entries.len()).to_equal(2)
+        expect(panel.entries[0].label).to_equal("Go")
+        expect(panel.entries[1].snippet).to_equal("please stop")
+
+    it "toggles visibility":
+        var panel = QuickTextPanel.create()
+        expect(panel.is_visible()).to_equal(false)
+        panel.toggle()
+        expect(panel.is_visible()).to_equal(true)
+        panel.toggle()
+        expect(panel.is_visible()).to_equal(false)
+
+    it "shows and hides":
+        var panel = QuickTextPanel.create()
+        panel.show()
+        expect(panel.is_visible()).to_equal(true)
+        panel.hide()
+        expect(panel.is_visible()).to_equal(false)
+
+    it "returns snippet by index":
+        var panel = QuickTextPanel.create()
+        panel.add_entry("A", "alpha", "1")
+        panel.add_entry("B", "bravo", "2")
+        expect(panel.get_snippet(0)).to_equal("alpha")
+        expect(panel.get_snippet(1)).to_equal("bravo")
+
+    it "returns empty string for out-of-range snippet index":
+        var panel = QuickTextPanel.create()
+        panel.add_entry("X", "xray", "1")
+        expect(panel.get_snippet(-1)).to_equal("")
+        expect(panel.get_snippet(5)).to_equal("")
+
+    it "returns empty render when hidden":
+        var panel = QuickTextPanel.create()
+        panel.add_entry("A", "alpha", "1")
+        expect(panel.render(80, false)).to_equal("")
+
+    it "returns non-empty render when visible with entries":
+        var panel = QuickTextPanel.create()
+        panel.add_entry("Go", "go", "1")
+        panel.show()
+        val rendered = panel.render(80, false)
+        expect(rendered.len()).to_be_greater_than(0)
+        expect(rendered).to_contain("Alt+1")
+        expect(rendered).to_contain("Go")
+
+    it "hit_test returns button index for valid position":
+        var panel = QuickTextPanel.create()
+        panel.add_entry("Go", "go", "1")
+        # Button width = label.len() + shortcut.len() + 7 = 2 + 1 + 7 = 10
+        expect(panel.hit_test(0)).to_equal(0)
+        expect(panel.hit_test(5)).to_equal(0)
+
+    it "hit_test returns -1 for position past all buttons":
+        var panel = QuickTextPanel.create()
+        panel.add_entry("A", "a", "1")
+        expect(panel.hit_test(100)).to_equal(-1)
+
+    it "height is 0 when hidden":
+        var panel = QuickTextPanel.create()
+        panel.add_entry("A", "a", "1")
+        expect(panel.height()).to_equal(0)
+
+    it "height is 1 when visible with entries":
+        var panel = QuickTextPanel.create()
+        panel.add_entry("A", "a", "1")
+        panel.show()
+        expect(panel.height()).to_equal(1)
+
+    it "height is 0 when visible but no entries":
+        var panel = QuickTextPanel.create()
+        panel.show()
+        expect(panel.height()).to_equal(0)
+
+# ============================================================================
+# 2. MobileKeybar
+# ============================================================================
+
+describe "MobileKeybar":
+    """
+    ## Mobile Keybar
+
+    Tests for creation, show/hide, render output,
+    hit testing, and the should_show_keybar helper.
+    """
+
+    it "creates with default buttons":
+        val bar = MobileKeybar.create()
+        expect(bar.is_visible()).to_equal(false)
+        expect(bar.buttons.len()).to_equal(9)
+        expect(bar.buttons[0].label).to_equal("Tab")
+        expect(bar.buttons[1].label).to_equal("Esc")
+
+    it "shows and hides":
+        var bar = MobileKeybar.create()
+        bar.show()
+        expect(bar.is_visible()).to_equal(true)
+        bar.hide()
+        expect(bar.is_visible()).to_equal(false)
+
+    it "returns empty render when hidden":
+        val bar = MobileKeybar.create()
+        expect(bar.render(80)).to_equal("")
+
+    it "returns non-empty render when visible":
+        var bar = MobileKeybar.create()
+        bar.show()
+        val rendered = bar.render(80)
+        expect(rendered.len()).to_be_greater_than(0)
+
+    it "hit_test returns key_value for first button":
+        val bar = MobileKeybar.create()
+        # First button Tab has width=5, starts at offset 0
+        expect(bar.hit_test(0)).to_equal("tab")
+        expect(bar.hit_test(4)).to_equal("tab")
+
+    it "hit_test returns key_value for second button":
+        val bar = MobileKeybar.create()
+        # Second button Esc: offset = 5 (Tab width) + 1 (separator) = 6
+        expect(bar.hit_test(6)).to_equal("escape")
+
+    it "hit_test returns empty string past all buttons":
+        val bar = MobileKeybar.create()
+        expect(bar.hit_test(999)).to_equal("")
+
+    it "height is 0 when hidden":
+        val bar = MobileKeybar.create()
+        expect(bar.height()).to_equal(0)
+
+    it "height is 1 when visible":
+        var bar = MobileKeybar.create()
+        bar.show()
+        expect(bar.height()).to_equal(1)
+
+describe "should_show_keybar":
+    """
+    ## Keybar Visibility Logic
+
+    Tests the platform/config decision logic for keybar display.
+    """
+
+    it "returns true when config_mode is always":
+        expect(should_show_keybar("linux", "always")).to_equal(true)
+        expect(should_show_keybar("android", "always")).to_equal(true)
+
+    it "returns false when config_mode is never":
+        expect(should_show_keybar("android", "never")).to_equal(false)
+        expect(should_show_keybar("ios", "never")).to_equal(false)
+
+    it "returns true for mobile platforms in auto mode":
+        expect(should_show_keybar("android", "auto")).to_equal(true)
+        expect(should_show_keybar("ios", "auto")).to_equal(true)
+
+    it "returns false for desktop platforms in auto mode":
+        expect(should_show_keybar("linux", "auto")).to_equal(false)
+        expect(should_show_keybar("macos", "auto")).to_equal(false)
+        expect(should_show_keybar("windows", "auto")).to_equal(false)
+
+# ============================================================================
+# 3. Nerd Font
+# ============================================================================
+
+describe "Nerd Font Icons":
+    """
+    ## Icon Lookup
+
+    Tests icon() returns known glyphs and fallback for unknowns.
+    """
+
+    it "returns known icon glyph for file":
+        expect(icon("file")).to_equal("\u{f15b}")
+
+    it "returns known icon glyph for terminal":
+        expect(icon("terminal")).to_equal("\u{f120}")
+
+    it "returns known icon glyph for check":
+        expect(icon("check")).to_equal("\u{f00c}")
+
+    it "returns fallback question mark for unknown icon":
+        expect(icon("nonexistent")).to_equal("?")
+
+    it "icon_or_ascii returns icon when use_nerd is true":
+        expect(icon_or_ascii("file", "[F]", true)).to_equal("\u{f15b}")
+
+    it "icon_or_ascii returns ascii fallback when use_nerd is false":
+        expect(icon_or_ascii("file", "[F]", false)).to_equal("[F]")
+
+describe "Box Characters":
+    """
+    ## Box Drawing
+
+    Tests ascii_box and rounded_box struct construction,
+    and render_box output dimensions.
+    """
+
+    it "ascii_box returns plus corners":
+        val bc = ascii_box()
+        expect(bc.top_left).to_equal("+")
+        expect(bc.top_right).to_equal("+")
+        expect(bc.bottom_left).to_equal("+")
+        expect(bc.bottom_right).to_equal("+")
+        expect(bc.horizontal).to_equal("-")
+        expect(bc.vertical).to_equal("|")
+
+    it "rounded_box returns unicode corners":
+        val bc = rounded_box()
+        expect(bc.top_left).to_equal("\u{256d}")
+        expect(bc.top_right).to_equal("\u{256e}")
+        expect(bc.bottom_left).to_equal("\u{2570}")
+        expect(bc.bottom_right).to_equal("\u{256f}")
+
+    it "render_box with ascii produces correct number of lines":
+        val lines = render_box(0, 0, 5, 4, false)
+        # h=4 means: 1 top + 2 middle + 1 bottom = 4 lines
+        expect(lines.len()).to_equal(4)
+
+    it "render_box top line starts and ends with corners":
+        val lines = render_box(0, 0, 6, 3, false)
+        expect(lines[0]).to_start_with("+")
+        expect(lines[0]).to_end_with("+")
+
+    it "render_box bottom line starts and ends with corners":
+        val lines = render_box(0, 0, 6, 3, false)
+        val last_idx = lines.len() - 1
+        expect(lines[last_idx]).to_start_with("+")
+        expect(lines[last_idx]).to_end_with("+")
+
+    it "render_box middle lines use vertical bars":
+        val lines = render_box(0, 0, 6, 4, false)
+        expect(lines[1]).to_start_with("|")
+        expect(lines[1]).to_end_with("|")
+
+    it "render_box with nerd font uses rounded corners":
+        val lines = render_box(0, 0, 5, 3, true)
+        expect(lines[0]).to_start_with("\u{256d}")
+        expect(lines[0]).to_end_with("\u{256e}")
+
+# ============================================================================
+# 4. Platform
+# ============================================================================
+
+describe "Platform Enum":
+    """
+    ## Platform Names and Classification
+
+    Tests enum variant .name() and .is_mobile() / .is_desktop().
+    """
+
+    it "Linux name is linux":
+        expect(Platform.Linux.name()).to_equal("linux")
+
+    it "MacOS name is macos":
+        expect(Platform.MacOS.name()).to_equal("macos")
+
+    it "Windows name is windows":
+        expect(Platform.Windows.name()).to_equal("windows")
+
+    it "Android name is android":
+        expect(Platform.Android.name()).to_equal("android")
+
+    it "IOS name is ios":
+        expect(Platform.IOS.name()).to_equal("ios")
+
+    it "Unknown name is unknown":
+        expect(Platform.Unknown.name()).to_equal("unknown")
+
+    it "Android is mobile":
+        expect(Platform.Android.is_mobile()).to_equal(true)
+
+    it "IOS is mobile":
+        expect(Platform.IOS.is_mobile()).to_equal(true)
+
+    it "Linux is not mobile":
+        expect(Platform.Linux.is_mobile()).to_equal(false)
+
+    it "MacOS is not mobile":
+        expect(Platform.MacOS.is_mobile()).to_equal(false)
+
+    it "Linux is desktop":
+        expect(Platform.Linux.is_desktop()).to_equal(true)
+
+    it "MacOS is desktop":
+        expect(Platform.MacOS.is_desktop()).to_equal(true)
+
+    it "Windows is desktop":
+        expect(Platform.Windows.is_desktop()).to_equal(true)
+
+    it "Android is not desktop":
+        expect(Platform.Android.is_desktop()).to_equal(false)
+
+    it "Unknown is neither mobile nor desktop":
+        expect(Platform.Unknown.is_mobile()).to_equal(false)
+        expect(Platform.Unknown.is_desktop()).to_equal(false)
+
+# ============================================================================
+# 5. Notification
+# ============================================================================
+
+describe "Notification Struct":
+    """
+    ## Notification Construction
+
+    Tests static constructors for Notification.
+    """
+
+    it "simple creates notification with default title":
+        val n = Notification.simple("build done")
+        expect(n.title).to_equal("smux")
+        expect(n.body).to_equal("build done")
+        expect(n.urgency).to_equal("normal")
+
+    it "with_title creates notification with custom title":
+        val n = Notification.with_title("Alert", "disk full")
+        expect(n.title).to_equal("Alert")
+        expect(n.body).to_equal("disk full")
+        expect(n.urgency).to_equal("normal")
+
+    it "simple and with_title both default to normal urgency":
+        val a = Notification.simple("x")
+        val b = Notification.with_title("T", "y")
+        expect(a.urgency).to_equal("normal")
+        expect(b.urgency).to_equal("normal")

@@ -1,0 +1,31 @@
+# Doomgeneric-style port proof: pure Simple game2d wrapper.
+
+use std.game2d as g
+use std.nogc_sync_mut.game2d.ports.doomgeneric as dg
+
+class Game:
+    state: dg.DoomPortState
+
+    fn load(self):
+        pass
+
+    me update(self, dt: f32):
+        val _ = dt
+        val input = dg.DoomPortInput(
+            forward: g.input.key_down(g.Key(38)),
+            back: g.input.key_down(g.Key(40)),
+            turn_left: g.input.key_down(g.Key(37)),
+            turn_right: g.input.key_down(g.Key(39)),
+            fire: g.input.key_pressed_this_frame(g.Key(32))
+        )
+        self.state = dg.doom_tick(self.state, input)
+
+    fn fixed_update(self, step: f32):
+        val _ = step
+
+    fn draw(self, ctx: g.Canvas):
+        val _ = ctx
+        val _frame = dg.render_frame(self.state, 160, 100)
+
+fn main():
+    g.run(Game(state: dg.DoomPortState.boot(dg.proof_wad())), "Simple Doomgeneric Proof", 160, 100)

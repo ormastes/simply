@@ -1,0 +1,307 @@
+#![allow(unnamed_duplicate_typed_args)]
+@allow(unnamed_duplicate_typed_args)
+# mcpgdb MCP — debugger tools
+
+use examples.mcpgdb.json_helpers.{LB, RB, jp, js, extract_nested, make_tool_error, make_tool_result}
+use examples.mcpgdb.state.{DebugSession, MCPGDB_SESSIONS, MCPGDB_CURRENT_SESSION, MCPGDB_WORKSPACE, next_session_id, set_current_session, current_or_named_session, put_session, remove_session, session_count}
+use examples.mcpgdb.backend_common.{choose_workspace_root, make_session, create_debugger_process, stop_session_process, run_session_command}
+use examples.mcpgdb.debug_rules.{evaluate_command_rule, decision_json}
+
+fn bool_arg(body: text, key: text) -> bool:
+    val value = extract_nested(body, key).to_lower()
+    value == "true" or value == "1" or value == "yes"
+
+fn debug_json_message(fields: [text]) -> text:
+    LB() + fields.join(",") + RB()
+
+fn handle_workspace_open(id: text, body: text) -> text:
+    val root_raw = extract_nested(body, "root")
+    val root = choose_workspace_root(root_raw)
+    MCPGDB_WORKSPACE.root = root
+    val compile_dir = extract_nested(body, "compile_commands_dir")
+    if compile_dir != "":
+        MCPGDB_WORKSPACE.compile_commands_dir = compile_dir
+    val result = debug_json_message([
+        jp("workspace_root", js(MCPGDB_WORKSPACE.root)),
+        jp("compile_commands_dir", js(MCPGDB_WORKSPACE.compile_commands_dir)),
+        jp("session_count", str(session_count()))
+    ])
+    make_tool_result(id, result)
+
+fn handle_workspace_status(id: text, body: text) -> text:
+    val result = debug_json_message([
+        jp("workspace_root", js(MCPGDB_WORKSPACE.root)),
+        jp("compile_commands_dir", js(MCPGDB_WORKSPACE.compile_commands_dir)),
+        jp("current_session", js(MCPGDB_CURRENT_SESSION)),
+        jp("session_count", str(session_count()))
+    ])
+    make_tool_result(id, result)
+
+fn handle_debug_session_create(id: text, body: text) -> text:
+    var backend = extract_nested(body, "backend")
+    if backend == "":
+        backend = "gdb"
+    val workspace_root = choose_workspace_root(extract_nested(body, "workspace_root"))
+    val session_id = next_session_id()
+    var session = make_session(session_id, backend, workspace_root)
+    session.bootstrap_monitor = extract_nested(body, "bootstrap_monitor")
+    var error = ""
+    (session, error) = create_debugger_process(session)
+    if error != "":
+        return make_tool_error(id, error)
+    put_session(session)
+    set_current_session(session_id)
+    val result = debug_json_message([
+        jp("session_id", js(session.session_id)),
+        jp("backend", js(session.backend)),
+        jp("state", js(session.state)),
+        jp("workspace_root", js(session.workspace_root))
+    ])
+    make_tool_result(id, result)
+
+fn handle_debug_session_list(id: text, body: text) -> text:
+    var items: [text] = []
+    for session in MCPGDB_SESSIONS:
+        var current = "false"
+        if session.session_id == MCPGDB_CURRENT_SESSION:
+            current = "true"
+        items.push(debug_json_message([
+            jp("session_id", js(session.session_id)),
+            jp("backend", js(session.backend)),
+            jp("state", js(session.state)),
+            jp("current", current)
+        ]))
+    make_tool_result(id, "[" + items.join(",") + "]")
+
+fn handle_debug_session_select(id: text, body: text) -> text:
+    val session_id = extract_nested(body, "session_id")
+    if session_id == "":
+        return make_tool_error(id, "missing session_id")
+    if val session = current_or_named_session(session_id):
+        set_current_session(session.session_id)
+        return make_tool_result(id, debug_json_message([
+            jp("current_session", js(session.session_id)),
+            jp("backend", js(session.backend))
+        ]))
+    make_tool_error(id, "session not found: " + session_id)
+
+fn handle_debug_session_close(id: text, body: text) -> text:
+    val session_id = extract_nested(body, "session_id")
+    if val session = current_or_named_session(session_id):
+        stop_session_process(session)
+        remove_session(session.session_id)
+        return make_tool_result(id, debug_json_message([
+            jp("closed", js(session.session_id)),
+            jp("remaining_sessions", str(session_count()))
+        ]))
+    make_tool_error(id, "session not found")
+
+fn session_command_or_error(session_id: text, command: text, allow_topology: bool, dangerous: bool) -> text:
+    if val session = current_or_named_session(session_id):
+        val decision = evaluate_command_rule(session.backend, command, dangerous, allow_topology)
+        if not decision.allowed:
+            return debug_json_message([
+                jp("status", js("denied")),
+                jp("decision", decision_json(decision))
+            ])
+        val output = run_session_command(session, command, false)
+        put_session(session)
+        return debug_json_message([
+            jp("session_id", js(session.session_id)),
+            jp("backend", js(session.backend)),
+            jp("decision", decision_json(decision)),
+            jp("response", output)
+        ])
+    debug_json_message([
+        jp("status", js("error")),
+        jp("message", js("session not found"))
+    ])
+
+fn backend_command(session: DebugSession, gdb_cmd: text, lldb_cmd: text) -> text:
+    if session.backend == "lldb":
+        return lldb_cmd
+    gdb_cmd
+
+fn command_for_breakpoint(session: DebugSession, file: text, line: text, symbol: text) -> text:
+    if symbol != "":
+        return backend_command(session, "break " + symbol, "breakpoint set --name " + symbol)
+    backend_command(session, "break " + file + ":" + line, "breakpoint set --file " + file + " --line " + line)
+
+fn command_for_memory_read(session: DebugSession, address: text, count: text, format: text) -> text:
+    if session.backend == "lldb":
+        return "memory read --count " + count + " --format " + format + " " + address
+    "x/" + count + format + " " + address
+
+fn command_for_memory_write(session: DebugSession, address: text, value: text) -> text:
+    if session.backend == "lldb":
+        return "memory write " + address + " " + value
+    "set {" + address + "}=" + value
+
+fn command_for_register_read(session: DebugSession, name: text) -> text:
+    if session.backend == "lldb":
+        if name == "":
+            return "register read"
+        return "register read " + name
+    if name == "":
+        return "info registers"
+    "info registers " + name
+
+fn command_for_register_write(session: DebugSession, name: text, value: text) -> text:
+    if session.backend == "lldb":
+        return "register write " + name + " " + value
+    "set $" + name + "=" + value
+
+fn run_structured_debug_tool(id: text, body: text, gdb_cmd: text, lldb_cmd: text, allow_topology: bool, dangerous: bool) -> text:
+    val session_id = extract_nested(body, "session_id")
+    if val session = current_or_named_session(session_id):
+        val cmd = backend_command(session, gdb_cmd, lldb_cmd)
+        val result = session_command_or_error(session.session_id, cmd, allow_topology, dangerous)
+        return make_tool_result(id, result)
+    make_tool_error(id, "session not found")
+
+fn handle_debug_launch(id: text, body: text) -> text:
+    val program = extract_nested(body, "program")
+    if program == "":
+        return make_tool_error(id, "missing program")
+    val args = extract_nested(body, "args")
+    var gdb_cmd = "file " + program + "\nrun"
+    var lldb_cmd = "target create " + program + "\nrun"
+    if args != "":
+        gdb_cmd = "file " + program + "\nset args " + args + "\nrun"
+        lldb_cmd = "target create " + program + "\nsettings set -- target.run-args " + args + "\nrun"
+    run_structured_debug_tool(id, body, gdb_cmd, lldb_cmd, true, false)
+
+fn handle_debug_attach(id: text, body: text) -> text:
+    val pid = extract_nested(body, "pid")
+    if pid == "":
+        return make_tool_error(id, "missing pid")
+    run_structured_debug_tool(id, body, "attach " + pid, "process attach --pid " + pid, true, false)
+
+fn handle_debug_connect_remote(id: text, body: text) -> text:
+    val host = extract_nested(body, "host")
+    val port = extract_nested(body, "port")
+    if host == "" or port == "":
+        return make_tool_error(id, "missing host or port")
+    var session_id = extract_nested(body, "session_id")
+    if val session = current_or_named_session(session_id):
+        var command = "target extended-remote " + host + ":" + port
+        if session.backend == "lldb":
+            command = "gdb-remote " + host + ":" + port
+        val result = session_command_or_error(session.session_id, command, true, false)
+        return make_tool_result(id, result)
+    make_tool_error(id, "session not found")
+
+fn handle_debug_disconnect(id: text, body: text) -> text:
+    run_structured_debug_tool(id, body, "disconnect", "process detach", true, false)
+
+fn handle_debug_restart(id: text, body: text) -> text:
+    run_structured_debug_tool(id, body, "run", "process launch --stop-at-entry false", true, false)
+
+fn handle_debug_continue(id: text, body: text) -> text:
+    run_structured_debug_tool(id, body, "continue", "process continue", false, false)
+
+fn handle_debug_pause(id: text, body: text) -> text:
+    run_structured_debug_tool(id, body, "interrupt", "process interrupt", false, false)
+
+fn handle_debug_step_in(id: text, body: text) -> text:
+    run_structured_debug_tool(id, body, "step", "thread step-in", false, false)
+
+fn handle_debug_step_over(id: text, body: text) -> text:
+    run_structured_debug_tool(id, body, "next", "thread step-over", false, false)
+
+fn handle_debug_step_out(id: text, body: text) -> text:
+    run_structured_debug_tool(id, body, "finish", "thread step-out", false, false)
+
+fn handle_breakpoint_set(id: text, body: text) -> text:
+    val file = extract_nested(body, "file")
+    val line = extract_nested(body, "line")
+    val symbol = extract_nested(body, "symbol")
+    val session_id = extract_nested(body, "session_id")
+    if val session = current_or_named_session(session_id):
+        val command = command_for_breakpoint(session, file, line, symbol)
+        return make_tool_result(id, session_command_or_error(session.session_id, command, false, false))
+    make_tool_error(id, "session not found")
+
+fn handle_breakpoint_remove(id: text, body: text) -> text:
+    val breakpoint_id = extract_nested(body, "breakpoint_id")
+    if breakpoint_id == "":
+        return make_tool_error(id, "missing breakpoint_id")
+    run_structured_debug_tool(id, body, "delete " + breakpoint_id, "breakpoint delete " + breakpoint_id, false, false)
+
+fn handle_breakpoint_list(id: text, body: text) -> text:
+    run_structured_debug_tool(id, body, "info breakpoints", "breakpoint list", false, false)
+
+fn handle_thread_list(id: text, body: text) -> text:
+    run_structured_debug_tool(id, body, "info threads", "thread list", false, false)
+
+fn handle_frame_list(id: text, body: text) -> text:
+    run_structured_debug_tool(id, body, "backtrace", "thread backtrace", false, false)
+
+fn handle_frame_select(id: text, body: text) -> text:
+    val frame_id = extract_nested(body, "frame_id")
+    if frame_id == "":
+        return make_tool_error(id, "missing frame_id")
+    run_structured_debug_tool(id, body, "frame " + frame_id, "frame select " + frame_id, false, false)
+
+fn handle_variable_list(id: text, body: text) -> text:
+    run_structured_debug_tool(id, body, "info locals", "frame variable", false, false)
+
+fn handle_evaluate(id: text, body: text) -> text:
+    val expr = extract_nested(body, "expression")
+    if expr == "":
+        return make_tool_error(id, "missing expression")
+    run_structured_debug_tool(id, body, "print " + expr, "expression -- " + expr, false, false)
+
+fn handle_register_read(id: text, body: text) -> text:
+    val name = extract_nested(body, "name")
+    val session_id = extract_nested(body, "session_id")
+    if val session = current_or_named_session(session_id):
+        val command = command_for_register_read(session, name)
+        return make_tool_result(id, session_command_or_error(session.session_id, command, false, false))
+    make_tool_error(id, "session not found")
+
+fn handle_register_write(id: text, body: text) -> text:
+    val name = extract_nested(body, "name")
+    val value = extract_nested(body, "value")
+    if name == "" or value == "":
+        return make_tool_error(id, "missing name or value")
+    val session_id = extract_nested(body, "session_id")
+    if val session = current_or_named_session(session_id):
+        val command = command_for_register_write(session, name, value)
+        return make_tool_result(id, session_command_or_error(session.session_id, command, false, true))
+    make_tool_error(id, "session not found")
+
+fn handle_memory_read(id: text, body: text) -> text:
+    val address = extract_nested(body, "address")
+    if address == "":
+        return make_tool_error(id, "missing address")
+    var count = extract_nested(body, "count")
+    if count == "":
+        count = "16"
+    var format = extract_nested(body, "format")
+    if format == "":
+        format = "x"
+    val session_id = extract_nested(body, "session_id")
+    if val session = current_or_named_session(session_id):
+        val command = command_for_memory_read(session, address, count, format)
+        return make_tool_result(id, session_command_or_error(session.session_id, command, false, false))
+    make_tool_error(id, "session not found")
+
+fn handle_memory_write(id: text, body: text) -> text:
+    val address = extract_nested(body, "address")
+    val value = extract_nested(body, "value")
+    if address == "" or value == "":
+        return make_tool_error(id, "missing address or value")
+    val session_id = extract_nested(body, "session_id")
+    if val session = current_or_named_session(session_id):
+        val command = command_for_memory_write(session, address, value)
+        return make_tool_result(id, session_command_or_error(session.session_id, command, false, true))
+    make_tool_error(id, "session not found")
+
+fn handle_debug_command_run(id: text, body: text) -> text:
+    val command = extract_nested(body, "command")
+    if command == "":
+        return make_tool_error(id, "missing command")
+    val dangerous = bool_arg(body, "dangerous")
+    val session_id = extract_nested(body, "session_id")
+    make_tool_result(id, session_command_or_error(session_id, command, false, dangerous))

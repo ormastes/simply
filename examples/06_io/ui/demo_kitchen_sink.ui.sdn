@@ -1,0 +1,218 @@
+app:
+    title: "Kitchen Sink - All Widgets"
+    theme: glass_dark
+
+layout:
+    type: vbox
+    id: root
+    children:
+        menu:
+            type: menubar
+            id: menu
+            items:
+                0:
+                    label: "File"
+                1:
+                    label: "Edit"
+                2:
+                    label: "View"
+        nav_tabs:
+            type: tabs
+            id: nav_tabs
+            children:
+                0:
+                    type: text
+                    id: tab_overview
+                    label: "Overview"
+                1:
+                    type: text
+                    id: tab_details
+                    label: "Details"
+                2:
+                    type: text
+                    id: tab_advanced
+                    label: "Advanced"
+        main_hbox:
+            type: hbox
+            id: main_hbox
+            children:
+                sidebar:
+                    type: panel
+                    id: sidebar
+                    width: 30
+                    title: "Sidebar"
+                    children:
+                        sidebar_list:
+                            type: list
+                            id: sidebar_list
+                            items:
+                                0:
+                                    label: "Home"
+                                1:
+                                    label: "Reports"
+                                2:
+                                    label: "Settings"
+                                3:
+                                    label: "Help"
+                        file_tree:
+                            type: tree
+                            id: file_tree
+                            children:
+                                d_src:
+                                    type: treenode
+                                    id: d_src
+                                    label: "src"
+                                    expanded: true
+                                    children:
+                                        f_main:
+                                            type: treenode
+                                            id: f_main
+                                            label: "main.spl"
+                                            expanded: false
+                                        f_util:
+                                            type: treenode
+                                            id: f_util
+                                            label: "util.spl"
+                                            expanded: false
+                                d_test:
+                                    type: treenode
+                                    id: d_test
+                                    label: "test"
+                                    expanded: false
+                                    children:
+                                        f_spec:
+                                            type: treenode
+                                            id: f_spec
+                                            label: "spec.spl"
+                                            expanded: false
+                        sidebar_divider:
+                            type: divider
+                            id: sidebar_divider
+                        action_btn:
+                            type: button
+                            id: action_btn
+                            label: "Action"
+                            action: "sidebar_action"
+                main_content:
+                    type: panel
+                    id: main_content
+                    flex: 1
+                    title: "Main Content"
+                    children:
+                        heading:
+                            type: text
+                            id: heading
+                            content: "Kitchen Sink Demo"
+                        search_input:
+                            type: input
+                            id: search_input
+                            placeholder: "Search..."
+                        edit_field:
+                            type: textfield
+                            id: edit_field
+                            value: "Editable text"
+                            placeholder: "Enter text"
+                        notes_area:
+                            type: textarea
+                            id: notes_area
+                            value: "Multi-line content"
+                            rows: 3
+                        option_a:
+                            type: checkbox
+                            id: option_a
+                            label: "Option A"
+                            checked: true
+                        option_b:
+                            type: checkbox
+                            id: option_b
+                            label: "Option B"
+                            checked: false
+                        mode_dropdown:
+                            type: dropdown
+                            id: mode_dropdown
+                            children:
+                                0:
+                                    type: text
+                                    id: opt_light
+                                    label: "Light"
+                                1:
+                                    type: text
+                                    id: opt_dark
+                                    label: "Dark"
+                                2:
+                                    type: text
+                                    id: opt_auto
+                                    label: "Auto"
+                        load_progress:
+                            type: progress
+                            id: load_progress
+                            value: 42
+                        app_icon:
+                            type: image
+                            id: app_icon
+                            src: "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='64' height='64' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%232563eb'/%3E%3Ctext x='32' y='42' font-family='system-ui,sans-serif' font-size='28' font-weight='700' fill='white' text-anchor='middle'%3ES%3C/text%3E%3C/svg%3E"
+                            alt: "App Icon"
+                        content_divider:
+                            type: divider
+                            id: content_divider
+                        data_table:
+                            type: table
+                            id: data_table
+                            headers: "Col A|Col B|Col C"
+                            children:
+                                row_0:
+                                    type: text
+                                    id: table_row_0
+                                    label: "A1|B1|C1"
+                                row_1:
+                                    type: text
+                                    id: table_row_1
+                                    label: "A2|B2|C2"
+                        search_tip:
+                            type: tooltip
+                            id: search_tip
+                            content: "Extra info"
+                            target: "search_input"
+        scroll_area:
+            type: scroll
+            id: scroll_area
+            max_height: 5
+            scroll_offset: 0
+            children:
+                line_0:
+                    type: text
+                    id: scroll_line_0
+                    content: "Scroll item 1"
+                line_1:
+                    type: text
+                    id: scroll_line_1
+                    content: "Scroll item 2"
+                line_2:
+                    type: text
+                    id: scroll_line_2
+                    content: "Scroll item 3"
+                line_3:
+                    type: text
+                    id: scroll_line_3
+                    content: "Scroll item 4"
+                line_4:
+                    type: text
+                    id: scroll_line_4
+                    content: "Scroll item 5"
+                line_5:
+                    type: text
+                    id: scroll_line_5
+                    content: "Scroll item 6"
+                line_6:
+                    type: text
+                    id: scroll_line_6
+                    content: "Scroll item 7"
+                line_7:
+                    type: text
+                    id: scroll_line_7
+                    content: "Scroll item 8"
+        status:
+            type: statusbar
+            id: status
+            left: "ALL WIDGETS"
+            right: "Kitchen Sink"

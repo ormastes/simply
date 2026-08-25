@@ -1,0 +1,17 @@
+use simple_os.arch.common.virtio_snd_probe.{simpleos_virtio_snd_probe}
+use simple_os.arch.common.virtio_input_probe.{simpleos_virtio_input_probe}
+use os.kernel.boot.mmio.{mmio_disable_test_mode}
+
+extern fn serial_println(msg: text)
+
+fn spl_start():
+    mmio_disable_test_mode()
+    val input_passed = simpleos_virtio_input_probe("aarch64", 5000000, 0x0A000000u64, 32, 0x200u64)
+    val audio_passed = simpleos_virtio_snd_probe("aarch64", 0x0A000000u64, 32, 0x200u64)
+    if input_passed and audio_passed:
+        serial_println("SIMPLEOS_VIRTIO_SND_PROBE_PASS arch=aarch64")
+    else:
+        serial_println("SIMPLEOS_VIRTIO_SND_PROBE_FAIL arch=aarch64")
+    # A freestanding entry must never return into undefined startup state.
+    while true:
+        rt_memory_barrier()

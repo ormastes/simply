@@ -1,0 +1,51 @@
+pub fn _rv32_reactor_counter_cap() -> i64:
+    1000000
+
+pub fn _rv32_reactor_sanitize_owner_impl(owner: i64) -> i64:
+    if owner < 0:
+        return 0
+    if owner > 2:
+        return 0
+    owner
+
+fn _rv32_reactor_counter_next_impl(value: i64) -> i64:
+    val cap: i64 = _rv32_reactor_counter_cap()
+    if value == cap:
+        return cap
+    if value == cap + 1:
+        return cap
+    if value < 0:
+        return 1
+    if value >= cap:
+        return cap
+    value + 1
+
+pub fn _rv32_reactor_acquire_impl(owner: i64, requested: i64) -> i32:
+    val safe_owner: i64 = _rv32_reactor_sanitize_owner_impl(owner)
+    if requested <= 0:
+        return 0
+    if requested > 2:
+        return 0
+    if safe_owner == 0:
+        return 1
+    0
+
+pub fn _rv32_reactor_conflicts_after_impl(owner: i64, requested: i64, conflicts: i64) -> i64:
+    val cap: i64 = _rv32_reactor_counter_cap()
+    if conflicts == cap and _rv32_reactor_acquire_impl(owner, requested) == 0:
+        return cap
+    if conflicts == cap + 1:
+        return cap
+    if _rv32_reactor_acquire_impl(owner, requested) == 0:
+        if requested > 0 and requested <= 2:
+            return _rv32_reactor_counter_next_impl(conflicts)
+    if conflicts < 0:
+        return 0
+    if conflicts > cap:
+        return cap
+    conflicts
+
+pub fn _rv32_reactor_release_impl(owner: i64, released: i64) -> i64:
+    if owner == released:
+        return 0
+    _rv32_reactor_sanitize_owner_impl(owner)

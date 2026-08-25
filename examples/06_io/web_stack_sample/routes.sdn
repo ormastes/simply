@@ -1,0 +1,53 @@
+routes:
+  - method: GET
+    pattern: "/"
+    controller: home
+    action: index
+  - method: GET
+    pattern: "/register"
+    controller: auth
+    action: register_form
+  - method: POST
+    pattern: "/register"
+    controller: auth
+    action: register
+  - method: GET
+    pattern: "/login"
+    controller: auth
+    action: login_form
+  - method: POST
+    pattern: "/login"
+    controller: auth
+    action: login
+  - method: POST
+    pattern: "/logout"
+    controller: auth
+    action: logout
+  - method: GET
+    pattern: "/items"
+    controller: items
+    action: index
+  - method: GET
+    pattern: "/items/new"
+    controller: items
+    action: new_form
+  - method: POST
+    pattern: "/items/new"
+    controller: items
+    action: create
+  - method: GET
+    pattern: "/items/:id/edit"
+    controller: items
+    action: edit_form
+  - method: POST
+    pattern: "/items/:id/edit"
+    controller: items
+    action: update
+  - method: POST
+    pattern: "/items/:id/delete"
+    controller: items
+    action: destroy
+  - method: GET
+    pattern: "/items/search"
+    controller: items
+    action: search

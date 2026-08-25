@@ -1,0 +1,91 @@
+use std.database.{DbCodec, DbValue, DbRow, TableSchema, Column, ColumnType}
+use std.web_framework.model.{ActiveModel, Repository, ValidationRule}
+use std.web_framework.validation.{Validator, Required, MinLength, MaxLength, Email}
+use std.crypto.{bcrypt_hash, bcrypt_verify}
+
+class User:
+    id: i64
+    username: text
+    email: text
+    password_hash: text
+    created_at: text
+
+class UserCodec:
+    fn table_name() -> text:
+        "users"
+
+    fn columns() -> List<text>:
+        ["username", "email", "password_hash", "created_at"]
+
+    fn encode(user: User) -> List<DbValue>:
+        [
+            DbValue.text(user.username),
+            DbValue.text(user.email),
+            DbValue.text(user.password_hash),
+            DbValue.text(user.created_at)
+        ]
+
+    fn decode(row: DbRow) -> User:
+        User(
+            id: row.get_i64("id"),
+            username: row.get_text("username"),
+            email: row.get_text("email"),
+            password_hash: row.get_text("password_hash"),
+            created_at: row.get_text("created_at")
+        )
+
+    fn schema() -> TableSchema:
+        TableSchema(
+            name: "users",
+            columns: [
+                Column(name: "id", col_type: ColumnType.integer, primary_key: true, auto_increment: true),
+                Column(name: "username", col_type: ColumnType.text, nullable: false, unique: true),
+                Column(name: "email", col_type: ColumnType.text, nullable: false, unique: true),
+                Column(name: "password_hash", col_type: ColumnType.text, nullable: false),
+                Column(name: "created_at", col_type: ColumnType.text, nullable: false)
+            ]
+        )
+
+fn create_user_repository(db: Database) -> Repository<User>:
+    Repository<User>(db: db, codec: UserCodec())
+
+fn user_registration_validator() -> Validator:
+    val v = Validator.new()
+    v.add_rule("username", Required())
+    v.add_rule("username", MinLength(length: 3))
+    v.add_rule("username", MaxLength(length: 50))
+    v.add_rule("email", Required())
+    v.add_rule("email", Email())
+    v.add_rule("password", Required())
+    v.add_rule("password", MinLength(length: 8))
+    v
+
+fn user_login_validator() -> Validator:
+    val v = Validator.new()
+    v.add_rule("username", Required())
+    v.add_rule("password", Required())
+    v
+
+fn hash_password(plain: text) -> Result<text, text>:
+    bcrypt_hash(plain, cost: 12)
+
+fn verify_password(plain: text, hashed: text) -> bool:
+    bcrypt_verify(plain, hashed)
+
+fn find_user_by_username(repo: Repository<User>, username: text) -> Option<User>:
+    val results = repo.where("username = ?", [DbValue.text(username)])
+    if results.len() > 0:
+        Option.some(results.get(0))
+    else:
+        Option.none()
+
+fn find_user_by_id(repo: Repository<User>, id: i64) -> Option<User>:
+    repo.find(id)
+
+fn is_username_taken(repo: Repository<User>, username: text) -> bool:
+    val results = repo.where("username = ?", [DbValue.text(username)])
+    results.len() > 0
+
+fn is_email_taken(repo: Repository<User>, email: text) -> bool:
+    val results = repo.where("email = ?", [DbValue.text(email)])
+    results.len() > 0

@@ -1,0 +1,523 @@
+@allow(unnamed_duplicate_typed_args)
+# T32 CLI — shared UI/access bridge
+# Discovery, inspection, actions, and history used by the stable bridge facade.
+
+use std.io_runtime.{read_file, file_exists}
+use app.t32_cli.types.{T32BridgeResult}
+use app.mcp_t32.session_state.{McpT32Session, MCP_T32_SESSIONS, MCP_T32_CURRENT_SESSION, MCP_T32_CURRENT_CORE, MCP_T32_HISTORY}
+use app.mcp_t32.session_tools.{
+    t32_find_current_session, t32_run_remote, t32_run_remote_with_timeout, t32_add_history, t32_add_history_with_request,
+    t32_query_gui_status_json
+}
+use app.mcp_t32.action_tools.{
+    t32_field_to_eval, t32_field_to_set_cmd, t32_field_state_set
+}
+use app.mcp_t32.window_tools.{t32_get_window_catalog, t32_get_action_catalog, t32_find_action, t32_get_window_actions, t32_parse_catalog_entry, t32_parse_catalog_entry_with_meta}
+use common.ui.access_cli_grammar.{access_result_from_snapshot, ACCESS_OPERATION_LIST}
+use common.ui.win_text_access.{WinTextSnapshot, win_text_trace32_snapshot, win_text_merge_snapshots}
+use app.io.mod.{getpid, time_now_unix_micros}
+
+var T32_ACTION_REQUEST_SEQUENCE: i64 = 0
+val T32_ACTION_MAX_ARGS: i64 = 1
+val T32_ACTION_ARG_MAX_LENGTH: i64 = 256
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+# Require an active MCP session, returning it or an error message
+fn bridge_require_session() -> Result<McpT32Session, text>:
+    val session_opt = t32_find_current_session()
+    match session_opt:
+        Some(session): Ok(session)
+        nil: Err("No active session. Use 'session open' first.")
+
+# Run a command on the active session and return (stdout, rc)
+fn bridge_exec(session: McpT32Session, cmd: text) -> (text, i64):
+    t32_run_remote(session, cmd)
+
+fn bridge_exec_with_timeout(session: McpT32Session, cmd: text, timeout_ms: i64) -> (text, i64):
+    t32_run_remote_with_timeout(session, cmd, timeout_ms)
+
+# Build a gui_status string from the active session, or empty
+fn bridge_gui_status(session: McpT32Session) -> text:
+    t32_query_gui_status_json(session)
+
+# ============================================================================
+# Session discovery
+# ============================================================================
+
+fn bridge_sessions_list() -> Result<T32BridgeResult, text>:
+    if MCP_T32_SESSIONS.len() == 0:
+        return Ok(T32BridgeResult.scalar("No sessions registered."))
+    var rows: [[text]] = [["ID", "Host", "Port", "Name", "Arch", "Connected"]]
+    for s in MCP_T32_SESSIONS:
+        var conn = "yes"
+        if not s.connected:
+            conn = "no"
+        var marker = ""
+        if s.id == MCP_T32_CURRENT_SESSION:
+            marker = "* "
+        rows.push([marker + s.id, s.host, str(s.port), s.intercom_name, s.architecture, conn])
+    Ok(T32BridgeResult.table("Sessions", rows))
+
+# ============================================================================
+# Evaluation
+# ============================================================================
+
+fn bridge_eval(expression: text) -> Result<T32BridgeResult, text>:
+    if expression == "":
+        return Err("expression is required.")
+    val session = bridge_require_session()?
+    val eval_cmd = "EVAL {expression}"
+    var stdout = ""
+    var rc: i64 = 0
+    (stdout, rc) = bridge_exec(session, eval_cmd)
+    t32_add_history(eval_cmd, stdout.trim(), session.id, MCP_T32_CURRENT_CORE)
+    if rc != 0 and rc != -1:
+        return Err("Eval failed (exit {rc}): {stdout.trim()}")
+    if rc == -1:
+        return Err(stdout.trim())
+    var result = T32BridgeResult.scalar_titled(expression, stdout.trim())
+    result.set_gui_status(bridge_gui_status(session))
+    Ok(result)
+
+# ============================================================================
+# Window functions (4)
+# ============================================================================
+
+fn bridge_window_list() -> Result<T32BridgeResult, text>:
+    val catalog = t32_get_window_catalog()
+    var snapshots: [WinTextSnapshot] = []
+    for entry in catalog:
+        var key = ""
+        var title = ""
+        var kind = ""
+        var open_cmd = ""
+        var capture_cmd = ""
+        var capture_mode = ""
+        var arch = ""
+        var notes = ""
+        (key, title, kind, open_cmd, capture_cmd, capture_mode, arch, notes) = t32_parse_catalog_entry_with_meta(entry)
+        var cap = capture_mode
+        if cap == "":
+            cap = "print_parse"
+        snapshots.push(win_text_trace32_snapshot(key, title, open_cmd, capture_cmd, cap, "", 0, 0, 0))
+    val merged = win_text_merge_snapshots("trace32", snapshots)
+    Ok(access_result_from_snapshot(ACCESS_OPERATION_LIST, "t32", MCP_T32_CURRENT_SESSION, merged.access, 0))
+
+fn bridge_window_open(window_key: text) -> Result<T32BridgeResult, text>:
+    if window_key == "":
+        return Err("window_key is required.")
+    val catalog = t32_get_window_catalog()
+    var found_cmd = ""
+    var found_title = ""
+    for entry in catalog:
+        var key = ""
+        var title = ""
+        var kind = ""
+        var open_cmd = ""
+        var capture_cmd = ""
+        (key, title, kind, open_cmd, capture_cmd) = t32_parse_catalog_entry(entry)
+        if key == window_key:
+            found_cmd = open_cmd
+            found_title = title
+    if found_cmd == "":
+        return Err("Window not found: {window_key}")
+    val session = bridge_require_session()?
+    var stdout = ""
+    var rc: i64 = 0
+    (stdout, rc) = bridge_exec(session, found_cmd)
+    t32_add_history(found_cmd, "opened", session.id, MCP_T32_CURRENT_CORE)
+    Ok(T32BridgeResult.scalar_titled("Window Opened", "{found_title} ({window_key})"))
+
+fn bridge_window_capture(window_key: text) -> Result<T32BridgeResult, text>:
+    if window_key == "":
+        return Err("window_key is required.")
+    val catalog = t32_get_window_catalog()
+    var found_capture = ""
+    var found_title = ""
+    for entry in catalog:
+        var key = ""
+        var title = ""
+        var kind = ""
+        var open_cmd = ""
+        var capture_cmd = ""
+        (key, title, kind, open_cmd, capture_cmd) = t32_parse_catalog_entry(entry)
+        if key == window_key:
+            found_capture = capture_cmd
+            found_title = title
+    if found_capture == "":
+        return Err("Window not found: {window_key}")
+    val session = bridge_require_session()?
+    var stdout = ""
+    var rc: i64 = 0
+    (stdout, rc) = bridge_exec(session, found_capture)
+    var content = stdout.trim()
+    # Fallback: if WinPrint result is empty, try PRinTer.FILE
+    if content == "" and rc == 0:
+        val temp_file = "/tmp/t32_capture_{window_key}.txt"
+        val printer_cmd = "PRinTer.FILE {temp_file} {found_capture.replace("WinPrint.", "")}"
+        var stdout2 = ""
+        var rc2: i64 = 0
+        (stdout2, rc2) = bridge_exec(session, printer_cmd)
+        if rc2 == 0:
+            val file_content = read_file(temp_file) ?? ""
+            if file_content != "":
+                content = file_content.trim()
+    t32_add_history("capture {window_key}", "captured", session.id, MCP_T32_CURRENT_CORE)
+    Ok(T32BridgeResult.raw(content))
+
+fn bridge_window_describe(window_key: text) -> Result<T32BridgeResult, text>:
+    if window_key == "":
+        return Err("window_key is required.")
+    val catalog = t32_get_window_catalog()
+    var found = false
+    var found_title = ""
+    var found_kind = ""
+    var found_capture_mode = ""
+    var found_arch = ""
+    var found_notes = ""
+    var found_open_cmd = ""
+    var found_capture_cmd = ""
+    for entry in catalog:
+        var key = ""
+        var title = ""
+        var kind = ""
+        var open_cmd = ""
+        var capture_cmd = ""
+        var capture_mode = ""
+        var arch = ""
+        var notes = ""
+        (key, title, kind, open_cmd, capture_cmd, capture_mode, arch, notes) = t32_parse_catalog_entry_with_meta(entry)
+        if key == window_key:
+            found = true
+            found_title = title
+            found_kind = kind
+            found_capture_mode = capture_mode
+            found_arch = arch
+            found_notes = notes
+            found_open_cmd = open_cmd
+            found_capture_cmd = capture_cmd
+    if not found:
+        return Err("Window not found: {window_key}")
+    var pairs: [[text]] = [
+        ["window_key", window_key],
+        ["title", found_title],
+        ["kind", found_kind],
+        ["open_command", found_open_cmd],
+        ["capture_command", found_capture_cmd]
+    ]
+    if found_capture_mode != "":
+        pairs = pairs + [["capture_mode", found_capture_mode]]
+    if found_arch != "":
+        pairs = pairs + [["arch", found_arch]]
+    if found_notes != "":
+        pairs = pairs + [["notes", found_notes]]
+    # Attach actions
+    val action_entries = t32_get_window_actions(window_key)
+    if action_entries.len() > 0:
+        var action_list: [text] = []
+        for aentry in action_entries:
+            val parts = aentry.split("|")
+            var akey = ""
+            var alabel = ""
+            if parts.len() > 0:
+                akey = parts[0]
+            if parts.len() > 1:
+                alabel = parts[1]
+            action_list.push("{akey}: {alabel}")
+        pairs = pairs + [["actions", action_list.join(", ")]]
+    Ok(T32BridgeResult.kv("Window: {found_title}", pairs))
+
+# ============================================================================
+# Screenshot (1)
+# ============================================================================
+
+fn bridge_screenshot(window_key: text, output_path: text) -> Result<T32BridgeResult, text>:
+    if window_key == "":
+        return Err("window_key is required.")
+    val session = bridge_require_session()?
+    var out_file = output_path
+    if out_file == "":
+        out_file = "/tmp/t32_{window_key}.bmp"
+    # Position window
+    bridge_exec(session, "WinPOS 0. 0. 80. 40.")
+    # Capture via SCREEN.DUMP
+    val screen_cmd = "SCREEN.DUMP {out_file} /BMP"
+    var stdout = ""
+    var rc: i64 = 0
+    (stdout, rc) = bridge_exec(session, screen_cmd)
+    t32_add_history("screenshot {window_key} -> {out_file}", "ok", session.id, MCP_T32_CURRENT_CORE)
+    if rc != 0 and rc != -1:
+        return Err("Screenshot failed: {stdout.trim()}")
+    if rc == -1:
+        return Err(stdout.trim())
+    var status = "ok"
+    val file_exists = file_exists(out_file) ?? false
+    if not file_exists:
+        # Fallback: text-mode capture
+        val printer_cmd = "PRinTer.FILE {out_file}.txt"
+        bridge_exec(session, printer_cmd)
+        status = "text_fallback"
+        out_file = out_file + ".txt"
+    val pairs = [
+        ["window", window_key],
+        ["output_path", out_file],
+        ["status", status]
+    ]
+    Ok(T32BridgeResult.kv("Screenshot", pairs))
+
+# ============================================================================
+# Action/Field functions (4)
+# ============================================================================
+
+fn t32_action_request_id() -> text:
+    T32_ACTION_REQUEST_SEQUENCE = T32_ACTION_REQUEST_SEQUENCE + 1
+    "t32-action-" + str(getpid()) + "-" + str(time_now_unix_micros()) + "-" + str(T32_ACTION_REQUEST_SEQUENCE)
+
+fn bridge_action_invoke_with_request(action_key: text, args: text, request_id: text, timeout_ms: i64, confirmed: bool) -> Result<T32BridgeResult, text>:
+    val actual_request_id = if request_id == "": t32_action_request_id() else: request_id
+    if action_key == "":
+        return Err("action_key is required.")
+    val history_command = "action:" + action_key
+    t32_add_history_with_request("access_request " + history_command, "request", MCP_T32_CURRENT_SESSION, MCP_T32_CURRENT_CORE, actual_request_id)
+    if not confirmed:
+        t32_add_history_with_request("access_result " + history_command, "code=interaction_required", MCP_T32_CURRENT_SESSION, MCP_T32_CURRENT_CORE, actual_request_id)
+        return Err("explicit confirmation is required")
+    val action_entry = t32_find_action(action_key)
+    var found_template = ""
+    var found_label = ""
+    val aparts = action_entry.split("|")
+    if aparts.len() > 1:
+        found_label = aparts[1]
+    if aparts.len() > 3:
+        found_template = aparts[3]
+    if found_template == "":
+        t32_add_history_with_request("access_result " + history_command, "code=target_not_found", MCP_T32_CURRENT_SESSION, MCP_T32_CURRENT_CORE, actual_request_id)
+        return Err("Action not found: {action_key}")
+    val final_cmd = match t32_action_command(found_template, args):
+        Err(message):
+            t32_add_history_with_request("access_result " + history_command, "code=invalid_argument", MCP_T32_CURRENT_SESSION, MCP_T32_CURRENT_CORE, actual_request_id)
+            return Err(message)
+        Ok(command): command
+    val session = match bridge_require_session():
+        Err(message):
+            t32_add_history_with_request("access_result " + history_command, "code=source_unavailable", MCP_T32_CURRENT_SESSION, MCP_T32_CURRENT_CORE, actual_request_id)
+            return Err(message)
+        Ok(active_session): active_session
+    if timeout_ms <= 0:
+        t32_add_history_with_request("access_result " + history_command, "code=invalid_argument", session.id, MCP_T32_CURRENT_CORE, actual_request_id)
+        return Err("Invalid action timeout")
+    val deadline_ms = time_now_unix_micros() / 1000 + timeout_ms
+    var stdout = ""
+    var rc: i64 = 0
+    (stdout, rc) = bridge_exec_with_timeout(session, final_cmd, timeout_ms)
+    if rc != 0 and rc != -1:
+        t32_add_history_with_request("access_result " + history_command, "code=source_unavailable;" + stdout.trim(), session.id, MCP_T32_CURRENT_CORE, actual_request_id)
+        return Err("Action failed (exit {rc}): {stdout.trim()}")
+    if rc == -1:
+        val failure_code = if stdout.to_lower().contains("timeout") or stdout.to_lower().contains("timed out"): "timeout" else: "source_unavailable"
+        t32_add_history_with_request("access_result " + history_command, "code=" + failure_code + ";" + stdout.trim(), session.id, MCP_T32_CURRENT_CORE, actual_request_id)
+        return Err(stdout.trim())
+    val remaining_ms = deadline_ms - time_now_unix_micros() / 1000
+    if remaining_ms <= 0:
+        t32_add_history_with_request("access_result " + history_command, "code=timeout;observation=deadline", session.id, MCP_T32_CURRENT_CORE, actual_request_id)
+        return Err("Post-action observation timed out")
+    var observed = ""
+    var observed_rc: i64 = 0
+    (observed, observed_rc) = bridge_exec_with_timeout(session, "EVAL STATE.RUN()", remaining_ms)
+    if observed_rc != 0:
+        val observation_code = if observed_rc == -1 or observed.to_lower().contains("timeout"): "timeout" else: "source_unavailable"
+        t32_add_history_with_request("access_result " + history_command, "code=" + observation_code + ";observation=" + observed.trim(), session.id, MCP_T32_CURRENT_CORE, actual_request_id)
+        return Err("Post-action observation failed: " + observed.trim())
+    val observation = observed.trim()
+    t32_add_history_with_request("access_result " + history_command, "code=ok;observation=" + observation, session.id, MCP_T32_CURRENT_CORE, actual_request_id)
+    val pairs = [
+        ["action_key", action_key],
+        ["label", found_label],
+        ["command", final_cmd],
+        ["output", stdout.trim()],
+        ["post_action_observation", observation]
+    ]
+    var result = T32BridgeResult.kv("Action: {found_label}", pairs)
+    result.correlation_id = actual_request_id
+    Ok(result)
+
+fn t32_action_command(template: text, args: text) -> Result<text, text>:
+    if args != "":
+        if args.len().to_i64() > T32_ACTION_ARG_MAX_LENGTH:
+            return Err("Invalid action argument: maximum length is " + str(T32_ACTION_ARG_MAX_LENGTH))
+        if not t32_action_argument_is_safe(args):
+            return Err("Invalid action argument: unsupported character")
+    var command = ""
+    var used_arg = false
+    var i: i64 = 0
+    while i < template.len():
+        val ch = template.substring(i, i + 1)
+        if ch == "{":
+            var end = i + 1
+            while end < template.len() and template.substring(end, end + 1) != "}":
+                end = end + 1
+            if end >= template.len():
+                return Err("Invalid action template: unresolved placeholder")
+            if end == i + 1:
+                return Err("Invalid action template: empty placeholder")
+            if args == "":
+                return Err("Action argument required for " + template.substring(i, end + 1))
+            command = command + args
+            used_arg = true
+            i = end + 1
+        elif ch == "}":
+            return Err("Invalid action template: unresolved placeholder")
+        elif ch == "%" and i + 1 < template.len() and "0123456789".contains(template.substring(i + 1, i + 2)):
+            val placeholder = template.substring(i, i + 2)
+            if placeholder != "%0":
+                return Err("Invalid action template: at most one argument is supported")
+            if args == "":
+                return Err("Action argument required for %0")
+            command = command + args
+            used_arg = true
+            i = i + 2
+        else:
+            command = command + ch
+            i = i + 1
+    if args != "" and not used_arg:
+        return Err("Action does not accept arguments")
+    Ok(command)
+
+fn t32_action_argument_is_safe(value: text) -> bool:
+    if value.len().to_i64() > T32_ACTION_ARG_MAX_LENGTH: return false
+    for ch in value:
+        if not "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./:+@-".contains(ch): return false
+    true
+
+fn bridge_action_invoke(action_key: text, args: text) -> Result<T32BridgeResult, text>:
+    bridge_action_invoke_with_request(action_key, args, "", 5000, false)
+
+fn bridge_action_list(window_key: text) -> Result<T32BridgeResult, text>:
+    var rows: [[text]] = [["Key", "Label", "Type", "Window"]]
+    if window_key != "":
+        val actions = t32_get_window_actions(window_key)
+        for aentry in actions:
+            val parts = aentry.split("|")
+            var akey = ""
+            var alabel = ""
+            var atype = ""
+            if parts.len() > 0:
+                akey = parts[0]
+            if parts.len() > 1:
+                alabel = parts[1]
+            if parts.len() > 2:
+                atype = parts[2]
+            rows.push([akey, alabel, atype, window_key])
+    else:
+        for aentry in t32_get_action_catalog():
+            val parts = aentry.split("|")
+            var akey = ""
+            var alabel = ""
+            var atype = ""
+            var target = ""
+            if parts.len() > 0:
+                akey = parts[0]
+            if parts.len() > 1:
+                alabel = parts[1]
+            if parts.len() > 2:
+                atype = parts[2]
+            if parts.len() > 4:
+                target = parts[4]
+            rows.push([akey, alabel, atype, target])
+    Ok(T32BridgeResult.table("Actions", rows))
+
+fn bridge_field_get(field_key: text) -> Result<T32BridgeResult, text>:
+    if field_key == "":
+        return Err("field_key is required.")
+    val session = bridge_require_session()?
+    val eval_expr = t32_field_to_eval(field_key)
+    val eval_cmd = "EVAL {eval_expr}"
+    var stdout = ""
+    var rc: i64 = 0
+    (stdout, rc) = bridge_exec(session, eval_cmd)
+    t32_add_history("field_get:{field_key} -> {eval_cmd}", stdout.trim(), session.id, MCP_T32_CURRENT_CORE)
+    var value = stdout.trim()
+    if rc != 0 and rc != -1:
+        value = "error: {stdout.trim()}"
+    if rc == -1:
+        return Err(stdout.trim())
+    t32_field_state_set(session.id, field_key, value)
+    val pairs = [
+        ["field_key", field_key],
+        ["value", value],
+        ["eval_expression", eval_expr]
+    ]
+    var result = T32BridgeResult.kv("Field: {field_key}", pairs)
+    result.set_gui_status(bridge_gui_status(session))
+    Ok(result)
+
+fn bridge_field_set(field_key: text, value: text) -> Result<T32BridgeResult, text>:
+    if field_key == "" or value == "":
+        return Err("field_key and value are required.")
+    val session = bridge_require_session()?
+    val set_cmd = t32_field_to_set_cmd(field_key, value)
+    if set_cmd == "":
+        return Err("Unknown field key for set: {field_key}. Use register.NAME, var.NAME, memory.ADDR, or pc/sp/lr/cpsr/r0-r3")
+    var stdout = ""
+    var rc: i64 = 0
+    (stdout, rc) = bridge_exec(session, set_cmd)
+    t32_add_history("field_set:{field_key}={value} -> {set_cmd}", stdout.trim(), session.id, MCP_T32_CURRENT_CORE)
+    if rc != 0 and rc != -1:
+        return Err("Field set failed (exit {rc}): {stdout.trim()}")
+    if rc == -1:
+        return Err(stdout.trim())
+    t32_field_state_set(session.id, field_key, value)
+    val pairs = [
+        ["field_key", field_key],
+        ["value", value],
+        ["command", set_cmd]
+    ]
+    Ok(T32BridgeResult.kv("Field Set", pairs))
+
+# ============================================================================
+# History/Resource functions (3)
+# ============================================================================
+
+fn bridge_history_tail(count: i64) -> Result<T32BridgeResult, text>:
+    var actual_count = count
+    if actual_count < 1:
+        actual_count = 20
+    var total: i64 = 0
+    for _h in MCP_T32_HISTORY:
+        total = total + 1
+    var start_idx: i64 = 0
+    if total > actual_count:
+        start_idx = total - actual_count
+    var rows: [[text]] = [["Command", "Result", "Session", "Core", "Request ID"]]
+    var idx: i64 = 0
+    for h in MCP_T32_HISTORY:
+        if idx >= start_idx:
+            # Truncate result to keep table readable
+            var result_text = h.result
+            if result_text.len() > 60:
+                result_text = result_text.substring(0, 57) + "..."
+            rows.push([h.command, result_text, h.session_id, h.core_id, h.request_id])
+        idx = idx + 1
+    Ok(T32BridgeResult.table("History (last {actual_count})", rows))
+
+fn bridge_resources_list() -> Result<T32BridgeResult, text>:
+    val items = [
+        "t32:///sessions  - T32 Session Manifest",
+        "t32:///windows   - T32 Window Catalog",
+        "t32:///history   - T32 Command History"
+    ]
+    Ok(T32BridgeResult.list("Resources", items))
+
+fn bridge_resource_read(uri: text) -> Result<T32BridgeResult, text>:
+    if uri == "":
+        return Err("uri is required.")
+    if uri == "t32:///sessions":
+        return bridge_sessions_list()
+    if uri == "t32:///windows":
+        return bridge_window_list()
+    if uri == "t32:///history":
+        return bridge_history_tail(50)
+    Err("Resource not found: {uri}")

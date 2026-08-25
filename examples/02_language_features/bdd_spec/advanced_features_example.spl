@@ -1,0 +1,153 @@
+# Example: Advanced SPipe Features
+# Demonstrates let_lazy, shared_examples, context_def, and tags
+
+import spec.{describe, context, it, expect, before_each, after_each, let_lazy, shared_examples, it_behaves_like, context_def, slow_it}
+import spec.matchers.{eq, be_true, be_false, include, be_empty, gt}
+import database.{Database, User}
+
+# ==============================================================================
+# Shared Examples - Reusable test groups
+# ==============================================================================
+
+shared_examples "a collection":
+    it "supports size":
+        expect(collection.size()).to gt(0)
+
+    it "supports iteration":
+        var count = 0
+        for item in collection:
+            count = count + 1
+        expect(count).to eq(collection.size())
+
+    it "supports empty check":
+        expect(collection.is_empty()).to be_false()
+
+shared_examples "an admin user":
+    it "has admin role":
+        expect(user.is_admin()).to be_true()
+
+    it "can delete users":
+        expect(user.can_delete_users()).to be_true()
+
+    it "can modify settings":
+        expect(user.can_modify_settings()).to be_true()
+
+# ==============================================================================
+# Context Definitions - Reusable setup
+# ==============================================================================
+
+context_def :database_connection:
+    given_lazy :db, \: Database.connect("test_db")
+    given :
+        db.clear_all_tables()
+
+context_def :admin_user:
+    given_lazy :user, \: User.new("admin", role: "admin", password: "secret")
+    given_lazy :auth_token, \: generate_token(user)
+
+context_def :regular_user:
+    given_lazy :user, \: User.new("john", role: "user", password: "pass123")
+    given_lazy :auth_token, \: generate_token(user)
+
+# ==============================================================================
+# Test Suites
+# ==============================================================================
+
+describe "User Management":
+    context :database_connection:
+        context "with admin user":
+            context :admin_user:
+                it_behaves_like "an admin user"
+
+                it "can create users":
+                    val new_user = user.create_user("jane", "pass")
+                    expect(db.users.count()).to eq(2)
+
+                it "can delete users":
+                    val temp_user = user.create_user("temp", "pass")
+                    user.delete_user(temp_user.id)
+                    expect(db.users.count()).to eq(1)
+
+        context "with regular user":
+            context :regular_user:
+                it "cannot delete users":
+                    expect(user.can_delete_users()).to be_false()
+
+                it "can view own profile":
+                    expect(user.can_view_profile(user.id)).to be_true()
+
+                it "cannot view other profiles":
+                    val other_user = User.new("other", role: "user")
+                    expect(user.can_view_profile(other_user.id)).to be_false()
+
+describe "Collections":
+    context "Array":
+        val collection = [1, 2, 3, 4, 5]
+        it_behaves_like "a collection"
+
+        it "supports indexing":
+            expect(collection[0]).to eq(1)
+            expect(collection[4]).to eq(5)
+
+    context "List":
+        val collection = List.from([1, 2, 3, 4, 5])
+        it_behaves_like "a collection"
+
+        it "supports push":
+            collection.push(6)
+            expect(collection.size()).to eq(6)
+
+describe "Lazy Fixtures":
+    # Database only created when accessed
+    let_lazy :db, \: Database.connect("test")
+
+    # Large dataset only loaded if needed
+    let_lazy :large_dataset, \: load_csv("large_file.csv")
+
+    it "uses database":
+        db.query("SELECT 1")  # db created here
+        expect(db.is_connected()).to be_true()
+
+    it "doesn't use database":
+        # db NOT created in this test
+        expect(2 + 2).to eq(4)
+
+    slow_it "processes large dataset":
+        # Only runs with --slow flag
+        # large_dataset created here
+        val result = process_data(large_dataset)
+        expect(result.size()).to gt(1000)
+
+describe "Tagged Tests":
+    it "unit test":
+        pass.with_tag("unit").with_tag("fast")
+
+    it "integration test":
+        pass.with_tag("integration").with_tag("api")
+
+    slow_it "performance test":
+        # Automatically tagged with "slow"
+        pass.with_tag("performance")
+
+describe "Multiple Hooks":
+    var setup_count = 0
+    var teardown_count = 0
+
+    before_all:
+        println("Setting up test suite")
+
+    before_each:
+        setup_count = setup_count + 1
+
+    after_each:
+        teardown_count = teardown_count + 1
+
+    after_all:
+        println("Tearing down test suite")
+
+    it "test 1":
+        expect(setup_count).to eq(1)
+
+    it "test 2":
+        expect(setup_count).to eq(2)
+        expect(teardown_count).to eq(1)

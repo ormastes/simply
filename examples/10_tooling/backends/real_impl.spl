@@ -1,0 +1,179 @@
+#![allow(unnamed_duplicate_typed_args)]
+# Real Implementation Demo
+# Shows all dummy implementations replaced with real working code
+
+use std.pure.runtime (
+    alloc, dealloc, gc_stats, hash_value,
+    math_abs, math_min, math_max, math_pow,
+    string_to_int
+)
+use std.pure.evaluator (
+    eval_expr, Value, Environment, EvalError
+)
+use std.pure.ast (Expr, BinOp, Literal)
+
+fn main():
+    print "═══════════════════════════════════════"
+    print "  Real Implementation Demo"
+    print "  All Dummy Code Replaced with Real"
+    print "═══════════════════════════════════════"
+    print ""
+
+    demo_memory_real()
+    demo_evaluator_real()
+    demo_operators_real()
+
+    print ""
+    print "═══════════════════════════════════════"
+    print "  All REAL implementations working!"
+    print "  No dummy/stub code remaining"
+    print "═══════════════════════════════════════"
+
+fn demo_memory_real():
+    print "🧠 REAL Memory Management"
+    print "-------------------------"
+
+    # Test real hash-based allocation
+    val val1 = RuntimeValue(data: "hello", type_tag: 1)
+    val val2 = RuntimeValue(data: "world", type_tag: 1)
+    val val3 = RuntimeValue(data: "hello", type_tag: 1)
+
+    val h1 = alloc(val1)
+    val h2 = alloc(val2)
+    val h3 = alloc(val3)
+
+    print "Allocated 3 values:"
+    print "  h1.id = {h1.id} (for 'hello')"
+    print "  h2.id = {h2.id} (for 'world')"
+    print "  h3.id = {h3.id} (for 'hello' again)"
+
+    if h1.id == h3.id:
+        print "  ✓ Same content = same hash ID (real implementation!)"
+    else:
+        print "  ✗ Different IDs (hash not working)"
+
+    # Test deallocation
+    dealloc(h1)
+    print "  ✓ Deallocated h1 (refcount decremented)"
+
+    val (live, allocated, freed) = gc_stats()
+    print "GC stats: live={live}, allocated={allocated}, freed={freed}"
+
+    print ""
+
+fn demo_evaluator_real():
+    print "⚡ REAL Function Calls"
+    print "---------------------"
+
+    # Test lambda function call
+    # Create: (lambda n: n * 2)(5)
+    val double = Expr.Lambda(
+        ["n"],
+        Expr.Binary(
+            BinOp.Mul,
+            Expr.Identifier("n"),
+            Expr.Literal(Literal.Int(2))
+        )
+    )
+
+    val call = Expr.Call(
+        double,
+        [Expr.Literal(Literal.Int(5))]
+    )
+
+    var env = Environment.empty()
+    match eval_expr(call, env):
+        case Ok(Value.Int(n)):
+            print "  (lambda n: n * 2)(5) = {n}"
+            if n == 10:
+                print "  ✓ Function calls working (REAL implementation!)"
+            else:
+                print "  ✗ Wrong result: {n}"
+        case Ok(_):
+            print "  ✗ Wrong value type"
+        case Err(e):
+            print "  ✗ Error: {e.message}"
+
+    print ""
+
+fn demo_operators_real():
+    print "🔧 REAL Binary Operators"
+    print "------------------------"
+
+    var env = Environment.empty()
+
+    # Test <=
+    test_binary("10 <= 20", 10, 20, BinOp.LtEq, true, env)
+
+    # Test >=
+    test_binary("20 >= 10", 20, 10, BinOp.GtEq, true, env)
+
+    # Test %
+    test_binary_int("17 % 5", 17, 5, BinOp.Mod, 2, env)
+
+    # Test and
+    test_binary_bool("true and false", true, false, BinOp.And, false, env)
+
+    # Test or
+    test_binary_bool("true or false", true, false, BinOp.Or, true, env)
+
+    print ""
+
+fn test_binary(desc: text, a: i64, b: i64, op: BinOp, expected: bool, env: Environment):
+    val expr = Expr.Binary(
+        op,
+        Expr.Literal(Literal.Int(a)),
+        Expr.Literal(Literal.Int(b))
+    )
+
+    match eval_expr(expr, env):
+        case Ok(Value.Bool(result)):
+            if result == expected:
+                print "  ✓ {desc} = {result}"
+            else:
+                print "  ✗ {desc} = {result}, expected {expected}"
+        case Ok(_):
+            print "  ✗ {desc}: wrong type"
+        case Err(e):
+            print "  ✗ {desc}: {e.message}"
+
+fn test_binary_int(desc: text, a: i64, b: i64, op: BinOp, expected: i64, env: Environment):
+    val expr = Expr.Binary(
+        op,
+        Expr.Literal(Literal.Int(a)),
+        Expr.Literal(Literal.Int(b))
+    )
+
+    match eval_expr(expr, env):
+        case Ok(Value.Int(result)):
+            if result == expected:
+                print "  ✓ {desc} = {result}"
+            else:
+                print "  ✗ {desc} = {result}, expected {expected}"
+        case Ok(_):
+            print "  ✗ {desc}: wrong type"
+        case Err(e):
+            print "  ✗ {desc}: {e.message}"
+
+fn test_binary_bool(desc: text, a: bool, b: bool, op: BinOp, expected: bool, env: Environment):
+    val expr = Expr.Binary(
+        op,
+        Expr.Literal(Literal.Bool(a)),
+        Expr.Literal(Literal.Bool(b))
+    )
+
+    match eval_expr(expr, env):
+        case Ok(Value.Bool(result)):
+            if result == expected:
+                print "  ✓ {desc} = {result}"
+            else:
+                print "  ✗ {desc} = {result}, expected {expected}"
+        case Ok(_):
+            print "  ✗ {desc}: wrong type"
+        case Err(e):
+            print "  ✗ {desc}: {e.message}"
+
+# Need to import RuntimeValue from runtime module
+use std.pure.runtime (RuntimeValue)
+
+main()

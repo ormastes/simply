@@ -1,0 +1,118 @@
+"""
+sim_main — end-to-end SimpleOS NVMe SSD firmware simulation (the production gate).
+
+Exercises the full HIL -> FTL -> FIL stack through the host queues:
+  1. write a batch of logical blocks
+  2. read-back verification
+  3. overwrite all (generate stale pages / write amplification)
+  4. garbage collection reclaims stale blocks with the logical view preserved
+  5. trim / deallocate
+  6. power-fail + recovery — committed state survives (committed-prefix property)
+
+Run: bin/simple run examples/09_embedded/simpleos_nvme_fw/fw/sim_main.spl
+"""
+
+use nvme_types.*
+use firmware.*
+
+val N: i64 = 128   # logical blocks exercised
+
+fn main():
+    var fail: i64 = 0
+    var fw: Firmware = firmware_new()
+    print "=== SimpleOS NVMe SSD firmware — end-to-end simulation ==="
+    print ""
+
+    # [1] host writes N blocks: data[lba] = (lba + 1) & 0xFF
+    print "[1] host writes {N} logical blocks"
+    var i: i64 = 0
+    while i < N:
+        fw.submit(cmd_make(i, OP_WRITE, i, 1, (i + 1) & 0xFF))
+        val flush1: i64 = i & 31           # drain every 32 to respect queue depth (64)
+        if flush1 == 31:
+            fw.service()
+            fw.reap_all()
+        i = i + 1
+    fw.service()
+    fw.reap_all()
+    fail = fail + expect_eq(fw.completions(), 0, "all writes serviced + drained")
+
+    # [2] read-back verification
+    print "[2] read-back verification"
+    fw.submit(cmd_make(500, OP_READ, 7, 1, 0))
+    fw.submit(cmd_make(501, OP_READ, 127, 1, 0))
+    fw.service()
+    val a: NvmeCpl = fw.reap()
+    val b: NvmeCpl = fw.reap()
+    fail = fail + expect_eq(a.data, 8, "read LBA 7 == 8")
+    fail = fail + expect_eq(a.status, SC_SUCCESS, "read LBA 7 ok")
+    fail = fail + expect_eq(b.data, 128, "read LBA 127 == 128")
+
+    # [3] overwrite all N (newest version = 0xA0 | (lba & 0x0F)); old pages go stale
+    print "[3] overwrite all {N} blocks (generates stale pages)"
+    i = 0
+    while i < N:
+        fw.submit(cmd_make(1000 + i, OP_WRITE, i, 1, 0xA0 | (i & 0x0F)))
+        val flush3: i64 = i & 31           # drain every 32 to respect queue depth (64)
+        if flush3 == 31:
+            fw.service()
+            fw.reap_all()
+        i = i + 1
+    fw.service()
+    fw.reap_all()
+    fw.submit(cmd_make(600, OP_READ, 7, 1, 0))
+    fw.service()
+    val ov: NvmeCpl = fw.reap()
+    fail = fail + expect_eq(ov.data, 0xA0 | 7, "LBA 7 reads newest version")
+
+    # [4] garbage collection reclaims stale blocks; logical view preserved
+    print "[4] garbage collection"
+    val free_pre: i64 = fw.free_blocks()
+    val reclaimed: i64 = fw.gc_sweep()
+    var did_gc: i64 = 0
+    if reclaimed > 0:
+        did_gc = 1
+    fail = fail + expect_eq(did_gc, 1, "GC reclaimed at least one block")
+    val free_post: i64 = fw.free_blocks()
+    var freed: i64 = 0
+    if free_post > free_pre:
+        freed = 1
+    fail = fail + expect_eq(freed, 1, "free-block count rose after GC")
+    fw.submit(cmd_make(700, OP_READ, 7, 1, 0))
+    fw.submit(cmd_make(701, OP_READ, 63, 1, 0))
+    fw.service()
+    val g7: NvmeCpl = fw.reap()
+    val g63: NvmeCpl = fw.reap()
+    fail = fail + expect_eq(g7.data, 0xA0 | 7, "LBA 7 intact after GC")
+    fail = fail + expect_eq(g63.data, 0xA0 | (63 & 0x0F), "LBA 63 intact after GC")
+
+    # [5] trim / deallocate
+    print "[5] trim / deallocate LBA 7"
+    fw.submit(cmd_make(800, OP_DSM_TRIM, 7, 1, 0))
+    fw.submit(cmd_make(801, OP_READ, 7, 1, 0))
+    fw.service()
+    val t0: NvmeCpl = fw.reap()
+    val t1: NvmeCpl = fw.reap()
+    fail = fail + expect_eq(t0.status, SC_SUCCESS, "trim completed")
+    fail = fail + expect_eq(t1.data, 0, "read after trim -> 0")
+
+    # [6] power-fail + recovery: committed state survives, trim stays trimmed
+    print "[6] power-fail + recovery (committed-prefix property)"
+    fw.checkpoint()
+    fw.power_cycle()
+    fw.submit(cmd_make(900, OP_READ, 50, 1, 0))
+    fw.submit(cmd_make(901, OP_READ, 7, 1, 0))
+    fw.submit(cmd_make(902, OP_READ, 100, 1, 0))
+    fw.service()
+    val s50: NvmeCpl = fw.reap()
+    val s7: NvmeCpl = fw.reap()
+    val s100: NvmeCpl = fw.reap()
+    fail = fail + expect_eq(s50.data, 0xA0 | (50 & 0x0F), "LBA 50 survives power cycle")
+    fail = fail + expect_eq(s100.data, 0xA0 | (100 & 0x0F), "LBA 100 survives power cycle")
+    fail = fail + expect_eq(s7.data, 0, "trimmed LBA 7 stays trimmed after recovery")
+
+    print ""
+    if fail == 0:
+        print "ALL END-TO-END CHECKS PASS"
+    else:
+        print "END-TO-END FAIL ({fail})"

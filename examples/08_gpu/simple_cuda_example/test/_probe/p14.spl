@@ -1,0 +1,205 @@
+use std.cuda.{cuda_init, cuda_device_count, cuda_device_get, cuda_ctx_create, cuda_mem_alloc, cuda_mem_free, cuda_sync, cuda_module_load_data, cuda_module_unload, cuda_launch_kernel, cuda_get_error_string}
+use std.common.binary_io.{f32_to_bits, f32_from_bits}
+
+extern fn rt_cuda_memcpy_htod_array(dst: i64, src: [u8], size: i64) -> i64
+extern fn rt_cuda_memcpy_dtoh(dst_host: i64, src_device: i64, size: i64) -> i64
+extern fn rt_alloc(size: i64) -> i64
+extern fn rt_free(ptr: i64)
+extern fn rt_ptr_read_u8(ptr: i64, offset: i64) -> i64
+extern fn rt_ptr_write_i64(addr: i64, offset: i64, value: i64)
+
+fn upload_bytes(dev: i64, bs: [u8]) -> bool:
+    rt_cuda_memcpy_htod_array(dev, bs, bs.len()) == 0
+
+fn download_bytes(dev: i64, size: i64) -> [u8]:
+    val staging = rt_alloc(size)
+    val rc = rt_cuda_memcpy_dtoh(staging, dev, size)
+    var out: [u8] = []
+    if rc == 0:
+        for i in 0..size:
+            out.push(rt_ptr_read_u8(staging, i) as u8)
+    rt_free(staging)
+    out
+
+fn f32s_to_bytes(xs: [f32]) -> [u8]:
+    var out: [u8] = []
+    for x in xs:
+        val b = f32_to_bits(x)
+        out.push((b & 0xFFu32) as u8)
+        out.push(((b >> 8) & 0xFFu32) as u8)
+        out.push(((b >> 16) & 0xFFu32) as u8)
+        out.push(((b >> 24) & 0xFFu32) as u8)
+    out
+
+fn bytes_to_f32s(bs: [u8]) -> [f32]:
+    var out: [f32] = []
+    val n = bs.len() / 4
+    for i in 0..n:
+        val b = (bs[i*4] as u32) | ((bs[i*4+1] as u32) << 8) | ((bs[i*4+2] as u32) << 16) | ((bs[i*4+3] as u32) << 24)
+        out.push(f32_from_bits(b))
+    out
+
+fn bytes_to_i32s(bs: [u8]) -> [i64]:
+    var out: [i64] = []
+    val n = bs.len() / 4
+    for i in 0..n:
+        out.push((bs[i*4] as i64) | ((bs[i*4+1] as i64) << 8) | ((bs[i*4+2] as i64) << 16) | ((bs[i*4+3] as i64) << 24))
+    out
+
+# Launch with i64 scalar args (device pointers and ints); each param is 8 bytes.
+fn launch(module: i64, name: text, grid: i64, block: i64, args: [i64]) -> i64:
+    val n = args.len()
+    val values = rt_alloc(8 * n)
+    val ptrs = rt_alloc(8 * n)
+    for i in 0..n:
+        rt_ptr_write_i64(values, 8 * i, args[i])
+        rt_ptr_write_i64(ptrs, 8 * i, values + 8 * i)
+    val rc = cuda_launch_kernel(module, name, grid, 1, 1, block, 1, 1, ptrs)
+    rt_free(values)
+    rt_free(ptrs)
+    rc
+
+val PTX = """
+.version 7.0
+.target sm_75
+.address_size 64
+
+.visible .entry scale_k(.param .u64 a, .param .u64 c, .param .u64 n)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<8>;
+    .reg .f32 %f<4>;
+    .reg .b64 %rd<12>;
+    ld.param.u64 %rd1, [a];
+    ld.param.u64 %rd2, [c];
+    ld.param.u64 %rd3, [n];
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r4, %r1, %r2, %r3;
+    cvt.u64.u32 %rd4, %r4;
+    setp.ge.u64 %p1, %rd4, %rd3;
+    @%p1 bra DONE_S;
+    shl.b64 %rd5, %rd4, 2;
+    add.u64 %rd6, %rd1, %rd5;
+    add.u64 %rd7, %rd2, %rd5;
+    ld.global.f32 %f1, [%rd6];
+    mul.f32 %f2, %f1, 0f40000000;
+    st.global.f32 [%rd7], %f2;
+DONE_S:
+    ret;
+}
+
+.visible .entry count_k(.param .u64 cnt, .param .u64 n)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [cnt];
+    ld.param.u64 %rd3, [n];
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r4, %r1, %r2, %r3;
+    cvt.u64.u32 %rd4, %r4;
+    setp.ge.u64 %p1, %rd4, %rd3;
+    @%p1 bra DONE_C;
+    atom.global.add.u32 %r5, [%rd1], 1;
+DONE_C:
+    ret;
+}
+
+.visible .entry reduce_k(.param .u64 a, .param .u64 out, .param .u64 n)
+{
+    .reg .pred %p<4>;
+    .reg .b32 %r<16>;
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<16>;
+    .shared .align 4 .b8 sh[1024];
+    ld.param.u64 %rd1, [a];
+    ld.param.u64 %rd2, [out];
+    ld.param.u64 %rd3, [n];
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r4, %r1, %r2, %r3;
+    cvt.u64.u32 %rd4, %r4;
+    mov.f32 %f1, 0f00000000;
+    setp.ge.u64 %p1, %rd4, %rd3;
+    @%p1 bra STORE_SH;
+    shl.b64 %rd5, %rd4, 2;
+    add.u64 %rd6, %rd1, %rd5;
+    ld.global.f32 %f1, [%rd6];
+STORE_SH:
+    mov.u64 %rd7, sh;
+    cvt.u64.u32 %rd8, %r3;
+    shl.b64 %rd9, %rd8, 2;
+    add.u64 %rd10, %rd7, %rd9;
+    st.shared.f32 [%rd10], %f1;
+    bar.sync 0;
+    shr.u32 %r5, %r2, 1;
+LOOP:
+    setp.eq.u32 %p2, %r5, 0;
+    @%p2 bra AFTER;
+    setp.ge.u32 %p3, %r3, %r5;
+    @%p3 bra SKIP;
+    cvt.u64.u32 %rd11, %r5;
+    shl.b64 %rd12, %rd11, 2;
+    add.u64 %rd13, %rd10, %rd12;
+    ld.shared.f32 %f2, [%rd10];
+    ld.shared.f32 %f3, [%rd13];
+    add.f32 %f4, %f2, %f3;
+    st.shared.f32 [%rd10], %f4;
+SKIP:
+    bar.sync 0;
+    shr.u32 %r5, %r5, 1;
+    bra LOOP;
+AFTER:
+    setp.ne.u32 %p3, %r3, 0;
+    @%p3 bra DONE_R;
+    ld.shared.f32 %f5, [%rd7];
+    atom.global.add.f32 %f6, [%rd2], %f5;
+DONE_R:
+    ret;
+}
+"""
+
+fn main():
+    print "init={cuda_init()} count={cuda_device_count()}"
+    val ctx = cuda_ctx_create(cuda_device_get(0))
+    print "ctx>0={ctx > 0}"
+    val module = cuda_module_load_data(PTX)
+    print "module>0={module > 0}"
+    if module <= 0:
+        print "load error: {cuda_get_error_string(0 - module)}"
+        return
+    val n = 1024
+    var h: [f32] = []
+    for i in 0..n:
+        h.push(1.0 + (i as f32))
+    val a = cuda_mem_alloc(n * 4)
+    val c = cuda_mem_alloc(n * 4)
+    upload_bytes(a, f32s_to_bytes(h))
+    val rc1 = launch(module, "scale_k", 4, 256, [a, c, n])
+    print "launch scale rc={rc1} sync={cuda_sync()}"
+    val r = bytes_to_f32s(download_bytes(c, n * 4))
+    print "scale r0={r[0]} r1023={r[1023]} (expect 2.0, 2048.0)"
+    val cnt = cuda_mem_alloc(4)
+    var z: [u8] = [0u8, 0u8, 0u8, 0u8]
+    upload_bytes(cnt, z)
+    val rc2 = launch(module, "count_k", 4, 256, [cnt, n])
+    cuda_sync()
+    val rcn = bytes_to_i32s(download_bytes(cnt, 4))
+    print "count rc={rc2} val={rcn[0]} (expect 1024)"
+    val out = cuda_mem_alloc(4)
+    upload_bytes(out, z)
+    val rc3 = launch(module, "reduce_k", 4, 256, [a, out, n])
+    cuda_sync()
+    val ro = bytes_to_f32s(download_bytes(out, 4))
+    print "reduce rc={rc3} sum={ro[0]} (expect 524800.0)"
+    cuda_mem_free(a)
+    cuda_mem_free(c)
+    cuda_mem_free(cnt)
+    cuda_mem_free(out)
+    cuda_module_unload(module)
+    print "done"

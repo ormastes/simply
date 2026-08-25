@@ -1,0 +1,464 @@
+app:
+    title: "Widget Showcase"
+    theme: glass_dark
+
+layout:
+    type: vbox
+    id: root
+    children:
+        nav:
+            type: navigation_bar
+            id: nav
+            title: "Widget Showcase"
+
+        body:
+            type: scroll
+            id: body
+            max_height: 24
+            scroll_offset: 0
+            flex: 1
+            children:
+                page_heading:
+                    type: heading
+                    id: page_heading
+                    content: "All Simple UI Widgets"
+                intro_text:
+                    type: text
+                    id: intro_text
+                    content: "Every renderer-supported widget kind on one mobile page."
+                sub_label:
+                    type: label
+                    id: sub_label
+                    label: "Scroll to explore each section."
+
+                div_top:
+                    type: divider
+                    id: div_top
+
+                # ---- Menubar with submenu ----
+                main_menubar:
+                    type: menubar
+                    id: main_menubar
+                    children:
+                        file_menu:
+                            type: text
+                            id: file_menu
+                            label: "File"
+                            has_submenu: true
+                            children:
+                                mi_new:
+                                    type: text
+                                    id: mi_new
+                                    label: "New"
+                                    action: "file_new"
+                                mi_sep:
+                                    type: text
+                                    id: mi_sep
+                                    is_separator: true
+                                mi_open:
+                                    type: text
+                                    id: mi_open
+                                    label: "Open"
+                                    action: "file_open"
+                        edit_menu:
+                            type: text
+                            id: edit_menu
+                            label: "Edit"
+
+                # ---- Panel section (distinct from card) ----
+                summary_panel:
+                    type: panel
+                    id: summary_panel
+                    title: "Quick Summary"
+                    children:
+                        summary_text:
+                            type: text
+                            id: summary_text
+                            content: "Panels render with their own chrome, separate from cards."
+
+                # ---- Horizontal row (hbox) ----
+                button_row:
+                    type: hbox
+                    id: button_row
+                    children:
+                        row_btn_a:
+                            type: button
+                            id: row_btn_a
+                            label: "Left"
+                            action: "row_left"
+                        row_btn_b:
+                            type: button
+                            id: row_btn_b
+                            label: "Right"
+                            action: "row_right"
+
+                # ---- Text input section ----
+                text_card:
+                    type: card
+                    id: text_card
+                    title: "Text Inputs"
+                    children:
+                        name_field:
+                            type: textfield
+                            id: name_field
+                            label: "Name"
+                            value: ""
+                            placeholder: "Type your name"
+                        search_input:
+                            type: input
+                            id: search_input
+                            value: ""
+                            placeholder: "Filter..."
+                        notes_area:
+                            type: textarea
+                            id: notes_area
+                            rows: "3"
+                            value: ""
+                            placeholder: "Write notes here..."
+                        search_bar_main:
+                            type: search_bar
+                            id: search_bar_main
+                            value: ""
+                            placeholder: "Search the app"
+
+                # ---- Selection controls ----
+                choices_card:
+                    type: card
+                    id: choices_card
+                    title: "Selection Controls"
+                    children:
+                        terms_cb:
+                            type: checkbox
+                            id: terms_cb
+                            label: "Accept terms"
+                            checked: true
+                        news_cb:
+                            type: checkbox
+                            id: news_cb
+                            label: "Subscribe to newsletter"
+                            checked: false
+                        notify_switch:
+                            type: switch
+                            id: notify_switch
+                            label: "Enable notifications"
+                            action: "toggle_notify"
+                        plan_radio:
+                            type: radio
+                            id: plan_radio
+                            selected_index: "1"
+                            children:
+                                0:
+                                    label: "Free plan"
+                                1:
+                                    label: "Pro plan"
+                                2:
+                                    label: "Team plan"
+                        country_dd:
+                            type: dropdown
+                            id: country_dd
+                            selected_index: "0"
+                            children:
+                                0:
+                                    label: "South Korea"
+                                1:
+                                    label: "United States"
+                                2:
+                                    label: "Japan"
+                        view_seg:
+                            type: segmented_control
+                            id: view_seg
+                            active_index: "0"
+                            children:
+                                0:
+                                    label: "Day"
+                                1:
+                                    label: "Week"
+                                2:
+                                    label: "Month"
+
+                # ---- Data display ----
+                data_card:
+                    type: card
+                    id: data_card
+                    title: "Data Display"
+                    children:
+                        progress_dl:
+                            type: progress
+                            id: progress_dl
+                            label: "Download"
+                            value: "65"
+                        fruits_list:
+                            type: list
+                            id: fruits_list
+                            selected_index: "2"
+                            items:
+                                0:
+                                    label: "Apple"
+                                1:
+                                    label: "Banana"
+                                2:
+                                    label: "Cherry"
+                                3:
+                                    label: "Date"
+                        people_table:
+                            type: table
+                            id: people_table
+                            headers: "Name|Age|City"
+                            sort_column: ""
+                            sort_dir: "asc"
+                            filter_text: ""
+                            children:
+                                row_0:
+                                    type: text
+                                    id: people_row_0
+                                    label: "Alice|30|Seoul"
+                                row_1:
+                                    type: text
+                                    id: people_row_1
+                                    label: "Bob|25|Busan"
+                                row_2:
+                                    type: text
+                                    id: people_row_2
+                                    label: "Carol|35|Incheon"
+                        tree_files:
+                            type: tree
+                            id: tree_files
+                            children:
+                                node_src:
+                                    type: treenode
+                                    id: node_src
+                                    label: "src"
+                                    expanded: true
+                                    children:
+                                        node_main:
+                                            type: treenode
+                                            id: node_main
+                                            label: "main.spl"
+                                        node_lib:
+                                            type: treenode
+                                            id: node_lib
+                                            label: "lib.spl"
+                                node_docs:
+                                    type: treenode
+                                    id: node_docs
+                                    label: "docs"
+
+                # ---- Media & navigation ----
+                media_card:
+                    type: card
+                    id: media_card
+                    title: "Media & Navigation"
+                    children:
+                        logo_img:
+                            type: image
+                            id: logo_img
+                            src: "logo.png"
+                            alt: "App logo"
+                        nav_tabs:
+                            type: tabs
+                            id: nav_tabs
+                            active_index: "1"
+                            children:
+                                0:
+                                    label: "Overview"
+                                1:
+                                    label: "Details"
+                                2:
+                                    label: "Settings"
+                        help_tip:
+                            type: tooltip
+                            id: help_tip
+                            target: "logo_img"
+                            content: "This is the application logo."
+
+                # ---- Actions ----
+                actions_card:
+                    type: card
+                    id: actions_card
+                    title: "Actions"
+                    children:
+                        submit_btn:
+                            type: button
+                            id: submit_btn
+                            label: "Submit"
+                            action: "submit_form"
+                        reset_btn:
+                            type: button
+                            id: reset_btn
+                            label: "Reset"
+                            action: "reset_form"
+                        disabled_btn:
+                            type: button
+                            id: disabled_btn
+                            label: "Locked"
+                            action: "noop"
+                            disabled: true
+
+                div_bottom:
+                    type: divider
+                    id: div_bottom
+
+                # ---- Dialog ----
+                confirm_dialog:
+                    type: dialog
+                    id: confirm_dialog
+                    title: "Confirm Action"
+                    children:
+                        dialog_text:
+                            type: text
+                            id: dialog_text
+                            content: "Are you sure you want to proceed?"
+                        dialog_ok:
+                            type: button
+                            id: dialog_ok
+                            label: "OK"
+                            action: "confirm_ok"
+
+                # ---- Glass / workspace shell widgets ----
+                shell_divider:
+                    type: divider
+                    id: shell_divider
+                shell_heading:
+                    type: heading
+                    id: shell_heading
+                    content: "Glass & Workspace Widgets"
+                gtb:
+                    type: glass_title_bar
+                    id: gtb
+                    title: "Workspace"
+                cmd_bar:
+                    type: command_bar
+                    id: cmd_bar
+                    children:
+                        cmd_run:
+                            type: button
+                            id: cmd_run
+                            label: "Run"
+                            action: "cmd_run"
+                        cmd_stop:
+                            type: button
+                            id: cmd_stop
+                            label: "Stop"
+                            action: "cmd_stop"
+                ws_tabs:
+                    type: workspace_tabs
+                    id: ws_tabs
+                    active_index: "1"
+                    children:
+                        0:
+                            label: "Editor"
+                        1:
+                            label: "Preview"
+                        2:
+                            label: "Logs"
+                side_nav:
+                    type: sidebar
+                    id: side_nav
+                    children:
+                        side_btn_a:
+                            type: button
+                            id: side_btn_a
+                            label: "Files"
+                            action: "nav_files"
+                        side_btn_b:
+                            type: button
+                            id: side_btn_b
+                            label: "Search"
+                            action: "nav_search"
+                util_rail:
+                    type: utility_rail
+                    id: util_rail
+                    active_index: "0"
+                    children:
+                        0:
+                            icon: "*"
+                            label: "Star"
+                        1:
+                            icon: "#"
+                            label: "Tags"
+                cmd_palette:
+                    type: command_palette
+                    id: cmd_palette
+                    placeholder: "Type a command..."
+                    children:
+                        0:
+                            label: "Open File"
+                            action: "pal_open"
+                        1:
+                            label: "Save All"
+                            action: "pal_save"
+                ctx_menu:
+                    type: context_menu
+                    id: ctx_menu
+                    children:
+                        0:
+                            label: "Cut"
+                            action: "ctx_cut"
+                        1:
+                            label: "Copy"
+                            action: "ctx_copy"
+                inspector_panel:
+                    type: inspector
+                    id: inspector_panel
+                    title: "Properties"
+                    children:
+                        insp_row:
+                            type: text
+                            id: insp_row
+                            content: "Width: 320  Height: 200"
+                chip_ok:
+                    type: status_chip
+                    id: chip_ok
+                    label: "Online"
+                    status: "success"
+                sel_pill:
+                    type: selection_pill
+                    id: sel_pill
+                    selected_index: "0"
+                    children:
+                        0:
+                            label: "All"
+                        1:
+                            label: "Mine"
+                toast_msg:
+                    type: toast
+                    id: toast_msg
+                    message: "Saved successfully"
+                    status: "success"
+                sheet:
+                    type: sheet_modal
+                    id: sheet
+                    title: "More Options"
+                    children:
+                        sheet_text:
+                            type: text
+                            id: sheet_text
+                            content: "Bottom sheet content."
+                empty:
+                    type: empty_state
+                    id: empty
+                    icon: "[ ]"
+                    title: "No Results"
+                    subtitle: "Try a different search."
+
+        tab_bar:
+            type: tab_bar
+            id: tab_bar
+            active_index: "0"
+            children:
+                0:
+                    icon: "H"
+                    label: "Home"
+                1:
+                    icon: "S"
+                    label: "Search"
+                2:
+                    icon: "P"
+                    label: "Profile"
+                    badge: "3"
+
+        status:
+            type: statusbar
+            id: status
+            left: "{app.mode}"
+            right: "{app.title}"

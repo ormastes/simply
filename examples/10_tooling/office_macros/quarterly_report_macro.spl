@@ -1,0 +1,40 @@
+# Office macro example — Simple as the suite's macro language.
+#
+# Builds a budget sheet with formulas, computes it, saves CSV, writes a
+# markdown report, and exports both to styled HTML. Run:
+#
+#     bin/simple run examples/10_tooling/office_macros/quarterly_report_macro.spl <out-dir>
+
+use app.office.office_api.{macro_new_sheet, macro_set_cell, macro_recalc, macro_get_cell, macro_save_sheet, macro_new_document, macro_add_heading, macro_add_paragraph, macro_add_bullet, macro_save_document, macro_export_html}
+use std.sffi.cli (cli_get_args)
+
+fn main() -> i64:
+    val args = cli_get_args()
+    val out_dir = if args.len() > 0: args[args.len() - 1] else: "."
+
+    # 1. Build and compute the budget sheet
+    var sh = macro_new_sheet("Budget")
+    sh = macro_set_cell(sh, "A1", "Item")
+    sh = macro_set_cell(sh, "B1", "Q1")
+    sh = macro_set_cell(sh, "A2", "Revenue")
+    sh = macro_set_cell(sh, "B2", "1200")
+    sh = macro_set_cell(sh, "A3", "Costs")
+    sh = macro_set_cell(sh, "B3", "800")
+    sh = macro_set_cell(sh, "A4", "Profit")
+    sh = macro_set_cell(sh, "B4", "=B2-B3")
+    sh = macro_recalc(sh)
+    val profit = macro_get_cell(sh, "B4")
+    macro_save_sheet(sh, "{out_dir}/budget.csv")
+
+    # 2. Write the narrative report, embedding the computed value
+    var doc = macro_new_document("Quarterly Report")
+    doc = macro_add_heading(doc, 1, "Quarterly Report")
+    doc = macro_add_paragraph(doc, "Profit this quarter: **{profit}**.")
+    doc = macro_add_bullet(doc, "Details in `budget.csv`")
+    macro_save_document(doc, "{out_dir}/report.md")
+
+    # 3. Export both to styled HTML pages
+    macro_export_html("sheets", "{out_dir}/budget.csv", "{out_dir}/budget.html")
+    macro_export_html("word", "{out_dir}/report.md", "{out_dir}/report.html")
+    print "macro: profit={profit}, wrote budget.csv/report.md + HTML to {out_dir}"
+    0

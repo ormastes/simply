@@ -1,0 +1,4 @@
+use logic_flush_cases.*
+
+fn rv32_flush_selftest() -> i32:
+    rv32_flush_cases_selftest()

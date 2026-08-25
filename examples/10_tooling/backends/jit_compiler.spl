@@ -1,0 +1,368 @@
+#!/usr/bin/env simple
+# JIT Compilation Demo
+#
+# Demonstrates runtime code compilation and execution.
+# Shows integration with compiler infrastructure for dynamic code evaluation.
+
+use app.io.jit_ffi.{
+    jit_available,
+    JitBackend,
+    exec_manager_new, exec_manager_with_backend, exec_manager_destroy,
+    exec_manager_compile_source, exec_manager_call, exec_manager_call_void,
+    exec_manager_has_function, exec_manager_list_functions,
+    exec_manager_set_opt_level, exec_manager_get_opt_level,
+    jit_eval, jit_compile_and_run, jit_load_and_run,
+    CompileResult
+}
+use app.io.{print}
+
+fn main():
+    if not jit_available():
+        print "=== JIT Compilation Demo ==="
+        print "JIT runtime not available in this build; demos skipped."
+        return
+
+    print "=== JIT Compilation Demo ==="
+    print ""
+
+    demo_basic_eval()
+    print ""
+    demo_execution_manager()
+    print ""
+    demo_backends()
+    print ""
+    demo_optimization()
+    print ""
+    demo_introspection()
+    print ""
+    demo_use_cases()
+    print ""
+
+    print "=== Demo Complete ==="
+
+fn demo_basic_eval():
+    """
+    Demonstrates quick expression evaluation.
+    """
+    print "--- Quick Evaluation (jit_eval) ---"
+
+    # Evaluate simple expression
+    val result1 = jit_eval("21 + 21")
+    if result1.success:
+        print "✓ 21 + 21 = {result1.return_value}"
+    else:
+        print "ℹ  JIT eval failed (no runtime): {result1.error_message}"
+
+    # Evaluate with variables (will fail without runtime)
+    val result2 = jit_eval("var x = 10; var y = 32; x + y")
+    print ""
+    print "jit_eval features:"
+    print "  - Compile and execute in one call"
+    print "  - Automatic cleanup"
+    print "  - Great for REPL or config evaluation"
+
+fn demo_execution_manager():
+    """
+    Demonstrates execution manager for multiple compilations.
+    """
+    print "--- Execution Manager ---"
+
+    # Create execution manager
+    val mgr = exec_manager_new()
+
+    if not mgr.is_valid:
+        print "ℹ  No JIT runtime available"
+        print "   In a real app, you would:"
+        print "   1. Create manager: exec_manager_new()"
+        print "   2. Compile code: exec_manager_compile_source(mgr, source)"
+        print "   3. Execute: exec_manager_call(mgr, 'function_name', args)"
+        print "   4. Cleanup: exec_manager_destroy(mgr)"
+        exec_manager_destroy(mgr)
+        return
+
+    # Compile multiple functions
+    val math_code = """
+    fn add(x, y):
+        x + y
+
+    fn multiply(x, y):
+        x * y
+
+    fn factorial(n):
+        if n <= 1:
+            1
+        else:
+            n * factorial(n - 1)
+    """
+
+    val compile_status = exec_manager_compile_source(mgr, math_code)
+
+    if compile_status.result == CompileResult.Success:
+        print "✓ Math functions compiled"
+
+        # Execute functions
+        val sum = exec_manager_call(mgr, "add", [10, 32])
+        val product = exec_manager_call(mgr, "multiply", [6, 7])
+        val fact = exec_manager_call(mgr, "factorial", [5])
+
+        if sum.success:
+            print "✓ add(10, 32) = {sum.return_value}"
+        if product.success:
+            print "✓ multiply(6, 7) = {product.return_value}"
+        if fact.success:
+            print "✓ factorial(5) = {fact.return_value}"
+    else:
+        print "✗ Compilation failed: {compile_status.error_message}"
+
+    # Cleanup
+    exec_manager_destroy(mgr)
+
+fn demo_backends():
+    """
+    Demonstrates different JIT backends.
+    """
+    print "--- JIT Backends ---"
+
+    print "Available backends:"
+    print "  - Auto: Automatic selection (Cranelift preferred)"
+    print "  - Cranelift: Fast compilation, decent runtime"
+    print "  - LLVM: Slower compilation, best runtime"
+    print ""
+
+    # Try Cranelift backend
+    val mgr_cranelift = exec_manager_with_backend(JitBackend.Cranelift)
+    if mgr_cranelift.is_valid:
+        print "✓ Cranelift backend available"
+    else:
+        print "ℹ  Cranelift backend not available"
+    exec_manager_destroy(mgr_cranelift)
+
+    # Try LLVM backend
+    val mgr_llvm = exec_manager_with_backend(JitBackend.LLVM)
+    if mgr_llvm.is_valid:
+        print "✓ LLVM backend available"
+    else:
+        print "ℹ  LLVM backend not available"
+    exec_manager_destroy(mgr_llvm)
+
+    print ""
+    print "Backend selection tips:"
+    print "  - Development: Use Cranelift (fast compile)"
+    print "  - Production: Use LLVM (best performance)"
+    print "  - Default: Use Auto (picks best available)"
+
+fn demo_optimization():
+    """
+    Demonstrates optimization level control.
+    """
+    print "--- Optimization Levels ---"
+
+    val mgr = exec_manager_new()
+
+    if not mgr.is_valid:
+        print "ℹ  No JIT runtime available"
+        print ""
+        print "Optimization levels:"
+        print "  0: No optimization (fastest compile)"
+        print "  1: Less optimization"
+        print "  2: Default (balanced)"
+        print "  3: Aggressive (best runtime)"
+        exec_manager_destroy(mgr)
+        return
+
+    # Show default level
+    val default_level = exec_manager_get_opt_level(mgr)
+    print "Default optimization: Level {default_level}"
+
+    # Try different levels
+    exec_manager_set_opt_level(mgr, 0)
+    print "✓ Set to Level 0 (no optimization)"
+
+    exec_manager_set_opt_level(mgr, 3)
+    print "✓ Set to Level 3 (aggressive)"
+
+    # Compile and benchmark
+    val code = "fn fibonacci(n): if n <= 1: n else: fibonacci(n-1) + fibonacci(n-2)"
+
+    exec_manager_set_opt_level(mgr, 0)
+    exec_manager_compile_source(mgr, code)
+    print "  Level 0: Fast compile, slower runtime"
+
+    exec_manager_set_opt_level(mgr, 3)
+    exec_manager_compile_source(mgr, code)
+    print "  Level 3: Slow compile, faster runtime"
+
+    exec_manager_destroy(mgr)
+
+fn demo_introspection():
+    """
+    Demonstrates runtime introspection.
+    """
+    print "--- Runtime Introspection ---"
+
+    val mgr = exec_manager_new()
+
+    if not mgr.is_valid:
+        print "ℹ  No JIT runtime available"
+        exec_manager_destroy(mgr)
+        return
+
+    # Compile some functions
+    val code = """
+    fn add(x, y): x + y
+    fn sub(x, y): x - y
+    fn mul(x, y): x * y
+    """
+
+    exec_manager_compile_source(mgr, code)
+
+    # List compiled functions
+    val functions = exec_manager_list_functions(mgr)
+    print "Compiled functions: {functions.len()}"
+    for func in functions:
+        print "  - {func}"
+
+    # Check specific function
+    if exec_manager_has_function(mgr, "add"):
+        print "✓ Function 'add' is available"
+
+    if not exec_manager_has_function(mgr, "div"):
+        print "✓ Function 'div' not found (as expected)"
+
+    exec_manager_destroy(mgr)
+
+fn demo_use_cases():
+    """
+    Demonstrates real-world use cases.
+    """
+    print "--- Real-World Use Cases ---"
+
+    print "1. REPL (Read-Eval-Print Loop)"
+    print "   user_input = read_line()"
+    print "   result = jit_eval(user_input)"
+    print "   print result.return_value"
+    print ""
+
+    print "2. Plugin System"
+    print "   plugin_code = file_read('plugins/my_plugin.spl')"
+    print "   mgr = exec_manager_new()"
+    print "   exec_manager_compile_source(mgr, plugin_code)"
+    print "   exec_manager_call(mgr, 'plugin_init', [])"
+    print ""
+
+    print "3. Config DSL Evaluation"
+    print "   config = 'timeout = 30 * 60  # 30 minutes'"
+    print "   result = jit_eval(config)"
+    print "   timeout_seconds = result.return_value"
+    print ""
+
+    print "4. Hot Code Reload"
+    print "   while development_mode:"
+    print "       if file_changed('module.spl'):"
+    print "           new_code = file_read('module.spl')"
+    print "           exec_manager_compile_source(mgr, new_code)"
+    print ""
+
+    print "5. Scientific Computing"
+    print "   user_formula = 'fn f(x): x^2 + 2*x + 1'"
+    print "   jit_compile_and_run(user_formula, 'f', [5])"
+    print ""
+
+    print "6. Game Scripting"
+    print "   script = file_read('scripts/enemy_ai.spl')"
+    print "   jit_load_and_run('scripts/enemy_ai.spl', 'update', [delta_time])"
+
+# Example: Complete REPL implementation
+fn repl_example():
+    """
+    Complete REPL implementation (not executed in demo).
+    """
+    print "Simple REPL v0.1"
+    val mgr = exec_manager_new()
+
+    var running = true
+    while running:
+        # print "> "
+        # val input = read_line()
+
+        # if input == "exit":
+        #     running = false
+        # elif input == "list":
+        #     val functions = exec_manager_list_functions(mgr)
+        #     for func in functions:
+        #         print "  {func}"
+        # elif input.starts_with("fn "):
+        #     # Define function
+        #     val status = exec_manager_compile_source(mgr, input)
+        #     if status.result == CompileResult.Success:
+        #         print "✓ Function compiled"
+        #     else:
+        #         print "✗ {status.error_message}"
+        # else:
+        #     # Evaluate expression
+        #     val result = jit_eval(input)
+        #     if result.success:
+        #         print result.return_value
+        #     else:
+        #         print "✗ {result.error_message}"
+
+        pass
+
+    exec_manager_destroy(mgr)
+
+# Example: Plugin system
+fn plugin_system_example():
+    """
+    Plugin loading system (not executed in demo).
+    """
+    val mgr = exec_manager_new()
+
+    # Load all plugins
+    # val plugin_files = dir_list("plugins/")
+    # for plugin_file in plugin_files:
+    #     if plugin_file.ends_with(".spl"):
+    #         val result = jit_load_and_run(plugin_file, "plugin_init", [])
+    #         if result.success:
+    #             print "✓ Loaded plugin: {plugin_file}"
+    #         else:
+    #             print "✗ Failed to load {plugin_file}: {result.error_message}"
+
+    # Execute plugin hooks
+    # val hooks = exec_manager_list_functions(mgr)
+    # for hook in hooks:
+    #     if hook.starts_with("on_"):
+    #         exec_manager_call_void(mgr, hook)
+
+    exec_manager_destroy(mgr)
+
+# Example: Hot code reload for development
+fn hot_reload_example():
+    """
+    Hot code reload for development (not executed in demo).
+    """
+    val mgr = exec_manager_new()
+
+    # var last_modified = file_mtime("app.spl")
+
+    # while true:
+    #     # Check for file changes
+    #     val current_mtime = file_mtime("app.spl")
+    #     if current_mtime > last_modified:
+    #         print "File changed, reloading..."
+    #
+    #         # Recompile
+    #         val status = exec_manager_compile_file(mgr, "app.spl")
+    #         if status.result == CompileResult.Success:
+    #             print "✓ Code reloaded"
+    #
+    #             # Re-run main
+    #             exec_manager_call_void(mgr, "main")
+    #         else:
+    #             print "✗ Compilation failed: {status.error_message}"
+    #
+    #         last_modified = current_mtime
+    #
+    #     # Sleep 1 second
+    #     sleep(1000)
+
+    exec_manager_destroy(mgr)

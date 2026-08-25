@@ -1,0 +1,23 @@
+use logic_rain_core.*
+
+fn rv32_rain_recover_cases_selftest() -> i32:
+    val a: i64 = 256
+    val b: i64 = 263
+    val c: i64 = 270
+    val d: i64 = 277
+    val e: i64 = 284
+    val f: i64 = 291
+    val g: i64 = 298
+    val h: i64 = 305
+    val parity: i64 = _rv32_rain_parity(a, b, c, d, e, f, g, h)
+    if _rv32_rain_recover_channel(parity, 0, a, b, c, d, e, f, g, h) != a:
+        return 1
+    if _rv32_rain_recover_channel(parity, 3, a, b, c, d, e, f, g, h) != d:
+        return 1
+    if _rv32_rain_recover_channel(parity, 7, a, b, c, d, e, f, g, h) != h:
+        return 1
+    if _rv32_rain_recover_channel(parity, -1, a, b, c, d, e, f, g, h) != -1:
+        return 1
+    if _rv32_rain_recover_channel(parity, 8, a, b, c, d, e, f, g, h) != -1:
+        return 1
+    0

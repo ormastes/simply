@@ -1,0 +1,18 @@
+#!/usr/bin/env simple
+# Neural network layer shape demo - runtime compatible.
+
+fn main():
+    print "=== Neural Network Layers Demo ==="
+    val xor_params = (2 * 4 + 4) + (4 * 1 + 1)
+    val classifier_params = (784 * 256 + 256) + (256 * 10 + 10)
+
+    print "XOR MLP: Linear(2,4) -> ReLU -> Linear(4,1) -> Sigmoid"
+    print "Parameters: {xor_params}"
+    print ""
+    print "Classifier MLP: Linear(784,256) -> ReLU -> Linear(256,10)"
+    print "Parameters: {classifier_params}"
+    print ""
+    print "For executable layer math, run:"
+    print "examples/07_ml/pure_nn/runtime_compatible/nn_layers_runtime.spl"
+
+main()

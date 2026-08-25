@@ -1,0 +1,36 @@
+{{#layout "layouts/application"}}
+
+<div class="auth-container">
+    <div class="form-card auth-card">
+        <h1 class="auth-title">Log In</h1>
+        <p class="auth-subtitle">Welcome back! Enter your credentials.</p>
+
+        <form method="POST" action="/login" class="form">
+            <input type="hidden" name="csrf_token" value="{{csrf_token}}">
+
+            <div class="form-group">
+                <label for="username" class="form-label">Username</label>
+                <input type="text" id="username" name="username" class="form-input"
+                       placeholder="Your username" required autofocus
+                       autocomplete="username">
+            </div>
+
+            <div class="form-group">
+                <label for="password" class="form-label">Password</label>
+                <input type="password" id="password" name="password" class="form-input"
+                       placeholder="Your password" required
+                       autocomplete="current-password">
+            </div>
+
+            <div class="form-actions">
+                <button type="submit" class="btn btn-primary btn-block">Log In</button>
+            </div>
+        </form>
+
+        <p class="auth-footer">
+            Don't have an account? <a href="/register">Create one</a>
+        </p>
+    </div>
+</div>
+
+{{/layout}}

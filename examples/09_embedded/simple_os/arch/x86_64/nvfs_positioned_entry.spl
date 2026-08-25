@@ -1,0 +1,39 @@
+"""Dedicated x86_64 entry for qualified NVFS positioned-I/O acceptance."""
+
+extern fn serial_println(msg: text)
+extern fn rt_debug_exit_success()
+extern fn rt_x86_tss_init() -> i64
+extern fn _get_kernel_start() -> u64
+extern fn _get_kernel_end() -> u64
+
+use os.kernel.arch.x86_64.arch_init.{arch_x86_64_direct_boot_init}
+use os.kernel.boot.boot_fs.{boot_fs_sequence}
+use os.kernel.memory.pmm.{pmm_init_identity_range, g_pmm}
+use os.kernel.memory.vmm.{vmm_init}
+use os.kernel.memory.vmm_address_space.{vmm_map_nvme_bar_high}
+
+fn fail(reason: text):
+    serial_println(reason)
+    serial_println("NVFS_POSITIONED_QEMU_FAILED")
+    rt_debug_exit_success()
+
+fn spl_start():
+    serial_println("")
+    serial_println("=== SimpleOS x86_64 NVFS positioned acceptance ===")
+    arch_x86_64_direct_boot_init()
+    if rt_x86_tss_init() != 0:
+        fail("[nvfs-positioned-entry] TSS init failed")
+        return
+    if not pmm_init_identity_range(
+        0x80000000, _get_kernel_start(), _get_kernel_end()):
+        fail("[nvfs-positioned-entry] memory init failed")
+        return
+    vmm_init(g_pmm, 0)
+    vmm_map_nvme_bar_high()
+
+    val boot = boot_fs_sequence()
+    if boot.is_err():
+        fail("[nvfs-positioned-entry] boot filesystem acceptance failed")
+        return
+    serial_println("NVFS_POSITIONED_QEMU_PASSED")
+    rt_debug_exit_success()

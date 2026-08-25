@@ -1,0 +1,174 @@
+# UBS Kernel — Durable Event Log (line-format persistence with restore parity)
+#
+# The event log (event_log.spl) is the only write surface. To survive a
+# restart it must persist to disk and come back byte-for-fact identical. This
+# module serialises a log to a simple, escape-safe line format and reloads it,
+# failing CLOSED: any checksum/count mismatch against the header yields an EMPTY
+# log rather than a silently-partial one, so a corrupted file can never masquerade
+# as a shorter-but-valid history.
+
+use kernel.event_log.{Event, EventLog, new_event_log, append, event_count}
+use std.io_runtime.{read_file, write_file, file_exists}
+
+# --- field escaping -------------------------------------------------------
+# The line format is "{seq}|{kind}|{entity}|{payload}", so a payload must never
+# carry a raw "|" or newline. Escape backslash FIRST (it is the escape char),
+# then "|" and newline. Mirrors escape_json in src/lib/common/text.spl.
+fn escape_field(s: text) -> text:
+    var r = ""
+    var i = 0
+    while i < s.len():
+        val ch = s.char_at(i)
+        if ch == "\\":
+            r = r + "\\\\"
+        elif ch == "|":
+            r = r + "\\p"
+        elif ch == "\n":
+            r = r + "\\n"
+        else:
+            r = r + ch
+        i = i + 1
+    return r
+
+fn unescape_field(s: text) -> text:
+    var r = ""
+    var i = 0
+    while i < s.len():
+        val ch = s.char_at(i)
+        if ch == "\\":
+            i = i + 1
+            if i < s.len():
+                val nx = s.char_at(i)
+                if nx == "\\":
+                    r = r + "\\"
+                elif nx == "p":
+                    r = r + "|"
+                elif nx == "n":
+                    r = r + "\n"
+                else:
+                    r = r + nx
+        else:
+            r = r + ch
+        i = i + 1
+    return r
+
+# --- checksum -------------------------------------------------------------
+# Content- and position-sensitive digest of the payload. Position weighting
+# means same-length substitutions and reorderings change the score. Mirrors
+# make_audit_hash / simple_text_score in src/catalog.spl.
+# ponytail: toy digest, not a cryptographic MAC — swap for a real MAC when the
+# log must resist a motivated forger rather than accidental corruption.
+fn simple_text_score(value: text) -> i64:
+    var total = 0
+    var i = 0
+    while i < value.len():
+        total = total + value.char_code_at(i) * (i + 1)
+        i = i + 1
+    return total
+
+fn log_checksum(log: EventLog) -> i64:
+    var acc = 0
+    var pos = 1
+    for ev in log.events:
+        # escape both fields before joining: "|" cannot appear in an escaped
+        # field, so the join is injective — ("a|b","c") no longer collides
+        # with ("a","b|c").
+        val s = escape_field(ev.kind) + "|" + escape_field(ev.payload)
+        acc = acc * 31 + pos * 17 + simple_text_score(s) + ev.entity * 7
+        pos = pos + 1
+    return acc
+
+# --- serialise ------------------------------------------------------------
+fn serialize_log(log: EventLog) -> text:
+    val n = event_count(log)
+    val c = log_checksum(log)
+    var out = "ubslog v1 count={n} checksum={c}"
+    for ev in log.events:
+        val kind_esc = escape_field(ev.kind)
+        val esc = escape_field(ev.payload)
+        out = out + "\n" + "{ev.seq}|" + kind_esc + "|{ev.entity}|" + esc
+    return out
+
+# --- parse helpers --------------------------------------------------------
+fn parse_int_field(s: text) -> i64:
+    var i = 0
+    var neg = false
+    if (s.len() > 0 and s.char_at(0) == "-"):
+        neg = true
+        i = 1
+    var n = 0
+    while i < s.len():
+        val code = s.char_code_at(i)
+        if (code >= 48 and code <= 57):
+            n = n * 10 + (code - 48)
+        i = i + 1
+    if neg:
+        return 0 - n
+    return n
+
+fn field_value(t: text) -> text:
+    val parts = t.split("=")
+    if parts.length() >= 2:
+        return parts[1]
+    return ""
+
+# --- parse ----------------------------------------------------------------
+# Rebuild the log by replaying append in order. seq is reassigned monotonically
+# by append (so the persisted seq is advisory); kind/entity/payload round-trip.
+fn parse_log(content: text) -> EventLog:
+    var log = new_event_log()
+    val lines = content.split("\n")
+    var i = 1
+    while i < lines.length():
+        val ln = lines[i]
+        if ln.len() > 0:
+            val fields = ln.split("|")
+            if fields.length() >= 4:
+                val kind = unescape_field(fields[1])
+                val entity = parse_int_field(fields[2])
+                val payload = unescape_field(fields[3])
+                log = append(log, kind, entity, payload)
+        i = i + 1
+    return log
+
+# --- persistence ----------------------------------------------------------
+fn save_log(path: text, log: EventLog) -> bool:
+    return write_file(path, serialize_log(log))
+
+# Fail-closed load: an absent file is an empty log; a header whose declared
+# count or checksum disagrees with the replayed log is treated as corruption
+# and also yields an empty log — never a silently-truncated history.
+fn load_log(path: text) -> EventLog:
+    if !file_exists(path):
+        return new_event_log()
+    val content = read_file(path)
+    val lines = content.split("\n")
+    if lines.length() == 0:
+        return new_event_log()
+    val header = lines[0]
+    if !header.starts_with("ubslog"):
+        return new_event_log()
+    val parsed = parse_log(content)
+    val tokens = header.split(" ")
+    var declared_count: i64 = -1
+    var declared_checksum: i64 = 0
+    var have_count = false
+    var have_checksum = false
+    for t in tokens:
+        if t.starts_with("count="):
+            declared_count = parse_int_field(field_value(t))
+            have_count = true
+        if t.starts_with("checksum="):
+            declared_checksum = parse_int_field(field_value(t))
+            have_checksum = true
+    if (!have_count or !have_checksum):
+        return new_event_log()
+    if declared_count != event_count(parsed):
+        return new_event_log()
+    if declared_checksum != log_checksum(parsed):
+        return new_event_log()
+    return parsed
+
+# Two logs restore to the same history iff they agree on count and checksum.
+fn restore_parity(a: EventLog, b: EventLog) -> bool:
+    return (event_count(a) == event_count(b) and log_checksum(a) == log_checksum(b))

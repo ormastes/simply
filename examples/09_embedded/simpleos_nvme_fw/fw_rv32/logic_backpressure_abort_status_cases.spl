@@ -1,0 +1,25 @@
+use logic_backpressure_abort_core.*
+
+fn rv32_bpa_status_cases_selftest() -> i32:
+    val cdw10: u32 = (100 << 16) | 1
+    val high_cid_cdw10: u32 = 0xFFFF0001
+    val invalid_sqid_cdw10: u32 = 0xFFFFFFFF
+    if _rv32_abort_status(1, cdw10, 0, 0, 1) != 2:
+        return 1
+    if _rv32_abort_status(0, cdw10, 1, 0, 1) != 2:
+        return 1
+    if _rv32_abort_status(0, cdw10, 0, 1, 1) != 2:
+        return 1
+    if _rv32_abort_status(0, high_cid_cdw10, 0, 0, 1) != 0:
+        return 1
+    if _rv32_abort_status(0, invalid_sqid_cdw10, 0, 0, 1) != 3:
+        return 1
+    if _rv32_abort_status(0, (100 << 16) | 99, 0, 0, 0) != 3:
+        return 1
+    if _rv32_abort_status(0, (100 << 16) | 8, 0, 0, 1) != 0:
+        return 1
+    if _rv32_abort_status(0, (100 << 16) | 9, 0, 0, 1) != 3:
+        return 1
+    if _rv32_abort_recorded_sqid(1, 3, (100 << 16) | 99) != 1:
+        return 1
+    0

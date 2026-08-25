@@ -1,0 +1,14 @@
+use logic_io_command_core.*
+
+fn rv32_io_command_invalid_bounds_cases_selftest() -> i32:
+    if _rv32_io_command_valid(7, 1, -1, 1, 0) == 0:
+        return 1
+    if _rv32_io_command_valid(8, 1, 3072, 1, 0) == 0:
+        return 1
+    if _rv32_io_command_valid(9, 1, 3070, 3, 0) == 0:
+        return 1
+    if _rv32_io_command_valid(10, 1, 0, 0, 0) == 0:
+        return 1
+    if _rv32_io_command_valid(15, 1, 0, 9, 0) == 0:
+        return 1
+    0

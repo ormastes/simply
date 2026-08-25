@@ -1,0 +1,287 @@
+#![allow(unnamed_duplicate_typed_args)]
+#!/usr/bin/env simple
+# Data Utilities - Runtime Compatible
+# Provides: shuffle, batch, split, normalize
+# Essential utilities for training neural networks
+
+# ============================================================================
+# Data Shuffling
+# ============================================================================
+
+fn shuffle_indices(n: i64, seed: i64) -> [i64]:
+    """Generate shuffled indices [0..n) using simple random permutation"""
+    var indices: [i64] = []
+    var i = 0
+    while i < n:
+        indices.push(i)
+        i = i + 1
+
+    # Fisher-Yates shuffle
+    i = n - 1
+    while i > 0:
+        # Generate pseudo-random index
+        val rand = ((i * seed * 2654435761) % (i + 1))
+        val j = if rand < 0: -rand else: rand
+
+        # Swap indices[i] and indices[j]
+        val temp = indices[i]
+        indices[i] = indices[j]
+        indices[j] = temp
+
+        i = i - 1
+
+    indices
+
+fn shuffle_data(x: [[f64]], y: [f64], seed: i64) -> [[[f64]]]:
+    """Shuffle dataset (x, y) together"""
+    val n = x.len()
+    val shuffled_indices = shuffle_indices(n, seed)
+
+    var x_shuffled: [[f64]] = []
+    var y_shuffled: [f64] = []
+
+    for idx in shuffled_indices:
+        x_shuffled.push(x[idx])
+        y_shuffled.push(y[idx])
+
+    [x_shuffled, [y_shuffled]]
+
+# ============================================================================
+# Batching
+# ============================================================================
+
+fn create_batches(x: [[f64]], y: [f64], batch_size: i64) -> [[[[f64]]]]:
+    """Split data into mini-batches"""
+    var batches: [[[f64]]] = []
+    val n = x.len()
+    var i = 0
+
+    while i < n:
+        var batch_x: [[f64]] = []
+        var batch_y: [f64] = []
+        var j = 0
+
+        while j < batch_size and i + j < n:
+            batch_x.push(x[i + j])
+            batch_y.push(y[i + j])
+            j = j + 1
+
+        batches.push([batch_x, [batch_y]])
+        i = i + batch_size
+
+    batches
+
+# ============================================================================
+# Train/Test Split
+# ============================================================================
+
+fn train_test_split(x: [[f64]], y: [f64], train_ratio: f64) -> [[[[f64]]]]:
+    """Split dataset into train and test sets"""
+    val n = x.len()
+    val train_size = (n * train_ratio)
+    val train_n = train_size
+
+    var x_train: [[f64]] = []
+    var y_train: [f64] = []
+    var x_test: [[f64]] = []
+    var y_test: [f64] = []
+
+    var i = 0
+    while i < n:
+        if i < train_n:
+            x_train.push(x[i])
+            y_train.push(y[i])
+        else:
+            x_test.push(x[i])
+            y_test.push(y[i])
+        i = i + 1
+
+    [[x_train, [y_train]], [x_test, [y_test]]]
+
+# ============================================================================
+# Normalization
+# ============================================================================
+
+fn normalize_features(x: [[f64]]) -> [[f64]]:
+    """Normalize features to [0, 1] range"""
+    if x.len() == 0:
+        return x
+
+    val n_samples = x.len()
+    val n_features = x[0].len()
+
+    # Find min and max for each feature
+    var mins: [f64] = []
+    var maxs: [f64] = []
+    var f = 0
+    while f < n_features:
+        var min_val = x[0][f]
+        var max_val = x[0][f]
+        var s = 1
+        while s < n_samples:
+            if x[s][f] < min_val:
+                min_val = x[s][f]
+            if x[s][f] > max_val:
+                max_val = x[s][f]
+            s = s + 1
+        mins.push(min_val)
+        maxs.push(max_val)
+        f = f + 1
+
+    # Normalize
+    var x_norm: [[f64]] = []
+    var i = 0
+    while i < n_samples:
+        var sample_norm: [f64] = []
+        var j = 0
+        while j < n_features:
+            val range_val = maxs[j] - mins[j]
+            val normalized = if range_val > 0.0:
+                (x[i][j] - mins[j]) / range_val
+            else:
+                0.0
+            sample_norm.push(normalized)
+            j = j + 1
+        x_norm.push(sample_norm)
+        i = i + 1
+
+    x_norm
+
+# ============================================================================
+# Demo
+# ============================================================================
+
+fn main():
+    print "═══════════════════════════════════════════════════════════"
+    print "    Data Utilities Demo (Runtime Compatible)"
+    print "═══════════════════════════════════════════════════════════"
+    print ""
+
+    # Create sample dataset
+    print "━━━ Example 1: Create Sample Dataset ━━━"
+    print ""
+    var x: [[f64]] = [
+        [1.0, 2.0],
+        [3.0, 4.0],
+        [5.0, 6.0],
+        [7.0, 8.0],
+        [9.0, 10.0],
+        [11.0, 12.0]
+    ]
+    var y: [f64] = [0.0, 1.0, 0.0, 1.0, 0.0, 1.0]
+
+    print "Dataset: 6 samples, 2 features"
+    print "X:"
+    var i = 0
+    while i < x.len():
+        print "  Sample {i}: [{x[i][0]}, {x[i][1]}] → y={y[i]}"
+        i = i + 1
+    print ""
+
+    # Shuffle
+    print "━━━ Example 2: Shuffle Dataset ━━━"
+    print ""
+    val shuffled = shuffle_data(x, y, 42)
+    val x_shuffled = shuffled[0]
+    val y_shuffled = shuffled[1][0]
+
+    print "After shuffling (seed=42):"
+    i = 0
+    while i < 3:
+        print "  Sample {i}: [{x_shuffled[i][0]}, {x_shuffled[i][1]}] → y={y_shuffled[i]}"
+        i = i + 1
+    print "  ..."
+    print ""
+
+    # Batching
+    print "━━━ Example 3: Create Mini-Batches ━━━"
+    print ""
+    val batches = create_batches(x, y, 2)
+    print "Batch size: 2"
+    print "Number of batches: {batches.len()}"
+    print ""
+    print "Batch 0:"
+    val batch0_x = batches[0][0]
+    val batch0_y = batches[0][1][0]
+    i = 0
+    while i < batch0_x.len():
+        print "  [{batch0_x[i][0]}, {batch0_x[i][1]}] → y={batch0_y[i]}"
+        i = i + 1
+    print ""
+
+    # Train/test split
+    print "━━━ Example 4: Train/Test Split ━━━"
+    print ""
+    val split = train_test_split(x, y, 0.7)
+    val train = split[0]
+    val test = split[1]
+    val x_train = train[0]
+    val y_train = train[1][0]
+    val x_test = test[0]
+    val y_test = test[1][0]
+
+    print "Train/test ratio: 70/30"
+    print "Train samples: {x_train.len()}"
+    print "Test samples: {x_test.len()}"
+    print ""
+
+    # Normalization
+    print "━━━ Example 5: Feature Normalization ━━━"
+    print ""
+    val x_norm = normalize_features(x)
+    print "Original ranges:"
+    print "  Feature 0: [1.0 - 11.0]"
+    print "  Feature 1: [2.0 - 12.0]"
+    print ""
+    print "Normalized to [0, 1]:"
+    i = 0
+    while i < 3:
+        print "  Sample {i}: [{x_norm[i][0]}, {x_norm[i][1]}]"
+        i = i + 1
+    print "  ..."
+    print ""
+
+    # Combined workflow
+    print "━━━ Example 6: Combined Workflow ━━━"
+    print ""
+    print "Typical training pipeline:"
+    print "  1. Normalize features"
+    print "  2. Split into train/test"
+    print "  3. Shuffle training data"
+    print "  4. Create mini-batches"
+    print ""
+
+    val x_normalized = normalize_features(x)
+    val split2 = train_test_split(x_normalized, y, 0.7)
+    val train2 = split2[0]
+    val x_train2 = train2[0]
+    val y_train2 = train2[1][0]
+    val shuffled2 = shuffle_data(x_train2, y_train2, 123)
+    val x_train_shuffled = shuffled2[0]
+    val y_train_shuffled = shuffled2[1][0]
+    val train_batches = create_batches(x_train_shuffled, y_train_shuffled, 2)
+
+    print "Pipeline results:"
+    print "  Normalized: ✓"
+    print "  Train samples: {x_train2.len()}"
+    print "  Shuffled: ✓"
+    print "  Mini-batches: {train_batches.len()}"
+    print ""
+
+    print "═══════════════════════════════════════════════════════════"
+    print "Summary"
+    print "═══════════════════════════════════════════════════════════"
+    print ""
+    print "✓ Shuffle: Fisher-Yates algorithm"
+    print "✓ Batching: Mini-batch creation"
+    print "✓ Split: Train/test separation"
+    print "✓ Normalize: Min-max normalization"
+    print "✓ Combined: Full training pipeline"
+    print ""
+    print "Usage in training:"
+    print "  - Shuffle each epoch for better generalization"
+    print "  - Use mini-batches for faster training"
+    print "  - Normalize to help convergence"
+    print "  - Hold out test set for evaluation"
+
+main()

@@ -1,0 +1,10 @@
+fn emit_window(message: text):
+    print message
+
+fn main() -> i64:
+    emit_window "{\"type\":\"openWindow\",\"windowId\":\"terminal\",\"title\":\"Terminal\",\"html\":\"<section class=\\\"simple-app-window\\\"><pre class=\\\"simple-app-pre\\\">Tauri mobile MDI smoke</pre><button data-action=\\\"mobile_action\\\">Action</button><input data-target-id=\\\"mobile_input\\\" value=\\\"ready\\\"><div data-scroll-probe=\\\"1\\\" style=\\\"max-height:90px;overflow:auto;touch-action:pan-y;border:1px solid #444\\\">SCROLL_TOP_AAA<br>L01<br>L02<br>L03<br>L04<br>L05<br>L06<br>L07<br>L08<br>SCROLL_BOTTOM_ZZZ</div></section>\",\"x\":40,\"y\":48,\"width\":360,\"height\":260}"
+    emit_window "{\"type\":\"openWindow\",\"windowId\":\"files\",\"title\":\"Files\",\"html\":\"<section class=\\\"simple-app-window\\\"><pre class=\\\"simple-app-pre\\\">Files window</pre><img class=\\\"simple-picture\\\" alt=\\\"taskbar icon\\\" src=\\\"data:image/gif;base64,R0lGODlhAQABAPAAAP8AAP///yH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==\\\"></section>\",\"x\":90,\"y\":96,\"width\":320,\"height\":220}"
+    emit_window "{\"type\":\"openWindow\",\"windowId\":\"tasks\",\"title\":\"Tasks\",\"html\":\"<section class=\\\"simple-app-window\\\"><pre class=\\\"simple-app-pre\\\">Taskbar icon drawing evidence</pre></section>\",\"x\":140,\"y\":144,\"width\":320,\"height\":210}"
+    emit_window "{\"type\":\"openWindow\",\"windowId\":\"settings\",\"title\":\"Settings\",\"html\":\"<section class=\\\"simple-app-window\\\"><pre class=\\\"simple-app-pre\\\">Event bridge ready</pre></section>\",\"x\":190,\"y\":192,\"width\":320,\"height\":200}"
+    print ""
+    return 0

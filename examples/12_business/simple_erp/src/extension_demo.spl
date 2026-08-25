@@ -1,0 +1,64 @@
+# Extension Demo — register a sixth business (clinic) with ZERO framework edits
+#
+# Everything below uses only public extension points: default_lanes() + one new
+# LaneDef, gate_write_for / role_can_for / routes_for / dispatch_for, and the
+# registry-agnostic report + dashboard. This file is the executable proof that
+# the framework supports different businesses by registration, not modification.
+
+use framework.registry.{LaneDef, lane_def, default_lanes, is_registered_write}
+use framework.guarded.{Tenant, Actor, Session, role_can_for}
+use web.routes.{routes_for, find_route_in, dispatch_for}
+use lanes.clinic.{Appointment, validate_appointment, mark_seen, bill, submit_appointment_write}
+use report.summary.{LaneKpi, kpi}
+use web.dashboard.{render_dashboard}
+use std.nogc_sync_mut.enterprise_store.store.{store_open}
+use std.io_runtime.{file_exists, file_delete, dir_create_all}
+
+fn extended_lanes() -> [LaneDef]:
+    var lanes = default_lanes()
+    lanes.push(lane_def("clinic", "/api/clinic/appointments", 200000, "admin"))
+    return lanes
+
+fn main():
+    val lanes = extended_lanes()
+    val tenant = Tenant { id: "t1", name: "Demo" }
+    val operator = Actor { id: 1, name: "Mina", role: "operator" }
+    val session = Session { token: "sess-1", user_id: 1, tenant_id: "t1", active: true }
+
+    # RBAC derives from the registry: clinic.write is allowed ONLY when registered.
+    assert role_can_for(lanes, "operator", "clinic.write")
+    assert !role_can_for(default_lanes(), "operator", "clinic.write")
+    assert is_registered_write(lanes, "clinic.write")
+
+    # Routing derives from the registry: the clinic route exists without edits.
+    val routes = routes_for(lanes)
+    val clinic_route = find_route_in(routes, "POST", "/api/clinic/appointments")
+    assert clinic_route.action == "clinic.write"
+
+    # A clinic write flows through the SAME gate as every other lane.
+    val appt = Appointment { id: 1, patient: "Ara", practitioner: "Dr. Joon", slot: "09:00", fee_minor: 45000, status: "booked" }
+    assert validate_appointment(appt)
+    dir_create_all("build/test-artifacts")
+    val db = "build/test-artifacts/erp_extension_demo.db"
+    if file_exists(db):
+        file_delete(db)
+    val store = store_open(db)
+    val direct = submit_appointment_write(lanes, session, tenant, operator, appt, "clinic-1", store)
+    assert direct.ok
+    val via_route = dispatch_for(lanes, session, tenant, operator, "POST", "/api/clinic/appointments", true, "clinic-2", store)
+    assert via_route.ok
+
+    # Domain state machine still lane-local.
+    val seen = mark_seen(appt)
+    val billed = bill(seen)
+    assert billed.status == "billed"
+    assert bill(appt).status == "booked"
+
+    # Dashboard renders the new lane with no dashboard changes.
+    var kpis: [LaneKpi] = []
+    kpis.push(kpi("clinic", 2, 0, 45000))
+    val html = render_dashboard("Clinic Extension", kpis)
+    assert html.contains("data-lane=\"clinic\"")
+
+    print "extension-ok lanes={lanes.length()} clinic_route={clinic_route.path} accepted=2"
+    print "framework-edits=0 registry=LaneDef"

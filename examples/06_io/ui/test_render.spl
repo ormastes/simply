@@ -1,0 +1,5 @@
+# Simple test file that outputs a render IPC message to stdout
+fn main():
+    val html = "<div style=\"padding:40px;text-align:center;font-family:monospace\"><h1 style=\"color:#89b4fa\">Simple UI - Tauri 2</h1><p style=\"color:#a6adc8;margin:16px 0\">Hello from Simple Language!</p><p style=\"color:#f9e2af\">Desktop render working.</p><div style=\"margin-top:24px;padding:16px;background:#313244;border-radius:8px\"><p style=\"color:#cdd6f4\">Platform: Linux x86_64</p><p style=\"color:#a6e3a1;margin-top:8px\">IPC: stdout JSON</p></div></div>"
+    val escaped = html.replace("\"", "\\\"")
+    print "{\"type\":\"render\",\"html\":\"{escaped}\"}"

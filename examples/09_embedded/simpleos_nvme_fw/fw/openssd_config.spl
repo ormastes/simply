@@ -1,0 +1,270 @@
+"""
+openssd_config -- multi-target board profiles for the Simple NVMe firmware.
+
+The core firmware stays target-neutral. This file names the geometry and hardware
+apertures needed to bind it to the host simulator or Cosmos+ OpenSSD RTL builds.
+"""
+
+use nvme_types.*
+use fil_scheduler.*
+
+val TARGET_SIMPLE_SIM: i64 = 0
+val TARGET_OPENSSD_2CH8WAY: i64 = 1
+val TARGET_OPENSSD_8CH8WAY: i64 = 2
+val TARGET_RV32_QEMU_RAM_NAND: i64 = 3
+val TARGET_RV32_KV260_AXI_RAM_NAND: i64 = 4
+val TARGET_INVALID: i64 = -1
+
+struct OpenSsdConfig:
+    target_id: i64
+    board_name: text
+    soc: text
+    transport: text
+    media: text
+    build_runner: text
+    evidence_class: text
+    available: bool
+    cpu_cores: i64
+    channels: i64
+    ways_per_channel: i64
+    blocks: i64
+    pages_per_block: i64
+    lbas: i64
+    ddr_base: u64
+    uart1_base: u64
+    nfc_base: u64
+    pcie_base: u64
+    pcie_vendor_id: i64
+    nvme_block_bytes: i64
+    slice_bytes: i64
+    nvme_blocks_per_slice: i64
+    greedy_ftl_major: i64
+
+fn simple_sim_config() -> OpenSsdConfig:
+    OpenSsdConfig(
+        target_id: TARGET_SIMPLE_SIM,
+        board_name: "Simple NVMe firmware simulator",
+        soc: "host interpreter",
+        transport: "in-process NVMe model",
+        media: "RAM NAND",
+        build_runner: "bin/simple test",
+        evidence_class: "H1 software model",
+        available: true,
+        cpu_cores: 1,
+        channels: NUM_CHANNELS,
+        ways_per_channel: 1,
+        blocks: NUM_BLOCKS,
+        pages_per_block: PAGES_PER_BLOCK,
+        lbas: LBA_COUNT,
+        ddr_base: 0,
+        uart1_base: 0,
+        nfc_base: 0,
+        pcie_base: 0,
+        pcie_vendor_id: 0x1B36,
+        nvme_block_bytes: 4096,
+        slice_bytes: 4096,
+        nvme_blocks_per_slice: 1,
+        greedy_ftl_major: 0
+    )
+
+fn openssd_2ch8way_config() -> OpenSsdConfig:
+    OpenSsdConfig(
+        target_id: TARGET_OPENSSD_2CH8WAY,
+        board_name: "Cosmos+ OpenSSD 2Ch8Way",
+        soc: "Xilinx Zynq-7000 XC7Z045",
+        transport: "Cosmos+ PCIe/NFC RTL",
+        media: "physical NAND",
+        build_runner: "scripts/openssd/build-cosmos-plus.shs",
+        evidence_class: "H2 physical board",
+        available: false,
+        cpu_cores: 2,
+        channels: 2,
+        ways_per_channel: 8,
+        blocks: NUM_BLOCKS,
+        pages_per_block: PAGES_PER_BLOCK,
+        lbas: LBA_COUNT,
+        ddr_base: 0x00100000,
+        uart1_base: 0xE0001000,
+        nfc_base: 0x43C00000,
+        pcie_base: 0x50000000,
+        pcie_vendor_id: 0x10EE,
+        nvme_block_bytes: 4096,
+        slice_bytes: 16384,
+        nvme_blocks_per_slice: 4,
+        greedy_ftl_major: 3
+    )
+
+fn openssd_8ch8way_config() -> OpenSsdConfig:
+    OpenSsdConfig(
+        target_id: TARGET_OPENSSD_8CH8WAY,
+        board_name: "CRZ Cosmos+ OpenSSD",
+        soc: "Xilinx Zynq-7000 XC7Z045",
+        transport: "Cosmos+ PCIe/NFC RTL",
+        media: "physical NAND",
+        build_runner: "scripts/openssd/build-cosmos-plus.shs",
+        evidence_class: "H2 physical board",
+        available: false,
+        cpu_cores: 2,
+        channels: NUM_CHANNELS,
+        ways_per_channel: 8,
+        blocks: NUM_BLOCKS,
+        pages_per_block: PAGES_PER_BLOCK,
+        lbas: LBA_COUNT,
+        ddr_base: 0x00100000,
+        uart1_base: 0xE0001000,
+        nfc_base: 0x43C00000,
+        pcie_base: 0x50000000,
+        pcie_vendor_id: 0x10EE,
+        nvme_block_bytes: 4096,
+        slice_bytes: 16384,
+        nvme_blocks_per_slice: 4,
+        greedy_ftl_major: 3
+    )
+
+fn rv32_qemu_ram_nand_config() -> OpenSsdConfig:
+    OpenSsdConfig(
+        target_id: TARGET_RV32_QEMU_RAM_NAND,
+        board_name: "RV32 QEMU RAM-NAND",
+        soc: "QEMU virt RV32IMAC ISA model",
+        transport: "QEMU GDB mailbox host sequence",
+        media: "256-byte RAM NAND state, 4-byte data payload",
+        build_runner: "scripts/qemu/qemu_rv32_nvme_fw_in_loop.shs",
+        evidence_class: "H1 firmware parity; no AXI/IRQ",
+        available: true,
+        cpu_cores: 1,
+        channels: 1,
+        ways_per_channel: 1,
+        blocks: 2,
+        pages_per_block: 1,
+        lbas: 1,
+        ddr_base: 0x80000000,
+        uart1_base: 0x10000000,
+        nfc_base: 0,
+        pcie_base: 0,
+        pcie_vendor_id: 0,
+        nvme_block_bytes: 4,
+        slice_bytes: 4,
+        nvme_blocks_per_slice: 1,
+        greedy_ftl_major: 0
+    )
+
+fn rv32_kv260_axi_ram_nand_config() -> OpenSsdConfig:
+    OpenSsdConfig(
+        target_id: TARGET_RV32_KV260_AXI_RAM_NAND,
+        board_name: "KV260 RV32 AXI RAM-NAND",
+        soc: "Xilinx K26 plus Simple RV32 soft core",
+        transport: "host AXI MMIO and queue DMA",
+        media: "256-byte RAM NAND state, 4-byte data payload",
+        build_runner: "scripts/fpga/build_k26_rv32_ddr_bitstream.shs",
+        evidence_class: "H1 FPGA model; H2 host transport pending",
+        available: false,
+        cpu_cores: 1,
+        channels: 1,
+        ways_per_channel: 1,
+        blocks: 2,
+        pages_per_block: 1,
+        lbas: 1,
+        ddr_base: 0x10000000,
+        uart1_base: 0,
+        nfc_base: 0x20000000,
+        pcie_base: 0xA0010000,
+        pcie_vendor_id: 0x10EE,
+        nvme_block_bytes: 4,
+        slice_bytes: 4,
+        nvme_blocks_per_slice: 1,
+        greedy_ftl_major: 0
+    )
+
+fn invalid_target_config() -> OpenSsdConfig:
+    OpenSsdConfig(
+        target_id: TARGET_INVALID,
+        board_name: "unsupported NVMe firmware target",
+        soc: "none",
+        transport: "none",
+        media: "none",
+        build_runner: "none",
+        evidence_class: "none",
+        available: false,
+        cpu_cores: 0,
+        channels: 0,
+        ways_per_channel: 0,
+        blocks: 0,
+        pages_per_block: 0,
+        lbas: 0,
+        ddr_base: 0,
+        uart1_base: 0,
+        nfc_base: 0,
+        pcie_base: 0,
+        pcie_vendor_id: 0,
+        nvme_block_bytes: 0,
+        slice_bytes: 0,
+        nvme_blocks_per_slice: 0,
+        greedy_ftl_major: 0
+    )
+
+fn nvme_fw_target_config(target_id: i64) -> OpenSsdConfig:
+    if target_id == TARGET_SIMPLE_SIM:
+        return simple_sim_config()
+    if target_id == TARGET_OPENSSD_2CH8WAY:
+        return openssd_2ch8way_config()
+    if target_id == TARGET_OPENSSD_8CH8WAY:
+        return openssd_8ch8way_config()
+    if target_id == TARGET_RV32_QEMU_RAM_NAND:
+        return rv32_qemu_ram_nand_config()
+    if target_id == TARGET_RV32_KV260_AXI_RAM_NAND:
+        return rv32_kv260_axi_ram_nand_config()
+    invalid_target_config()
+
+fn openssd_cosmos_plus_config() -> OpenSsdConfig:
+    openssd_8ch8way_config()
+
+fn openssd_target_is_hardware(c: OpenSsdConfig) -> i64:
+    if c.target_id == TARGET_OPENSSD_2CH8WAY or c.target_id == TARGET_OPENSSD_8CH8WAY:
+        return 1
+    0
+
+fn openssd_config_selftest() -> i64:
+    var fail: i64 = 0
+    val sim = nvme_fw_target_config(TARGET_SIMPLE_SIM)
+    val dev = nvme_fw_target_config(TARGET_OPENSSD_2CH8WAY)
+    val prod = nvme_fw_target_config(TARGET_OPENSSD_8CH8WAY)
+    val qemu = nvme_fw_target_config(TARGET_RV32_QEMU_RAM_NAND)
+    val kv260 = nvme_fw_target_config(TARGET_RV32_KV260_AXI_RAM_NAND)
+    val invalid = nvme_fw_target_config(99)
+
+    fail = fail + expect_eq(sim.target_id, TARGET_SIMPLE_SIM, "target: simulator id")
+    fail = fail + expect_eq(sim.channels, NUM_CHANNELS, "target: simulator keeps current scheduler channels")
+    fail = fail + expect_eq(openssd_target_is_hardware(sim), 0, "target: simulator is not hardware")
+    fail = fail + expect_eq(invalid.target_id, TARGET_INVALID, "target: unknown fails closed")
+    fail = fail + expect_eq(invalid.cpu_cores, 0, "target: invalid profile cannot run firmware")
+
+    fail = fail + expect_eq(qemu.target_id, TARGET_RV32_QEMU_RAM_NAND, "target: QEMU RAM-NAND id")
+    fail = fail + expect_eq(bool_to_int(qemu.available), 1, "target: QEMU profile is runnable")
+    fail = fail + expect_eq(qemu.nvme_block_bytes, 4, "target: QEMU data payload matches RAM NAND")
+    fail = fail + expect_eq(qemu.nfc_base, 0, "target: QEMU does not claim an NFC aperture")
+    fail = fail + expect_eq(qemu.pcie_vendor_id, 0, "target: QEMU does not claim a PCIe endpoint")
+    fail = fail + expect_eq(kv260.target_id, TARGET_RV32_KV260_AXI_RAM_NAND, "target: KV260 AXI id")
+    fail = fail + expect_eq(bool_to_int(kv260.available), 0, "target: KV260 host path stays unavailable until H2")
+    fail = fail + expect_eq(kv260.nfc_base, 0x20000000, "target: KV260 firmware mailbox base")
+
+    fail = fail + expect_eq(dev.channels, 2, "target: OpenSSD 2Ch8Way channels")
+    fail = fail + expect_eq(dev.ways_per_channel, 8, "target: OpenSSD 2Ch8Way ways/channel")
+    fail = fail + expect_eq(dev.pcie_vendor_id, 0x10EE, "target: OpenSSD 2Ch8Way Xilinx PCIe vendor")
+    fail = fail + expect_eq(dev.nvme_blocks_per_slice, 4, "target: OpenSSD slice is four 4K blocks")
+    fail = fail + expect_eq(openssd_target_is_hardware(dev), 1, "target: 2Ch8Way is hardware")
+
+    fail = fail + expect_eq(prod.cpu_cores, 2, "openssd: Zynq-7000 Cortex-A9 core count")
+    fail = fail + expect_eq(prod.channels, 8, "openssd: Cosmos+ NAND channels")
+    fail = fail + expect_eq(prod.ways_per_channel, 8, "openssd: Cosmos+ NAND ways/channel")
+    fail = fail + expect_eq(prod.blocks, NUM_BLOCKS, "openssd: firmware block geometry")
+    fail = fail + expect_eq(prod.pages_per_block, PAGES_PER_BLOCK, "openssd: page geometry")
+    fail = fail + expect_eq(prod.lbas, LBA_COUNT, "openssd: exposed LBA count")
+    fail = fail + expect_eq(prod.greedy_ftl_major, 3, "openssd: GreedyFTL generation")
+    fail = fail + expect_eq(prod.pcie_vendor_id, 0x10EE, "openssd: Xilinx PCIe vendor")
+    fail = fail + expect_eq(prod.nvme_blocks_per_slice, prod.slice_bytes / prod.nvme_block_bytes, "openssd: slice/NVMe block ratio")
+    fail = fail + expect_eq(bool_to_int(prod.ddr_base == 0x00100000), 1, "openssd: DDR base")
+    fail = fail + expect_eq(bool_to_int(prod.uart1_base == 0xE0001000), 1, "openssd: Cadence UART1 base")
+    fail = fail + expect_eq(bool_to_int(prod.nfc_base == 0x43C00000), 1, "openssd: PL NFC aperture")
+    fail = fail + expect_eq(bool_to_int(prod.pcie_base == 0x50000000), 1, "openssd: PL PCIe endpoint aperture")
+
+    fail

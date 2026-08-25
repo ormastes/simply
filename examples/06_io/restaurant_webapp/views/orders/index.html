@@ -1,0 +1,48 @@
+{{#layout "application"}}
+
+<h1>Orders</h1>
+
+<div class="order-filters">
+    <a href="/admin/orders" class="btn {{#unless status_filter}}btn-active{{/unless}}">All</a>
+    <a href="/admin/orders?status=pending" class="btn">Pending</a>
+    <a href="/admin/orders?status=cooking" class="btn">Cooking</a>
+    <a href="/admin/orders?status=ready" class="btn">Ready</a>
+    <a href="/admin/orders?status=delivered" class="btn">Delivered</a>
+</div>
+
+<table class="table">
+    <thead>
+        <tr>
+            <th>#</th>
+            <th>Table</th>
+            <th>Status</th>
+            <th>Total</th>
+            <th>Payment</th>
+            <th>Time</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+        {{#each orders}}
+        <tr>
+            <td>{{id}}</td>
+            <td>{{table_number}}</td>
+            <td><span class="badge badge-{{status}}">{{status}}</span></td>
+            <td>${{total_display}}</td>
+            <td>{{payment_status}}</td>
+            <td>{{created_at}}</td>
+            <td>
+                <a href="/admin/orders/{{id}}" class="btn btn-sm">View</a>
+                {{#if is_pending}}
+                <form method="POST" action="/admin/orders/{{id}}/send-to-cook" style="display:inline;">
+                    <input type="hidden" name="csrf_token" value="{{../csrf_token}}">
+                    <button type="submit" class="btn btn-sm btn-primary">Send to Cook</button>
+                </form>
+                {{/if}}
+            </td>
+        </tr>
+        {{/each}}
+    </tbody>
+</table>
+
+{{/layout}}

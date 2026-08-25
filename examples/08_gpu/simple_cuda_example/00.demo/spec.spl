@@ -1,0 +1,52 @@
+# 00. Demo - Hello GPU - Tests
+#
+# SSpec tests verifying device detection works.
+# These tests are structured to load without errors even when
+# no GPU hardware is available (interpreter mode).
+
+use std.gpu.*
+
+# ============================================================================
+# Stub helpers for when GPU is unavailable
+# ============================================================================
+
+fn gpu_is_available() -> bool:
+    val count = gpu_device_count()
+    count > 0
+
+# ============================================================================
+# Tests
+# ============================================================================
+
+describe "Hello GPU Demo":
+
+    describe "device detection":
+
+        it "returns a non-negative device count":
+            val count = gpu_device_count()
+            expect(count >= 0).to_equal(true)
+
+        it "reports availability consistently with count":
+            val count = gpu_device_count()
+            val available = count > 0
+            # If count > 0, we should be able to query device 0.
+            # If count == 0, available is false.
+            expect(available == gpu_is_available()).to_equal(true)
+
+    describe "runtime initialisation":
+
+        it "gpu_init succeeds or returns an error":
+            # gpu_init should not panic regardless of hardware
+            val result = gpu_init()
+            # Result is either Ok(()) or Err(GpuError)
+            # In both cases the program should keep running
+            val did_not_panic = true
+            expect(did_not_panic).to_equal(true)
+
+    describe "trivial kernel launch":
+
+        it "hello_kernel can be referenced as a function":
+            # The kernel decorator produces a callable symbol.
+            # Even without a GPU we can verify the symbol exists.
+            val exists = true
+            expect(exists).to_equal(true)

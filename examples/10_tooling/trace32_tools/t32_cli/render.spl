@@ -1,0 +1,55 @@
+# T32 CLI — Output rendering
+# Converts T32BridgeResult into human-readable text output.
+
+use app.t32_cli.types.{T32BridgeResult}
+use common.ui.access_cli_grammar.{access_render_human}
+
+# Auto-dispatch renderer based on result kind
+fn render_result(result: T32BridgeResult) -> text:
+    val footer = render_gui_status(result.gui_status)
+    var body = access_render_human(result)
+    if footer != "":
+        body = body + "\n" + footer
+    body
+
+# Render error message
+fn render_error(message: text) -> text:
+    "Error: {message}"
+
+fn render_gui_status(gui_json: text) -> text:
+    if gui_json == "" or gui_json == "{}":
+        return ""
+    var parts: [text] = []
+    val cpu_state = extract_json_value(gui_json, "cpu_state")
+    if cpu_state != "":
+        parts = parts.push("CPU: {cpu_state}")
+    val practice_state = extract_json_value(gui_json, "practice_state")
+    if practice_state != "":
+        parts = parts.push("PRACTICE: {practice_state}")
+    val system_state = extract_json_value(gui_json, "system_state")
+    if system_state != "":
+        parts = parts.push("System: {system_state}")
+    if parts.len() == 0:
+        return ""
+    "[" + parts.join(" | ") + "]"
+
+fn extract_json_value(json: text, key: text) -> text:
+    val search = "\"" + key + "\""
+    val idx = json.index_of(search, 0)
+    if idx < 0:
+        return ""
+    var pos = idx + search.len()
+    while pos < json.len() and (json[pos] == ' ' or json[pos] == ':'):
+        pos = pos + 1
+    if pos >= json.len():
+        return ""
+    if json[pos] == '"':
+        val start = pos + 1
+        var end = start
+        while end < json.len() and json[end] != '"':
+            end = end + 1
+        return json.slice(start, end)
+    val start = pos
+    while pos < json.len() and json[pos] != ',' and json[pos] != '}' and json[pos] != ' ':
+        pos = pos + 1
+    json.slice(start, pos)

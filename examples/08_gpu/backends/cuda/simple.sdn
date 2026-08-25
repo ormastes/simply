@@ -1,0 +1,9 @@
+project:
+  name: svmg_hello_cuda
+
+# Same program, different backend. Only this file differs between the
+# cuda/, vulkan/ and metal/ directories.
+gpu:
+  backend: cuda        # auto | cuda | vulkan | metal
+  submode: interpreter
+  arch: auto

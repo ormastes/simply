@@ -1,0 +1,115 @@
+"""
+rel_vref_check — absolute oracles for the L3 lane rel_vref.spl (contract:
+doc/05_design/hardware/nand_recovery/recovery_algorithms_design.md §3, design
+§9 L3, verification matrix §10 "Retry table + ROR-lite" row). Known values at
+known points, not self-comparison.
+
+Oracles:
+  1. Table order EXACT per the design's fixed 7-entry table (retention-biased,
+     alternating sign, growing magnitude): index 0..6 -> -8,-16,+8,-24,+16,-32,
+     +24; index >= 7 -> 0 (defined fallback, never a crash / OOB read).
+  2. Uncalibrated lookup returns 0 ("no seed") — the exact signal the L4
+     ladder's calibrated-seed-first rung reads as "fall to table[0] == -8".
+  3. After `rel_vref_calibrate(cache, B, +6)`, `rel_vref_lookup(cache, B) == 6`
+     while an untouched OTHER block still reads the uncalibrated "no seed" 0
+     (per-block isolation of the dense [i64] cache — no cross-block bleed).
+  4. `rel_vref_decay_on_erase(cache, B)` restores the DEFAULT (0, uncalibrated)
+     for EXACTLY block B; a second, independently-calibrated sibling block is
+     read back UNCHANGED (decay is scoped, not a wholesale cache reset).
+  5. Bounds: `rel_vref_calibrate` clamps `off` to
+     [-REL_VREF_MAX_ABS, +REL_VREF_MAX_ABS] (= [-32, +32], design §3 constants
+     table) — an over-range +100/-100 offset is persisted as +32/-32, an
+     already-in-range value (-32) passes through unclamped. Out-of-range block
+     indices (>= NUM_BLOCKS, negative) fail CLOSED on lookup/calibrate/decay:
+     lookup returns 0 (no seed, no OOB read) and calibrate/decay are no-ops
+     that leave the cache's real entries unchanged (no OOB write).
+
+Run: bin/simple run examples/09_embedded/simpleos_nvme_fw/fw/rel_vref_check.spl
+Gate: prints "REL VREF OK" and exits 0.
+"""
+
+use nvme_types.*
+use nd_types.*
+use rel_types.*
+use rel_vref.*
+
+# Loop-built dense zero array (rel_vref.spl owns no array constructor; mirrors
+# rel_types_check.spl's own zeros() idiom).
+fn zeros(n: i64) -> [i64]:
+    var a: [i64] = []
+    var i: i64 = 0
+    while i < n:
+        a.push(0)
+        i = i + 1
+    a
+
+fn fresh_cache() -> RelVrefCache:
+    RelVrefCache(offset: zeros(NUM_BLOCKS), valid: zeros(NUM_BLOCKS), gen: zeros(NUM_BLOCKS))
+
+fn main():
+    var fail: i64 = 0
+
+    # ── Oracle 1: table order EXACT per design §3 ──────────────────────────────
+    fail = fail + expect_eq(rel_vref_table_len(), 7, "rel_vref_table_len() == 7 (step budget)")
+    fail = fail + expect_eq(rel_vref_table_at(0), 0 - 8, "table[0] == -8")
+    fail = fail + expect_eq(rel_vref_table_at(1), 0 - 16, "table[1] == -16")
+    fail = fail + expect_eq(rel_vref_table_at(2), 8, "table[2] == +8")
+    fail = fail + expect_eq(rel_vref_table_at(3), 0 - 24, "table[3] == -24")
+    fail = fail + expect_eq(rel_vref_table_at(4), 16, "table[4] == +16")
+    fail = fail + expect_eq(rel_vref_table_at(5), 0 - 32, "table[5] == -32")
+    fail = fail + expect_eq(rel_vref_table_at(6), 24, "table[6] == +24")
+    fail = fail + expect_eq(rel_vref_table_at(7), 0, "table[>=7] == 0 (defined fallback, no crash)")
+    fail = fail + expect_eq(REL_VREF_MAX_ABS, 32, "REL_VREF_MAX_ABS == 32 (design §3 constants table)")
+
+    # ── Oracle 2: uncalibrated lookup == 0 == the ladder's "fall to table[0]" ──
+    val c0: RelVrefCache = fresh_cache()
+    fail = fail + expect_eq(rel_vref_lookup(c0, nd_block(3)), 0, "uncalibrated block 3: lookup == 0 (no seed)")
+    fail = fail + expect_eq(rel_vref_table_at(0), 0 - 8, "no-seed signal (0) is exactly the ladder's cue to retry table[0] == -8 first")
+
+    # ── Oracle 3: calibrate(B,+6) seeds B; an OTHER block stays uncalibrated ───
+    val c1: RelVrefCache = rel_vref_calibrate(c0, nd_block(3), 6)
+    fail = fail + expect_eq(rel_vref_lookup(c1, nd_block(3)), 6, "calibrated block 3: lookup == +6 (persisted winner)")
+    fail = fail + expect_eq(rel_vref_lookup(c1, nd_block(40)), 0, "OTHER block 40: still no seed (0) -- no cross-block bleed")
+    fail = fail + expect_eq(rel_vref_lookup(c1, nd_block(0)), 0, "OTHER block 0: still no seed (0) -- no cross-block bleed")
+
+    # ── Oracle 4: decay restores default for EXACTLY block 3, sibling intact ──
+    val c2: RelVrefCache = rel_vref_calibrate(c1, nd_block(50), 0 - 16)   # independent sibling calibration
+    fail = fail + expect_eq(rel_vref_lookup(c2, nd_block(50)), 0 - 16, "sibling block 50 calibrated: lookup == -16")
+    val c3: RelVrefCache = rel_vref_decay_on_erase(c2, nd_block(3))
+    fail = fail + expect_eq(rel_vref_lookup(c3, nd_block(3)), 0, "erase-decay block 3: lookup restored to default 0")
+    fail = fail + expect_eq(rel_vref_lookup(c3, nd_block(50)), 0 - 16, "sibling block 50 UNCHANGED by block 3's decay (scoped, not a wholesale reset)")
+
+    # ── Oracle 5a: calibrate clamps out-of-range offsets to REL_VREF_MAX_ABS ──
+    val c4: RelVrefCache = rel_vref_calibrate(c0, nd_block(10), 100)
+    fail = fail + expect_eq(rel_vref_lookup(c4, nd_block(10)), 32, "calibrate(+100) clamps to +32 (REL_VREF_MAX_ABS)")
+    val c5: RelVrefCache = rel_vref_calibrate(c0, nd_block(11), 0 - 100)
+    fail = fail + expect_eq(rel_vref_lookup(c5, nd_block(11)), 0 - 32, "calibrate(-100) clamps to -32 (-REL_VREF_MAX_ABS)")
+    val c6: RelVrefCache = rel_vref_calibrate(c0, nd_block(12), 0 - 32)
+    fail = fail + expect_eq(rel_vref_lookup(c6, nd_block(12)), 0 - 32, "calibrate(-32) already in-range: passes through unclamped")
+    val c7: RelVrefCache = rel_vref_calibrate(c0, nd_block(13), 24)
+    fail = fail + expect_eq(rel_vref_lookup(c7, nd_block(13)), 24, "calibrate(+24) already in-range (table[6]): passes through unclamped")
+
+    # ── Oracle 5b: out-of-range block index fails CLOSED, no OOB read/write ───
+    # A dedicated fresh chain (not the earlier c0/c1/c2/c3 lineage, whose
+    # underlying arrays keep being threaded through further real mutations in
+    # the sections above): real usage always threads ONE mount value linearly
+    # (design §2's `m.vref = rel_vref_calibrate(m.vref, blk, offset)`), never
+    # resurrects an older snapshot after later calls kept mutating the same
+    # value -- so the isolated chain here matches the module's real call shape.
+    val cb0: RelVrefCache = fresh_cache()
+    fail = fail + expect_eq(rel_vref_lookup(cb0, nd_block(NUM_BLOCKS)), 0, "lookup(blk == NUM_BLOCKS) fails closed -> 0, no OOB read")
+    fail = fail + expect_eq(rel_vref_lookup(cb0, nd_block(0 - 1)), 0, "lookup(blk == -1) fails closed -> 0, no OOB read")
+
+    val cb1: RelVrefCache = rel_vref_calibrate(cb0, nd_block(3), 6)
+    fail = fail + expect_eq(rel_vref_lookup(cb1, nd_block(3)), 6, "calibrated block 3 (fresh chain): lookup == +6")
+
+    val cb2: RelVrefCache = rel_vref_calibrate(cb1, nd_block(NUM_BLOCKS), 9)
+    fail = fail + expect_eq(rel_vref_lookup(cb2, nd_block(3)), 6, "calibrate(blk == NUM_BLOCKS) is a no-op -- real block 3 entry untouched")
+
+    val cb3: RelVrefCache = rel_vref_decay_on_erase(cb1, nd_block(0 - 1))
+    fail = fail + expect_eq(rel_vref_lookup(cb3, nd_block(3)), 6, "decay(blk == -1) is a no-op -- real block 3 entry untouched")
+
+    if fail == 0:
+        print "REL VREF OK"
+    else:
+        print "REL VREF FAIL ({fail})"

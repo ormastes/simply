@@ -1,0 +1,42 @@
+# Business Framework — Lane Registry (the extension point)
+#
+# A business lane is DATA, not framework code: one LaneDef registers its name,
+# write action, write route, and approval policy. RBAC (which actions an
+# operator may write), the web route table, and suite/dashboard iteration all
+# DERIVE from the registered lanes — so adding a new business (clinic, gym,
+# logistics, ...) is one LaneDef + one lane module, with zero framework edits.
+# This is the Odoo/SAP "module registry" pattern reduced to its load-bearing core.
+
+struct LaneDef:
+    val name: text
+    val write_action: text
+    val write_path: text
+    val threshold_minor: i64
+    val approver_role: text
+
+fn lane_def(name: text, write_path: text, threshold_minor: i64, approver_role: text) -> LaneDef:
+    return LaneDef { name: name, write_action: name + ".write", write_path: write_path, threshold_minor: threshold_minor, approver_role: approver_role }
+
+# The stock suite. Applications with different businesses pass their own list
+# everywhere a `lanes: [LaneDef]` parameter appears instead of editing this.
+fn default_lanes() -> [LaneDef]:
+    var lanes: [LaneDef] = []
+    lanes.push(lane_def("crm", "/api/crm/leads", 500000, "admin"))
+    lanes.push(lane_def("reservation", "/api/reservations", 500000, "admin"))
+    lanes.push(lane_def("sale", "/api/sales", 500000, "admin"))
+    lanes.push(lane_def("market", "/api/market/listings", 500000, "admin"))
+    lanes.push(lane_def("restaurant", "/api/restaurant/orders", 500000, "admin"))
+    return lanes
+
+# Is `action` the registered write action of some lane?
+fn is_registered_write(lanes: [LaneDef], action: text) -> bool:
+    for l in lanes:
+        if l.write_action == action:
+            return true
+    return false
+
+fn find_lane(lanes: [LaneDef], name: text) -> LaneDef:
+    for l in lanes:
+        if l.name == name:
+            return l
+    return LaneDef { name: "", write_action: "", write_path: "", threshold_minor: 0, approver_role: "" }

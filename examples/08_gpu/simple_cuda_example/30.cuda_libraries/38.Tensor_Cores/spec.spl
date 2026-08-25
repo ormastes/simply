@@ -1,0 +1,46 @@
+# 38. Tensor Cores - Tests
+#
+# WMMA fragment bookkeeping plus the tile-shaped GEMM on exactly-representable
+# inputs. No tensor-core API exists in std.gpu, so these check the f32 GEMM
+# that stands in for it.
+
+use std.gpu.*
+use self.main.{tensor_gemm, ml_matmul, identity, ramp, filled, fragments_along, warps_needed, WMMA_M, WMMA_N, WMMA_K}
+
+describe "Tensor core operations":
+
+    describe "fragment geometry":
+
+        it "uses 16x16x16 fragments":
+            expect(WMMA_M).to_equal(16)
+            expect(WMMA_N).to_equal(16)
+            expect(WMMA_K).to_equal(16)
+
+        it "one warp covers one 16x16 tile":
+            expect(warps_needed(16, 16)).to_equal(1)
+            expect(warps_needed(32, 256)).to_equal(32)
+
+        it "rounds partial fragments up":
+            expect(fragments_along(17, 16)).to_equal(2)
+
+    describe "tile-shaped GEMM":
+
+        it "multiplies identity by a matrix":
+            val c = tensor_gemm(identity(16), ramp(256), 16, 16, 16)?
+            expect(c[0]).to_equal(1.0)
+            expect(c[1]).to_equal(2.0)
+            expect(c[255]).to_equal(256.0)
+
+        it "accumulates 16 products in f32":
+            val c = tensor_gemm(filled(256, 1.0), filled(256, 1.0), 16, 16, 16)?
+            expect(c[0]).to_equal(16.0)
+            expect(c.len()).to_equal(256)
+
+        it "handles zero matrices":
+            val c = tensor_gemm(filled(256, 0.0), filled(256, 1.0), 16, 16, 16)?
+            expect(c[0]).to_equal(0.0)
+
+        it "performs an ML matmul (batch x in) x (in x out)":
+            val out = ml_matmul(filled(8 * 4, 0.5), filled(2 * 8, 1.0), 2, 8, 4)?
+            expect(out.len()).to_equal(8)
+            expect(out[0]).to_equal(4.0)

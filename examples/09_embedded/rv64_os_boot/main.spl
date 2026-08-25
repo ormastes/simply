@@ -1,0 +1,35 @@
+"""
+# Minimal RV64 OS Boot — UART Hello World
+
+Boots on QEMU virt machine (bare-metal, M-mode).
+Writes "SimpleOS RV64GC OK" to 16550 UART at 0x10000000.
+"""
+
+val UART_BASE: i64 = 0x10000000
+
+extern fn rt_mmio_write8(addr: i64, value: i64)
+
+fn uart_putc(ch: i64):
+    rt_mmio_write8(UART_BASE, ch)
+
+fn main():
+    # "SimpleOS RV64GC OK\n"
+    uart_putc(0x53)  # S
+    uart_putc(0x69)  # i
+    uart_putc(0x6D)  # m
+    uart_putc(0x70)  # p
+    uart_putc(0x6C)  # l
+    uart_putc(0x65)  # e
+    uart_putc(0x4F)  # O
+    uart_putc(0x53)  # S
+    uart_putc(0x20)  # (space)
+    uart_putc(0x52)  # R
+    uart_putc(0x56)  # V
+    uart_putc(0x36)  # 6
+    uart_putc(0x34)  # 4
+    uart_putc(0x47)  # G
+    uart_putc(0x43)  # C
+    uart_putc(0x20)  # (space)
+    uart_putc(0x4F)  # O
+    uart_putc(0x4B)  # K
+    uart_putc(0x0A)  # \n

@@ -1,0 +1,36 @@
+# Clinic Lane — the extensibility proof
+#
+# A sixth business added WITHOUT touching the framework: this module plus one
+# LaneDef registration (see extension_demo.spl) is the entire cost of a new
+# business. RBAC, routing, gating, and dashboards all derive from the registry.
+
+use framework.guarded.{Tenant, Actor, Session, WriteResult, gate_write_for}
+use std.nogc_sync_mut.enterprise_store.store.{EnterpriseStore}
+use framework.registry.{LaneDef}
+
+struct Appointment:
+    val id: i64
+    val patient: text
+    val practitioner: text
+    val slot: text
+    val fee_minor: i64
+    val status: text
+
+fn validate_appointment(a: Appointment) -> bool:
+    return (a.id > 0 and a.patient.len() > 0 and a.practitioner.len() > 0 and a.slot.len() > 0 and a.fee_minor >= 0)
+
+# Forward-only: booked -> seen -> billed. Anything else returns unchanged.
+fn mark_seen(a: Appointment) -> Appointment:
+    if a.status != "booked":
+        return a
+    return Appointment { id: a.id, patient: a.patient, practitioner: a.practitioner, slot: a.slot, fee_minor: a.fee_minor, status: "seen" }
+
+fn bill(a: Appointment) -> Appointment:
+    if a.status != "seen":
+        return a
+    return Appointment { id: a.id, patient: a.patient, practitioner: a.practitioner, slot: a.slot, fee_minor: a.fee_minor, status: "billed" }
+
+# The lane's single write entry point — same shape as every other lane, but
+# gated against whatever registry the APP passes in.
+fn submit_appointment_write(lanes: [LaneDef], session: Session, tenant: Tenant, user: Actor, a: Appointment, key: text, store: EnterpriseStore) -> WriteResult:
+    return gate_write_for(lanes, store, session, tenant, user, "clinic.write", validate_appointment(a), key)

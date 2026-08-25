@@ -1,0 +1,49 @@
+app:
+    title: "Validation Demo"
+    theme: glass_dark
+
+layout:
+    type: vbox
+    children:
+        form:
+            type: panel
+            title: "Validation Demo Form"
+            children:
+                name_input:
+                    type: input
+                    placeholder: "Enter your name"
+                email_input:
+                    type: input
+                    placeholder: "Enter email"
+                    required: true
+                error_input:
+                    type: input
+                    placeholder: "bad@"
+                    error: true
+                    error_message: "Invalid email format"
+                submit_btn:
+                    type: button
+                    label: "Submit"
+                    action: "submit_form"
+                    disabled: true
+                cancel_btn:
+                    type: button
+                    label: "Cancel"
+                    action: "cancel_form"
+                sys_id:
+                    type: textfield
+                    value: "System generated ID: ABC-123"
+                    placeholder: ""
+                    readonly: true
+                dis_cb:
+                    type: checkbox
+                    label: "Agree to Terms"
+                    checked: false
+                    disabled: true
+                rules_text:
+                    type: text
+                    content: "Validation: email must contain @, name is required"
+        status:
+            type: statusbar
+            left: "{app.mode}"
+            right: "{app.title}"

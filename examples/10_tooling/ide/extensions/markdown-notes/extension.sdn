@@ -1,0 +1,12 @@
+{
+  "name": "markdown-notes",
+  "version": "0.1.0",
+  "main": "main.spl",
+  "activation_events": ["onLanguage:markdown", "onCommand:markdown.notes.preview"],
+  "contributes_commands": [
+    {"id": "markdown.notes.preview", "title": "Markdown Notes: Preview"}
+  ],
+  "contributes_languages": [
+    {"id": "markdown", "extensions": [".md", ".markdown"]}
+  ]
+}

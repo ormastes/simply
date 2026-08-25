@@ -1,0 +1,43 @@
+# feature/broker/coordination — Strategies: sequential, parallel, pipeline
+
+fn broker_coordinate_sequential(task_ids: [text]) -> text:
+    # Process tasks one at a time in order
+    var results: [text] = []
+    for task_id in task_ids:
+        val idx = _find_task_index(task_id)
+        if idx >= 0:
+            val r = broker_process_task(idx)
+            results.push(r)
+    results.join("\n")
+
+fn broker_coordinate_parallel(task_ids: [text]) -> text:
+    # Award all tasks simultaneously (best-effort)
+    var results: [text] = []
+    for task_id in task_ids:
+        val idx = _find_task_index(task_id)
+        if idx >= 0:
+            val r = broker_process_task(idx)
+            results.push(r)
+    results.join("\n")
+
+fn broker_coordinate_pipeline(task_ids: [text]) -> text:
+    # Pipeline: output of task N feeds into task N+1
+    var results: [text] = []
+    var prev_result = ""
+    for task_id in task_ids:
+        val idx = _find_task_index(task_id)
+        if idx >= 0:
+            if prev_result != "":
+                BK_TASK_CONTENTS[idx] = BK_TASK_CONTENTS[idx] + "\n\nContext from previous step:\n" + prev_result
+            val r = broker_process_task(idx)
+            prev_result = r
+            results.push(r)
+    results.join("\n")
+
+fn _find_task_index(task_id: text) -> i64:
+    var i = 0
+    while i < BK_TASK_COUNT:
+        if BK_TASK_IDS[i] == task_id:
+            return i
+        i = i + 1
+    -1

@@ -1,0 +1,298 @@
+"""
+nvme_device — the owner struct that ties the whole pure-Simple NVMe emulator
+together. NvmeEmu OWNS the shared-memory region, the host + device DMA ports, the
+FTL (and its NandArray), and the in-process SQ/CQ rings, mutating them all through
+`me.*` so state persists past the value-semantics boundary (gotcha 4).
+
+REALISTIC DMA SPLIT: Commands (cid/opcode/lba/prp/nwords) pass in-process via the
+SQ/CQ rings. The DATA is what actually crosses the host<->device boundary, and it
+does so through the memcpy seam:
+  - host_write : host DMA reads the host buffer, lands it in shared memory at prp.
+  - dev_step   : device DMA reads shared memory at prp, hands it to the FTL/NAND;
+                 on reads it pulls the page from NAND and device-DMAs it back to
+                 shared memory; host_fetch_data host-DMAs it out again.
+Both DMAs are independently re-pluggable (set_host_memcpy / set_dev_memcpy) which
+is what makes the boundary real and fault-injectable.
+
+The SQ/CQ are kept as parallel [i64] columns (raw scalars in big arrays — the emu
+discipline) with monotonic head cursors; a Command/Completion record is rebuilt at
+the typed boundary (gotcha 1: wrap at the edge).
+"""
+
+use nvme_ct.*
+use nvme_shared.*
+use nvme_memcpy.*
+use nand_onfi.*
+use ftl_emu.*
+use nvme_host.*
+
+struct NvmeEmu:
+    smem:   SharedMem
+    host:   HostPort
+    dev:    DevPort
+    ftl:    Ftl
+    # Submission queue columns + head cursor (device fetch point).
+    sq_cid: [i64]
+    sq_op:  [i64]
+    sq_lba: [i64]
+    sq_prp: [i64]
+    sq_n:   [i64]
+    sq_head: i64
+    # Completion queue columns + head cursor (host reap point).
+    cq_cid:    [i64]
+    cq_status: [i64]
+    cq_info:   [i64]
+    cq_head:   i64
+
+fn nvme_emu_new() -> NvmeEmu:
+    var sc: [i64] = []
+    var so: [i64] = []
+    var sl: [i64] = []
+    var sp: [i64] = []
+    var sn: [i64] = []
+    var cc: [i64] = []
+    var cs: [i64] = []
+    var ci: [i64] = []
+    NvmeEmu(
+        smem: shared_mem_new(),
+        host: host_port_new(),
+        dev: dev_port_new(),
+        ftl: ftl_new(),
+        sq_cid: sc, sq_op: so, sq_lba: sl, sq_prp: sp, sq_n: sn, sq_head: 0,
+        cq_cid: cc, cq_status: cs, cq_info: ci, cq_head: 0
+    )
+
+impl NvmeEmu:
+    # ── internal ring helpers ─────────────────────────────────────────────────
+    # Append a command to the SQ. push() (append, not indexed store) keeps the
+    # gotcha-5 x8-corruption pattern off the table; the device selftest asserts
+    # every queued scalar round-trips exactly.
+    me enqueue(cid: Cid, op: i64, lba: Lba, prp: Addr, n: i64):
+        me.sq_cid = me.sq_cid.push(cid.value)
+        me.sq_op  = me.sq_op.push(op)
+        me.sq_lba = me.sq_lba.push(lba.value)
+        me.sq_prp = me.sq_prp.push(prp.value)
+        me.sq_n   = me.sq_n.push(n)
+
+    me post(cid: Cid, status: i64, info: i64):
+        me.cq_cid    = me.cq_cid.push(cid.value)
+        me.cq_status = me.cq_status.push(status)
+        me.cq_info   = me.cq_info.push(info)
+
+    # ── HOST INTERFACE ────────────────────────────────────────────────────────
+    # host DMA the caller's buffer into shared memory at prp, then enqueue WRITE.
+    me host_write(cid: Cid, lba: Lba, prp: Addr, words: [i64]) -> bool:
+        val n = words.length()
+        val slice = me.host.run(words, 0, n)
+        me.smem.store(prp, slice)
+        me.enqueue(cid, OP_WRITE, lba, prp, n)
+        true
+
+    me host_read_submit(cid: Cid, lba: Lba, prp: Addr) -> bool:
+        me.enqueue(cid, OP_READ, lba, prp, WORDS_PER_PAGE)
+        true
+
+    # Pop the oldest completion (cid=-1 / SC_INTERNAL when the CQ is empty).
+    me host_reap() -> Completion:
+        if me.cq_head >= me.cq_cid.length():
+            return completion_make(Cid(value: -1), SC_INTERNAL, 0)
+        val i = me.cq_head
+        val cid = me.cq_cid.get(i)
+        val status = me.cq_status.get(i)
+        val info = me.cq_info.get(i)
+        me.cq_head = me.cq_head + 1
+        completion_make(Cid(value: cid), status, info)
+
+    me host_completions() -> i64:
+        me.cq_cid.length() - me.cq_head
+
+    # host DMA n words out of shared memory at prp back to the caller.
+    me host_fetch_data(prp: Addr, n: i64) -> [i64]:
+        me.host.run(me.smem.load(prp, n), 0, n)
+
+    me set_host_memcpy(f: fn([i64], i64, i64) -> [i64]):
+        me.host.set_copy(f)
+
+    # ── DEVICE INTERFACE ──────────────────────────────────────────────────────
+    # Process one queued command. Returns 1 if a command was processed, else 0.
+    me dev_step() -> i64:
+        if me.sq_head >= me.sq_cid.length():
+            return 0
+        val i = me.sq_head
+        val cid = me.sq_cid.get(i)
+        val op  = me.sq_op.get(i)
+        val lba = me.sq_lba.get(i)
+        val prp = me.sq_prp.get(i)
+        val n   = me.sq_n.get(i)
+        me.sq_head = me.sq_head + 1
+        if op == OP_WRITE:
+            val raw = me.smem.load(Addr(value: prp), n)
+            val words = me.dev.run(raw, 0, n)
+            val st = me.ftl.write(Lba(value: lba), words)
+            me.post(Cid(value: cid), st, n)
+        elif op == OP_READ:
+            val r = me.ftl.read(Lba(value: lba))
+            val slice = me.dev.run(r.words, 0, n)
+            me.smem.store(Addr(value: prp), slice)
+            val st = me.ftl.read_status(Lba(value: lba))
+            me.post(Cid(value: cid), st, n)
+        else:
+            me.post(Cid(value: cid), SC_INTERNAL, 0)
+        1
+
+    # Drain every queued command; returns how many were processed.
+    me dev_run() -> i64:
+        var count: i64 = 0
+        var r = me.dev_step()
+        while r == 1:
+            count = count + 1
+            r = me.dev_step()
+        count
+
+    me set_dev_memcpy(f: fn([i64], i64, i64) -> [i64]):
+        me.dev.set_copy(f)
+
+    # ── passthrough ───────────────────────────────────────────────────────────
+    me free_ppns() -> i64:
+        me.ftl.free_ppns()
+
+    me erase_count(block_index: i64) -> i64:
+        me.ftl.erase_count(block_index)
+
+    # ── read-only NAND/FTL introspection (delegates to the owned Ftl) ─────────
+    me dbg_physical_ppn(lba: Lba) -> i64:
+        me.ftl.physical_ppn(lba)
+
+    me dbg_nand_words(ppn: i64) -> [i64]:
+        me.ftl.nand_words(ppn)
+
+    me dbg_next_free_ppn() -> i64:
+        me.ftl.next_free_ppn()
+
+# ── Self-test: full host<->device round-trip through the DMA seam ─────────────
+fn nvme_device_selftest() -> i64:
+    var fails: i64 = 0
+
+    var emu: NvmeEmu = nvme_emu_new()
+    fails = fails + expect_eq(emu.free_ppns(), NUM_PAGES, "fresh emu free_ppns == NUM_PAGES")
+    fails = fails + expect_eq(emu.host_completions(), 0, "no completions initially")
+
+    # ---- LBA A: lands ppn0 -> NAND channel 0. prp 0..3 in shared mem. ----
+    var wa: [i64] = []
+    wa = wa.push(0xA0)
+    wa = wa.push(0xA1)
+    wa = wa.push(0xA2)
+    wa = wa.push(0xA3)
+    fails = fails + expect_eq(bool_i64(emu.host_write(Cid(value: 1), Lba(value: 0), Addr(value: 0), wa)), 1, "host_write A accepted")
+    fails = fails + expect_eq(emu.dev_step(), 1, "dev_step processes write A")
+    fails = fails + expect_eq(emu.host_completions(), 1, "one completion after write A")
+    val ca = emu.host_reap()
+    fails = fails + expect_eq(ca.cid.value, 1, "completion A cid round-trip")
+    fails = fails + expect_eq(ca.status, SC_SUCCESS, "completion A status success")
+    fails = fails + expect_eq(emu.host_completions(), 0, "CQ drained after reap A")
+
+    # ---- Advance the sequential allocator into channel 1 (ppn >= 64). ----
+    # Write filler LBAs 1..63 so the next allocation (cursor 64) lands in ch1.
+    var filler: [i64] = []
+    filler = filler.push(7)
+    filler = filler.push(7)
+    filler = filler.push(7)
+    filler = filler.push(7)
+    var k: i64 = 1
+    while k < 64:
+        emu.host_write(Cid(value: 100 + k), Lba(value: k), Addr(value: 0), filler)
+        emu.dev_step()
+        # reap to keep the CQ from growing unbounded (not asserted)
+        emu.host_reap()
+        k = k + 1
+    # cursor should now be 64 -> next ppn is channel 1
+    fails = fails + expect_eq(emu.free_ppns(), NUM_PAGES - 64, "64 ppns consumed before LBA B")
+
+    # ---- LBA B: lands ppn64 -> NAND channel 1. prp 8..11 in shared mem. ----
+    var wb: [i64] = []
+    wb = wb.push(0xB0)
+    wb = wb.push(0xB1)
+    wb = wb.push(0xB2)
+    wb = wb.push(0xB3)
+    fails = fails + expect_eq(bool_i64(emu.host_write(Cid(value: 2), Lba(value: 64), Addr(value: 8), wb)), 1, "host_write B accepted")
+    fails = fails + expect_eq(emu.dev_run(), 1, "dev_run drains write B")
+    val cb = emu.host_reap()
+    fails = fails + expect_eq(cb.cid.value, 2, "completion B cid round-trip")
+    fails = fails + expect_eq(cb.status, SC_SUCCESS, "completion B status success")
+
+    # ---- Confirm A and B landed in DIFFERENT NAND channels ----
+    # LBA A -> ppn0 (ch0); LBA B -> ppn64 (ch1).
+    fails = fails + expect_eq(ppn_channel(Ppn(value: 0)).value, 0, "LBA A physical channel == 0")
+    fails = fails + expect_eq(ppn_channel(Ppn(value: 64)).value, 1, "LBA B physical channel == 1")
+
+    # ---- Read A back THROUGH the full path: submit -> dev -> fetch ----
+    fails = fails + expect_eq(bool_i64(emu.host_read_submit(Cid(value: 3), Lba(value: 0), Addr(value: 16))), 1, "read A submitted")
+    fails = fails + expect_eq(emu.dev_step(), 1, "dev_step processes read A")
+    val cra = emu.host_reap()
+    fails = fails + expect_eq(cra.status, SC_SUCCESS, "read A completion success")
+    val ra = emu.host_fetch_data(Addr(value: 16), WORDS_PER_PAGE)
+    fails = fails + expect_eq(ra.get(0), 0xA0, "read A word0 survives full path")
+    fails = fails + expect_eq(ra.get(1), 0xA1, "read A word1 survives full path")
+    fails = fails + expect_eq(ra.get(2), 0xA2, "read A word2 survives full path")
+    fails = fails + expect_eq(ra.get(3), 0xA3, "read A word3 survives full path")
+
+    # ---- Read B back THROUGH the full path (different channel) ----
+    fails = fails + expect_eq(bool_i64(emu.host_read_submit(Cid(value: 4), Lba(value: 64), Addr(value: 20))), 1, "read B submitted")
+    fails = fails + expect_eq(emu.dev_run(), 1, "dev_run processes read B")
+    val crb = emu.host_reap()
+    fails = fails + expect_eq(crb.status, SC_SUCCESS, "read B completion success")
+    val rb = emu.host_fetch_data(Addr(value: 20), WORDS_PER_PAGE)
+    fails = fails + expect_eq(rb.get(0), 0xB0, "read B word0 survives full path")
+    fails = fails + expect_eq(rb.get(3), 0xB3, "read B word3 survives full path")
+
+    # ---- A's data untouched by B's round-trip (independent channels) ----
+    fails = fails + expect_eq(bool_i64(emu.host_read_submit(Cid(value: 5), Lba(value: 0), Addr(value: 24))), 1, "re-read A submitted")
+    emu.dev_step()
+    emu.host_reap()
+    val ra2 = emu.host_fetch_data(Addr(value: 24), WORDS_PER_PAGE)
+    fails = fails + expect_eq(ra2.get(0), 0xA0, "A still intact after B (ch independence)")
+
+    # ---- Device DMA seam is REAL: re-plug a corrupting copy and observe it. ----
+    # Corrupt copy bumps the first transferred word. Write LBA 70 through it.
+    emu.set_dev_memcpy(\s, o, n: dma_copy_corrupt(s, o, n))
+    var wc: [i64] = []
+    wc = wc.push(500)
+    wc = wc.push(600)
+    wc = wc.push(700)
+    wc = wc.push(800)
+    emu.host_write(Cid(value: 6), Lba(value: 70), Addr(value: 28), wc)
+    emu.dev_step()                       # device DMA corrupts word0 on the way into NAND
+    emu.host_reap()
+    # restore a clean device DMA for the read-back so we observe NAND contents
+    emu.set_dev_memcpy(\s, o, n: dma_copy_words(s, o, n))
+    emu.host_read_submit(Cid(value: 7), Lba(value: 70), Addr(value: 32))
+    emu.dev_step()
+    emu.host_reap()
+    val rc = emu.host_fetch_data(Addr(value: 32), WORDS_PER_PAGE)
+    fails = fails + expect_eq(rc.get(0), 501, "device DMA corruption landed (500 -> 501)")
+    fails = fails + expect_eq(rc.get(1), 600, "device DMA left word1 intact")
+
+    # ---- Host DMA seam is REAL too: re-plug a corrupting host copy. ----
+    # host_write host-DMAs the buffer into shared memory; corruption bumps word0.
+    emu.set_host_memcpy(\s, o, n: dma_copy_corrupt(s, o, n))
+    var wd: [i64] = []
+    wd = wd.push(900)
+    wd = wd.push(910)
+    wd = wd.push(920)
+    wd = wd.push(930)
+    emu.host_write(Cid(value: 8), Lba(value: 71), Addr(value: 36), wd)
+    emu.dev_step()
+    emu.host_reap()
+    emu.set_host_memcpy(\s, o, n: dma_copy_words(s, o, n))  # clean host DMA to read out
+    emu.host_read_submit(Cid(value: 9), Lba(value: 71), Addr(value: 40))
+    emu.dev_step()
+    emu.host_reap()
+    val rd = emu.host_fetch_data(Addr(value: 40), WORDS_PER_PAGE)
+    fails = fails + expect_eq(rd.get(0), 901, "host DMA corruption landed (900 -> 901)")
+    fails = fails + expect_eq(rd.get(3), 930, "host DMA left word3 intact")
+
+    if fails == 0:
+        print "NVME_DEVICE_SELFTEST PASS"
+    else:
+        print "NVME_DEVICE_SELFTEST FAIL ({fails})"
+    fails

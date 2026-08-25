@@ -1,0 +1,821 @@
+# Simple ERP in-memory business example.
+
+extern fn rt_cli_get_args() -> [text]
+
+fn cli_args() -> [text]:
+    rt_cli_get_args()
+
+class ErpFeature:
+    lane: text
+    easy: text
+    pro: text
+
+class CrmLead:
+    id: i64
+    name: text
+    account: text
+    contact: text
+    stage: text
+    value: i64
+    next_action: text
+
+class CrmQuote:
+    id: i64
+    lead_id: i64
+    amount: i64
+    approved: bool
+
+class Reservation:
+    id: i64
+    resource: text
+    kind: text
+    capacity: i64
+    booked: i64
+    status: text
+    deposit: i64
+
+class Sale:
+    id: i64
+    channel: text
+    subtotal: i64
+    tax: i64
+    paid: bool
+    status: text
+    audit_note: text
+
+class ErpUser:
+    id: i64
+    name: text
+    role: text
+
+class AuditEvent:
+    user_name: text
+    action: text
+    target: text
+    allowed: bool
+
+class InventoryItem:
+    sku: text
+    name: text
+    on_hand: i64
+    reserved: i64
+
+class StoreOrder:
+    id: i64
+    sku: text
+    qty: i64
+    paid: bool
+
+class TenantContext:
+    id: text
+    name: text
+
+class ErpSession:
+    token: text
+    user_id: i64
+    tenant_id: text
+    active: bool
+
+class LedgerEntry:
+    idempotency_key: text
+    tenant_id: text
+    debit_account: text
+    credit_account: text
+    amount: i64
+
+class RecoveryCheck:
+    name: text
+    passed: bool
+
+class AuditChainEntry:
+    sequence: i64
+    payload: text
+    previous_hash: i64
+    hash: i64
+
+class HealthCheck:
+    name: text
+    status: text
+
+class RepositorySnapshot:
+    schema_version: i64
+    tenant_id: text
+    lead_count: i64
+    order_count: i64
+    ledger_count: i64
+    chain_head: i64
+
+class MigrationStep:
+    version: i64
+    name: text
+    applied: bool
+
+class WriteRequest:
+    request_id: text
+    tenant_id: text
+    session_token: text
+    actor_id: i64
+    domain: text
+    idempotency_key: text
+    payload: text
+
+class WriteDecision:
+    allowed: bool
+    validation_ok: bool
+    rbac_ok: bool
+    reason: text
+
+class WriteReceipt:
+    request_id: text
+    audit_event_id: text
+    ledger_key: text
+    status: text
+
+class WriteResult:
+    ok: bool
+    reason: text
+    audit_action: text
+    ledger_key: text
+
+class ReadinessGate:
+    name: text
+    passed: bool
+
+class DurableSnapshotRecord:
+    path: text
+    payload: text
+    checksum: i64
+    restored: bool
+
+fn erp_features() -> List<ErpFeature>:
+    [
+        ErpFeature(
+            lane: "crm",
+            easy: "lead inbox, contact timeline, quote follow-up",
+            pro: "account hierarchy, activity SLA, quote approval, service history"
+        ),
+        ErpFeature(
+            lane: "reservation",
+            easy: "meeting, hotel room, and restaurant booking calendar",
+            pro: "resource capacity, holds, deposits, no-show policy, blackout rules"
+        ),
+        ErpFeature(
+            lane: "selling",
+            easy: "online shop, unmanned shop, restaurant, coffee, meal, bakery checkout",
+            pro: "auction, retail shop, inventory movement, tax, payment audit"
+        )
+    ]
+
+fn erp_feature_summary() -> text:
+    "Simple ERP: easy mode and pro mode for crm, reservation, selling"
+
+fn erp_feature_count() -> i64:
+    3
+
+fn sample_leads() -> List<CrmLead>:
+    [
+        CrmLead(id: 1, name: "Acme Cafe", account: "Acme", contact: "Mina", stage: "new", value: 120000, next_action: "call"),
+        CrmLead(id: 2, name: "North Hotel", account: "North Hotel", contact: "Jun", stage: "quote", value: 420000, next_action: "send quote"),
+        CrmLead(id: 3, name: "City Office", account: "City Office", contact: "Ara", stage: "won", value: 250000, next_action: "handoff")
+    ]
+
+fn sample_quotes() -> List<CrmQuote>:
+    [
+        CrmQuote(id: 1, lead_id: 2, amount: 420000, approved: false),
+        CrmQuote(id: 2, lead_id: 3, amount: 250000, approved: true)
+    ]
+
+fn sample_reservations() -> List<Reservation>:
+    [
+        Reservation(id: 1, resource: "meeting room A", kind: "meeting", capacity: 10, booked: 6, status: "open", deposit: 0),
+        Reservation(id: 2, resource: "hotel room 301", kind: "hotel room", capacity: 1, booked: 0, status: "open", deposit: 0),
+        Reservation(id: 3, resource: "bakery table 4", kind: "restaurant", capacity: 4, booked: 2, status: "open", deposit: 2000)
+    ]
+
+fn sample_sales() -> List<Sale>:
+    [
+        Sale(id: 1, channel: "online shop", subtotal: 10000, tax: 1000, paid: true, status: "paid", audit_note: "card"),
+        Sale(id: 2, channel: "unmanned shop", subtotal: 7000, tax: 700, paid: true, status: "paid", audit_note: "kiosk"),
+        Sale(id: 3, channel: "restaurant coffee meal bakery", subtotal: 15000, tax: 1500, paid: false, status: "ready", audit_note: "counter"),
+        Sale(id: 4, channel: "auction", subtotal: 30000, tax: 3000, paid: false, status: "won", audit_note: "bid close"),
+        Sale(id: 5, channel: "retail shop", subtotal: 22000, tax: 2200, paid: true, status: "paid", audit_note: "pos")
+    ]
+
+fn sample_users() -> List<ErpUser>:
+    [
+        ErpUser(id: 1, name: "Owner", role: "admin"),
+        ErpUser(id: 2, name: "Mina", role: "operator"),
+        ErpUser(id: 3, name: "Jae", role: "auditor")
+    ]
+
+fn sample_inventory() -> List<InventoryItem>:
+    [
+        InventoryItem(sku: "COFFEE", name: "Coffee beans", on_hand: 120, reserved: 20),
+        InventoryItem(sku: "MEAL", name: "Meal kit", on_hand: 40, reserved: 5),
+        InventoryItem(sku: "ROOM", name: "Room service bundle", on_hand: 8, reserved: 2)
+    ]
+
+fn sample_orders() -> List<StoreOrder>:
+    [
+        StoreOrder(id: 1, sku: "COFFEE", qty: 5, paid: true),
+        StoreOrder(id: 2, sku: "MEAL", qty: 6, paid: false),
+        StoreOrder(id: 3, sku: "ROOM", qty: 2, paid: true)
+    ]
+
+fn sample_tenant() -> TenantContext:
+    TenantContext(id: "tenant-simple-demo", name: "Simple Demo")
+
+fn sample_sessions() -> List<ErpSession>:
+    [
+        ErpSession(token: "sess-admin", user_id: 1, tenant_id: "tenant-simple-demo", active: true),
+        ErpSession(token: "sess-expired", user_id: 2, tenant_id: "tenant-simple-demo", active: false)
+    ]
+
+fn sample_ledger() -> List<LedgerEntry>:
+    [
+        LedgerEntry(idempotency_key: "sale-1", tenant_id: "tenant-simple-demo", debit_account: "cash", credit_account: "sales", amount: 11000),
+        LedgerEntry(idempotency_key: "stock-coffee-1", tenant_id: "tenant-simple-demo", debit_account: "cost_of_goods", credit_account: "inventory", amount: 500),
+        LedgerEntry(idempotency_key: "reservation-deposit-3", tenant_id: "tenant-simple-demo", debit_account: "cash", credit_account: "deposits", amount: 2000)
+    ]
+
+fn sample_recovery_checks() -> List<RecoveryCheck>:
+    [
+        RecoveryCheck(name: "backup-written", passed: true),
+        RecoveryCheck(name: "restore-readable", passed: true),
+        RecoveryCheck(name: "ledger-replay-balanced", passed: true)
+    ]
+
+fn sample_audit_chain() -> List<AuditChainEntry>:
+    [
+        make_audit_chain_entry(1, "login Owner", 0),
+        make_audit_chain_entry(2, "sale.write sale:1", make_audit_hash(1, "login Owner", 0)),
+        make_audit_chain_entry(3, "backup.restore check", make_audit_hash(2, "sale.write sale:1", make_audit_hash(1, "login Owner", 0)))
+    ]
+
+fn sample_health_checks() -> List<HealthCheck>:
+    [
+        HealthCheck(name: "ledger", status: "ok"),
+        HealthCheck(name: "backup", status: "ok"),
+        HealthCheck(name: "sessions", status: "ok")
+    ]
+
+fn sample_migrations() -> List<MigrationStep>:
+    [
+        MigrationStep(version: 1, name: "identity-core", applied: true),
+        MigrationStep(version: 2, name: "ledger-core", applied: true),
+        MigrationStep(version: 3, name: "security-ops", applied: true)
+    ]
+
+fn sample_write_requests() -> List<WriteRequest>:
+    [
+        WriteRequest(request_id: "req-crm-1", tenant_id: "tenant-simple-demo", session_token: "sess-admin", actor_id: 1, domain: "crm", idempotency_key: "crm-lead-1", payload: "advance lead"),
+        WriteRequest(request_id: "req-reservation-1", tenant_id: "tenant-simple-demo", session_token: "sess-admin", actor_id: 1, domain: "reservation", idempotency_key: "reservation-1", payload: "book room"),
+        WriteRequest(request_id: "req-sale-99", tenant_id: "tenant-simple-demo", session_token: "sess-admin", actor_id: 1, domain: "sale", idempotency_key: "sale-99", payload: "capture sale")
+    ]
+
+fn sample_write_results() -> List<WriteResult>:
+    [
+        guarded_crm_write(sample_sessions()[0], sample_tenant(), sample_users()[0], sample_leads()[0], "crm-lead-1"),
+        guarded_reservation_write(sample_sessions()[0], sample_tenant(), sample_users()[0], sample_reservations()[0], "reservation-1"),
+        guarded_sale_write(sample_sessions()[0], sample_tenant(), sample_users()[0], sample_sales()[0], LedgerEntry(idempotency_key: "sale-99", tenant_id: "tenant-simple-demo", debit_account: "cash", credit_account: "sales", amount: 900)),
+        guarded_sale_write(sample_sessions()[1], sample_tenant(), sample_users()[1], sample_sales()[0], LedgerEntry(idempotency_key: "sale-100", tenant_id: "tenant-simple-demo", debit_account: "cash", credit_account: "sales", amount: 1000)),
+        guarded_sale_write(sample_sessions()[0], sample_tenant(), sample_users()[2], sample_sales()[0], LedgerEntry(idempotency_key: "sale-101", tenant_id: "tenant-simple-demo", debit_account: "cash", credit_account: "sales", amount: 1000))
+    ]
+
+fn sample_readiness_gates() -> List<ReadinessGate>:
+    [
+        ReadinessGate(name: "identity", passed: session_valid(sample_sessions()[0], sample_tenant(), sample_users()[0])),
+        ReadinessGate(name: "rbac", passed: user_can(sample_users()[0], "ledger.close") and not user_can(sample_users()[2], "sale.write")),
+        ReadinessGate(name: "validation", passed: validate_lead(sample_leads()[0]) and validate_reservation(sample_reservations()[0]) and validate_sale(sample_sales()[0])),
+        ReadinessGate(name: "ledger", passed: ledger_total_amount(sample_ledger()) == 13500 and ledger_account_balance(sample_ledger(), "cash") == 13000),
+        ReadinessGate(name: "recovery", passed: recovery_ready(sample_recovery_checks()) and restore_matches_snapshot(snapshot_current())),
+        ReadinessGate(name: "security", passed: audit_chain_valid(sample_audit_chain()) and operations_ready(sample_health_checks())),
+        ReadinessGate(name: "writes", passed: allowed_write_count(sample_write_results()) == 3 and denied_write_count(sample_write_results()) == 2 and accepted_receipt_count(sample_write_requests()) == 3),
+        ReadinessGate(name: "durable-store", passed: durable_snapshot_ready(sample_durable_snapshot()))
+    ]
+
+fn erp_has_lane(name: text) -> bool:
+    for feature in erp_features():
+        if feature.lane == name:
+            return true
+    false
+
+fn role_can(role: text, action: text) -> bool:
+    if role == "admin":
+        return true
+    if role == "operator":
+        return action == "crm.write" or action == "reservation.write" or action == "sale.write"
+    if role == "auditor":
+        return action == "audit.read" or action == "report.read"
+    false
+
+fn user_can(user: ErpUser, action: text) -> bool:
+    role_can(user.role, action)
+
+fn active_session_count(sessions: List<ErpSession>) -> i64:
+    var count = 0
+    for session in sessions:
+        if session.active:
+            count = count + 1
+    count
+
+fn session_valid(session: ErpSession, tenant: TenantContext, user: ErpUser) -> bool:
+    session.active and session.tenant_id == tenant.id and session.user_id == user.id and session.token.len() > 0
+
+fn audit(user_name: text, action: text, target: text, allowed: bool) -> AuditEvent:
+    AuditEvent(user_name: user_name, action: action, target: target, allowed: allowed)
+
+fn valid_money(amount: i64) -> bool:
+    amount >= 0
+
+fn validate_lead(lead: CrmLead) -> bool:
+    lead.id > 0 and lead.name.len() > 0 and lead.account.len() > 0 and lead.contact.len() > 0 and valid_money(lead.value)
+
+fn validate_reservation(reservation: Reservation) -> bool:
+    reservation.id > 0 and reservation.resource.len() > 0 and reservation.capacity >= 0 and reservation.booked >= 0 and reservation.booked <= reservation.capacity and valid_money(reservation.deposit)
+
+fn validate_sale(sale: Sale) -> bool:
+    sale.id > 0 and sale.channel.len() > 0 and valid_money(sale.subtotal) and valid_money(sale.tax) and sale.audit_note.len() > 0
+
+fn production_control_summary() -> text:
+    "Production controls: rbac=3 roles, validation=crm/reservation/sale, audit=enabled, inventory=3 skus, fulfillment=paid-stock"
+
+fn ledger_entry_valid(entry: LedgerEntry, tenant: TenantContext) -> bool:
+    entry.idempotency_key.len() > 0 and entry.tenant_id == tenant.id and entry.debit_account.len() > 0 and entry.credit_account.len() > 0 and entry.debit_account != entry.credit_account and valid_money(entry.amount)
+
+fn ledger_has_key(entries: List<LedgerEntry>, key: text) -> bool:
+    for entry in entries:
+        if entry.idempotency_key == key:
+            return true
+    false
+
+fn ledger_accepts_new(entries: List<LedgerEntry>, entry: LedgerEntry, tenant: TenantContext) -> bool:
+    ledger_entry_valid(entry, tenant) and not ledger_has_key(entries, entry.idempotency_key)
+
+fn ledger_total_amount(entries: List<LedgerEntry>) -> i64:
+    var total = 0
+    for entry in entries:
+        total = total + entry.amount
+    total
+
+fn ledger_account_balance(entries: List<LedgerEntry>, account: text) -> i64:
+    var balance = 0
+    for entry in entries:
+        if entry.debit_account == account:
+            balance = balance + entry.amount
+        if entry.credit_account == account:
+            balance = balance - entry.amount
+    balance
+
+fn recovery_passed_count(checks: List<RecoveryCheck>) -> i64:
+    var count = 0
+    for check in checks:
+        if check.passed:
+            count = count + 1
+    count
+
+fn recovery_ready(checks: List<RecoveryCheck>) -> bool:
+    recovery_passed_count(checks) == checks.len()
+
+fn production_recovery_summary() -> text:
+    "Production recovery: tenant={sample_tenant().id}, active_sessions={active_session_count(sample_sessions())}, ledger_entries={sample_ledger().len()}, ledger_total={ledger_total_amount(sample_ledger())}, idempotency=pass, recovery={recovery_passed_count(sample_recovery_checks())} checks"
+
+fn simple_text_score(value: text) -> i64:
+    var total = 0
+    var i = 0
+    while i < value.len():
+        total = total + 1
+        i = i + 1
+    total
+
+fn make_audit_hash(sequence: i64, payload: text, previous_hash: i64) -> i64:
+    previous_hash * 31 + sequence * 17 + simple_text_score(payload)
+
+fn make_audit_chain_entry(sequence: i64, payload: text, previous_hash: i64) -> AuditChainEntry:
+    AuditChainEntry(sequence: sequence, payload: payload, previous_hash: previous_hash, hash: make_audit_hash(sequence, payload, previous_hash))
+
+fn audit_chain_valid(entries: List<AuditChainEntry>) -> bool:
+    var previous = 0
+    var expected_sequence = 1
+    for entry in entries:
+        if entry.sequence != expected_sequence:
+            return false
+        if entry.previous_hash != previous:
+            return false
+        if entry.hash != make_audit_hash(entry.sequence, entry.payload, entry.previous_hash):
+            return false
+        previous = entry.hash
+        expected_sequence = expected_sequence + 1
+    true
+
+fn redact_secret(value: text) -> text:
+    if value.len() == 0:
+        return ""
+    "[redacted]"
+
+fn safe_session_label(session: ErpSession) -> text:
+    "session:{redact_secret(session.token)} user={session.user_id} tenant={session.tenant_id}"
+
+fn health_ok_count(checks: List<HealthCheck>) -> i64:
+    var count = 0
+    for check in checks:
+        if check.status == "ok":
+            count = count + 1
+    count
+
+fn operations_ready(checks: List<HealthCheck>) -> bool:
+    health_ok_count(checks) == checks.len()
+
+fn production_security_summary() -> text:
+    "Production security: audit_chain=valid, redaction=pass, health={health_ok_count(sample_health_checks())} ok, restore_parity=pass"
+
+fn audit_chain_head(entries: List<AuditChainEntry>) -> i64:
+    if entries.len() == 0:
+        return 0
+    entries[entries.len() - 1].hash
+
+fn snapshot_current() -> RepositorySnapshot:
+    RepositorySnapshot(
+        schema_version: 3,
+        tenant_id: sample_tenant().id,
+        lead_count: sample_leads().len(),
+        order_count: sample_orders().len(),
+        ledger_count: sample_ledger().len(),
+        chain_head: audit_chain_head(sample_audit_chain())
+    )
+
+fn migrations_current(steps: List<MigrationStep>, version: i64) -> bool:
+    var applied = 0
+    for step in steps:
+        if step.applied:
+            applied = applied + 1
+    applied == steps.len() and steps.len() > 0 and steps[steps.len() - 1].version == version
+
+fn restore_matches_snapshot(snapshot: RepositorySnapshot) -> bool:
+    snapshot.schema_version == 3 and snapshot.tenant_id == sample_tenant().id and snapshot.lead_count == sample_leads().len() and snapshot.order_count == sample_orders().len() and snapshot.ledger_count == sample_ledger().len() and snapshot.chain_head == audit_chain_head(sample_audit_chain())
+
+fn snapshot_payload(snapshot: RepositorySnapshot) -> text:
+    "schema={snapshot.schema_version};tenant={snapshot.tenant_id};leads={snapshot.lead_count};orders={snapshot.order_count};ledger={snapshot.ledger_count};chain={snapshot.chain_head}"
+
+fn snapshot_checksum(snapshot: RepositorySnapshot) -> i64:
+    snapshot.schema_version * 1000000 + snapshot.lead_count * 10000 + snapshot.order_count * 1000 + snapshot.ledger_count * 100 + snapshot.chain_head
+
+fn durable_snapshot_write(path: text, snapshot: RepositorySnapshot) -> DurableSnapshotRecord:
+    val payload = snapshot_payload(snapshot)
+    DurableSnapshotRecord(path: path, payload: payload, checksum: snapshot_checksum(snapshot), restored: false)
+
+fn durable_snapshot_ready(record: DurableSnapshotRecord) -> bool:
+    record.restored and record.payload == snapshot_payload(snapshot_current()) and record.checksum == snapshot_checksum(snapshot_current())
+
+fn sample_durable_snapshot() -> DurableSnapshotRecord:
+    durable_snapshot_write("/tmp/simple_erp_snapshot.txt", snapshot_current())
+
+fn production_persistence_summary() -> text:
+    "Production persistence: schema=3, migrations=3 applied, snapshot=consistent, restore_snapshot=pass, durable_snapshot=missing, checksum={sample_durable_snapshot().checksum}"
+
+fn production_durability_summary() -> text:
+    "Production durability: path={sample_durable_snapshot().path}, restored=false, status=blocked-durable-store"
+
+fn write_action(domain: text) -> text:
+    if domain == "crm":
+        return "crm.write"
+    if domain == "reservation":
+        return "reservation.write"
+    if domain == "sale":
+        return "sale.write"
+    "unknown.write"
+
+fn request_session_matches(request: WriteRequest, session: ErpSession, tenant: TenantContext, user: ErpUser) -> bool:
+    session_valid(session, tenant, user) and request.tenant_id == tenant.id and request.session_token == session.token and request.actor_id == user.id
+
+fn decide_write_request(request: WriteRequest, session: ErpSession, tenant: TenantContext, user: ErpUser) -> WriteDecision:
+    val validation_ok = request.payload.len() > 0 and request.idempotency_key.len() > 0
+    val rbac_ok = user_can(user, write_action(request.domain))
+    if not request_session_matches(request, session, tenant, user):
+        return WriteDecision(allowed: false, validation_ok: validation_ok, rbac_ok: rbac_ok, reason: "invalid-session")
+    if not rbac_ok:
+        return WriteDecision(allowed: false, validation_ok: validation_ok, rbac_ok: false, reason: "forbidden")
+    if not validation_ok:
+        return WriteDecision(allowed: false, validation_ok: false, rbac_ok: rbac_ok, reason: "invalid-request")
+    if ledger_has_key(sample_ledger(), request.idempotency_key):
+        return WriteDecision(allowed: false, validation_ok: validation_ok, rbac_ok: rbac_ok, reason: "duplicate-ledger-key")
+    WriteDecision(allowed: true, validation_ok: true, rbac_ok: true, reason: "accepted")
+
+fn write_receipt(request: WriteRequest, decision: WriteDecision) -> WriteReceipt:
+    if decision.allowed:
+        return WriteReceipt(request_id: request.request_id, audit_event_id: "audit-" + request.request_id, ledger_key: request.idempotency_key, status: "accepted")
+    WriteReceipt(request_id: request.request_id, audit_event_id: "", ledger_key: "", status: decision.reason)
+
+fn accepted_receipt_count(requests: List<WriteRequest>) -> i64:
+    var count = 0
+    for request in requests:
+        val decision = decide_write_request(request, sample_sessions()[0], sample_tenant(), sample_users()[0])
+        val receipt = write_receipt(request, decision)
+        if receipt.status == "accepted":
+            count = count + 1
+    count
+
+fn write_denied(reason: text, action: text) -> WriteResult:
+    WriteResult(ok: false, reason: reason, audit_action: action, ledger_key: "")
+
+fn write_allowed(action: text, ledger_key: text) -> WriteResult:
+    WriteResult(ok: true, reason: "accepted", audit_action: action, ledger_key: ledger_key)
+
+fn guarded_crm_write(session: ErpSession, tenant: TenantContext, user: ErpUser, lead: CrmLead, ledger_key: text) -> WriteResult:
+    if not session_valid(session, tenant, user):
+        return write_denied("invalid-session", "crm.write")
+    if not user_can(user, "crm.write"):
+        return write_denied("forbidden", "crm.write")
+    if not validate_lead(lead):
+        return write_denied("invalid-lead", "crm.write")
+    if ledger_has_key(sample_ledger(), ledger_key):
+        return write_denied("duplicate-ledger-key", "crm.write")
+    write_allowed("crm.write", ledger_key)
+
+fn guarded_reservation_write(session: ErpSession, tenant: TenantContext, user: ErpUser, reservation: Reservation, ledger_key: text) -> WriteResult:
+    if not session_valid(session, tenant, user):
+        return write_denied("invalid-session", "reservation.write")
+    if not user_can(user, "reservation.write"):
+        return write_denied("forbidden", "reservation.write")
+    if not validate_reservation(reservation):
+        return write_denied("invalid-reservation", "reservation.write")
+    if ledger_has_key(sample_ledger(), ledger_key):
+        return write_denied("duplicate-ledger-key", "reservation.write")
+    write_allowed("reservation.write", ledger_key)
+
+fn guarded_sale_write(session: ErpSession, tenant: TenantContext, user: ErpUser, sale: Sale, entry: LedgerEntry) -> WriteResult:
+    if not session_valid(session, tenant, user):
+        return write_denied("invalid-session", "sale.write")
+    if not user_can(user, "sale.write"):
+        return write_denied("forbidden", "sale.write")
+    if not validate_sale(sale):
+        return write_denied("invalid-sale", "sale.write")
+    if not ledger_accepts_new(sample_ledger(), entry, tenant):
+        return write_denied("duplicate-or-invalid-ledger", "sale.write")
+    write_allowed("sale.write", entry.idempotency_key)
+
+fn allowed_write_count(results: List<WriteResult>) -> i64:
+    var count = 0
+    for result in results:
+        if result.ok:
+            count = count + 1
+    count
+
+fn denied_write_count(results: List<WriteResult>) -> i64:
+    var count = 0
+    for result in results:
+        if not result.ok:
+            count = count + 1
+    count
+
+fn production_write_summary() -> text:
+    "Production writes: guarded_writes={allowed_write_count(sample_write_results())} allowed, denied={denied_write_count(sample_write_results())}, receipts={accepted_receipt_count(sample_write_requests())}, gates=session+rbac+validation+audit+ledger"
+
+fn readiness_passed_count(gates: List<ReadinessGate>) -> i64:
+    var count = 0
+    for gate in gates:
+        if gate.passed:
+            count = count + 1
+    count
+
+fn production_ready(gates: List<ReadinessGate>) -> bool:
+    gates.len() > 0 and readiness_passed_count(gates) == gates.len()
+
+fn production_readiness_summary() -> text:
+    "Production readiness: gates={readiness_passed_count(sample_readiness_gates())}/{sample_readiness_gates().len()}, status=blocked-durable-store"
+
+fn lead_pipeline_value(leads: List<CrmLead>) -> i64:
+    var total = 0
+    for lead in leads:
+        if lead.stage != "won":
+            total = total + lead.value
+    total
+
+fn open_lead_count(leads: List<CrmLead>) -> i64:
+    var count = 0
+    for lead in leads:
+        if lead.stage != "won":
+            count = count + 1
+    count
+
+fn advance_lead(lead: CrmLead, stage: text, next_action: text) -> CrmLead:
+    CrmLead(id: lead.id, name: lead.name, account: lead.account, contact: lead.contact, stage: stage, value: lead.value, next_action: next_action)
+
+fn approved_quote_total(quotes: List<CrmQuote>) -> i64:
+    var total = 0
+    for quote in quotes:
+        if quote.approved:
+            total = total + quote.amount
+    total
+
+fn reservation_can_book(reservation: Reservation, seats: i64) -> bool:
+    reservation.status == "open" and seats > 0 and reservation.booked + seats <= reservation.capacity
+
+fn book_reservation(reservation: Reservation, seats: i64) -> Reservation:
+    assert reservation_can_book(reservation, seats)
+    Reservation(
+        id: reservation.id,
+        resource: reservation.resource,
+        kind: reservation.kind,
+        capacity: reservation.capacity,
+        booked: reservation.booked + seats,
+        status: reservation.status,
+        deposit: reservation.deposit
+    )
+
+fn hold_reservation(reservation: Reservation, seats: i64, deposit: i64) -> Reservation:
+    assert reservation_can_book(reservation, seats)
+    Reservation(
+        id: reservation.id,
+        resource: reservation.resource,
+        kind: reservation.kind,
+        capacity: reservation.capacity,
+        booked: reservation.booked + seats,
+        status: "held",
+        deposit: deposit
+    )
+
+fn cancel_reservation(reservation: Reservation) -> Reservation:
+    Reservation(
+        id: reservation.id,
+        resource: reservation.resource,
+        kind: reservation.kind,
+        capacity: reservation.capacity,
+        booked: 0,
+        status: "cancelled",
+        deposit: 0
+    )
+
+fn no_show_reservation(reservation: Reservation) -> Reservation:
+    Reservation(
+        id: reservation.id,
+        resource: reservation.resource,
+        kind: reservation.kind,
+        capacity: reservation.capacity,
+        booked: reservation.booked,
+        status: "no-show",
+        deposit: reservation.deposit
+    )
+
+fn open_reservation_slots(reservations: List<Reservation>) -> i64:
+    var total = 0
+    for reservation in reservations:
+        if reservation.status == "open":
+            total = total + reservation.capacity - reservation.booked
+    total
+
+fn sale_total(sale: Sale) -> i64:
+    sale.subtotal + sale.tax
+
+fn mark_sale_paid(sale: Sale) -> Sale:
+    Sale(
+        id: sale.id,
+        channel: sale.channel,
+        subtotal: sale.subtotal,
+        tax: sale.tax,
+        paid: true,
+        status: "paid",
+        audit_note: sale.audit_note
+    )
+
+fn unpaid_sales_total(sales: List<Sale>) -> i64:
+    var total = 0
+    for sale in sales:
+        if not sale.paid:
+            total = total + sale_total(sale)
+    total
+
+fn sales_channel_count(sales: List<Sale>) -> i64:
+    var count = 0
+    for sale in sales:
+        if sale.channel.len() > 0:
+            count = count + 1
+    count
+
+fn payment_audit_count(sales: List<Sale>) -> i64:
+    var count = 0
+    for sale in sales:
+        if sale.audit_note.len() > 0:
+            count = count + 1
+    count
+
+fn inventory_available(item: InventoryItem) -> i64:
+    item.on_hand - item.reserved
+
+fn inventory_available_total(items: List<InventoryItem>) -> i64:
+    var total = 0
+    for item in items:
+        total = total + inventory_available(item)
+    total
+
+fn find_inventory(items: List<InventoryItem>, sku: text) -> InventoryItem:
+    for item in items:
+        if item.sku == sku:
+            return item
+    InventoryItem(sku: "", name: "", on_hand: 0, reserved: 0)
+
+fn order_can_fulfill(order: StoreOrder, items: List<InventoryItem>) -> bool:
+    if not order.paid:
+        return false
+    val item = find_inventory(items, order.sku)
+    item.sku.len() > 0 and order.qty > 0 and inventory_available(item) >= order.qty
+
+fn fulfillable_order_count(orders: List<StoreOrder>, items: List<InventoryItem>) -> i64:
+    var count = 0
+    for order in orders:
+        if order_can_fulfill(order, items):
+            count = count + 1
+    count
+
+fn easy_mode_dashboard() -> text:
+    easy_mode_dashboard_for(sample_leads(), sample_reservations(), sample_sales())
+
+fn pro_mode_dashboard() -> text:
+    pro_mode_dashboard_for(sample_leads(), sample_reservations(), sample_sales())
+
+fn easy_mode_dashboard_for(leads: List<CrmLead>, reservations: List<Reservation>, sales: List<Sale>) -> text:
+    "Easy ERP: follow {open_lead_count(leads)} open leads, book {open_reservation_slots(reservations)} open slots, collect {unpaid_sales_total(sales)} unpaid"
+
+fn pro_mode_dashboard_for(leads: List<CrmLead>, reservations: List<Reservation>, sales: List<Sale>) -> text:
+    "Pro ERP: pipeline={lead_pipeline_value(leads)}, approved_quotes={approved_quote_total(sample_quotes())}, reservation_open_slots={open_reservation_slots(reservations)}, unpaid_sales={unpaid_sales_total(sales)}, selling_channels={sales_channel_count(sales)}, payment_audits={payment_audit_count(sales)}, inventory_available={inventory_available_total(sample_inventory())}, fulfillable_orders={fulfillable_order_count(sample_orders(), sample_inventory())}"
+
+fn render_interface(mode: text) -> text:
+    if mode == "easy":
+        return easy_mode_dashboard()
+    if mode == "pro":
+        return pro_mode_dashboard()
+    erp_feature_summary() + "\n" + easy_mode_dashboard() + "\n" + pro_mode_dashboard() + "\n" + production_control_summary()
+
+fn main():
+    assert erp_feature_count() == 3
+    assert erp_has_lane("crm")
+    assert erp_has_lane("reservation")
+    assert erp_has_lane("selling")
+    assert user_can(sample_users()[0], "ledger.close")
+    assert user_can(sample_users()[1], "sale.write")
+    assert not user_can(sample_users()[2], "sale.write")
+    assert active_session_count(sample_sessions()) == 1
+    assert session_valid(sample_sessions()[0], sample_tenant(), sample_users()[0])
+    assert audit("Mina", "sale.write", "sale:3", true).allowed
+    assert validate_lead(sample_leads()[0])
+    assert validate_reservation(sample_reservations()[0])
+    assert validate_sale(sample_sales()[0])
+    assert lead_pipeline_value(sample_leads()) == 540000
+    assert open_lead_count(sample_leads()) == 2
+    assert advance_lead(sample_leads()[0], "quote", "send quote").stage == "quote"
+    assert approved_quote_total(sample_quotes()) == 250000
+    assert open_reservation_slots(sample_reservations()) == 7
+    assert reservation_can_book(sample_reservations()[0], 4)
+    assert not reservation_can_book(sample_reservations()[0], 5)
+    assert book_reservation(sample_reservations()[0], 4).booked == 10
+    assert hold_reservation(sample_reservations()[1], 1, 10000).status == "held"
+    assert cancel_reservation(sample_reservations()[0]).status == "cancelled"
+    assert no_show_reservation(sample_reservations()[2]).status == "no-show"
+    assert unpaid_sales_total(sample_sales()) == 49500
+    assert mark_sale_paid(sample_sales()[3]).paid
+    assert sales_channel_count(sample_sales()) == 5
+    assert payment_audit_count(sample_sales()) == 5
+    assert inventory_available_total(sample_inventory()) == 141
+    assert fulfillable_order_count(sample_orders(), sample_inventory()) == 2
+    assert ledger_entry_valid(sample_ledger()[0], sample_tenant())
+    assert not ledger_accepts_new(sample_ledger(), sample_ledger()[0], sample_tenant())
+    assert ledger_accepts_new(sample_ledger(), LedgerEntry(idempotency_key: "sale-99", tenant_id: "tenant-simple-demo", debit_account: "cash", credit_account: "sales", amount: 900), sample_tenant())
+    assert ledger_total_amount(sample_ledger()) == 13500
+    assert ledger_account_balance(sample_ledger(), "cash") == 13000
+    assert recovery_ready(sample_recovery_checks())
+    assert audit_chain_valid(sample_audit_chain())
+    assert not audit_chain_valid([make_audit_chain_entry(1, "login Owner changed", 0), sample_audit_chain()[1]])
+    assert safe_session_label(sample_sessions()[0]).contains("[redacted]")
+    assert not safe_session_label(sample_sessions()[0]).contains("sess-admin")
+    assert operations_ready(sample_health_checks())
+    assert migrations_current(sample_migrations(), 3)
+    assert restore_matches_snapshot(snapshot_current())
+    assert not durable_snapshot_ready(sample_durable_snapshot())
+    assert allowed_write_count(sample_write_results()) == 3
+    assert denied_write_count(sample_write_results()) == 2
+    assert guarded_sale_write(sample_sessions()[0], sample_tenant(), sample_users()[0], sample_sales()[0], sample_ledger()[0]).reason == "duplicate-or-invalid-ledger"
+    assert accepted_receipt_count(sample_write_requests()) == 3
+    assert write_receipt(sample_write_requests()[0], decide_write_request(sample_write_requests()[0], sample_sessions()[0], sample_tenant(), sample_users()[0])).status == "accepted"
+    assert not production_ready(sample_readiness_gates())
+    assert easy_mode_dashboard().contains("Easy ERP")
+    assert pro_mode_dashboard().contains("pipeline=540000")
+    assert production_control_summary().contains("audit=enabled")
+    assert production_recovery_summary().contains("idempotency=pass")
+    assert production_security_summary().contains("audit_chain=valid")
+    assert production_persistence_summary().contains("restore_snapshot=pass")
+    assert production_persistence_summary().contains("durable_snapshot=missing")
+    assert production_write_summary().contains("guarded_writes=3")
+    assert production_readiness_summary().contains("gates=7/8")
+    assert render_interface("easy").starts_with("Easy ERP")
+    assert render_interface("pro").starts_with("Pro ERP")
+    val args = cli_args()
+    if args.len() > 2:
+        print render_interface(args[2])
+    else:
+        print render_interface("all")
+        print production_recovery_summary()
+        print production_security_summary()
+        print production_persistence_summary()
+        print production_durability_summary()
+        print production_write_summary()
+        print production_readiness_summary()

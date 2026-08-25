@@ -1,0 +1,14 @@
+use std.gpu.engine2d.backend_metal.{MetalBackend}
+use std.gpu.engine2d.backend_probe.{backend_status_text}
+use examples.ui.engine2d_backend_scene.{W, H, run_engine2d_scene_backend}
+
+fn main() -> i64:
+    print "  backend 'metal':"
+    var backend = MetalBackend.create()
+    if not backend.init(W, H):
+        print "    status: {backend_status_text(backend.last_probe.status)} - {backend.last_probe.reason}"
+        print "    -> skipped (not implemented/available on this host)"
+        return 1
+    if run_engine2d_scene_backend(backend, "metal", false):
+        return 0
+    1

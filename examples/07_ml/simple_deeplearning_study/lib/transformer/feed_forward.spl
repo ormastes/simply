@@ -1,0 +1,39 @@
+# Feed-Forward Network — from scratch
+# Chapter 4: "Build a Large Language Model From Scratch" (Rasbt)
+#
+# Two-layer FFN with GELU activation:
+#   FFN(x) = Linear2(GELU(Linear1(x)))
+#
+# The expansion ratio (typically 4x) creates a bottleneck.
+
+use std.pure.tensor.{PureTensor}
+use examples.simple_deeplearning_study.lib.prim.linear.{StudyLinear}
+use examples.simple_deeplearning_study.lib.prim.gelu.{StudyGELU}
+use examples.simple_deeplearning_study.lib.prim.dropout.{StudyDropout}
+
+class StudyFeedForward:
+    linear1: StudyLinear      # [d_model -> d_ff]
+    gelu: StudyGELU
+    linear2: StudyLinear      # [d_ff -> d_model]
+    dropout: StudyDropout
+
+    static fn create(d_model: i64, d_ff: i64, drop_rate: f64) -> StudyFeedForward:
+        StudyFeedForward(
+            linear1: StudyLinear.create(d_model, d_ff, true),
+            gelu: StudyGELU.create(),
+            linear2: StudyLinear.create(d_ff, d_model, true),
+            dropout: StudyDropout.create(drop_rate)
+        )
+
+    # Forward: x [seq_len, d_model] -> [seq_len, d_model]
+    fn forward(x: PureTensor<f64>) -> PureTensor<f64>:
+        var out = self.linear1.forward(x)
+        out = self.gelu.forward(out)
+        out = self.linear2.forward(out)
+        self.dropout.forward(out)
+
+fn study_ff_create(d_model: i64, drop_rate: f64) -> StudyFeedForward:
+    # Default expansion ratio: 4x
+    StudyFeedForward.create(d_model, d_model * 4, drop_rate)
+
+export StudyFeedForward, study_ff_create

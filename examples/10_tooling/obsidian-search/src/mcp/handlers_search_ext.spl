@@ -1,0 +1,129 @@
+# MCP Handlers — Phase C Enhanced Search dispatch
+#
+# Routes tool/call requests for enhanced search tools to core/search_ext
+# and formats results as MCP tool responses.
+
+use src.util.json_helpers.{js, jp, jo, jo1, jo2, jo3, ja, ji, jf, jb, make_json_result, make_error, tool_text_result, extract_field, extract_nested, extract_arg, safe_substr, LB, RB, SB_L, SB_R}
+use src.core.search_engine.{SearchResult}
+use src.core.search_ext.{fuzzy_search, search_replace_in_note, search_replace_in_vault, search_by_date_range, search_with_aliases, reindex_vault}
+
+# --- Format search results as JSON ---
+
+fn format_search_results_ext(results: [SearchResult]) -> text:
+    var items: [text] = []
+    for r in results:
+        var pairs: [text] = []
+        pairs.push(jp("path", js(r.path)))
+        pairs.push(jp("title", js(r.title)))
+        if r.snippet != "":
+            pairs.push(jp("snippet", js(r.snippet)))
+        pairs.push(jp("score", jf(r.bm25_score)))
+        if r.tags != "":
+            pairs.push(jp("tags", js(r.tags)))
+        items.push(jo(pairs))
+    ja(items)
+
+# --- Main handler dispatch ---
+
+fn handle_search_ext_tool(id: text, tool_name: text, body: text, vault_path: text) -> text:
+
+    if tool_name == "fuzzy_search":
+        val query_str = extract_arg(body, "query")
+        val threshold_str = extract_arg(body, "threshold")
+        val limit_str = extract_arg(body, "limit")
+        if query_str == "":
+            return make_error(id, -32602, "Missing required parameter: query")
+        var threshold = 0.3
+        if threshold_str != "":
+            threshold = float(threshold_str) ?? 0.3
+        var limit = if limit_str != "": int(limit_str) ?? 20 else: 20
+        if limit <= 0:
+            limit = 20
+        if limit > 100:
+            limit = 100
+        val results = fuzzy_search(vault_path, query_str, threshold, limit)
+        val json_results = format_search_results_ext(results)
+        val output = jo2(jp("results", json_results), jp("count", ji(results.len())))
+        return tool_text_result(id, output)
+
+    elif tool_name == "search_replace":
+        val path = extract_arg(body, "path")
+        val search = extract_arg(body, "search")
+        val replace = extract_arg(body, "replace")
+        val dry_run_str = extract_arg(body, "dry_run")
+        if search == "":
+            return make_error(id, -32602, "Missing required parameter: search")
+        if replace == "":
+            return make_error(id, -32602, "Missing required parameter: replace")
+        val dry_run = dry_run_str != "false"
+
+        if path == "":
+            # Vault-wide search and replace
+            val result = search_replace_in_vault(vault_path, search, replace, dry_run)
+            val files_modified = result.0
+            val total_matches = result.1
+            val mode_label = if dry_run: "dry_run" else: "applied"
+            val output = jo3(
+                jp("mode", js(mode_label)),
+                jp("files_modified", ji(files_modified)),
+                jp("total_matches", ji(total_matches))
+            )
+            return tool_text_result(id, output)
+        else:
+            # Single note search and replace
+            val result = search_replace_in_note(vault_path, path, search, replace, dry_run)
+            val match_count = result.0
+            val message = result.1
+            val mode_label = if dry_run: "dry_run" else: "applied"
+            val output = jo3(
+                jp("mode", js(mode_label)),
+                jp("match_count", ji(match_count)),
+                jp("message", js(message))
+            )
+            return tool_text_result(id, output)
+
+    elif tool_name == "search_by_date":
+        val start_date = extract_arg(body, "start_date")
+        val end_date = extract_arg(body, "end_date")
+        val query_str = extract_arg(body, "query")
+        val limit_str = extract_arg(body, "limit")
+        if start_date == "":
+            return make_error(id, -32602, "Missing required parameter: start_date")
+        if end_date == "":
+            return make_error(id, -32602, "Missing required parameter: end_date")
+        var limit = if limit_str != "": int(limit_str) ?? 20 else: 20
+        if limit <= 0:
+            limit = 20
+        if limit > 100:
+            limit = 100
+        val results = search_by_date_range(vault_path, start_date, end_date, query_str, limit)
+        val json_results = format_search_results_ext(results)
+        val output = jo2(jp("results", json_results), jp("count", ji(results.len())))
+        return tool_text_result(id, output)
+
+    elif tool_name == "search_with_aliases":
+        val query_str = extract_arg(body, "query")
+        val limit_str = extract_arg(body, "limit")
+        if query_str == "":
+            return make_error(id, -32602, "Missing required parameter: query")
+        var limit = if limit_str != "": int(limit_str) ?? 20 else: 20
+        if limit <= 0:
+            limit = 20
+        if limit > 100:
+            limit = 100
+        val results = search_with_aliases(vault_path, query_str, limit)
+        val json_results = format_search_results_ext(results)
+        val output = jo2(jp("results", json_results), jp("count", ji(results.len())))
+        return tool_text_result(id, output)
+
+    elif tool_name == "reindex_vault":
+        val result = reindex_vault(vault_path)
+        val total_files = result.0
+        val total_links = result.1
+        val output = jo2(
+            jp("total_files", ji(total_files)),
+            jp("total_links", ji(total_links))
+        )
+        return tool_text_result(id, output)
+
+    make_error(id, -32602, "Unknown enhanced search tool: " + tool_name)

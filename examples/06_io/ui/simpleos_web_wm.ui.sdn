@@ -1,0 +1,18 @@
+app:
+    title: "SimpleOS Web WM"
+    theme: glass_obsidian_dark
+
+layout:
+    type: vbox
+    id: root
+    children:
+        shell:
+            type: panel
+            id: simpleos_wm_shell
+            title: "SimpleOS"
+            flex: 1
+            children:
+                summary:
+                    type: text
+                    id: simpleos_wm_summary
+                    content: "SimpleOS hosted desktop shell served through the web WM runtime."

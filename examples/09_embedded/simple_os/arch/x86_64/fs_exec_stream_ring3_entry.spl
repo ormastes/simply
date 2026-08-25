@@ -1,0 +1,87 @@
+# x86_64 STREAMING general-spawn ring-3 verification entry (Track 3b).
+#
+# Proves x86_64_fs_exec_enter_stream_ring3 / _map_pt_loads(use_stream=true):
+# each PT_LOAD segment's bytes are pulled straight off disk via
+# simpleos_fat32_stream_read_at into freshly allocated pmm frames — NOT copied
+# out of a whole-file-resident buffer (the old simpleos_fat32_path_read_buf
+# 4 MiB cap this change removes). Only a bounded ELF header + phdr prefix is
+# ever resident; the file itself can be arbitrarily large.
+#
+# Reads the target PRE-vmm — the same ordering fs_exec_general_ring3_entry.spl
+# uses — so this lane stays independent of the post-vmm NVMe DMA path.
+#
+# The payload writes "FDR\n" via `out` (ring-3 proof) then "FSEXEC_OK rc=42\n"
+# and exits via syscall 60. Under the multi-command SSH resume the exit(2)
+# longjmps back to the kernel, so the handoff RETURNS rc=42 here and this
+# entry exits QEMU itself; if the payload instead halts QEMU directly
+# (isa-debug-exit), the serial markers have already been emitted either way.
+
+extern fn serial_println(msg: text)
+extern fn rt_debug_exit_success()
+extern fn rt_x86_tss_init() -> i64
+extern fn simpleos_nvme_init() -> i64
+extern fn simpleos_fat32_path_read_buffer_addr() -> u64
+extern fn simpleos_fat32_stream_open(path: text) -> i64
+extern fn simpleos_fat32_stream_read_at(file_off: u64, dst: u64, len: u64) -> i64
+
+use os.kernel.arch.x86_64.arch_init.{arch_x86_64_early_init}
+use os.kernel.memory.pmm.{pmm_init_identity_range, g_pmm}
+use os.kernel.memory.vmm.{vmm_init}
+use os.kernel.loader.x86_64_fs_exec_ring3.{x86_64_fs_exec_enter_stream_ring3}
+
+# The target file. Point at a >4 MiB test ELF to prove the whole-file 4 MiB cap
+# is gone (the OLD path could never have held such a file resident).
+fn _target_path() -> text: "/FSEXECBG.ELF"
+
+fn spl_start():
+    serial_println("")
+    serial_println("=== SimpleOS x86_64 STREAMING ring-3 (Track 3b) ===")
+
+    arch_x86_64_early_init()
+    serial_println("[stream] arch-init + syscall MSRs done")
+    rt_x86_tss_init()
+
+    if simpleos_nvme_init() != 0:
+        serial_println("[stream] FAIL nvme init")
+        serial_println("TEST FAILED")
+        rt_debug_exit_success()
+        return
+    serial_println("[stream] nvme online")
+
+    # Open the stream and read ONLY a bounded header+phdr prefix — never the
+    # whole file. The stream stays open; the handoff's _map_pt_loads pulls each
+    # PT_LOAD's bytes from it during mapping.
+    val path = _target_path()
+    val fsize = simpleos_fat32_stream_open(path)
+    if fsize <= 64:
+        serial_println("[stream] FAIL open path={path} rc={fsize}")
+        serial_println("TEST FAILED")
+        rt_debug_exit_success()
+        return
+    val hdr_buf = simpleos_fat32_path_read_buffer_addr()
+    val HDR_CAP: i64 = 8192
+    val want = if fsize < HDR_CAP: fsize else: HDR_CAP
+    val hdr_n = simpleos_fat32_stream_read_at(0.to_u64(), hdr_buf, want.to_u64())
+    if hdr_n < 64:
+        serial_println("[stream] FAIL header read rc={hdr_n}")
+        serial_println("TEST FAILED")
+        rt_debug_exit_success()
+        return
+    serial_println("[stream] header path={path} file_size={fsize} hdr_bytes={hdr_n}")
+
+    # Kernel end = 0x18000000 (384 MiB bound for 128 MB base + ~118 MB RW extent).
+    if not pmm_init_identity_range(0x80000000, 0x100000, 0x18000000):
+        serial_println("[stream] FAIL pmm_init")
+        serial_println("TEST FAILED")
+        rt_debug_exit_success()
+        return
+    vmm_init(g_pmm, 0)
+    serial_println("[stream] pmm+vmm online")
+
+    val rc = x86_64_fs_exec_enter_stream_ring3(path, hdr_buf, hdr_n.to_u64(), fsize.to_u64(), [], [])
+    if rc == 42:
+        serial_println("[stream] ring3 exited rc={rc} (kernel resumed) TEST PASSED")
+    else:
+        serial_println("[stream] handoff returned rc={rc}")
+        serial_println("TEST FAILED")
+    rt_debug_exit_success()

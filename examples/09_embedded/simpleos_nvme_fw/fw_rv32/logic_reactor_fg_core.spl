@@ -1,0 +1,17 @@
+use logic_reactor_lock_core.*
+
+pub fn _rv32_reactor_fg_tick_impl(pending: i64, owner: i64) -> i64:
+    if pending <= 0:
+        return 0
+    if _rv32_reactor_acquire_impl(owner, 1) == 0:
+        return 0
+    1
+
+pub fn _rv32_reactor_service_impl(pending: i64, guard_limit: i64) -> i64:
+    if pending <= 0:
+        return 0
+    if guard_limit <= 0:
+        return 0
+    if pending < guard_limit:
+        return pending
+    guard_limit

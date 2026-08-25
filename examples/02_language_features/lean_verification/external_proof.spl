@@ -1,0 +1,16 @@
+# External proof reference example
+# Demonstrates: proof uses: to reference external Lean theorems
+#
+# The `proof uses:` directive tells the code generator to import and
+# reference an externally proven theorem instead of generating sorry.
+# The `decreases:` clause provides a termination measure for Lean.
+
+@verify
+fn factorial(n: i64) -> i64:
+    in: n >= 0
+    out(ret): ret >= 1
+    decreases: n
+    proof uses: factorial_positive
+    if n <= 1:
+        return 1
+    n * factorial(n - 1)

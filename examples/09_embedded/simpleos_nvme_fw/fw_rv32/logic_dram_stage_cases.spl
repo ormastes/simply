@@ -1,0 +1,20 @@
+use logic_dram_durability_core.*
+
+fn rv32_dram_stage_cases_selftest() -> i32:
+    if _rv32_dram_stage_status(1, 0, 2, 1, 16, 1) != 0:
+        return 1
+    if _rv32_dram_stage_status(1, 0, 2, 2, 16, 1) != 130:
+        return 1
+    if _rv32_dram_stage_status(1, 16, 1, 0, 16, 1) != 130:
+        return 1
+    if _rv32_dram_stage_status(1, 5, 1, 0, 16, 0) != 130:
+        return 1
+    if _rv32_dram_mask_byte(291) != 35:
+        return 1
+    if _rv32_dram_used(-3, 16) != 0:
+        return 1
+    if _rv32_dram_used(99, 16) != 16:
+        return 1
+    if _rv32_dram_overflows(-1) != 0:
+        return 1
+    0

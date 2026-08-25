@@ -1,0 +1,133 @@
+# LLM Caret Provider Specification
+
+# Inline helpers
+fn list_providers() -> [text]:
+    ["claude_cli", "claude_api", "openai", "openai_compat", "local_torch"]
+
+fn is_valid_provider(provider: text) -> bool:
+    if provider == "claude_cli":
+        return true
+    if provider == "claude_api":
+        return true
+    if provider == "openai":
+        return true
+    if provider == "openai_compat":
+        return true
+    if provider == "local_torch":
+        return true
+    false
+
+fn _LB() -> text:
+    "{(123 as char)}"
+
+fn _RB() -> text:
+    "{(125 as char)}"
+
+fn _Q() -> text:
+    "\""
+
+struct LLMResponse:
+    content: text
+    model: text
+    provider: text
+    session_id: text
+    stop_reason: text
+    input_tokens: i64
+    output_tokens: i64
+    error: text
+    is_error: bool
+    raw: text
+
+fn new_llm_error(provider: text, error_msg: text) -> LLMResponse:
+    LLMResponse(
+        content: "",
+        model: "",
+        provider: provider,
+        session_id: "",
+        stop_reason: "error",
+        input_tokens: 0,
+        output_tokens: 0,
+        error: error_msg,
+        is_error: true,
+        raw: ""
+    )
+
+# ============================================================================
+# Tests
+# ============================================================================
+
+describe "Provider List":
+    it "lists all providers":
+        val providers = list_providers()
+        expect(providers.len()).to_equal(5)
+
+    it "includes claude_cli":
+        val providers = list_providers()
+        var found = false
+        for p in providers:
+            if p == "claude_cli":
+                found = true
+        expect(found).to_equal(true)
+
+    it "includes claude_api":
+        val providers = list_providers()
+        var found = false
+        for p in providers:
+            if p == "claude_api":
+                found = true
+        expect(found).to_equal(true)
+
+    it "includes openai":
+        val providers = list_providers()
+        var found = false
+        for p in providers:
+            if p == "openai":
+                found = true
+        expect(found).to_equal(true)
+
+    it "includes openai_compat":
+        val providers = list_providers()
+        var found = false
+        for p in providers:
+            if p == "openai_compat":
+                found = true
+        expect(found).to_equal(true)
+
+    it "includes local_torch":
+        val providers = list_providers()
+        var found = false
+        for p in providers:
+            if p == "local_torch":
+                found = true
+        expect(found).to_equal(true)
+
+describe "Provider Validation":
+    it "validates claude_cli":
+        expect(is_valid_provider("claude_cli")).to_equal(true)
+
+    it "validates claude_api":
+        expect(is_valid_provider("claude_api")).to_equal(true)
+
+    it "validates openai":
+        expect(is_valid_provider("openai")).to_equal(true)
+
+    it "validates openai_compat":
+        expect(is_valid_provider("openai_compat")).to_equal(true)
+
+    it "validates local_torch":
+        expect(is_valid_provider("local_torch")).to_equal(true)
+
+    it "rejects unknown provider":
+        expect(is_valid_provider("unknown")).to_equal(false)
+
+    it "rejects empty provider":
+        expect(is_valid_provider("")).to_equal(false)
+
+describe "LLMResponse Error":
+    it "creates error response":
+        val resp = new_llm_error("claude_cli", "connection refused")
+        expect(resp.is_error).to_equal(true)
+        expect(resp.error).to_equal("connection refused")
+        expect(resp.provider).to_equal("claude_cli")
+        expect(resp.stop_reason).to_equal("error")
+        expect(resp.content).to_equal("")

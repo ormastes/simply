@@ -1,0 +1,74 @@
+# Unit tests for query_parser module
+
+use src.util.query_parser.{parse_query, has_filters, ParsedQuery}
+
+describe "QueryParser":
+    """Tests for search query parsing with operators"""
+
+    context "freetext extraction":
+        """Extracting plain text from queries"""
+
+        it "extracts plain query":
+            val q = parse_query("hello world")
+            expect(q.freetext).to_equal("hello world")
+
+        it "handles empty query":
+            val q = parse_query("")
+            expect(q.freetext).to_equal("")
+
+    context "operator parsing":
+        """Extracting operator filters"""
+
+        it "extracts tag operator":
+            val q = parse_query("meeting notes tag:standup")
+            expect(q.freetext).to_equal("meeting notes")
+            expect(q.tag_filters.len()).to_equal(1)
+            expect(q.tag_filters[0]).to_equal("standup")
+
+        it "extracts path operator":
+            val q = parse_query("path:daily/ journal entries")
+            expect(q.freetext).to_equal("journal entries")
+            expect(q.path_filters.len()).to_equal(1)
+            expect(q.path_filters[0]).to_equal("daily/")
+
+        it "extracts title operator":
+            val q = parse_query("title:standup search")
+            expect(q.freetext).to_equal("search")
+            expect(q.title_filters.len()).to_equal(1)
+            expect(q.title_filters[0]).to_equal("standup")
+
+        it "extracts multiple operators":
+            val q = parse_query("tag:meeting path:daily/ search text")
+            expect(q.tag_filters.len()).to_equal(1)
+            expect(q.path_filters.len()).to_equal(1)
+            expect(q.freetext).to_equal("search text")
+
+        it "extracts modified:recent":
+            val q = parse_query("modified:recent notes")
+            expect(q.modified_recent).to_equal(true)
+            expect(q.freetext).to_equal("notes")
+
+        it "extracts linkto operator":
+            val q = parse_query("linkto:project-alpha")
+            expect(q.linkto_filters.len()).to_equal(1)
+            expect(q.linkto_filters[0]).to_equal("project-alpha")
+
+        it "extracts linkedfrom operator":
+            val q = parse_query("linkedfrom:index")
+            expect(q.linkedfrom_filters.len()).to_equal(1)
+            expect(q.linkedfrom_filters[0]).to_equal("index")
+
+    context "has_filters":
+        """Checking if query has any filters"""
+
+        it "returns false for plain query":
+            val q = parse_query("just text")
+            expect(has_filters(q)).to_equal(false)
+
+        it "returns true when tag filter present":
+            val q = parse_query("tag:meeting")
+            expect(has_filters(q)).to_equal(true)
+
+        it "returns true for modified:recent":
+            val q = parse_query("modified:recent")
+            expect(has_filters(q)).to_equal(true)

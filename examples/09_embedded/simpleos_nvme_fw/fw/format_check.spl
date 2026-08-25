@@ -1,0 +1,57 @@
+"""
+format_check — Format NVM preserves the physical media's persistent state.
+
+Format NVM erases all USER DATA (every LBA reads 0 afterward) but, on real silicon, it must
+NOT resurrect retired bad blocks or reset endurance/wear history — those are physical
+properties of the NAND, not user data. This regression pins that: a retired bad block and a
+nonzero per-block erase count both survive a format, while a written LBA reads back 0.
+
+(Fails before the fix, when FORMAT_NVM rebuilt the whole FTL via ftl_new() -> fil_new(), which
+wiped the bad-block table and erase counts.)
+
+Run: bin/simple run examples/09_embedded/simpleos_nvme_fw/fw/format_check.spl
+"""
+
+use nvme_types.*
+use fil.*
+use ftl.*
+
+fn main():
+    var fail: i64 = 0
+    var a: Ftl = ftl_new()
+
+    # Establish state that MUST survive a format.
+    a.write(0, 1234)                 # user data at LBA 0
+    a.fil.erase(10)                  # wear: erase_count(10) -> 1
+    a.fil.erase(10)                  # -> 2
+    a.fil.inject_erase_fail(20)      # next erase of block 20 fails -> retire it
+    a.fil.erase(20)                  # block 20 retired (bad)
+
+    val ec_before: i64 = a.fil.erase_count(10)
+    val bad_before: i64 = a.fil.bad_count()
+    fail = fail + expect_eq(ec_before, 2, "precondition: erase_count(10) == 2")
+    fail = fail + expect_eq(bool_to_int(a.fil.block_bad(20)), 1, "precondition: block 20 retired")
+    fail = fail + expect_eq(a.read(0), 1234, "precondition: LBA 0 holds user data")
+
+    # FORMAT NVM.
+    a.format()
+
+    fail = fail + expect_eq(a.read(0), 0, "format erases user data (LBA 0 reads 0)")
+    # Wear ACCRUES across a format (the erase itself is wear) and is never reset to 0 —
+    # the bug was ftl_new() resetting it. Block 10 was erased twice, +1 for the format.
+    fail = fail + expect_eq(a.fil.erase_count(10), ec_before + 1, "format accrues wear, never resets it")
+    fail = fail + expect_eq(bool_to_int(a.fil.block_bad(20)), 1, "format PRESERVES bad-block retirement")
+    fail = fail + expect_eq(a.fil.bad_count(), bad_before, "format preserves the retired-block count")
+
+    # Format is a committed operation: it must SURVIVE a power cycle. A crash + recovery
+    # must NOT silently un-format the device (LBA 0 must still read 0), and the retired
+    # block must stay retired.
+    a.crash()
+    a.recover()
+    fail = fail + expect_eq(a.read(0), 0, "formatted device stays formatted across a power cycle")
+    fail = fail + expect_eq(bool_to_int(a.fil.block_bad(20)), 1, "retired block survives the post-format power cycle")
+
+    if fail == 0:
+        print "FORMAT OK"
+    else:
+        print "FORMAT FAIL ({fail})"

@@ -1,0 +1,40 @@
+app:
+    title: "Button Checkbox Dropdown Demo"
+    theme: glass_dark
+
+layout:
+    type: vbox
+    children:
+        controls:
+            type: panel
+            title: "Interactive Controls"
+            children:
+                submit_btn:
+                    type: button
+                    label: "Submit"
+                    action: "submit_form"
+                cancel_btn:
+                    type: button
+                    label: "Cancel"
+                    action: "cancel_form"
+                terms_cb:
+                    type: checkbox
+                    label: "Accept Terms"
+                    checked: true
+                news_cb:
+                    type: checkbox
+                    label: "Newsletter"
+                    checked: false
+                color_dd:
+                    type: dropdown
+                    items:
+                        0:
+                            label: "Option A"
+                        1:
+                            label: "Option B"
+                        2:
+                            label: "Option C"
+        status:
+            type: statusbar
+            left: "{app.mode}"
+            right: "{app.title}"

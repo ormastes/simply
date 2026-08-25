@@ -1,0 +1,185 @@
+# responsive_showcase_gui.spl — Adaptive responsive scaffold showcase on the
+# pure-Simple Engine2D CPU lane.
+#
+# Renders an adaptive_nav_scaffold at three canonical viewports:
+#   - phone   390x844  (iOS touch, nav_pattern=bottom)
+#   - tablet  700x1000 (Android touch, nav_pattern=rail)
+#   - desktop 1440x900 (macOS no-touch, nav_pattern=sidebar)
+#
+# For each viewport the app:
+#   1. Builds a scaffold via compute_form_factor + adaptive_nav_scaffold
+#   2. Projects it to DrawCmd via widget_tree_to_draw_cmds
+#   3. Initialises a fresh CpuBackend at that size
+#   4. Clears + issues draw_rect_filled / draw_rect / draw_text per DrawCmd
+#   5. Presents + reads pixels; prints evidence line
+#   6. Optionally writes a PPM to $RESP_PPM_DIR/responsive_<name>.ppm
+#
+# Headless: SIMPLE_EXECUTION_MODE=interpret SIMPLE_LIB=src bin/simple run <file>
+# Window:   SIMPLE_GUI=1 SIMPLE_EXECUTION_MODE=interpret SIMPLE_LIB=src bin/simple run <file>
+#           (opens the desktop-viewport frame in a window)
+
+use std.gpu.engine2d.backend_cpu.{CpuBackend}
+use std.io.window_winit.{WinitLoop, WinitWindow, WinitInput, winit_loop_new, winit_loop_free, winit_window_new, winit_window_free, winit_present_rgba, winit_poll_input}
+use common.image.ppm_decode.{encode_ppm_p6}
+use common.ui.viewport.{new_viewport}
+use common.ui.form_factor.{compute_form_factor}
+use common.ui.adaptive_scaffold.{NavItem, adaptive_nav_scaffold}
+use common.ui.widget.{WidgetNode}
+use common.ui.builder.{column, label}
+use common.ui.widget_draw_cmds.{DrawCmd, widget_tree_to_draw_cmds}
+use std.nogc_sync_mut.sffi.io.{file_write_bytes}
+
+use std.io_runtime.{env_get}
+
+# =========================================================================
+# Shared nav items + content node (built fresh per call to avoid id collisions)
+# =========================================================================
+
+fn make_items() -> [NavItem]:
+    return [
+        NavItem(id: "s_home",     label: "Home",     icon: "home",     action: "go_home"),
+        NavItem(id: "s_explore",  label: "Explore",  icon: "explore",  action: "go_explore"),
+        NavItem(id: "s_library",  label: "Library",  icon: "library",  action: "go_library"),
+        NavItem(id: "s_profile",  label: "Profile",  icon: "profile",  action: "go_profile")
+    ]
+
+fn make_content(suffix: text) -> WidgetNode:
+    val items: [WidgetNode] = [
+        label("rc_title_{suffix}",  "Responsive Showcase"),
+        label("rc_body_{suffix}",   "Content area"),
+        label("rc_hint_{suffix}",   "Adaptive layout")
+    ]
+    return column("rc_content_{suffix}", items)
+
+# =========================================================================
+# Draw one viewport via CpuBackend and return pixels
+# =========================================================================
+
+fn render_viewport(name: text, vp_w: i32, vp_h: i32, platform: text, touch: bool) -> [u32]:
+    val vp = new_viewport(vp_w, vp_h, "gui")
+    val ff = compute_form_factor(vp, platform, touch)
+    val root = adaptive_nav_scaffold("rs_{name}", make_items(), make_content(name), ff)
+    val cmds = widget_tree_to_draw_cmds(root, vp_w, vp_h)
+
+    # Find probe label for evidence line
+    var probe_label = "none"
+    for cmd in cmds:
+        if cmd.widget_id == "nav_pattern_probe":
+            probe_label = cmd.label
+
+    var b = CpuBackend.create()
+    if not b.init(vp_w, vp_h):
+        print "viewport={name} FAIL: CpuBackend init failed"
+        return []
+
+    b.clear(0xFF14141Cu32)
+
+    for cmd in cmds:
+        if cmd.widget_id == "nav_pattern_probe":
+            pass_dn
+        elif cmd.kind == "rect":
+            b.draw_rect_filled(cmd.x, cmd.y, cmd.w, cmd.h, cmd.color)
+        elif cmd.kind == "rect_outline":
+            b.draw_rect(cmd.x, cmd.y, cmd.w, cmd.h, cmd.color)
+        elif cmd.kind == "text":
+            if cmd.label != "":
+                b.draw_text(cmd.x, cmd.y, cmd.label, cmd.color, cmd.size)
+
+    b.present()
+    val pixels = b.read_pixels()
+    b.shutdown()
+
+    print "viewport={name} {vp_w}x{vp_h} nav_pattern={probe_label} pixels={pixels.len()}"
+    return pixels
+
+# =========================================================================
+# PPM helper
+# =========================================================================
+
+fn maybe_write_ppm(pixels: [u32], vp_w: i32, vp_h: i32, name: text, ppm_dir: text):
+    if ppm_dir == "":
+        return
+    if pixels.len() < vp_w * vp_h:
+        return
+    val path = "{ppm_dir}/responsive_{name}.ppm"
+    val bytes = encode_ppm_p6(vp_w.to_u32(), vp_h.to_u32(), pixels)
+    if file_write_bytes(path, bytes):
+        print "wrote {path} ({bytes.len()} bytes)"
+    else:
+        print "failed to write {path}"
+
+# =========================================================================
+# pack for winit presentation
+# =========================================================================
+
+fn pack(src: [u32]) -> [i64]:
+    var out: [i64] = [0; src.len()]
+    var i = 0
+    while i < src.len():
+        out[i] = src[i].to_i64() & 0xFFFFFF
+        i = i + 1
+    out
+
+# =========================================================================
+# main
+# =========================================================================
+
+fn main() -> i64:
+    print "Responsive Showcase GUI — Engine2D CPU lane, 3 viewports"
+
+    val ppm_dir = env_get("RESP_PPM_DIR") ?? ""
+
+    # 1. phone 390x844 ios touch → bottom nav
+    val px_phone = render_viewport("phone", 390, 844, "ios", true)
+    if px_phone.len() < 390 * 844:
+        print "phone render failed"
+        return 1
+    maybe_write_ppm(px_phone, 390, 844, "phone", ppm_dir)
+
+    # 2. tablet 700x1000 android touch → rail
+    val px_tablet = render_viewport("tablet", 700, 1000, "android", true)
+    if px_tablet.len() < 700 * 1000:
+        print "tablet render failed"
+        return 1
+    maybe_write_ppm(px_tablet, 700, 1000, "tablet", ppm_dir)
+
+    # 3. desktop 1440x900 macos no-touch → sidebar
+    val px_desktop = render_viewport("desktop", 1440, 900, "macos", false)
+    if px_desktop.len() < 1440 * 900:
+        print "desktop render failed"
+        return 1
+    maybe_write_ppm(px_desktop, 1440, 900, "desktop", ppm_dir)
+
+    print "all 3 viewports rendered successfully"
+
+    # Optional GUI window — shows the desktop frame
+    if (env_get("SIMPLE_GUI") ?? "") != "1":
+        print "No GUI requested; headless only."
+        return 0
+
+    val lp = winit_loop_new()
+    if not lp.is_valid:
+        print "No GUI runtime available."
+        return 1
+    val dw: i64 = 1440
+    val dh: i64 = 900
+    val win = winit_window_new(lp, dw, dh, "Simple Responsive Showcase (CPU lane)")
+    if not win.is_valid:
+        winit_loop_free(lp)
+        return 1
+
+    val packed = pack(px_desktop)
+    var running = true
+    var iters = 0
+    while running and iters < 2000000:
+        winit_present_rgba(win, dw, dh, packed)
+        val input = winit_poll_input(lp)
+        if input.close:
+            running = false
+        for k in input.keys:
+            if k == 27:
+                running = false
+        iters = iters + 1
+    winit_window_free(win)
+    winit_loop_free(lp)
+    return 0

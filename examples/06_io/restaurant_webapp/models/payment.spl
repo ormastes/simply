@@ -1,0 +1,121 @@
+use std.database.{DbCodec, DbValue, DbRow, TableSchema, Column, ColumnType, Database}
+use std.web_framework.model.{Repository}
+use std.nogc_sync_mut.io.time_ops.{time_now_unix_micros}
+
+class Payment:
+    id: i64
+    order_id: i64
+    method: text
+    status: text
+    amount: i64
+    card_last_four: text
+    transaction_id: text
+    gateway_response: text
+    created_at: text
+
+class PaymentCodec:
+    fn table_name() -> text:
+        "payments"
+
+    fn columns() -> List<text>:
+        ["order_id", "method", "status", "amount", "card_last_four",
+         "transaction_id", "gateway_response", "created_at"]
+
+    fn encode(p: Payment) -> List<DbValue>:
+        [
+            DbValue.integer(p.order_id),
+            DbValue.text(p.method),
+            DbValue.text(p.status),
+            DbValue.integer(p.amount),
+            DbValue.text(p.card_last_four),
+            DbValue.text(p.transaction_id),
+            DbValue.text(p.gateway_response),
+            DbValue.text(p.created_at)
+        ]
+
+    fn decode(row: DbRow) -> Payment:
+        Payment(
+            id: row.get_i64("id"),
+            order_id: row.get_i64("order_id"),
+            method: row.get_text("method"),
+            status: row.get_text("status"),
+            amount: row.get_i64("amount"),
+            card_last_four: row.get_text("card_last_four"),
+            transaction_id: row.get_text("transaction_id"),
+            gateway_response: row.get_text("gateway_response"),
+            created_at: row.get_text("created_at")
+        )
+
+    fn schema() -> TableSchema:
+        TableSchema(
+            name: "payments",
+            columns: [
+                Column(name: "id", col_type: ColumnType.integer, primary_key: true, auto_increment: true),
+                Column(name: "order_id", col_type: ColumnType.integer, nullable: false),
+                Column(name: "method", col_type: ColumnType.text, nullable: false),
+                Column(name: "status", col_type: ColumnType.text, nullable: false),
+                Column(name: "amount", col_type: ColumnType.integer, nullable: false),
+                Column(name: "card_last_four", col_type: ColumnType.text, nullable: false),
+                Column(name: "transaction_id", col_type: ColumnType.text, nullable: false),
+                Column(name: "gateway_response", col_type: ColumnType.text, nullable: false),
+                Column(name: "created_at", col_type: ColumnType.text, nullable: false)
+            ]
+        )
+
+fn create_payment_repository(db: Database) -> Repository<Payment>:
+    Repository<Payment>(db: db, codec: PaymentCodec())
+
+fn find_payments_for_order(repo: Repository<Payment>, order_id: i64) -> List<Payment>:
+    repo.find_where("order_id = ? ORDER BY created_at DESC", [DbValue.integer(order_id)])
+
+fn find_payment_by_id(repo: Repository<Payment>, id: i64) -> Result<Payment, text>:
+    repo.find_by_id(id)
+
+# --- Mock Payment Gateway ---
+# Simulates credit card processing for infra testing.
+# In production, this would call Stripe/Square/etc.
+
+fn mock_gateway_charge(amount: i64, card_number: text, card_expiry: text, card_cvc: text) -> Result<text, text>:
+    if card_number == "":
+        return Result.err("Card number required")
+    if amount <= 0:
+        return Result.err("Amount must be positive")
+
+    val last_four = if card_number.len() >= 4:
+        card_number[card_number.len() - 4 : card_number.len()]
+    else:
+        card_number
+
+    # Mock: cards starting with 4 succeed, others fail
+    if card_number[0:1] == "4":
+        Result.ok("mock_txn_{amount}_{last_four}")
+    else:
+        Result.err("Card declined (mock gateway: only cards starting with 4 are accepted)")
+
+fn mock_gateway_refund(transaction_id: text, amount: i64) -> Result<text, text>:
+    if transaction_id == "":
+        return Result.err("Transaction ID required")
+    Result.ok("mock_refund_{transaction_id}")
+
+# --- Payment Methods ---
+
+fn payment_method_desk_credit() -> text:
+    "desk_credit"
+
+fn payment_method_gate_pay() -> text:
+    "gate_pay"
+
+fn payment_method_store_checkout() -> text:
+    "store_checkout"
+
+fn is_valid_payment_method(method: text) -> bool:
+    if method == "desk_credit": return true
+    if method == "gate_pay": return true
+    if method == "store_checkout": return true
+    false
+
+fn payment_method_display(method: text) -> text:
+    if method == "desk_credit": return "Desk Pay (Credit Card)"
+    if method == "gate_pay": return "Gate Pay (End of Meal)"
+    if method == "store_checkout": return "Store Checkout"
+    "Unknown"

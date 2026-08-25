@@ -1,0 +1,80 @@
+# x86_64 Imported-Class Instantiation Fault Probe
+#
+# Minimal baremetal --entry-closure probe isolating the documented
+# "instantiating an IMPORTED class faults" bug (wm_entry.spl:14-17,
+# doc/08_tracking/bug/baremetal_entry_closure_class_instantiation_fault_2026-07-06.md).
+#
+# Staged serial markers pinpoint where control is lost:
+#   S1      -> reached spl_start
+#   S2      -> imported class instantiated (ShortcutHandler.new())
+#   S3      -> imported-class method + field state verified
+#   S4      -> imported class whose ctor reads a scalar module global
+#   S5      -> method mutated a HEAP-TYPED module global of the imported module
+#   CLASSOK -> full imported-class round-trip succeeded
+
+use os.gui.shortcut.{ShortcutHandler}
+use os.gui.class_probe.{ProbeCounter, probe_events_len}
+
+extern fn rt_port_inb(port: u64) -> u64
+extern fn rt_port_outb(port: u64, value: u64)
+
+val SERIAL_DATA: u64 = 0x3F8
+val SERIAL_LSR: u64 = 0x3FD
+val DEBUG_EXIT: u64 = 0xF4
+
+fn serial_wait_ready():
+    var guard: i64 = 100000
+    while guard > 0:
+        if (rt_port_inb(SERIAL_LSR) & 0x20) != 0:
+            return
+        guard = guard - 1
+
+fn serial_put(ch: u64):
+    serial_wait_ready()
+    rt_port_outb(SERIAL_DATA, ch)
+
+fn serial_text(s: text):
+    for ch in s:
+        serial_put(ch as u64)
+
+fn serial_newline():
+    serial_put(13)
+    serial_put(10)
+
+fn spl_start():
+    serial_text("S1")
+    serial_newline()
+
+    # Stage 2: instantiate an IMPORTED class (the documented fault point).
+    var h = ShortcutHandler.new()
+    serial_text("S2")
+    serial_newline()
+
+    # Stage 3: method call + field state on the imported class instance.
+    # 0x38 = left-alt press, 0xB8 = left-alt release (0x38 | 0x80).
+    val _a0 = h.handle_scancode(0x38)
+    val pressed = h.alt_held
+    val _a1 = h.handle_scancode(0xB8)
+    val released = h.alt_held
+    if pressed and not released:
+        serial_text("S3")
+        serial_newline()
+
+    # Stage 4: imported class whose static ctor reads a scalar module global.
+    var c = ProbeCounter.new()
+    if c.count == 41:
+        serial_text("S4")
+        serial_newline()
+
+    # Stage 5: method mutating a heap-typed module global (array) of the
+    # imported module — zero/null unless module initializers ran.
+    val bumped = c.bump(1)
+    if bumped == 42 and probe_events_len() == 1:
+        serial_text("S5")
+        serial_newline()
+
+    if pressed and not released and bumped == 42:
+        serial_text("CLASSOK")
+        serial_newline()
+
+    rt_port_outb(DEBUG_EXIT, 0)

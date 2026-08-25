@@ -1,0 +1,1095 @@
+"""
+ftl — Flash Translation Layer core.
+
+Composes the FIL (fil), the DFTL map cache (ftl_map), the log-structured allocator
+(ftl_band), and the journal (ftl_journal) into the host-visible block device:
+  - log-structured write (allocate a fresh page, journal, remap, invalidate the old)
+  - read / read-status (ECC-aware)
+  - trim / deallocate
+  - checkpoint + dirty-shutdown recovery (committed-prefix property via WAL replay)
+  - garbage collection (relocate live pages off a victim, erase, reclaim)
+"""
+
+use nvme_types.*
+use nd_types.*
+use fil.*
+use ftl_map.*
+use ftl_band.*
+use ftl_journal.*
+use ftl_gc.*
+use sandbox.*
+use hooks.*
+use rain.*
+use rel_types.*         # RelHealth / RelRefreshState / RelDisturbState / RelWearState + RelAction
+use rel_health.*        # durable observability sink (design §7)
+use rel_refresh.*       # FCR/DEAR-lite refresh verdict + queue (design §4)
+use rel_disturb.*       # STRAW-lite read-disturb hottest-page estimate (design §5)
+use rel_wear.*          # SREA-lite dwell-aware static wear verdict (design §6)
+
+struct Ftl:
+    fil:       Fil
+    map:       L2pMap
+    band:      BandAlloc
+    journal:   Journal
+    seq:       i64
+    rd_disturb: [i64]      # per-block read counter (volatile) driving read-disturb scrub
+    hooks:     PolicyHooks  # sandboxed dynamic policy hooks (req 7)
+    rain_parity: [i64]     # one XOR parity word per RAIN stripe (gap-closure P8), maintained live
+    # ── L8 FTL reliability mount (RelFtlMount fields, design §1.4) ────────────
+    # The FIL mount's durable RelVrefCache lives inside me.fil (fil.spl); here is
+    # the map-owning FTL mount: the refresh queue, the disturb hottest-page estimate,
+    # the dwell-aware wear state, and the DURABLE health sink (design §1.4 health
+    # discipline — the FIL read result's (corrected, depth) fold into rel_health here).
+    rel_health:  RelHealth
+    rel_refresh: RelRefreshState
+    rel_disturb: RelDisturbState
+    rel_wear:    RelWearState
+    # Observability counters (design §7/§10 budget + spare oracles). rel_reclaim_count
+    # increments by AT MOST ONE per rel_tick — the one-reclaim-class-step-per-tick budget
+    # invariant is directly observable through it. rel_spares/rel_last_spare record the
+    # event-driven spare substitutions drawn from the OP pool on the retire path.
+    rel_reclaim_count: i64
+    rel_spares:        i64
+    rel_last_spare:    i64
+
+val FTL_MAX_SEQ: i64 = 1000000000000000000
+
+# ── L8 wiring pass: service-tick reclaim-class budget selector (design §7) ─────
+# The critical budget invariant: gc_once, a refresh rewrite, scrub_once, and
+# wear_level_once ALL drain the shared GC_RESERVE via reclaim_block, so firing
+# several per tick can exhaust the reserve and thrash. The faithful extension is
+# ONE reclaim-class step per tick total, chosen by fixed priority among gated
+# candidates (architecture §4 table). GC keeps priority (preserves the existing
+# write-cliff fix); low_wm is passed in because GC_LOW_WATERMARK lives in
+# firmware.spl (ftl.spl must not import it — no cycle).
+fn rel_step_none() -> i64:
+    0
+
+fn rel_step_gc() -> i64:
+    1
+
+fn rel_step_refresh() -> i64:
+    2
+
+fn rel_step_scrub() -> i64:
+    3
+
+fn rel_step_wl() -> i64:
+    4
+
+fn rel_tick_select(free_blocks: i64, low_wm: i64, refresh_pending: i64,
+                   worst_disturb: i64, disturb_thr: i64,
+                   erase_spread: i64, wl_thr: i64) -> i64:
+    if free_blocks < low_wm:
+        return rel_step_gc()        # 1: reclaim free space (existing low-watermark GC)
+    if refresh_pending > 0:
+        return rel_step_refresh()   # 2: drain a MarkForRefresh (FCR/DEAR rewrite)
+    if worst_disturb > disturb_thr:
+        return rel_step_scrub()     # 3: read-disturb scrub (STRAW)
+    if erase_spread > wl_thr:
+        return rel_step_wl()        # 4: static wear leveling (SREA)
+    rel_step_none()
+
+# Zero-initialised durable health sink (design §7 RelHealth). Built with the plain
+# struct-literal constructor + ftl_fill because rel_health.spl (L2) owns the mutators
+# but rel_types.spl (L1) deliberately provides no per-policy *_new (module-boundary law).
+fn ftl_rel_health_new() -> RelHealth:
+    RelHealth(reads: ftl_fill(NUM_BLOCKS, 0), corrected_sum: ftl_fill(NUM_BLOCKS, 0),
+              corrected_events: ftl_fill(NUM_BLOCKS, 0), retry_depth_max: ftl_fill(NUM_BLOCKS, 0),
+              refresh_cause: ftl_fill(NUM_BLOCKS, 0))
+
+fn read_disturb_counter_next(v: i64) -> i64:
+    if v < 0:
+        return 1
+    if v >= FW_SAFE_I64_LIMIT:
+        return FW_SAFE_I64_LIMIT
+    v + 1
+
+fn ftl_new() -> Ftl:
+    Ftl(fil: fil_new(), map: ftl_map_new(), band: ftl_band_new(), journal: ftl_journal_new(), seq: 0, rd_disturb: ftl_fill(NUM_BLOCKS, 0), hooks: policy_hooks_new(), rain_parity: ftl_fill(rain_num_stripes(), 0), rel_health: ftl_rel_health_new(), rel_refresh: rel_refresh_new(), rel_disturb: rel_disturb_new(), rel_wear: rel_wear_new(), rel_reclaim_count: 0, rel_spares: 0, rel_last_spare: UNMAP)
+
+# Opt-in: the full FTL stack running on the Vt-physics NeChip emulator (via
+# fil_new_emu) instead of the behavioural NAND. Host-level FTL traffic then hits
+# real threshold-voltage retention/disturb drift, so an aged/worn page can surface
+# a genuine (unmasked) ECC failure through read_status. Default ftl_new() is
+# unchanged. See fil_nand_emu_e2e_check.spl.
+fn ftl_new_emu() -> Ftl:
+    Ftl(fil: fil_new_emu(), map: ftl_map_new(), band: ftl_band_new(), journal: ftl_journal_new(), seq: 0, rd_disturb: ftl_fill(NUM_BLOCKS, 0), hooks: policy_hooks_new(), rain_parity: ftl_fill(rain_num_stripes(), 0), rel_health: ftl_rel_health_new(), rel_refresh: rel_refresh_new(), rel_disturb: rel_disturb_new(), rel_wear: rel_wear_new(), rel_reclaim_count: 0, rel_spares: 0, rel_last_spare: UNMAP)
+
+fn ftl_host_lba_valid(lba: i64) -> bool:
+    lba >= 0 and lba < LBA_COUNT
+
+impl Ftl:
+    me next_seq() -> i64:
+        var high: i64 = me.seq
+        if high < me.journal.ckpt_seq:
+            high = me.journal.ckpt_seq
+        var i: i64 = 0
+        val n: i64 = me.journal.wal_len()
+        while i < n:
+            val s: i64 = me.journal.record_seq(i)
+            if s > high:
+                high = s
+            i = i + 1
+        if high < 0:
+            high = 0
+        if high >= FTL_MAX_SEQ:
+            me.seq = FTL_MAX_SEQ
+        else:
+            me.seq = high + 1
+        me.seq
+
+    # Write one logical block (log-structured): program a fresh physical page with OOB
+    # {lba, seq}, journal the remap, update L2P, invalidate the previous version.
+    me write(lba: i64, data: i64) -> i64:
+        if not ftl_host_lba_valid(lba):
+            return SC_LBA_RANGE
+        # Host writes never consume the GC scratch reserve (over-provisioning headroom),
+        # so garbage collection can always relocate a victim and reclaim stale space.
+        val ppn: i64 = me.band.alloc_page_host(GC_RESERVE)
+        if ppn == NO_PPN:
+            return SC_NS_NOT_READY
+        val s: i64 = me.next_seq()
+        val old_ppn: i64 = me.map.lookup(lba)
+        val pc: i64 = me.fil.program(ppn, lba, s, data)
+        if pc != NAND_OK:
+            me.band.set_bad(ppn_block(ppn))
+            me.rel_retire(ppn_block(ppn))    # program-fail retire -> event-driven spare substitution
+            return SC_INTERNAL
+        me.ensure_journal_room()
+        val before_wal: i64 = me.journal.wal_len()
+        if me.journal.append(0, lba, old_ppn, ppn, s) <= before_wal:
+            return SC_NS_NOT_READY
+        me.rain_update_page(ppn, 0, data)
+        me.map.update(lba, ppn)
+        me.band.mark_valid(ppn)
+        # Fresh data on this block: reset the FCR age-proxy clock and clear any stale
+        # refresh mark (design §4 rel_refresh_on_write).
+        me.rel_refresh = rel_refresh_on_write(me.rel_refresh, nd_block(ppn_block(ppn)), s)
+        if old_ppn != UNMAP:
+            me.band.mark_invalid(old_ppn)
+        SC_SUCCESS
+
+    me can_write_blocks(nblocks: i64) -> bool:
+        if nblocks < 0:
+            return false
+        me.band.host_writable_pages(GC_RESERVE) >= nblocks
+
+    # Read one logical block; an unmapped (never-written / trimmed) LBA reads 0.
+    # Each read accumulates read-disturb on the backing block (drives scrub_once) and
+    # feeds the STRAW-lite hottest-page estimate. The read is driven through the L8 FIL
+    # recovery-ladder mount (me.fil.read_with_ladder): a retention-drifted page that
+    # FAILS a plain sense is recovered via the bounded Vref retry table when the media
+    # backend supports it (Vt-physics emu), transparently — no host retry logic. The
+    # (corrected, retry-depth) observability folds into the durable rel_health sink,
+    # and a read that needed a retry (depth > 0) enqueues a DEAR MarkForRefresh (design
+    # §4 trigger 1). On the default backend read_with_ladder returns the same offset-0
+    # payload as the pre-L8 plain read (no recovery actuator), so this is behaviour-
+    # preserving there.
+    me read(lba: i64) -> i64:
+        if not ftl_host_lba_valid(lba):
+            return 0
+        val ppn: i64 = me.map.lookup(lba)
+        if ppn == UNMAP:
+            return 0
+        val blk: i64 = ppn_block(ppn)
+        me.bump_read_disturb(blk)
+        me.rel_disturb = rel_disturb_observe(me.rel_disturb, nd_block(blk), nd_page(ppn_page(ppn)))
+        val res: RelReadResult = me.fil.read_with_ladder(ppn, nd_block(blk))
+        me.rel_note_read(blk, res)
+        res.data
+
+    # Read status: SC_MEDIA_ERR if the recovery ladder could not recover the page, else
+    # SC_SUCCESS. Consistent with read(): a drifted page the ladder recovers reports
+    # SC_SUCCESS (not a false media error). Does NOT fold health/refresh or bump disturb
+    # — a status probe (and read_range_status loops it) must not inflate the observability
+    # counters; only the data read() path does.
+    me read_status(lba: i64) -> i64:
+        if not ftl_host_lba_valid(lba):
+            return SC_LBA_RANGE
+        val ppn: i64 = me.map.lookup(lba)
+        if ppn == UNMAP:
+            return SC_SUCCESS
+        val blk: i64 = ppn_block(ppn)
+        val res: RelReadResult = me.fil.read_with_ladder(ppn, nd_block(blk))
+        var st: i64 = SC_SUCCESS
+        if res.ok == 0:
+            st = SC_MEDIA_ERR
+        st
+
+    # Fold one completed FIL-mount read into the durable observability sink and fire
+    # the DEAR refresh trigger. All rel_* policies (health/disturb/refresh/wear) take
+    # the NdBlock newtype at their scalar boundary — rel_health is now harmonized with
+    # the sibling lanes — so the raw i64 `blk` here converts via nd_block() at each
+    # call. (design §1.4 health discipline, §4 DEAR, §7 rel_health.)
+    me rel_note_read(blk: i64, res: RelReadResult):
+        me.rel_health = rel_health_note_read(me.rel_health, nd_block(blk), res.corrected, res.depth)
+        if res.ok == 1 and res.depth > 0:
+            me.rel_refresh = rel_refresh_enqueue(me.rel_refresh, nd_block(blk))
+            me.rel_health = rel_health_mark_cause(me.rel_health, nd_block(blk), rel_cause_err())
+
+    me read_range_status(lba: i64, nblocks: i64) -> i64:
+        if nblocks < 0:
+            return SC_LBA_RANGE
+        if nblocks > LBA_COUNT:
+            return SC_LBA_RANGE
+        if nblocks > 0:
+            if not ftl_host_lba_valid(lba) or lba > LBA_COUNT - nblocks:
+                return SC_LBA_RANGE
+        var i: i64 = 0
+        var st: i64 = SC_SUCCESS
+        while i < nblocks and st == SC_SUCCESS:
+            st = me.read_status(lba + i)
+            i = i + 1
+        st
+
+    # Trim/deallocate: drop the mapping and invalidate the physical page.
+    me trim(lba: i64) -> i64:
+        if not ftl_host_lba_valid(lba):
+            return SC_LBA_RANGE
+        val ppn: i64 = me.map.lookup(lba)
+        if ppn != UNMAP:
+            val s: i64 = me.next_seq()
+            me.ensure_journal_room()
+            val before_wal: i64 = me.journal.wal_len()
+            if me.journal.append(0, lba, ppn, UNMAP, s) <= before_wal:
+                return SC_NS_NOT_READY
+            me.band.mark_invalid(ppn)
+            me.map.update(lba, UNMAP)
+        SC_SUCCESS
+
+    # ── Emu-backend test API (Vt retention / wear injection). No-op unless the
+    #    stack was built via ftl_new_emu; forwards down to the NeChip media so a
+    #    test can age/wear a block and watch the drift surface through read /
+    #    read_status. `blk` is a firmware block index. ──────────────────────────
+    me emu_advance_time_s(seconds: f64):
+        me.fil.emu_advance_time_s(seconds)
+
+    me emu_set_block_wear(blk: i64, pe_cycles: i64):
+        me.fil.emu_set_block_wear(blk, pe_cycles)
+
+    me emu_set_vref_offset(offset: i64):
+        me.fil.emu_set_vref_offset(offset)
+
+    # Soft-observability re-export (arch doc §3 prereq 3, §5): the NeChip Vt
+    # histogram / read margin surfaced through the full FTL→FIL→FMC→NandEmu→NeChip
+    # chain so a reliability spec can validate a policy's effect against the Vt
+    # oracle. `ppn` is a firmware page number. Empty / 0 unless built via ftl_new_emu.
+    me emu_vt_histogram(ppn: i64) -> [i64]:
+        me.fil.emu_vt_histogram(ppn)
+
+    me emu_read_margin(ppn: i64) -> i64:
+        me.fil.emu_read_margin(ppn)
+
+    # Physical page currently backing a host LBA (UNMAP if unmapped) — lets a test
+    # locate the block a write landed on so it can wear/age exactly that block.
+    me lba_ppn(lba: i64) -> i64:
+        if not ftl_host_lba_valid(lba):
+            return UNMAP
+        me.map.lookup(lba)
+
+    # Persist a checkpoint: flush the dirty map cache to the flash-resident L2P,
+    # advance the journal checkpoint, and truncate the now-durable WAL prefix. After
+    # this the L2P alone reflects all state up to me.seq, so the dropped WAL records
+    # are not needed for recovery.
+    me checkpoint():
+        me.map.flush()
+        me.journal.checkpoint(me.seq)
+        me.journal.truncate_checkpointed()
+
+    # Guarantee room for one more WAL record. If the ring is full, checkpoint first
+    # (flush durable + truncate) so the record is never silently dropped — which would
+    # otherwise ack a write to the host whose mapping is lost on the next power cycle.
+    me ensure_journal_room():
+        if me.journal.is_full():
+            me.checkpoint()
+
+    me rain_update_page(ppn: i64, old_data: i64, new_data: i64):
+        val idx: i64 = rain_stripe_idx(ppn)
+        if idx == UNMAP:
+            return
+        me.ensure_rain_parity_table()
+        me.rain_parity[idx] = me.rain_parity[idx] ^ old_data ^ new_data
+
+    me rain_block_words(blk: i64) -> [i64]:
+        var words: [i64] = ftl_fill(PAGES_PER_BLOCK, 0)
+        if not block_in_range(blk):
+            return words
+        val base: i64 = block_first_ppn(blk)
+        var p: i64 = 0
+        while p < PAGES_PER_BLOCK:
+            words[p] = me.fil.read(base + p).data
+            p = p + 1
+        words
+
+    me rain_note_erased_block(blk: i64, old_words: [i64]):
+        if not block_in_range(blk):
+            return
+        val base: i64 = block_first_ppn(blk)
+        var p: i64 = 0
+        while p < PAGES_PER_BLOCK and p < old_words.len():
+            me.rain_update_page(base + p, old_words[p], 0)
+            p = p + 1
+
+    # Simulate a power loss: lose ALL volatile DRAM state. The write-back map cache
+    # (un-flushed dirty entries) and the band valid bitmap + allocator frontier are
+    # gone; the flash-resident L2P, the journal, the NAND array + OOB, and the
+    # bad-block table are persistent and survive. recover() rebuilds the volatile
+    # state from this persistent media.
+    me crash():
+        me.map.crash_volatile()
+        me.band.reset_volatile()
+        me.rd_disturb = ftl_fill(NUM_BLOCKS, 0)
+
+    # Power-on recovery. Rebuild all volatile state from persistent media:
+    #  1. Replay the journal (WAL) onto the flash-resident L2P in append order
+    #     (= ascending seq) so the newest mapping per LBA wins and trim records
+    #     (new_ppn == UNMAP) clear the entry. Records <= the last checkpoint are
+    #     already durable in the L2P; replaying them is idempotent.
+    #  2. Reconstruct the band valid bitmap from the now-authoritative L2P.
+    #  3. Re-apply persistently-retired blocks so the allocator skips them, and reclassify
+    #     any unreferenced-but-still-programmed block (fully stale, never GC'd before the
+    #     crash) as GC-eligible CLOSED so it is erased before reuse — leaving it FREE would
+    #     let the allocator reprogram an un-erased page and wrongly retire a healthy block.
+    me recover():
+        val n: i64 = me.journal.wal_len()
+        var seq_floor: i64 = me.journal.ckpt_seq
+        if seq_floor < 0:
+            seq_floor = 0
+        if seq_floor > FTL_MAX_SEQ:
+            seq_floor = FTL_MAX_SEQ
+        var seen_seq: [i64] = ftl_fill(LBA_COUNT, seq_floor)
+        var i: i64 = 0
+        while i < n:
+            val lba: i64 = me.journal.record_lba(i)
+            val newp: i64 = me.journal.record_new(i)
+            val s: i64 = me.journal.record_seq(i)
+            if ftl_host_lba_valid(lba) and s >= seen_seq[lba] and (newp == UNMAP or ppn_in_range(newp)):
+                me.map.update(lba, newp)
+                seen_seq[lba] = s
+            i = i + 1
+        me.map.flush()
+        var lba2: i64 = 0
+        while lba2 < LBA_COUNT:
+            val ppn: i64 = me.map.l2p_entry(lba2)
+            if ppn != UNMAP:
+                me.band.rebuild_mark(ppn)
+            lba2 = lba2 + 1
+        var blk: i64 = 0
+        while blk < NUM_BLOCKS:
+            if me.fil.block_bad(blk):
+                me.band.set_bad(blk)
+            elif me.band.block_state(blk) == BLK_FREE and me.fil.block_programmed(blk):
+                me.band.rebuild_close_stale(blk)
+            blk = blk + 1
+        me.band.rebuild_finalize()
+
+    # Format NVM: erase all user data. Physically erase every non-retired block — this
+    # clears the pages (so they are reprogrammable) and accrues REAL wear (erase counts
+    # rise; they are never reset to zero). The bad-block table and the accumulated
+    # erase counts therefore PERSIST across a format, exactly as on real silicon; only the
+    # logical state (L2P map, band frontier, journal/WAL, sequence, read-disturb counters)
+    # resets to empty. Retired blocks are skipped and re-applied so the allocator keeps
+    # avoiding them.
+    me format():
+        var blk: i64 = 0
+        while blk < NUM_BLOCKS:
+            if not me.fil.block_bad(blk):
+                val old_words: [i64] = me.rain_block_words(blk)
+                val er: i64 = me.fil.erase(blk)
+                if er == NAND_OK:
+                    me.rain_note_erased_block(blk, old_words)
+            blk = blk + 1
+        me.map = ftl_map_new()
+        me.band = ftl_band_new()
+        me.journal = ftl_journal_new()
+        me.seq = 0
+        me.rd_disturb = ftl_fill(NUM_BLOCKS, 0)
+        blk = 0
+        while blk < NUM_BLOCKS:
+            if me.fil.block_bad(blk):
+                me.band.set_bad(blk)
+            blk = blk + 1
+        me.band.rebuild_finalize()
+
+    me free_blocks() -> i64:
+        me.band.free_blocks()
+
+    me erase_count(blk: i64) -> i64:
+        me.fil.erase_count(blk)
+
+    # ── Wear / health introspection (SMART) ──────────────────────────────────
+    me total_erases() -> i64:
+        var t: i64 = 0
+        var b: i64 = 0
+        while b < NUM_BLOCKS:
+            t = t + me.fil.erase_count(b)
+            b = b + 1
+        t
+
+    me max_erase() -> i64:
+        var m: i64 = 0
+        var b: i64 = 0
+        while b < NUM_BLOCKS:
+            val e: i64 = me.fil.erase_count(b)
+            if e > m:
+                m = e
+            b = b + 1
+        m
+
+    me bad_blocks() -> i64:
+        me.fil.bad_count()
+
+    me read_disturb_count(blk: i64) -> i64:
+        if not block_in_range(blk):
+            return 0
+        if blk >= me.rd_disturb.len():
+            return 0
+        if me.rd_disturb[blk] < 0:
+            return 0
+        if me.rd_disturb[blk] > FW_SAFE_I64_LIMIT:
+            return FW_SAFE_I64_LIMIT
+        me.rd_disturb[blk]
+
+    me bump_read_disturb(blk: i64):
+        if not block_in_range(blk):
+            return
+        if blk >= me.rd_disturb.len():
+            return
+        me.rd_disturb[blk] = read_disturb_counter_next(me.rd_disturb[blk])
+
+    me clear_read_disturb(blk: i64):
+        if not block_in_range(blk):
+            return
+        if blk >= me.rd_disturb.len():
+            return
+        me.rd_disturb[blk] = 0
+
+    # test hook: inject NAND read bit-errors at a physical page (forwarded to FIL).
+    me inject_read_bitflip(ppn: i64, n: i64):
+        me.fil.inject_read_bitflip(ppn, n)
+
+    # ── Internal RAID/RAIN (die/channel failure protection, gap-closure P8) ───────
+    # Scrub/repair RAIN parity over the device's current physical contents: for every stripe
+    # (one page per channel at a fixed group+page), parity = XOR of the NUM_CHANNELS
+    # pages' data. This is the RAID parity-scrub pass; normal writes/GC/format keep
+    # parity current incrementally.
+    me rain_seal():
+        me.ensure_rain_parity_table()
+        var group: i64 = 0
+        while group < rain_num_groups():
+            var page: i64 = 0
+            while page < PAGES_PER_BLOCK:
+                var acc: i64 = 0
+                var ok: bool = true
+                var c: i64 = 0
+                while c < NUM_CHANNELS:
+                    val sppn: i64 = rain_ppn(group, c, page)
+                    val rd: FilRead = me.fil.read(sppn)
+                    if rd.code == NAND_ECC_FAIL:
+                        ok = false
+                    acc = acc ^ rd.data
+                    c = c + 1
+                if ok:
+                    me.rain_parity[group * PAGES_PER_BLOCK + page] = acc
+                page = page + 1
+            group = group + 1
+
+    # Rebuild every live page on a corrupted/failed channel from sealed parity + the
+    # surviving channels. NAND is erase-before-program, so we work one block at a time:
+    # compute the recovered payloads from the survivors (intact, on other channels) XOR
+    # the sealed parity, erase the failed block, then reprogram its live pages in place.
+    # The L2P ppns are unchanged, so the normal read path returns the original data.
+    # Returns the number of pages rebuilt.
+    #
+    # DURABILITY PRECONDITION — NOT power-cycle safe in v1 (tracked in
+    # doc/08_tracking/bug/rain_parity_volatile_channel_recovery_dataloss_2026-07-18.md):
+    # The failed block is disposable — its recovered contents come only from
+    # `sealed parity XOR surviving channels`, never from the block itself. So the erase is
+    # destructive but the *reconstruction source* is separate, and the erase→reprogram is
+    # idempotently re-drivable AS LONG AS that source is available: survivors are
+    # flash-resident (durable), but `me.rain_parity` is an in-DRAM table maintained live on
+    # the write path — it is NOT persisted to media, and recover() does NOT rebuild it
+    # (rain_seal cannot re-derive a stripe once its channel has failed, since it would read
+    # that channel's own garbage/erased data). Therefore the rebuild is only safely
+    # re-drivable WITHIN the same power session that sealed the parity while all channels
+    # were healthy. On real hardware a power loss after a channel failure and before this
+    # rebuild completes loses the failed channel's live pages: the DRAM parity is gone and
+    # cannot be recomputed from the failed/erased channel. In v1 this is a test-only
+    # capability (not wired into the host/admin flow — the production write path only
+    # maintains parity incrementally); the root fix is on-media parity persistence (persist
+    # on checkpoint, restore in recover), a filed feature — do not re-flag this as
+    # copy-atomicity, and do not paper over it with a "safe" note.
+    me rain_recover_channel(failed: i64) -> i64:
+        if not rain_channel_valid(failed):
+            return 0
+        if not me.rain_parity_ready():
+            return 0
+        # Invert the L2P (lba → ppn) so we know which physical pages are live, and for whom.
+        var rev: [i64] = ftl_fill(NUM_PAGES, UNMAP)
+        var lba: i64 = 0
+        while lba < LBA_COUNT:
+            val ppn: i64 = me.map.lookup(lba)
+            if ppn != UNMAP:
+                rev[ppn] = lba
+            lba = lba + 1
+        var rebuilt: i64 = 0
+        var group: i64 = 0
+        while group < rain_num_groups():
+            val blk: i64 = rain_blk(group, failed)
+            # 1. recovered payload per page = sealed parity XOR the surviving channels' data.
+            var rec: [i64] = ftl_fill(PAGES_PER_BLOCK, 0)
+            var page: i64 = 0
+            while page < PAGES_PER_BLOCK:
+                var acc: i64 = me.rain_parity[group * PAGES_PER_BLOCK + page]
+                var c: i64 = 0
+                while c < NUM_CHANNELS:
+                    if c != failed:
+                        val sppn: i64 = rain_ppn(group, c, page)
+                        val rd: FilRead = me.fil.read(sppn)
+                        if rd.code == NAND_ECC_FAIL:
+                            return rebuilt
+                        acc = acc ^ rd.data
+                    c = c + 1
+                rec[page] = acc
+                page = page + 1
+            # 2. erase the failed block (clears the corrupted pages so they are programmable).
+            if me.fil.erase(blk) != NAND_OK:
+                return rebuilt
+            # 3. reprogram the block's live pages in place with the recovered payload.
+            val s: i64 = me.next_seq()
+            page = 0
+            while page < PAGES_PER_BLOCK:
+                val ppn: i64 = block_first_ppn(blk) + page
+                val who: i64 = rev[ppn]
+                if who != UNMAP:
+                    val payload: i64 = rec[page]
+                    if me.fil.program(ppn, who, s, payload) != NAND_OK:
+                        return rebuilt
+                    rebuilt = rebuilt + 1
+                page = page + 1
+            group = group + 1
+        rebuilt
+
+    me rain_parity_ready() -> bool:
+        me.rain_parity.len() == rain_num_stripes()
+
+    me ensure_rain_parity_table():
+        if not me.rain_parity_ready():
+            me.rain_parity = ftl_fill(rain_num_stripes(), 0)
+
+    # ── Read-only introspection (migration capture) ──────────────────────────
+    # Physical page currently backing a logical block (UNMAP if unmapped).
+    me physical_ppn(lba: i64) -> i64:
+        me.map.lookup(lba)
+
+    # Physical block currently backing a logical block (UNMAP if unmapped).
+    me physical_block(lba: i64) -> i64:
+        val p: i64 = me.map.lookup(lba)
+        if p == UNMAP:
+            return UNMAP
+        ppn_block(p)
+
+    # Raw NAND page payload stored at a physical page.
+    me nand_word(ppn: i64) -> i64:
+        me.fil.read(ppn).data
+
+    # OOB logical-block tag stored at a physical page (UNMAP if erased/empty).
+    me nand_lba(ppn: i64) -> i64:
+        me.fil.read(ppn).lba
+
+    me block_valid_count(blk: i64) -> i64:
+        me.band.valid_count(blk)
+
+    me page_live(ppn: i64) -> i64:
+        var v: i64 = 0
+        if me.band.is_valid(ppn):
+            v = 1
+        v
+
+    # Reclaim one block: relocate its live pages to fresh pages (durable + journaled
+    # BEFORE the block is erased), then erase and free it. Returns the block, or UNMAP
+    # if it could not be fully drained.
+    #
+    # SAFETY (data-loss guard): the block is erased ONLY after EVERY live page has been
+    # relocated. If a relocation cannot allocate a fresh page (device full / GC reserve
+    # exhausted), this aborts and returns UNMAP, leaving the block — and the host data it
+    # still holds — intact. Erasing a block with un-relocated live pages would destroy
+    # committed data while the L2P map still points into it. A crash mid-reclaim leaves
+    # the new copy discoverable by recovery (newest seq wins).
+    me reclaim_block(blk: i64) -> i64:
+        val base: i64 = block_first_ppn(blk)
+        var p: i64 = 0
+        while p < PAGES_PER_BLOCK:
+            val ppn: i64 = base + p
+            val live: bool = me.band.is_valid(ppn)
+            if live:
+                # Source read through the L8 recovery-ladder mount (design §2, closes
+                # gap A2): a retention-drifted-but-recoverable source page is recovered
+                # via the Vref retry table instead of aborting the whole reclaim. On the
+                # default backend / a truly uncorrectable page the ladder exhausts
+                # (res.ok == 0) and we abort exactly as before — no copy, no erase.
+                val res: RelReadResult = me.fil.read_with_ladder(ppn, nd_block(blk))
+                if res.ok == 0:
+                    return UNMAP    # source page is not safely recoverable; do NOT copy or erase
+                val newp: i64 = me.band.alloc_page()
+                if newp == NO_PPN:
+                    return UNMAP    # cannot relocate -> do NOT erase; block stays intact
+                val s: i64 = me.next_seq()
+                val pc: i64 = me.fil.program(newp, res.lba, s, res.data)
+                if pc != NAND_OK:
+                    me.band.set_bad(ppn_block(newp))
+                    me.rel_retire(ppn_block(newp))  # relocation-target retire -> spare substitution
+                    return UNMAP    # failed relocation -> old page remains live; do NOT erase
+                me.ensure_journal_room()
+                val before_wal: i64 = me.journal.wal_len()
+                if me.journal.append(0, res.lba, ppn, newp, s) <= before_wal:
+                    return UNMAP    # relocation is not durable; old page remains live
+                me.rain_update_page(newp, 0, res.data)
+                me.map.update(res.lba, newp)
+                me.band.mark_valid(newp)
+                me.band.mark_invalid(ppn)
+            p = p + 1
+        val old_words: [i64] = me.rain_block_words(blk)
+        val er: i64 = me.fil.erase(blk)
+        if er != NAND_OK:
+            me.band.set_bad(blk)
+            me.clear_read_disturb(blk)
+            me.rel_retire(blk)              # erase-fail retire -> event-driven spare substitution
+            return UNMAP
+        me.rain_note_erased_block(blk, old_words)
+        me.band.free_block(blk)
+        me.clear_read_disturb(blk)  # erased -> read-disturb accumulation cleared
+        me.rel_on_erase(blk)        # design §7 erase-reset: vref decay + disturb/health clear + wear/refresh update
+        blk
+
+    # Garbage-collect one victim. The victim is chosen by the (sandboxed) GC-scoring
+    # policy hook ranking the firmware's OWN CLOSED candidates; with no hook installed
+    # this is the greedy (fewest-valid) default. Returns the reclaimed block, or UNMAP if
+    # nothing is collectable / it could not be drained.
+    me gc_once() -> i64:
+        val victim: i64 = me.policy_gc_victim()
+        if victim == UNMAP:
+            return UNMAP
+        me.reclaim_block(victim)
+
+    # GC victim selection via the policy hook. The firmware enumerates its OWN CLOSED
+    # candidates (the trusted set) and asks the hook only to SCORE each; the lowest-scored
+    # candidate wins. Because the hook can only score blocks the firmware offers — never
+    # name one — it can never select a FREE / OPEN-active / BAD block (which would corrupt
+    # the allocator). The default scorer ranks by live-page count (greedy). Returns UNMAP
+    # when no CLOSED block exists.
+    me policy_gc_victim() -> i64:
+        var best: i64 = UNMAP
+        var best_score: i64 = 0
+        var blk: i64 = 0
+        while blk < NUM_BLOCKS:
+            if me.band.block_state(blk) == BLK_CLOSED:
+                val score: i64 = me.hooks.gc_candidate_score(blk, me.band.valid_count(blk), me.fil.erase_count(blk))
+                if best == UNMAP or score < best_score:
+                    best_score = score
+                    best = blk
+            blk = blk + 1
+        best
+
+    # ── Dynamic policy-hook control (req 7) ──────────────────────────────────
+    # Install a GC-scoring policy at runtime (caller passes a lambda taking
+    # (block, valid, erase, fuel) -> HookVote). Void delegation form, mirroring the emu
+    # seam: the setter forwards one hop to the hooks registry.
+    me install_gc_policy(f: fn(i64, i64, i64, i64) -> HookVote):
+        me.hooks.install_gc_score(f)
+
+    # Revert GC selection to the built-in greedy default.
+    me clear_gc_policy():
+        me.hooks.clear_gc_score()
+
+    # The loader's install gate: true for an allowed policy kind, false (rejected, counted)
+    # for a forbidden metadata / recovery / commit domain.
+    me try_load_policy(kind: i64) -> bool:
+        me.hooks.request_install(kind)
+
+    me policy_rejected_installs() -> i64:
+        me.hooks.rejected_count()
+
+    me policy_fuel_aborts() -> i64:
+        me.hooks.fuel_abort_count()
+
+    me set_hook_fuel_budget(n: i64):
+        me.hooks.fuel_budget = n
+
+    # Static wear leveling: when the erase-count spread between the most- and least-worn
+    # live blocks exceeds WL_THRESHOLD, reclaim the coldest (least-erased) block so the
+    # static data it holds moves and that lightly-worn block rejoins the write rotation.
+    # Returns the leveled block, or UNMAP if wear is already balanced.
+    me wear_level_once() -> i64:
+        val cold: i64 = gc_select_wear_victim(me.band, me.fil)
+        if cold == UNMAP:
+            return UNMAP
+        if me.max_erase() - me.fil.erase_count(cold) <= WL_THRESHOLD:
+            return UNMAP
+        me.reclaim_block(cold)
+
+    # Read-disturb scrub: reclaim a CLOSED block whose accumulated read count exceeds
+    # READ_DISTURB_THRESHOLD, rewriting its live pages fresh (clearing disturb) and
+    # erasing it. Returns the scrubbed block, or UNMAP if none needs it.
+    me scrub_once() -> i64:
+        var target: i64 = UNMAP
+        var blk: i64 = 0
+        while blk < NUM_BLOCKS:
+            if me.band.block_state(blk) == BLK_CLOSED:
+                if me.band.valid_count(blk) > 0 and me.read_disturb_count(blk) > READ_DISTURB_THRESHOLD:
+                    if target == UNMAP:
+                        target = blk
+            blk = blk + 1
+        if target == UNMAP:
+            return UNMAP
+        me.reclaim_block(target)
+
+    # ── L8 wiring pass: service-tick reclaim-class round-robin (design §7) ─────
+    # Feed observations continuously (reads → rel_disturb/rel_health in read();
+    # erases → rel_vref decay / rel_wear / rel_health clear in reclaim_block; writes
+    # → rel_refresh_on_write in write()), then execute AT MOST ONE reclaim-class step
+    # per tick chosen by rel_tick_select's fixed priority (GC > refresh > scrub > WL).
+    # The single-step-per-tick discipline is the budget invariant: it preserves the
+    # shared GC_RESERVE and the existing write-cliff fix. Returns the selected step
+    # code (rel_step_*) so a test can observe which class fired.
+    me rel_tick(low_wm: i64) -> i64:
+        val step: i64 = me.rel_select_step(low_wm)
+        var did: i64 = UNMAP
+        if step == rel_step_gc():
+            did = me.gc_once()
+        elif step == rel_step_refresh():
+            did = me.rel_drain_refresh()
+        elif step == rel_step_scrub():
+            did = me.scrub_once()
+        elif step == rel_step_wl():
+            did = me.rel_wear_level()
+        if step != rel_step_none() and did != UNMAP:
+            me.rel_reclaim_count = me.rel_reclaim_count + 1
+        step
+
+    # The step rel_tick WOULD take this cycle (without executing it) — lets the
+    # single-queue firmware.service_tick gate its background-owner acquisition so an
+    # idle device does not contend the map-owner token (preserves firmware_selftest's
+    # owner-conflict accounting) while still draining every reclaim class when due.
+    me rel_select_step(low_wm: i64) -> i64:
+        rel_tick_select(me.free_blocks(), low_wm, me.rel_refresh_pending_count(),
+                        me.worst_read_disturb(), READ_DISTURB_THRESHOLD,
+                        me.wl_spread(), WL_THRESHOLD)
+
+    me rel_maintenance_due(low_wm: i64) -> bool:
+        me.rel_select_step(low_wm) != rel_step_none()
+
+    # Refresh queue drain (step 2): reclaim the first refresh-marked CLOSED block that
+    # still holds live data. reclaim_block relocates its (ladder-recovered) live pages
+    # to fresh pages and erases it — the erase-reset then clears the refresh mark.
+    me rel_drain_refresh() -> i64:
+        var b: i64 = 0
+        while b < NUM_BLOCKS:
+            if me.rel_refresh.marked[b] == 1 and me.band.block_state(b) == BLK_CLOSED and me.band.valid_count(b) > 0:
+                return me.reclaim_block(b)
+            b = b + 1
+        UNMAP
+
+    # Static wear leveling (step 4), gated by the SREA-lite dwell verdict: only churn
+    # the coldest block once it has actually rested (dwell >= REL_WL_DWELL_MIN), then
+    # fire the existing wear_level_once. rel_wear_due Accepts (deferral) otherwise.
+    me rel_wear_level() -> i64:
+        val cold: i64 = gc_select_wear_victim(me.band, me.fil)
+        if cold == UNMAP:
+            return UNMAP
+        val verdict: RelAction = rel_wear_due(me.rel_wear, nd_block(cold), me.fil.erase_count(cold), me.max_erase(), me.total_erases())
+        if verdict.kind != rel_act_reclaim():
+            return UNMAP    # SREA deferral: cold block not dwelled enough
+        me.wear_level_once()
+
+    # ── Tick gate inputs (all over CLOSED-with-live blocks: the reclaim candidates) ─
+    me rel_refresh_pending_count() -> i64:
+        var n: i64 = 0
+        var b: i64 = 0
+        while b < NUM_BLOCKS:
+            if me.rel_refresh.marked[b] == 1 and me.band.block_state(b) == BLK_CLOSED and me.band.valid_count(b) > 0:
+                n = n + 1
+            b = b + 1
+        n
+
+    me worst_read_disturb() -> i64:
+        var w: i64 = 0
+        var b: i64 = 0
+        while b < NUM_BLOCKS:
+            if me.band.block_state(b) == BLK_CLOSED and me.band.valid_count(b) > 0:
+                val d: i64 = me.read_disturb_count(b)
+                if d > w:
+                    w = d
+            b = b + 1
+        w
+
+    me wl_spread() -> i64:
+        val cold: i64 = gc_select_wear_victim(me.band, me.fil)
+        if cold == UNMAP:
+            return 0
+        me.max_erase() - me.fil.erase_count(cold)
+
+    # ── Retire / erase-reset shared helpers (design §7) ───────────────────────
+    # Event-driven spare substitution: a data-region block (0..55) was retired on a
+    # media failure -> draw one over-provision spare (56..63, fil_badblock) to backfill
+    # capacity, closing gap A7. Retiring a spare itself does not recurse. Records the
+    # substitution for observability; the OP block is already allocator-visible so this
+    # advances the reserved-pool cursor rather than changing the band's free set.
+    me rel_retire(blk: i64):
+        if blk < 0 or blk >= 56:
+            return
+        val s: i64 = me.fil.alloc_spare()
+        if s != UNMAP:
+            me.rel_spares = me.rel_spares + 1
+            me.rel_last_spare = s
+
+    # Erase-reset discipline: a block's reliability state must not survive a P/E cycle.
+    # Clears the ROR calibration (fil), the disturb hottest-page estimate, the per-cycle
+    # health counters, and stamps the wear dwell snapshot + clears the refresh mark.
+    me rel_on_erase(blk: i64):
+        me.fil.decay_vref_on_erase(nd_block(blk))
+        me.rel_disturb = rel_disturb_clear(me.rel_disturb, nd_block(blk))
+        me.rel_health  = rel_health_on_erase(me.rel_health, nd_block(blk))
+        me.rel_wear    = rel_wear_on_erase(me.rel_wear, nd_block(blk), me.total_erases())
+        me.rel_refresh = rel_refresh_on_write(me.rel_refresh, nd_block(blk), me.seq)
+
+    # ── Reliability observability accessors (design §5/§7/§10 oracles) ────────
+    me rel_reclaims() -> i64:
+        me.rel_reclaim_count
+
+    me rel_spares_allocated() -> i64:
+        me.rel_spares
+
+    me rel_last_spare_block() -> i64:
+        me.rel_last_spare
+
+    me health_retry_depth(blk: i64) -> i64:
+        if not block_in_range(blk):
+            return 0
+        me.rel_health.retry_depth_max[blk]
+
+    me health_corrected_events(blk: i64) -> i64:
+        if not block_in_range(blk):
+            return 0
+        me.rel_health.corrected_events[blk]
+
+    me refresh_marked(blk: i64) -> i64:
+        if not block_in_range(blk):
+            return 0
+        me.rel_refresh.marked[blk]
+
+    me refresh_cause(blk: i64) -> i64:
+        if not block_in_range(blk):
+            return 0
+        me.rel_health.refresh_cause[blk]
+
+    me calibrated_offset(blk: i64) -> i64:
+        me.fil.calibrated_offset(blk)
+
+# ── Self-test ─────────────────────────────────────────────────────────────────
+
+fn ftl_selftest() -> i64:
+    var fail: i64 = 0
+    var ftl: Ftl = ftl_new()
+
+    # basic write / read / overwrite
+    fail = fail + expect_eq(ftl.write(10, 0xAB), SC_SUCCESS, "write lba10")
+    fail = fail + expect_eq(ftl.write(20, 0xCD), SC_SUCCESS, "write lba20")
+    val free_before_bad_write: i64 = ftl.free_blocks()
+    fail = fail + expect_eq(ftl.write(LBA_COUNT, 0xEE), SC_LBA_RANGE, "out-of-range FTL write rejected")
+    fail = fail + expect_eq(ftl.free_blocks(), free_before_bad_write, "out-of-range FTL write consumes no block")
+    fail = fail + expect_eq(ftl.read(LBA_COUNT), 0, "out-of-range FTL read is inert")
+    fail = fail + expect_eq(ftl.read_status(LBA_COUNT), SC_LBA_RANGE, "out-of-range FTL read_status rejected")
+    fail = fail + expect_eq(ftl.read_range_status(LBA_COUNT - 1, 2), SC_LBA_RANGE, "out-of-range FTL read range rejected")
+    fail = fail + expect_eq(ftl.read_range_status(1, FW_OVERFLOW_TEST_SIZE), SC_LBA_RANGE, "overflow-sized FTL read range rejected")
+    fail = fail + expect_eq(bool_to_int(ftl.can_write_blocks(-1)), 0, "negative write capacity request fails closed")
+    fail = fail + expect_eq(ftl.trim(LBA_COUNT), SC_LBA_RANGE, "out-of-range FTL trim rejected")
+    fail = fail + expect_eq(ftl.read(10), 0xAB, "read lba10")
+    fail = fail + expect_eq(ftl.read(20), 0xCD, "read lba20")
+    val blk10: i64 = ftl.physical_block(10)
+    ftl.rd_disturb[blk10] = -11
+    fail = fail + expect_eq(ftl.read_disturb_count(blk10), 0, "corrupted negative read-disturb clamps to zero")
+    fail = fail + expect_eq(ftl.read(10), 0xAB, "read after corrupted read-disturb counter")
+    fail = fail + expect_eq(ftl.read_disturb_count(blk10), 1, "read-disturb resumes from zero after corruption")
+    ftl.rd_disturb[blk10] = FW_OVERFLOW_TEST_SIZE + 1
+    fail = fail + expect_eq(ftl.read_disturb_count(blk10), FW_SAFE_I64_LIMIT, "corrupted oversized read-disturb saturates")
+    fail = fail + expect_eq(ftl.read(10), 0xAB, "read survives oversized read-disturb counter")
+    fail = fail + expect_eq(ftl.read_disturb_count(blk10), FW_SAFE_I64_LIMIT, "read-disturb stays saturated after oversized corruption")
+    ftl.rd_disturb = []
+    fail = fail + expect_eq(ftl.read_disturb_count(blk10), 0, "truncated read-disturb table fails closed")
+    fail = fail + expect_eq(ftl.read(10), 0xAB, "read survives truncated read-disturb table")
+    ftl.rd_disturb = ftl_fill(NUM_BLOCKS, 0)
+    val seq_before_corrupt: i64 = ftl.seq
+    ftl.seq = -9
+    fail = fail + expect_eq(ftl.write(10, 0x88), SC_SUCCESS, "write recovers corrupted negative sequence")
+    fail = fail + expect_eq(ftl.seq, seq_before_corrupt + 1, "sequence resumes after WAL max")
+    fail = fail + expect_eq(ftl.read(10), 0x88, "read after recovered sequence write")
+    ftl.seq = FTL_MAX_SEQ
+    fail = fail + expect_eq(ftl.write(10, 0x89), SC_SUCCESS, "write survives corrupted saturated sequence")
+    fail = fail + expect_eq(ftl.seq, FTL_MAX_SEQ, "saturated sequence does not wrap negative")
+    fail = fail + expect_eq(ftl.read(10), 0x89, "read after saturated sequence write")
+    ftl.write(10, 0x99)
+    fail = fail + expect_eq(ftl.read(10), 0x99, "overwrite lba10 (newest wins)")
+
+    # trim
+    ftl.trim(20)
+    fail = fail + expect_eq(ftl.read(20), 0, "trim lba20 -> reads 0")
+
+    # crash + recovery: committed state survives a lost L2P
+    ftl.crash()
+    fail = fail + expect_eq(ftl.read(10), 0, "after crash: volatile L2P lost")
+    ftl.recover()
+    fail = fail + expect_eq(ftl.read(10), 0x99, "recover: lba10 newest survives")
+    fail = fail + expect_eq(ftl.read(20), 0, "recover: lba20 stays trimmed")
+    ftl.journal.append(0, LBA_COUNT, UNMAP, block_first_ppn(1), ftl.seq + 1)
+    ftl.journal.append(0, 10, UNMAP, NUM_PAGES, ftl.seq + 2)
+    ftl.crash()
+    ftl.recover()
+    fail = fail + expect_eq(ftl.read(10), 0x99, "recover skips invalid WAL ppn")
+    fail = fail + expect_eq(ftl.read(LBA_COUNT), 0, "recover skips invalid WAL lba")
+    var stale: Ftl = ftl_new()
+    stale.write(30, 0x11)
+    val stale_old_ppn: i64 = stale.physical_ppn(30)
+    stale.write(30, 0x22)
+    stale.journal.append(0, 30, UNMAP, stale_old_ppn, 1)
+    stale.crash()
+    stale.recover()
+    fail = fail + expect_eq(stale.read(30), 0x22, "recover ignores stale WAL sequence rollback")
+    var jw: Ftl = ftl_new()
+    jw.write(31, 0x31)
+    jw.journal.cap = 0
+    fail = fail + expect_eq(jw.write(31, 0x32), SC_NS_NOT_READY, "write fails closed when WAL cannot append")
+    fail = fail + expect_eq(jw.read(31), 0x31, "failed WAL append write leaves old mapping intact")
+    fail = fail + expect_eq(jw.rain_parity[1], 0, "failed WAL append write leaves new-page parity untouched")
+    fail = fail + expect_eq(jw.trim(31), SC_NS_NOT_READY, "trim fails closed when WAL cannot append")
+    fail = fail + expect_eq(jw.read(31), 0x31, "failed WAL append trim leaves mapping intact")
+
+    # garbage collection: create a CLOSED block full of mostly-stale data, reclaim it
+    var i: i64 = 0
+    while i < PAGES_PER_BLOCK:
+        ftl.write(100 + i, 200 + i)
+        i = i + 1
+    ftl.write(900, 0x55)                 # opens a new block; block 0 is now CLOSED
+    i = 0
+    while i < PAGES_PER_BLOCK - 4:        # overwrite most of block 0 -> stale
+        ftl.write(100 + i, 111)
+        i = i + 1
+    ftl.rd_disturb = []
+    val victim: i64 = ftl.gc_once()
+    var reclaimed: i64 = 0
+    if victim != UNMAP:
+        reclaimed = 1
+    fail = fail + expect_eq(reclaimed, 1, "gc reclaimed a victim block")
+    fail = fail + expect_eq(ftl.read_disturb_count(victim), 0, "gc survives truncated read-disturb table")
+    ftl.rd_disturb = ftl_fill(NUM_BLOCKS, 0)
+    # logical view preserved across GC (relocated live pages still read correctly)
+    fail = fail + expect_eq(ftl.read(100), 111, "post-GC read overwritten lba100")
+    fail = fail + expect_eq(ftl.read(163), 263, "post-GC read relocated lba163")
+    fail = fail + expect_eq(ftl.erase_count(victim), 1, "gc erased + reclaimed the victim block")
+
+    var gf: Ftl = ftl_new()
+    i = 0
+    while i < PAGES_PER_BLOCK * 2:
+        gf.write(700 + i, 1000 + i)
+        i = i + 1
+    gf.fil.inject_prog_fail(2)
+    val blocked: i64 = gf.gc_once()
+    fail = fail + expect_eq(blocked, UNMAP, "gc aborts when relocation program fails")
+    fail = fail + expect_eq(gf.read(700), 1000, "failed gc keeps old live page readable")
+    fail = fail + expect_eq(gf.band.block_state(2), BLK_BAD, "failed relocation retires target block in allocator")
+
+    var ef: Ftl = ftl_new()
+    i = 0
+    while i < PAGES_PER_BLOCK * 2:
+        ef.write(1000 + i, 2000 + i)
+        i = i + 1
+    ef.fil.inject_erase_fail(0)
+    val erase_blocked: i64 = ef.gc_once()
+    fail = fail + expect_eq(erase_blocked, UNMAP, "gc does not free a block when erase fails")
+    fail = fail + expect_eq(ef.read(1000), 2000, "failed erase gc keeps relocated data readable")
+    fail = fail + expect_eq(ef.band.block_state(0), BLK_BAD, "failed erase retires victim in allocator")
+
+    var rf: Ftl = ftl_new()
+    i = 0
+    while i < PAGES_PER_BLOCK * 2:
+        rf.write(1200 + i, 3000 + i)
+        i = i + 1
+    val src_ppn: i64 = rf.physical_ppn(1200)
+    rf.inject_read_bitflip(src_ppn, 2)
+    val read_blocked: i64 = rf.gc_once()
+    fail = fail + expect_eq(read_blocked, UNMAP, "gc aborts on uncorrectable source read")
+    fail = fail + expect_eq(rf.read_status(1200), SC_MEDIA_ERR, "failed source read remains reported as media error")
+    fail = fail + expect_eq(rf.band.block_state(0), BLK_CLOSED, "failed source read keeps victim closed")
+
+    var wal_gc: Ftl = ftl_new()
+    i = 0
+    while i < PAGES_PER_BLOCK * 2:
+        wal_gc.write(1400 + i, 4000 + i)
+        i = i + 1
+    val gc_parity_before: i64 = wal_gc.rain_parity[0]
+    wal_gc.journal.cap = 0
+    fail = fail + expect_eq(wal_gc.gc_once(), UNMAP, "gc aborts when relocation WAL cannot append")
+    fail = fail + expect_eq(wal_gc.read(1400), 4000, "failed relocation WAL keeps old live page readable")
+    fail = fail + expect_eq(wal_gc.rain_parity[0], gc_parity_before, "failed relocation WAL leaves parity untouched")
+    fail = fail + expect_eq(wal_gc.band.block_state(0), BLK_CLOSED, "failed relocation WAL keeps victim closed")
+
+    fail
+
+# RAIN wired into the FTL: write known data, lose a whole channel, rebuild it from live parity.
+fn ftl_rain_selftest() -> i64:
+    var fail: i64 = 0
+    var ftl: Ftl = ftl_new()
+    var i: i64 = 0
+    while i < 64:
+        val v: i64 = (i % 251) + 1
+        val st: i64 = ftl.write(i, v)
+        fail = fail + expect_eq(st, SC_SUCCESS, "ftl-rain: write")
+        i = i + 1
+    fail = fail + expect_eq(ftl.rain_parity_ready(), true, "ftl-rain: writes maintain parity table")
+    val ppn0: i64 = ftl.physical_ppn(0)
+    val blk0: i64 = ppn_block(ppn0)
+    val failed: i64 = blk0 % NUM_CHANNELS
+    fail = fail + expect_eq(ftl.rain_recover_channel(NUM_CHANNELS), 0, "ftl-rain: invalid channel rebuild is inert")
+    fail = fail + expect_eq(ftl.read(0), 1, "ftl-rain: invalid rebuild leaves data intact")
+    val saved_parity: [i64] = ftl.rain_parity
+    val erase_before_bad_parity: i64 = ftl.erase_count(blk0)
+    ftl.rain_parity = []
+    fail = fail + expect_eq(ftl.rain_recover_channel(failed), 0, "ftl-rain: corrupted parity table blocks rebuild")
+    fail = fail + expect_eq(ftl.erase_count(blk0), erase_before_bad_parity, "ftl-rain: corrupted parity table does not erase failed block")
+    ftl.rain_parity = saved_parity
+    var bad_rain: Ftl = ftl_new()
+    fail = fail + expect_eq(bad_rain.write(0, 1), SC_SUCCESS, "ftl-rain: media-failure setup write")
+    val bad_blk: i64 = ppn_block(bad_rain.physical_ppn(0))
+    bad_rain.fil.inject_erase_fail(bad_blk)
+    fail = fail + expect_eq(bad_rain.rain_recover_channel(bad_blk % NUM_CHANNELS), 0, "ftl-rain: erase failure reports no rebuilt pages")
+    fail = fail + expect_eq(bool_to_int(bad_rain.fil.block_bad(bad_blk)), 1, "ftl-rain: erase failure retires failed block")
+    var bad_survivor: Ftl = ftl_new()
+    fail = fail + expect_eq(bad_survivor.write(0, 1), SC_SUCCESS, "ftl-rain: bad-survivor setup write")
+    val survivor_ppn: i64 = rain_ppn(0, 1, 0)
+    fail = fail + expect_eq(bad_survivor.fil.program(survivor_ppn, 900, 1, 2), NAND_OK, "ftl-rain: bad-survivor direct program")
+    bad_survivor.inject_read_bitflip(survivor_ppn, 2)
+    fail = fail + expect_eq(bad_survivor.rain_recover_channel(0), 0, "ftl-rain: unreadable survivor blocks rebuild")
+    fail = fail + expect_eq(bad_survivor.read(0), 1, "ftl-rain: unreadable survivor leaves failed-channel data intact")
+    ftl.rain_parity = []
+    ftl.rain_seal()
+    fail = fail + expect_eq(ftl.rain_parity_ready(), true, "ftl-rain: seal repairs corrupted parity table")
+    var corrupted: i64 = 0
+    i = 0
+    while i < 64:
+        val ppn: i64 = ftl.physical_ppn(i)
+        if ppn != UNMAP:
+            val blk: i64 = ppn_block(ppn)
+            if blk % NUM_CHANNELS == failed:
+                ftl.inject_read_bitflip(ppn, 2)
+                corrupted = corrupted + 1
+        i = i + 1
+    val rebuilt: i64 = ftl.rain_recover_channel(failed)
+    fail = fail + expect_eq(rebuilt, corrupted, "ftl-rain: all lost pages rebuilt")
+    i = 0
+    while i < 64:
+        val want: i64 = (i % 251) + 1
+        val got: i64 = ftl.read(i)
+        fail = fail + expect_eq(got, want, "ftl-rain: LBA survives channel loss")
+        i = i + 1
+    fail

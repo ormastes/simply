@@ -1,0 +1,57 @@
+# @cover src/kernel/posting.spl 80%
+"""
+# Accounting Posting Bridge
+
+Every accepted write posts a balanced journal entry (debit cash, credit revenue)
+and one immutable event into the event-sourced ledger. Account balances are
+projections summed from the entries, so a hand-built unbalanced entry must fail
+the balanced-ledger invariant.
+"""
+
+use std.spec
+use units.money.{money}
+use kernel.event_log.{EventLog, new_event_log, event_count, events_for}
+use kernel.projection.{JournalLine, JournalEntry, line, account_balance}
+use kernel.posting.{cash_account, revenue_account, journal_for_accepted, post_accepted_write, posting_balanced}
+
+describe "Posting — balanced journal entries":
+    it "produces a balanced entry for an accepted write":
+        val entry = journal_for_accepted(1, "USD", 11000)
+        expect(posting_balanced(entry)).to_equal(true)
+
+    it "debits cash and credits revenue by the same magnitude":
+        val entry = journal_for_accepted(2, "USD", 5000)
+        val cash = account_balance([entry], cash_account(), "USD")
+        val revenue = account_balance([entry], revenue_account(), "USD")
+        expect(cash.minor).to_equal(5000)
+        expect(revenue.minor).to_equal(-5000)
+
+    it "fails the invariant for a hand-built unbalanced entry":
+        var lines: [JournalLine] = []
+        lines.push(line(cash_account(), money("USD", 100)))
+        lines.push(line(revenue_account(), money("USD", -90)))
+        val entry = JournalEntry { id: 3, lines: lines }
+        expect(posting_balanced(entry)).to_equal(false)
+
+describe "Posting — event log append":
+    it "appends exactly one event with the right kind and entity":
+        var log = new_event_log()
+        log = post_accepted_write(log, "sale.write", 7, 11000)
+        expect(event_count(log)).to_equal(1)
+        var found_kind = ""
+        var found_entity: i64 = 0
+        for ev in events_for(log, 7):
+            found_kind = ev.kind
+            found_entity = ev.entity
+        expect(found_kind).to_equal("sale.write")
+        expect(found_entity).to_equal(7)
+
+describe "Posting — account balance projection":
+    it "sums cash across several accepted-write entries":
+        var entries: [JournalEntry] = []
+        entries.push(journal_for_accepted(1, "USD", 11000))
+        entries.push(journal_for_accepted(2, "USD", 5000))
+        entries.push(journal_for_accepted(3, "USD", 15000))
+        entries.push(journal_for_accepted(4, "USD", 2000))
+        val cash = account_balance(entries, cash_account(), "USD")
+        expect(cash.minor).to_equal(33000)

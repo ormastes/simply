@@ -1,0 +1,261 @@
+# LLM Caret Config Specification
+
+# Inline config parser for test isolation
+var CONFIG_LOADED = false
+var DEFAULT_PROVIDER = "claude_cli"
+var DEFAULT_HISTORY_FILE = ".llm_caret_history.sdn"
+var DEFAULT_MAX_HISTORY = 100
+
+var CLAUDE_CLI_PATH = "claude"
+var CLAUDE_CLI_MODEL = "claude-sonnet-4-20250514"
+var CLAUDE_CLI_EXTRA_ARGS = ""
+
+var CLAUDE_API_KEY_ENV = "ANTHROPIC_API_KEY"
+var CLAUDE_API_BASE_URL = "https://api.anthropic.com"
+var CLAUDE_API_MODEL = "claude-sonnet-4-20250514"
+
+var OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
+var OPENAI_BASE_URL = "https://api.openai.com"
+var OPENAI_MODEL = "gpt-4o"
+
+var COMPAT_BASE_URL = "http://localhost:11434"
+var COMPAT_MODEL = "llama3"
+var COMPAT_API_KEY_ENV = ""
+
+var LOCAL_MODEL_PATH = ""
+var LOCAL_PYTHON_PATH = "python3"
+
+fn _unwrap_idx_cfg(opt) -> i64:
+    match opt:
+        Some(i): return i
+        nil: return -1
+
+fn _apply_config(section: text, key: text, value: text):
+    if section == "defaults":
+        if key == "provider":
+            DEFAULT_PROVIDER = value
+        elif key == "history_file":
+            DEFAULT_HISTORY_FILE = value
+        elif key == "max_history":
+            DEFAULT_MAX_HISTORY = int(value)
+    elif section == "claude_cli":
+        if key == "cli_path":
+            CLAUDE_CLI_PATH = value
+        elif key == "model":
+            CLAUDE_CLI_MODEL = value
+        elif key == "extra_args":
+            CLAUDE_CLI_EXTRA_ARGS = value
+    elif section == "claude_api":
+        if key == "api_key_env":
+            CLAUDE_API_KEY_ENV = value
+        elif key == "base_url":
+            CLAUDE_API_BASE_URL = value
+        elif key == "model":
+            CLAUDE_API_MODEL = value
+    elif section == "openai":
+        if key == "api_key_env":
+            OPENAI_API_KEY_ENV = value
+        elif key == "base_url":
+            OPENAI_BASE_URL = value
+        elif key == "model":
+            OPENAI_MODEL = value
+    elif section == "openai_compat":
+        if key == "base_url":
+            COMPAT_BASE_URL = value
+        elif key == "model":
+            COMPAT_MODEL = value
+        elif key == "api_key_env":
+            COMPAT_API_KEY_ENV = value
+    elif section == "local_torch":
+        if key == "model_path":
+            LOCAL_MODEL_PATH = value
+        elif key == "python_path":
+            LOCAL_PYTHON_PATH = value
+
+fn _parse_section_name(trimmed: text) -> text:
+    val slen = trimmed.len() - 1
+    trimmed.substring(0, slen)
+
+fn _parse_kv_key(trimmed: text, colon_idx: i64) -> text:
+    trimmed.substring(0, colon_idx).trim()
+
+fn _parse_kv_value(trimmed: text, colon_idx: i64) -> text:
+    trimmed.substring(colon_idx + 1).trim()
+
+fn parse_config_text(raw: text) -> text:
+    var current_section = ""
+    val lines = raw.split("\n")
+    for line in lines:
+        val trimmed = line.trim()
+        if trimmed == "" or trimmed.starts_with("#"):
+            continue
+        if not line.starts_with(" ") and not line.starts_with("\t") and trimmed.ends_with(":"):
+            current_section = _parse_section_name(trimmed)
+            continue
+        val colon_idx = _unwrap_idx_cfg(trimmed.index_of(":"))
+        if colon_idx > 0:
+            val value = _parse_kv_value(line.trim(), colon_idx)
+            val key = _parse_kv_key(trimmed, colon_idx)
+            _apply_config(current_section, key, value)
+    CONFIG_LOADED = true
+    ""
+
+fn reset_config():
+    CONFIG_LOADED = false
+    DEFAULT_PROVIDER = "claude_cli"
+    DEFAULT_HISTORY_FILE = ".llm_caret_history.sdn"
+    DEFAULT_MAX_HISTORY = 100
+    CLAUDE_CLI_PATH = "claude"
+    CLAUDE_CLI_MODEL = "claude-sonnet-4-20250514"
+    CLAUDE_CLI_EXTRA_ARGS = ""
+    CLAUDE_API_KEY_ENV = "ANTHROPIC_API_KEY"
+    CLAUDE_API_BASE_URL = "https://api.anthropic.com"
+    CLAUDE_API_MODEL = "claude-sonnet-4-20250514"
+    OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
+    OPENAI_BASE_URL = "https://api.openai.com"
+    OPENAI_MODEL = "gpt-4o"
+    COMPAT_BASE_URL = "http://localhost:11434"
+    COMPAT_MODEL = "llama3"
+    COMPAT_API_KEY_ENV = ""
+    LOCAL_MODEL_PATH = ""
+    LOCAL_PYTHON_PATH = "python3"
+
+# Helper functions to work around var mutation in closures
+fn check(v):
+    expect(v).to_equal(true)
+
+fn _test_parse_defaults() -> bool:
+    reset_config()
+    val sdn = "defaults:\n    provider: openai\n    max_history: 50"
+    parse_config_text(sdn)
+    DEFAULT_PROVIDER == "openai" and DEFAULT_MAX_HISTORY == 50
+
+fn _test_parse_claude_cli() -> bool:
+    reset_config()
+    val sdn = "claude_cli:\n    cli_path: /usr/bin/claude\n    model: claude-opus-4-20250514"
+    parse_config_text(sdn)
+    CLAUDE_CLI_PATH == "/usr/bin/claude" and CLAUDE_CLI_MODEL == "claude-opus-4-20250514"
+
+fn _test_parse_claude_api() -> bool:
+    reset_config()
+    val sdn = "claude_api:\n    base_url: https://custom.api.com\n    model: claude-haiku"
+    parse_config_text(sdn)
+    CLAUDE_API_BASE_URL == "https://custom.api.com" and CLAUDE_API_MODEL == "claude-haiku"
+
+fn _test_parse_openai() -> bool:
+    reset_config()
+    val sdn = "openai:\n    model: gpt-3.5-turbo\n    base_url: https://custom.openai.com"
+    parse_config_text(sdn)
+    OPENAI_MODEL == "gpt-3.5-turbo" and OPENAI_BASE_URL == "https://custom.openai.com"
+
+fn _test_parse_openai_compat() -> bool:
+    reset_config()
+    val sdn = "openai_compat:\n    base_url: http://192.168.1.100:8080\n    model: mistral-7b"
+    parse_config_text(sdn)
+    COMPAT_BASE_URL == "http://192.168.1.100:8080" and COMPAT_MODEL == "mistral-7b"
+
+fn _test_parse_local_torch() -> bool:
+    reset_config()
+    val sdn = "local_torch:\n    model_path: /models/llama3\n    python_path: python3.11"
+    parse_config_text(sdn)
+    LOCAL_MODEL_PATH == "/models/llama3" and LOCAL_PYTHON_PATH == "python3.11"
+
+fn _test_skips_comments() -> bool:
+    reset_config()
+    val sdn = "# Comment\n\ndefaults:\n    # Another comment\n    provider: test_provider\n"
+    parse_config_text(sdn)
+    DEFAULT_PROVIDER == "test_provider"
+
+fn _test_parse_multiple_sections() -> bool:
+    reset_config()
+    val sdn = "defaults:\n    provider: claude_api\nopenai:\n    model: gpt-4-turbo"
+    parse_config_text(sdn)
+    DEFAULT_PROVIDER == "claude_api" and OPENAI_MODEL == "gpt-4-turbo"
+
+fn _test_config_loaded_flag() -> bool:
+    reset_config()
+    if CONFIG_LOADED:
+        return false
+    parse_config_text("defaults:\n    provider: test")
+    CONFIG_LOADED
+
+fn _test_empty_config() -> bool:
+    reset_config()
+    parse_config_text("")
+    CONFIG_LOADED and DEFAULT_PROVIDER == "claude_cli"
+
+# ============================================================================
+# Tests
+# ============================================================================
+
+describe "Config Defaults":
+    it "has default provider":
+        reset_config()
+        expect(DEFAULT_PROVIDER).to_equal("claude_cli")
+
+    it "has default history file":
+        reset_config()
+        expect(DEFAULT_HISTORY_FILE).to_equal(".llm_caret_history.sdn")
+
+    it "has default max history":
+        reset_config()
+        expect(DEFAULT_MAX_HISTORY).to_equal(100)
+
+    it "has default claude cli path":
+        reset_config()
+        expect(CLAUDE_CLI_PATH).to_equal("claude")
+
+    it "has default claude cli model":
+        reset_config()
+        expect(CLAUDE_CLI_MODEL).to_equal("claude-sonnet-4-20250514")
+
+    it "has default claude api base url":
+        reset_config()
+        expect(CLAUDE_API_BASE_URL).to_equal("https://api.anthropic.com")
+
+    it "has default openai base url":
+        reset_config()
+        expect(OPENAI_BASE_URL).to_equal("https://api.openai.com")
+
+    it "has default openai model":
+        reset_config()
+        expect(OPENAI_MODEL).to_equal("gpt-4o")
+
+    it "has default compat base url":
+        reset_config()
+        expect(COMPAT_BASE_URL).to_equal("http://localhost:11434")
+
+    it "has default local python path":
+        reset_config()
+        expect(LOCAL_PYTHON_PATH).to_equal("python3")
+
+describe "Config Parsing":
+    it "parses defaults section":
+        check(_test_parse_defaults())
+
+    it "parses claude_cli section":
+        check(_test_parse_claude_cli())
+
+    it "parses claude_api section":
+        check(_test_parse_claude_api())
+
+    it "parses openai section":
+        check(_test_parse_openai())
+
+    it "parses openai_compat section":
+        check(_test_parse_openai_compat())
+
+    it "parses local_torch section":
+        check(_test_parse_local_torch())
+
+    it "skips comments and empty lines":
+        check(_test_skips_comments())
+
+    it "parses multiple sections":
+        check(_test_parse_multiple_sections())
+
+    it "sets config loaded flag":
+        check(_test_config_loaded_flag())
+
+    it "handles empty config":
+        check(_test_empty_config())

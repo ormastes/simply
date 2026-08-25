@@ -1,0 +1,107 @@
+#![allow(unnamed_duplicate_typed_args)]
+@allow(unnamed_duplicate_typed_args)
+# mcpgdb MCP — clangd workspace tools
+
+use std.io_runtime.{file_exists, process_run}
+use examples.mcpgdb.json_helpers.{LB, RB, jp, js, jo0, extract_nested, make_tool_error, make_tool_result, shell_bin, shell_quote}
+use examples.mcpgdb.state.{MCPGDB_WORKSPACE}
+use examples.mcpgdb.backend_common.{choose_workspace_root, clangd_binary, start_clangd_workspace, stop_clangd_workspace, clangd_initialize, ensure_file_opened, clangd_uri, next_clangd_request_id, send_clangd_message, read_clangd_until_id}
+
+fn relative_or_absolute_path(path: text) -> text:
+    if path.starts_with("/"):
+        return path
+    if MCPGDB_WORKSPACE.root == "":
+        return path
+    MCPGDB_WORKSPACE.root + "/" + path
+
+fn clangd_request(method: text, params: text) -> text:
+    val request_id = next_clangd_request_id()
+    val body = LB()
+        + jp("jsonrpc", js("2.0"))
+        + "," + jp("id", request_id)
+        + "," + jp("method", js(method))
+        + "," + jp("params", params)
+        + RB()
+    val err = send_clangd_message(body)
+    if err != "":
+        return LB() + jp("status", js("error")) + "," + jp("message", js(err)) + RB()
+    val response = read_clangd_until_id(request_id, 50)
+    if response == "":
+        return LB() + jp("status", js("error")) + "," + jp("message", js("clangd request timeout")) + RB()
+    response
+
+fn ensure_clangd_ready(root: text, compile_dir: text) -> text:
+    if MCPGDB_WORKSPACE.clangd_pid != "":
+        return ""
+    val err = start_clangd_workspace(root, compile_dir)
+    if err != "":
+        return err
+    clangd_initialize(root)
+
+fn lsp_position_params(path: text, line: text, character: text) -> text:
+    val full = relative_or_absolute_path(path)
+    ensure_file_opened(full)
+    LB()
+        + jp("textDocument", LB() + jp("uri", js(clangd_uri(full))) + RB())
+        + "," + jp("position", LB() + jp("line", line) + "," + jp("character", character) + RB())
+        + RB()
+
+fn handle_workspace_clangd_open(id: text, body: text) -> text:
+    val root = choose_workspace_root(extract_nested(body, "root"))
+    val compile_dir = extract_nested(body, "compile_commands_dir")
+    if MCPGDB_WORKSPACE.clangd_pid != "":
+        stop_clangd_workspace()
+    val err = ensure_clangd_ready(root, compile_dir)
+    if err != "":
+        return make_tool_error(id, err)
+    var result = LB()
+    result = result + jp("workspace_root", js(root))
+    result = result + "," + jp("clangd_binary", js(clangd_binary()))
+    result = result + "," + jp("compile_commands_dir", js(MCPGDB_WORKSPACE.compile_commands_dir))
+    result = result + RB()
+    make_tool_result(id, result)
+
+fn handle_clangd_definition(id: text, body: text) -> text:
+    val params = lsp_position_params(extract_nested(body, "file"), extract_nested(body, "line"), extract_nested(body, "character"))
+    make_tool_result(id, clangd_request("textDocument/definition", params))
+
+fn handle_clangd_references(id: text, body: text) -> text:
+    val base = lsp_position_params(extract_nested(body, "file"), extract_nested(body, "line"), extract_nested(body, "character"))
+    val params = base.substring(0, base.len() - 1) + "," + jp("context", LB() + jp("includeDeclaration", "true") + RB()) + RB()
+    make_tool_result(id, clangd_request("textDocument/references", params))
+
+fn handle_clangd_hover(id: text, body: text) -> text:
+    val params = lsp_position_params(extract_nested(body, "file"), extract_nested(body, "line"), extract_nested(body, "character"))
+    make_tool_result(id, clangd_request("textDocument/hover", params))
+
+fn handle_clangd_symbols(id: text, body: text) -> text:
+    val file = relative_or_absolute_path(extract_nested(body, "file"))
+    ensure_file_opened(file)
+    val params = LB() + jp("textDocument", LB() + jp("uri", js(clangd_uri(file))) + RB()) + RB()
+    make_tool_result(id, clangd_request("textDocument/documentSymbol", params))
+
+fn handle_clangd_completion(id: text, body: text) -> text:
+    val params = lsp_position_params(extract_nested(body, "file"), extract_nested(body, "line"), extract_nested(body, "character"))
+    make_tool_result(id, clangd_request("textDocument/completion", params))
+
+fn handle_clangd_type_definition(id: text, body: text) -> text:
+    val params = lsp_position_params(extract_nested(body, "file"), extract_nested(body, "line"), extract_nested(body, "character"))
+    make_tool_result(id, clangd_request("textDocument/typeDefinition", params))
+
+fn handle_clangd_diagnostics(id: text, body: text) -> text:
+    val file = relative_or_absolute_path(extract_nested(body, "file"))
+    if not file_exists(file):
+        return make_tool_error(id, "file not found: " + file)
+    val binary = clangd_binary()
+    if binary == "":
+        return make_tool_error(id, "clangd binary not found")
+    val (stdout, stderr, code) = process_run(binary, ["--check=" + file])
+    var status = "error"
+    if code == 0:
+        status = "ok"
+    var result = LB()
+    result = result + jp("status", js(status))
+    result = result + "," + jp("stdout", js(stdout.trim()))
+    result = result + "," + jp("stderr", js(stderr.trim()))
+    result = result + RB()
+    make_tool_result(id, result)

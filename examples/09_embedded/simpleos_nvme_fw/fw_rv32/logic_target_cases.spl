@@ -1,0 +1,9 @@
+use logic_target_aperture_cases.*
+use logic_target_profile_cases.*
+
+fn rv32_target_cases_selftest() -> i32:
+    if rv32_target_profile_cases_selftest() != 0:
+        return 1
+    if rv32_target_aperture_cases_selftest() != 0:
+        return 1
+    0

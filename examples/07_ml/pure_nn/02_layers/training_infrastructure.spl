@@ -1,0 +1,24 @@
+#!/usr/bin/env simple
+# Training infrastructure demo - runtime compatible.
+
+fn sgd_step(param: f64, grad: f64, lr: f64) -> f64:
+    param - lr * grad
+
+fn main():
+    print "=== Training Infrastructure Demo ==="
+    var weight = 0.0
+    val target = 2.0
+    val lr = 0.25
+
+    var epoch = 0
+    while epoch < 6:
+        val grad = 2.0 * (weight - target)
+        val loss = (weight - target) * (weight - target)
+        print "epoch={epoch} weight={weight} loss={loss}"
+        weight = sgd_step(weight, grad, lr)
+        epoch = epoch + 1
+
+    print ""
+    print "Covered concepts: loss, gradient, optimizer step, history."
+    print "For minibatch training, run:"
+    print "examples/07_ml/pure_nn/runtime_compatible/minibatch_sgd_runtime.spl"

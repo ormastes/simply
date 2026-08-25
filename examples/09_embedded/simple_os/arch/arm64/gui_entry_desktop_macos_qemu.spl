@@ -1,0 +1,6 @@
+use arch.arm64.gui_entry_desktop.{gui_entry_desktop_start}
+
+fn spl_start():
+    # QEMU virt RAM begins at 0x40000000. The macOS/HVF wrapper shares the
+    # complete 512 MiB RAM file and reserves only its final 8 MiB.
+    gui_entry_desktop_start(0x5F800000u64)

@@ -1,0 +1,67 @@
+# Canvas2D bridge smoke test.
+#
+# Emits a handful of PaintOps, serializes them through the
+# scene_to_canvas2d_json layer, and ships them via the new
+# `paint_canvas` IPC message. The Electron host (tools/electron-shell)
+# renders them on a <canvas> and forwards mouse/scroll events back so
+# we can confirm round-trip.
+#
+# Launch:
+#   ./tools/electron-shell/node_modules/.bin/electron \
+#       tools/electron-shell examples/ui/canvas_smoke.spl
+
+use common.render_scene.paint_types.{PaintOp, DisplayList}
+use std.common.color.types.{Color, from_rgb, from_rgba}
+use common.render_scene.scene_to_canvas2d_json.{display_list_to_canvas2d_ops}
+use app.ui.ipc.protocol.{build_ipc_paint_canvas, parse_ipc_message}
+use common.ui.widget.{UIEvent}
+
+extern fn rt_stdin_read_line() -> text?
+
+fn _bg(r: i64, g: i64, b: i64) -> Color:
+    from_rgb(r, g, b)
+
+fn _build_smoke_list() -> DisplayList:
+    """Build a small DisplayList: gradient backdrop + text + a button rect."""
+    var ops: [PaintOp] = []
+    # Deep-space backdrop
+    ops = ops.push(PaintOp.FillRect(x: 0.0, y: 0.0, w: 1280.0, h: 800.0, color: from_rgb(6, 6, 18)))
+    # Title strip
+    ops = ops.push(PaintOp.FillRect(x: 0.0, y: 0.0, w: 1280.0, h: 64.0, color: from_rgba(255, 255, 255, 18)))
+    # Title text
+    ops = ops.push(PaintOp.DrawText(x: 96.0, y: 40.0, text_content: "Canvas2D Smoke", font_size: 18.0, color: from_rgb(227, 224, 243)))
+    # Card
+    ops = ops.push(PaintOp.FillRect(x: 200.0, y: 160.0, w: 880.0, h: 360.0, color: from_rgba(18, 18, 31, 200)))
+    # Card body
+    ops = ops.push(PaintOp.DrawText(x: 232.0, y: 200.0, text_content: "Hover, click, scroll. Events should print to stderr.", font_size: 16.0, color: from_rgb(198, 198, 200)))
+    # Button (filled rect + label)
+    ops = ops.push(PaintOp.FillRect(x: 232.0, y: 240.0, w: 160.0, h: 44.0, color: from_rgb(124, 105, 163)))
+    ops = ops.push(PaintOp.DrawText(x: 268.0, y: 268.0, text_content: "Click me", font_size: 14.0, color: from_rgb(255, 255, 255)))
+    # Bottom accent line
+    ops = ops.push(PaintOp.FillRect(x: 0.0, y: 798.0, w: 1280.0, h: 2.0, color: from_rgb(124, 105, 163)))
+    DisplayList(ops: ops)
+
+fn main() -> i64:
+    val list = _build_smoke_list()
+    val ops_json = display_list_to_canvas2d_ops(list)
+    print build_ipc_paint_canvas(ops_json, 1280, 800)
+
+    var running = true
+    while running:
+        val line = rt_stdin_read_line()
+        if line != nil and line != "":
+            val event = parse_ipc_message(line)
+            if event != nil:
+                match event:
+                    UIEvent.Quit:
+                        running = false
+                    UIEvent.MouseEvent(x, y, button, kind):
+                        eprint "[mouse] kind={kind} button={button} x={x} y={y}"
+                    UIEvent.ScrollEvent(x, y, dx, dy):
+                        eprint "[scroll] x={x} y={y} dx={dx} dy={dy}"
+                    UIEvent.KeyPress(key):
+                        eprint "[key] {key}"
+                    _:
+                        pass_dn
+
+    return 0

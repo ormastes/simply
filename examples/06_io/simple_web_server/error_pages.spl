@@ -1,0 +1,13 @@
+# Error Pages — Full Standalone Web Server Example
+#
+# Custom HTML error pages for the standalone server.
+#
+# Reuses: std.nogc_sync_mut.http_server (lightweight lib)
+# Lib source: src/lib/nogc_sync_mut/http_server/
+# Design: doc/05_design/simple_web_server_example.md
+
+use std.nogc_sync_mut.http_server.types.{HttpRequest, HttpResponse, HttpStatus}
+use std.nogc_sync_mut.http_server.response.{html_not_found_page}
+
+fn handle_404(req: HttpRequest) -> HttpResponse:
+    html_not_found_page(req.path)

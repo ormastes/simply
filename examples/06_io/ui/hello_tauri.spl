@@ -1,0 +1,9 @@
+# Hello Tauri — Tauri Backend Hello World
+#
+# Launches the Tauri native-window backend on port 3000
+# with the hello_tauri.ui.sdn layout.
+
+use app.ui.tauri.app.{run_tauri}
+
+fn main() -> i64:
+    return run_tauri("examples/06_io/ui/hello_tauri.ui.sdn", 3000)

@@ -1,0 +1,141 @@
+# tmux Command Wrapper
+# Safe wrapper around tmux commands via process_run.
+
+extern fn rt_process_run(cmd: text, args: [text]) -> (text, text, i64)
+extern fn rt_env_get(key: text) -> text
+
+# ============================================================================
+# Types
+# ============================================================================
+
+struct TmuxPane:
+    id: text
+    width: i32
+    height: i32
+    active: bool
+
+struct TmuxResult:
+    stdout: text
+    stderr: text
+    code: i64
+
+    fn ok() -> bool:
+        self.code == 0
+
+# ============================================================================
+# Availability
+# ============================================================================
+
+fn tmux_is_available() -> bool:
+    val env = rt_env_get("TMUX")
+    env != "" and env != nil
+
+fn tmux_is_installed() -> bool:
+    val (out, err, code) = rt_process_run("tmux", ["-V"])
+    code == 0
+
+# ============================================================================
+# Command Runner
+# ============================================================================
+
+fn tmux_run(args: [text]) -> TmuxResult:
+    val (stdout, stderr, code) = rt_process_run("tmux", args)
+    TmuxResult(stdout: stdout, stderr: stderr, code: code)
+
+# ============================================================================
+# Pane Operations
+# ============================================================================
+
+fn tmux_current_pane_id() -> text:
+    val result = tmux_run(["display-message", "-p", "#{pane_id}"])
+    if result.ok():
+        return result.stdout.trim()
+    return ""
+
+fn tmux_list_panes() -> [TmuxPane]:
+    val result = tmux_run(["list-panes", "-F", "#{pane_id} #{pane_width} #{pane_height} #{pane_active}"])
+    var panes: [TmuxPane] = []
+    if not result.ok():
+        return panes
+    val lines = result.stdout.trim().split("\n")
+    for line in lines:
+        val parts = line.split(" ")
+        if parts.len() >= 4:
+            var pane = TmuxPane(
+                id: parts[0],
+                width: parts[1].to_int() as i32,
+                height: parts[2].to_int() as i32,
+                active: parts[3] == "1"
+            )
+            panes.push(pane)
+    return panes
+
+fn tmux_split_pane(vertical: bool, size_pct: i32) -> text:
+    var args: [text] = ["split-window"]
+    if vertical:
+        args.push("-v")
+    else:
+        args.push("-h")
+    args.push("-p")
+    args.push("{size_pct}")
+    args.push("-P")
+    args.push("-F")
+    args.push("#{pane_id}")
+    val result = tmux_run(args)
+    if result.ok():
+        return result.stdout.trim()
+    return ""
+
+# ============================================================================
+# Message & Capture
+# ============================================================================
+
+fn tmux_display_message(msg: text):
+    tmux_run(["display-message", msg])
+
+fn tmux_capture_pane(pane_id: text) -> text:
+    val result = tmux_run(["capture-pane", "-t", pane_id, "-p"])
+    if result.ok():
+        return result.stdout
+    return ""
+
+fn tmux_send_keys(pane_id: text, keys: text):
+    tmux_run(["send-keys", "-t", pane_id, keys])
+
+fn tmux_send_keys_enter(pane_id: text, command: text):
+    tmux_run(["send-keys", "-t", pane_id, command, "Enter"])
+
+# ============================================================================
+# Hooks
+# ============================================================================
+
+fn tmux_set_hook(name: text, cmd: text):
+    tmux_run(["set-hook", "-g", name, "run-shell '{cmd}'"])
+
+fn tmux_unset_hook(name: text):
+    tmux_run(["set-hook", "-gu", name])
+
+# ============================================================================
+# Window & Session
+# ============================================================================
+
+fn tmux_current_session() -> text:
+    val result = tmux_run(["display-message", "-p", "#{session_name}"])
+    if result.ok():
+        return result.stdout.trim()
+    return ""
+
+fn tmux_current_window() -> text:
+    val result = tmux_run(["display-message", "-p", "#{window_id}"])
+    if result.ok():
+        return result.stdout.trim()
+    return ""
+
+fn tmux_set_option(key: text, value: text):
+    tmux_run(["set-option", key, value])
+
+fn tmux_get_option(key: text) -> text:
+    val result = tmux_run(["show-option", "-gv", key])
+    if result.ok():
+        return result.stdout.trim()
+    return ""

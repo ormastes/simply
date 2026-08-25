@@ -1,0 +1,35 @@
+# GELU Activation — from scratch
+# Chapter 4: "Build a Large Language Model From Scratch" (Rasbt)
+#
+# Gaussian Error Linear Unit:
+#   GELU(x) = x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+#
+# Smoother than ReLU, used in GPT-2 and BERT.
+
+use std.pure.tensor.{PureTensor, tensor_from_data}
+use examples.simple_deeplearning_study.lib.util.math_helpers.{dl_tanh, dl_sqrt, dl_pi}
+
+# GELU approximation (used in GPT-2)
+fn gelu(x: f64) -> f64:
+    val sqrt_2_over_pi = dl_sqrt(2.0 / dl_pi())
+    val inner = sqrt_2_over_pi * (x + 0.044715 * x * x * x)
+    0.5 * x * (1.0 + dl_tanh(inner))
+
+class StudyGELU:
+    # No parameters — stateless activation
+
+    static fn create() -> StudyGELU:
+        StudyGELU()
+
+    fn forward(x: PureTensor<f64>) -> PureTensor<f64>:
+        var data: [f64] = []
+        var i = 0
+        while i < x.data.len():
+            data.push(gelu(x.data[i]))
+            i = i + 1
+        tensor_from_data(data, x.shape)
+
+fn study_gelu_create() -> StudyGELU:
+    StudyGELU.create()
+
+export StudyGELU, study_gelu_create, gelu

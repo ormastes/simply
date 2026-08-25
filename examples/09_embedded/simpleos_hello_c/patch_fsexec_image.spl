@@ -1,0 +1,79 @@
+# Binary-patch a known-good SIMPLEOS FAT32 image so /FSEXEC.ELF holds a given
+# clang-built ELF, reusing the exact reader-compatible on-disk layout the
+# pure-Simple os.port.disk_image writer produced. Used by
+# scripts/os/build_clang_hello_ring3.shs to stage a clang hello for the ring-3
+# FS-exec loader without depending on the disk_image builder (which is currently
+# unbuildable under the churn-broken compiler — see the disk_image build-regression
+# bug). The base image layout is fixed: 512B clusters, FAT1@0x4000, FAT2@0x5000,
+# data@0x6000, root=cluster 2, FSEXEC.ELF first root dir entry, start cluster 3.
+#
+# Paths (populated by the build script):
+#   in  base : build/os/elfexec/fat32-fsexec.img
+#   in  elf  : build/os/hello/hello_fs.elf
+#   out img  : build/os/hello/fat32-hello.img
+#
+# All mutation is inline in main(): [u8] is a value type, so passing img to a
+# helper would mutate a copy.
+use std.nogc_sync_mut.sffi.io.{file_read_bytes, file_write_bytes}
+
+fn main() -> i64:
+    var img: [u8] = file_read_bytes("build/os/elfexec/fat32-fsexec.img") ?? []
+    val elf: [u8] = file_read_bytes("build/os/hello/hello_fs.elf") ?? []
+    val ilen: i64 = img.length
+    val hlen: i64 = elf.length
+    if ilen < 65536 or hlen < 64:
+        print "patch_error=short img=" + ilen.to_text() + " elf=" + hlen.to_text()
+        return 1
+
+    val BPS: i64 = 512
+    val FAT1: i64 = 16384          # sector 32
+    val FAT2: i64 = 20480          # sector 40
+    val CL3_BYTE: i64 = 25088      # data cluster 3 = 0x6000 + 512
+    val DIRENT: i64 = 24576        # FSEXEC.ELF dirent (first root entry)
+
+    val nclus: i64 = (hlen + BPS - 1) / BPS
+    val last: i64 = 3 + nclus - 1
+    if CL3_BYTE + hlen > ilen:
+        print "patch_error=data overflow (elf too big for base image)"
+        return 1
+
+    # 1. ELF bytes into the data region starting at cluster 3 (contiguous).
+    var i: i64 = 0
+    while i < hlen:
+        img[CL3_BYTE + i] = elf[i]
+        i = i + 1
+
+    # 2. FAT chain (both copies): cluster c -> c+1, last -> EOC 0x0FFFFFFF.
+    var c: i64 = 3
+    while c <= last:
+        var nextv: i64 = c + 1
+        if c == last:
+            nextv = 0x0FFFFFFF
+        val b0: u8 = (nextv & 0xFF) as u8
+        val b1: u8 = ((nextv >> 8) & 0xFF) as u8
+        val b2: u8 = ((nextv >> 16) & 0xFF) as u8
+        val b3: u8 = ((nextv >> 24) & 0xFF) as u8
+        val o1: i64 = FAT1 + c * 4
+        img[o1] = b0
+        img[o1 + 1] = b1
+        img[o1 + 2] = b2
+        img[o1 + 3] = b3
+        val o2: i64 = FAT2 + c * 4
+        img[o2] = b0
+        img[o2 + 1] = b1
+        img[o2 + 2] = b2
+        img[o2 + 3] = b3
+        c = c + 1
+
+    # 3. dirent file size = hlen (offset 28..31), keep start cluster = 3.
+    img[DIRENT + 28] = (hlen & 0xFF) as u8
+    img[DIRENT + 29] = ((hlen >> 8) & 0xFF) as u8
+    img[DIRENT + 30] = ((hlen >> 16) & 0xFF) as u8
+    img[DIRENT + 31] = ((hlen >> 24) & 0xFF) as u8
+
+    val write_ok = file_write_bytes("build/os/hello/fat32-hello.img", img)
+    if not write_ok:
+        print "patch_error=write failed"
+        return 1
+    print "patch_ok elf_bytes=" + hlen.to_text() + " clusters=3.." + last.to_text() + " write=1"
+    return 0

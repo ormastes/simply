@@ -1,0 +1,91 @@
+"""
+nvme_controller_gc_check — the multi-queue IO path (NvmeController.io_process()) must
+not permanently cliff into SC_NS_NOT_READY once the FTL's free-block count crosses the
+GC low watermark.
+
+Companion to gc_safety_check.spl (drives the FTL boundary directly against `Ftl`) and
+queue_tail_backpressure_check.spl (multi-queue setup conventions, reused here). Unlike
+the sibling single-queue path (hil.spl/firmware.spl's service_tick, which auto-drains GC
+whenever free_blocks() < GC_LOW_WATERMARK), io_process() previously never invoked GC at
+all: once the reserve ran dry, every further write failed forever. This proves the fix —
+writes routed through a real admin-created IO queue keep succeeding well past the write
+count at which an un-fixed io_process() would have permanently cliffed.
+
+Setup pokes BandAlloc state directly (the same white-box technique
+nvme_controller_selftest() already uses at its "media-capacity" boundary case, see
+nvme_controller.spl) to start just above the low watermark, with a run of pre-closed,
+fully-stale (zero live pages) blocks sitting as free-to-reclaim GC victims — this avoids
+spending thousands of real writes walking a fresh device down to the boundary.
+
+Run: bin/simple run examples/09_embedded/simpleos_nvme_fw/fw/nvme_controller_gc_check.spl
+"""
+
+use nvme_types.*
+use nvme_admin_types.*
+use nvme_admin.*
+use nvme_controller.*
+use firmware.*
+
+fn main():
+    var fail: i64 = 0
+    var c: NvmeController = nvme_controller_new()
+
+    c.admin_submit(admin_create_cq_cmd(2, 1, MAX_QUEUE_SIZE))
+    c.admin_submit(admin_create_sq_cmd(3, 1, MAX_QUEUE_SIZE, 1))
+    c.admin_process()
+    c.admin_reap()
+    c.admin_reap()
+
+    # Start just above the low watermark: pre-close `blocks_to_close` blocks with zero
+    # valid pages (free-to-reclaim GC victims), leave one block OPEN-but-full (so the
+    # very next write must open a fresh block), and leave exactly `starting_free` ==
+    # GC_LOW_WATERMARK + 1 blocks BLK_FREE.
+    val starting_free: i64 = GC_LOW_WATERMARK + 1
+    val blocks_to_close: i64 = NUM_BLOCKS - 1 - starting_free
+    var b: i64 = 0
+    while b < blocks_to_close:
+        c.ftl.band.blk_state[b] = BLK_CLOSED
+        c.ftl.band.blk_valid[b] = 0
+        b = b + 1
+    c.ftl.band.active_blk = blocks_to_close
+    c.ftl.band.blk_state[blocks_to_close] = BLK_OPEN
+    c.ftl.band.active_wp = PAGES_PER_BLOCK
+    c.ftl.band.free_count = c.ftl.band.actual_free_blocks()
+    fail = fail + expect_eq(c.free_blocks(), starting_free, "synthetic setup starts just above the low watermark")
+
+    # Without GC draining io_process(), each further write opens at most one fresh block
+    # every PAGES_PER_BLOCK writes; free space ratchets down by one block per opening and
+    # nothing ever gives it back, so the write that would need to open the block leaving
+    # GC_RESERVE or fewer free is refused — and stays refused forever. That write count,
+    # counted from `starting_free`, is exactly:
+    val unfixed_cliff_writes: i64 = (starting_free - GC_RESERVE) * PAGES_PER_BLOCK + 1
+
+    # Drive one full extra block-cycle past that cliff point through the real multi-queue
+    # path — proving the fixed io_process() keeps reclaiming space (not just barely
+    # avoiding the cliff once).
+    val total_writes: i64 = unfixed_cliff_writes + PAGES_PER_BLOCK
+
+    var refused_at: i64 = NULL_IDX
+    var min_free: i64 = c.free_blocks()
+    var cid: i64 = 200
+    var i: i64 = 0
+    while i < total_writes and refused_at == NULL_IDX:
+        c.io_submit(1, cmd_make(cid, OP_WRITE, 0, 1, 0x5A))
+        c.io_process()
+        val cpl: NvmeCpl = c.io_reap(1)
+        if cpl.status != SC_SUCCESS:
+            refused_at = i
+        val fb: i64 = c.free_blocks()
+        if fb < min_free:
+            min_free = fb
+        cid = cid + 1
+        i = i + 1
+
+    fail = fail + expect_eq(refused_at, NULL_IDX, "writes keep succeeding past the pre-fix low-watermark cliff point")
+    fail = fail + expect_eq(i, total_writes, "every write up to (and one block-cycle past) the unfixed cliff threshold completed")
+    fail = fail + expect_eq(bool_to_int(min_free >= GC_LOW_WATERMARK), 1, "io_process() keeps free space at/above the low watermark throughout, mirroring firmware.spl's service_tick")
+
+    if fail == 0:
+        print "NVME CONTROLLER GC OK"
+    else:
+        print "NVME CONTROLLER GC FAIL ({fail})"

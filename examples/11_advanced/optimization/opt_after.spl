@@ -1,0 +1,118 @@
+# Performance Optimized - AFTER Optimization
+# Fixed all performance issues from opt_before.spl
+
+import perf.profiler
+import perf.benchmark
+
+# Fix 1: Use list join instead of string concatenation
+fn build_report(items: List<text>) -> text:
+    var parts = ["Report:"]
+    for item in items:
+        parts.push("- " + item)  # ✅ Build list first
+    parts.join("\n")  # ✅ Single join operation - O(n)
+
+# Fix 2: Cache function call results
+fn process_data(data: List<i64>) -> List<i64>:
+    var result = []
+    val n = data.len()  # ✅ Cache .len() result
+    val threshold = n / 2  # ✅ Calculate once
+    for i in 0..n:  # ✅ Use cached value
+        if data[i] > threshold:
+            result.push(data[i] * 2)
+    result
+
+# Fix 3: Use Set for O(n) duplicate detection
+fn find_duplicates(items: List<i64>) -> List<i64>:
+    var seen = {}  # ✅ Use Dict as Set
+    var duplicates = {}  # ✅ Track duplicates
+
+    for item in items:  # ✅ Single pass - O(n)
+        if seen.contains_key(item) and not duplicates.contains_key(item):
+            duplicates[item] = true
+        else:
+            seen[item] = true
+
+    var result = []
+    for (dup, _) in duplicates:
+        result.push(dup)
+    result
+
+# Fix 4: Fibonacci with memoization
+var FIB_CACHE: Dict<i64, i64> = {}
+
+fn fibonacci(n: i64) -> i64:
+    if n <= 1:
+        return n
+
+    # ✅ Check cache first
+    if FIB_CACHE.contains_key(n):
+        return FIB_CACHE[n]
+
+    # ✅ Calculate and cache
+    val result = fibonacci(n - 1) + fibonacci(n - 2)
+    FIB_CACHE[n] = result
+    result
+
+# Fix 5: Hoist dict lookup and avoid double lookup
+fn sum_values(data: List<text>, lookup: Dict<text, i64>) -> i64:
+    var total = 0
+    for item in data:
+        # ✅ Single lookup, cache result
+        if val Some(value) = lookup.get(item):
+            # ✅ Hoist loop-invariant multiplication
+            total = total + (value * 100)
+    total
+
+# Benchmark the optimized code
+fn main():
+    print "=== AFTER Optimization ==="
+    print ""
+
+    var suite = benchmark.BenchSuite.create("Fast Code")
+    suite.load_baseline("benchmark_before.json")
+
+    # Test 1: String building
+    val items = [for i in 0..100: "Item {i}"]
+    val r1 = suite.run_bench("build_report", 100, \:
+        build_report(items)
+    )
+    suite.add_result(r1)
+
+    # Test 2: Cached function calls
+    val data = [for i in 0..100: i]
+    val r2 = suite.run_bench("process_data", 100, \:
+        process_data(data)
+    )
+    suite.add_result(r2)
+
+    # Test 3: Set-based duplicate detection
+    val small_data = [for i in 0..50: i % 10]
+    val r3 = suite.run_bench("find_duplicates", 10, \:
+        find_duplicates(small_data)
+    )
+    suite.add_result(r3)
+
+    # Test 4: Memoized fibonacci
+    FIB_CACHE = {}  # Reset cache for fair benchmark
+    val r4 = suite.run_bench("fibonacci", 100, \:
+        fibonacci(15)
+    )
+    suite.add_result(r4)
+
+    # Test 5: Optimized dict lookups
+    val keys = [for i in 0..20: "key{i}"]
+    var lookup = {}
+    for k in keys:
+        lookup[k] = 42
+
+    val r5 = suite.run_bench("sum_values", 10, \:
+        sum_values(keys, lookup)
+    )
+    suite.add_result(r5)
+
+    print suite.report()
+    suite.save("benchmark_after.json")
+
+    print ""
+    print "=== Optimization Summary ==="
+    benchmark.compare_with_baseline("benchmark_after.json", "benchmark_before.json")

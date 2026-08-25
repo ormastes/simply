@@ -1,0 +1,316 @@
+"""
+fw_pool — generation-handle object pool of write/read task contexts.
+
+Provides a fixed-capacity (16-slot) slab of task context rows.  Each slot is
+identified by a generation-stamped Handle so that stale handles (use-after-free)
+are detected cheaply without a GC.
+"""
+
+use nvme_types.*
+
+val POOL_CAP: i64 = 16
+
+fn pool_gen_next(v: i64) -> i64:
+    if v < 0:
+        return 1
+    if v >= FW_SAFE_I64_LIMIT:
+        return FW_SAFE_I64_LIMIT
+    v + 1
+
+# ── TaskPool ──────────────────────────────────────────────────────────────────
+struct TaskPool:
+    gen:      [i64]   # generation counter per slot
+    used:     [i64]   # 1 = slot is live, 0 = free
+    t_cid:    [i64]   # NVMe command id
+    t_lba:    [i64]   # starting LBA
+    t_nblk:   [i64]   # nblocks
+    t_data:   [i64]   # simulated payload byte
+    t_phase:  [i64]   # PH_* write-task phase
+    t_oldppn: [i64]   # previous physical page (UNMAP = none)
+    t_newppn: [i64]   # newly allocated physical page (UNMAP = not yet alloc'd)
+    t_seq:    [i64]   # write-sequence number
+    t_status: [i64]   # final SC_* status
+    cap:      i64
+    live:     i64
+
+fn task_pool_new() -> TaskPool:
+    var gen:      [i64] = []
+    var used:     [i64] = []
+    var t_cid:    [i64] = []
+    var t_lba:    [i64] = []
+    var t_nblk:   [i64] = []
+    var t_data:   [i64] = []
+    var t_phase:  [i64] = []
+    var t_oldppn: [i64] = []
+    var t_newppn: [i64] = []
+    var t_seq:    [i64] = []
+    var t_status: [i64] = []
+    var i: i64 = 0
+    while i < POOL_CAP:
+        gen.push(0)
+        used.push(0)
+        t_cid.push(0)
+        t_lba.push(0)
+        t_nblk.push(0)
+        t_data.push(0)
+        t_phase.push(PH_INIT)
+        t_oldppn.push(UNMAP)
+        t_newppn.push(UNMAP)
+        t_seq.push(0)
+        t_status.push(SC_SUCCESS)
+        i = i + 1
+    TaskPool(
+        gen: gen, used: used,
+        t_cid: t_cid, t_lba: t_lba, t_nblk: t_nblk, t_data: t_data,
+        t_phase: t_phase, t_oldppn: t_oldppn, t_newppn: t_newppn,
+        t_seq: t_seq, t_status: t_status,
+        cap: POOL_CAP, live: 0
+    )
+
+impl TaskPool:
+    me counted_live() -> i64:
+        var n: i64 = 0
+        var i: i64 = 0
+        while i < me.cap and i < POOL_CAP:
+            if me.used[i] != 0:
+                n = n + 1
+            i = i + 1
+        if me.live < 0:
+            return 0
+        if me.live < n:
+            return me.live
+        n
+
+    # acquire: find a free slot, stamp it, return a valid Handle.
+    # Returns handle_invalid() when the pool is full.
+    me acquire(cid: i64, lba: i64, nblk: i64, data: i64) -> Handle:
+        var slot: i64 = NULL_IDX
+        var i: i64 = 0
+        while i < me.cap and i < POOL_CAP:
+            val u = me.used[i]
+            if u == 0 and me.gen[i] >= 0 and me.gen[i] < FW_SAFE_I64_LIMIT:
+                if slot < 0:
+                    slot = i
+            i = i + 1
+        if slot < 0:
+            return handle_invalid()
+        me.used[slot] = 1
+        me.t_cid[slot] = cid
+        me.t_lba[slot] = lba
+        me.t_nblk[slot] = nblk
+        me.t_data[slot] = data
+        me.t_phase[slot] = PH_INIT
+        me.t_oldppn[slot] = UNMAP
+        me.t_newppn[slot] = UNMAP
+        me.t_seq[slot] = 0
+        me.t_status[slot] = SC_SUCCESS
+        me.live = me.live_count() + 1
+        Handle(pool: 0, index: slot, generation: me.gen[slot])
+
+    # valid: true iff the handle references a live slot with matching generation.
+    me valid(h: Handle) -> bool:
+        if h.index < 0:
+            return false
+        if h.index >= me.cap:
+            return false
+        if h.index >= POOL_CAP:
+            return false
+        val u = me.used[h.index]
+        if u != 1:
+            return false
+        val g = me.gen[h.index]
+        if g < 0 or g >= FW_SAFE_I64_LIMIT:
+            return false
+        g == h.generation
+
+    # phase: current PH_* phase, or NULL_IDX if the handle is invalid.
+    me phase(h: Handle) -> i64:
+        val v = me.valid(h)
+        if v:
+            return me.t_phase[h.index]
+        NULL_IDX
+
+    me set_phase(h: Handle, ph: i64):
+        val v = me.valid(h)
+        if v:
+            me.t_phase[h.index] = ph
+
+    me set_ppns(h: Handle, oldp: i64, newp: i64, seq: i64):
+        val v = me.valid(h)
+        if v:
+            me.t_oldppn[h.index] = oldp
+            me.t_newppn[h.index] = newp
+            me.t_seq[h.index] = seq
+
+    me set_status(h: Handle, st: i64):
+        val v = me.valid(h)
+        if v:
+            me.t_status[h.index] = st
+
+    me lba(h: Handle) -> i64:
+        val v = me.valid(h)
+        if v:
+            return me.t_lba[h.index]
+        NULL_IDX
+
+    me data(h: Handle) -> i64:
+        val v = me.valid(h)
+        if v:
+            return me.t_data[h.index]
+        NULL_IDX
+
+    me status(h: Handle) -> i64:
+        val v = me.valid(h)
+        if v:
+            return me.t_status[h.index]
+        NULL_IDX
+
+    me cid(h: Handle) -> i64:
+        val v = me.valid(h)
+        if v:
+            return me.t_cid[h.index]
+        NULL_IDX
+
+    me old_ppn(h: Handle) -> i64:
+        val v = me.valid(h)
+        if v:
+            return me.t_oldppn[h.index]
+        UNMAP
+
+    me new_ppn(h: Handle) -> i64:
+        val v = me.valid(h)
+        if v:
+            return me.t_newppn[h.index]
+        UNMAP
+
+    me seq(h: Handle) -> i64:
+        val v = me.valid(h)
+        if v:
+            return me.t_seq[h.index]
+        0
+
+    # release: free the slot and bump the generation (stale-handle guard).
+    me release(h: Handle):
+        val v = me.valid(h)
+        if v:
+            val live: i64 = me.live_count()
+            me.used[h.index] = 0
+            val og = me.gen[h.index]
+            me.gen[h.index] = pool_gen_next(og)
+            if live > 0:
+                me.live = live - 1
+            else:
+                me.live = 0
+
+    me live_count() -> i64:
+        me.counted_live()
+
+# ── Self-test ─────────────────────────────────────────────────────────────────
+fn fw_pool_selftest() -> i64:
+    var fail: i64 = 0
+    var p = task_pool_new()
+
+    # --- acquire gives a valid handle at PH_INIT ---
+    val h1 = p.acquire(10, 100, 1, 42)
+    var v1: i64 = 0
+    if p.valid(h1):
+        v1 = 1
+    fail = fail + expect_eq(v1, 1, "acquire: handle valid")
+    val ph1 = p.phase(h1)
+    fail = fail + expect_eq(ph1, PH_INIT, "acquire: phase=PH_INIT")
+    val lb1 = p.lba(h1)
+    fail = fail + expect_eq(lb1, 100, "acquire: lba stored")
+    val d1 = p.data(h1)
+    fail = fail + expect_eq(d1, 42, "acquire: data stored")
+    val ci1 = p.cid(h1)
+    fail = fail + expect_eq(ci1, 10, "acquire: cid stored (first-param *8 guard)")
+    val lc1 = p.live_count()
+    fail = fail + expect_eq(lc1, 1, "acquire: live=1")
+
+    # --- set_phase advances; phase() reflects it ---
+    p.set_phase(h1, PH_ALLOC)
+    val ph_a = p.phase(h1)
+    fail = fail + expect_eq(ph_a, PH_ALLOC, "set_phase: PH_ALLOC")
+    p.set_phase(h1, PH_PROGRAM)
+    val ph_b = p.phase(h1)
+    fail = fail + expect_eq(ph_b, PH_PROGRAM, "set_phase: PH_PROGRAM")
+    p.set_ppns(h1, 7, 8, 9)
+    fail = fail + expect_eq(p.old_ppn(h1), 7, "set_ppns: old_ppn")
+    fail = fail + expect_eq(p.new_ppn(h1), 8, "set_ppns: new_ppn")
+    fail = fail + expect_eq(p.seq(h1), 9, "set_ppns: seq")
+
+    # --- second acquire gets a distinct slot ---
+    val h2 = p.acquire(20, 200, 2, 99)
+    var v2: i64 = 0
+    if p.valid(h2):
+        v2 = 1
+    fail = fail + expect_eq(v2, 1, "second acquire: valid")
+    var distinct: i64 = 0
+    if h1.index != h2.index:
+        distinct = 1
+    fail = fail + expect_eq(distinct, 1, "second acquire: distinct slot")
+    val lc2 = p.live_count()
+    fail = fail + expect_eq(lc2, 2, "second acquire: live=2")
+    p.live = -4
+    fail = fail + expect_eq(p.live_count(), 0, "corrupted negative pool live clamps to zero")
+    val hneg = p.acquire(21, 201, 1, 55)
+    fail = fail + expect_eq(if p.valid(hneg): 1 else: 0, 1, "corrupted negative pool live still allows acquire")
+    fail = fail + expect_eq(p.live_count(), 1, "corrupted negative pool live increments from zero")
+    p.release(hneg)
+    fail = fail + expect_eq(p.live_count(), 0, "release after corrupted negative pool live stays nonnegative")
+    p.live = POOL_CAP + 99
+    fail = fail + expect_eq(p.live_count(), 2, "corrupted oversized pool live counts slots")
+    p.live = 2
+    p.gen[h2.index] = -1
+    fail = fail + expect_eq(if p.valid(h2): 1 else: 0, 0, "corrupted negative pool generation fails closed")
+    p.gen[h2.index] = h2.generation
+    p.gen[h2.index] = FW_SAFE_I64_LIMIT
+    fail = fail + expect_eq(if p.valid(h2): 1 else: 0, 0, "saturated pool generation fails closed")
+    p.used[h2.index] = 0
+    val hsat = p.acquire(22, 202, 1, 56)
+    fail = fail + expect_eq(if p.valid(hsat): 1 else: 0, 1, "acquire skips saturated generation slot")
+    p.release(hsat)
+    p.gen[h2.index] = h2.generation
+    p.used[h2.index] = 1
+    p.live = 2
+    p.used[h2.index] = 7
+    fail = fail + expect_eq(if p.valid(h2): 1 else: 0, 0, "corrupted pool used flag fails closed")
+    fail = fail + expect_eq(p.live_count(), 2, "corrupted pool used flag remains counted live")
+    p.used[h2.index] = 1
+
+    # --- release: stale-handle / use-after-free guard + live_count drops ---
+    p.release(h1)
+    var va: i64 = 0
+    if p.valid(h1):
+        va = 1
+    fail = fail + expect_eq(va, 0, "release: h1 now invalid")
+    val lc3 = p.live_count()
+    fail = fail + expect_eq(lc3, 1, "release: live dropped to 1")
+
+    # --- fill pool to cap; next acquire returns handle_invalid() ---
+    # After release(h1): h2 occupies 1 slot, 15 slots free.  Fill them.
+    var i: i64 = 0
+    while i < 15:
+        p.acquire(50 + i, 300 + i, 1, 0)
+        i = i + 1
+    # h1's old slot is now reused (used==1, gen bumped) — the OLD h1 must be rejected by
+    # GENERATION mismatch, not merely used==0 (genuine use-after-free guard).
+    var stale_gen: i64 = 0
+    if p.valid(h1):
+        stale_gen = 1
+    fail = fail + expect_eq(stale_gen, 0, "stale handle rejected by generation after slot reuse")
+    val hf = p.acquire(999, 999, 1, 0)
+    var inv: i64 = 1
+    if handle_is_valid(hf):
+        inv = 0
+    fail = fail + expect_eq(inv, 1, "full pool: acquire returns invalid handle")
+    p.cap = POOL_CAP + 1
+    val overflow_cap_h = p.acquire(1000, 1000, 1, 0)
+    var overflow_cap_inv: i64 = 1
+    if handle_is_valid(overflow_cap_h):
+        overflow_cap_inv = 0
+    fail = fail + expect_eq(overflow_cap_inv, 1, "corrupt oversized pool cap acquire fails closed")
+    val forged = Handle(pool: 0, index: POOL_CAP, generation: 0)
+    fail = fail + expect_eq(if p.valid(forged): 1 else: 0, 0, "corrupt oversized pool cap valid fails closed")
+
+    fail

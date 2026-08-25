@@ -1,0 +1,72 @@
+# 11. Foundations - Device Query
+#
+# The CUDA driver-API view of the machine: initialise the driver, count the
+# devices, and print each device's name and compute capability. This is the
+# Simple counterpart of the classic `deviceQuery` sample.
+#
+# C/CUDA equivalent:
+#   cuInit(0);
+#   int count; cuDeviceGetCount(&count);
+#   for (int i = 0; i < count; i++) {
+#       CUdevice dev; cuDeviceGet(&dev, i);
+#       char name[256]; cuDeviceGetName(name, 256, dev);
+#       int major, minor;
+#       cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev);
+#       cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev);
+#       printf("Device %d: %s (sm_%d%d)\n", i, name, major, minor);
+#   }
+#
+# std.cuda is the thin i64-handle layer over the driver ABI (status words,
+# not Results). std.gpu (module 00) wraps the same calls in Result<_, GpuError>.
+
+use std.cuda.*
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+fn describe_status(step: text, status: i64) -> bool:
+    if status == CUDA_SUCCESS:
+        print "{step}: OK"
+        return true
+    print "{step}: failed ({cuda_get_error_string(status)})"
+    false
+
+fn split_capability(packed: i64) -> (i64, i64):
+    # The driver wrapper packs compute capability as major * 10 + minor.
+    (packed / 10, packed % 10)
+
+fn print_device(index: i64):
+    val handle = cuda_device_get(index)
+    val name = cuda_device_name(handle)
+    val cap = split_capability(cuda_device_compute_capability(handle))
+    print "  Device {index}: {name}"
+    print "    Compute Capability: {cap.0}.{cap.1}  (sm_{cap.0}{cap.1})"
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn main():
+    print "=== Device Query (Simple, std.cuda) ==="
+    print ""
+
+    if not cuda_available():
+        print "CUDA driver library not available on this host - exiting."
+        return
+
+    # cuInit must run before any device query.
+    if not describe_status("cuInit", cuda_init()):
+        return
+
+    val count = cuda_device_count()
+    print "CUDA devices found: {count}"
+    if count <= 0:
+        print "No CUDA device - exiting."
+        return
+
+    for i in 0..count:
+        print_device(i)
+
+    print ""
+    print "=== Done ==="

@@ -1,0 +1,450 @@
+## cmake_generator — Generate Makefile or build.ninja from parsed CMake commands
+##
+## Takes parsed CmakeCommand list and project configuration, then
+## writes out a build file in the chosen format.
+
+use std.text
+use std.fs
+use std.process
+
+# --- Project model ---
+
+struct CmakeVar:
+    name: text
+    value: text
+
+struct CmakeTarget:
+    name: text
+    kind: text       # "executable" or "static_library"
+    sources: [text]
+    link_libs: [text]
+    include_dirs: [text]
+
+struct CmakeProject:
+    name: text
+    languages: [text]
+    vars: [CmakeVar]
+    targets: [CmakeTarget]
+    options: [CmakeVar]     # option(NAME desc DEFAULT)
+    source_dir: text
+    build_dir: text
+
+# --- Variable expansion ---
+
+fn expand_cmake_vars(input: text, project: CmakeProject) -> text:
+    """Expand ${VAR} references."""
+    var result = input
+    for v in project.vars:
+        result = result.replace_all("${{{v.name}}}", v.value)
+    # Built-in variables
+    result = result.replace_all("${CMAKE_SOURCE_DIR}", project.source_dir)
+    result = result.replace_all("${CMAKE_BINARY_DIR}", project.build_dir)
+    result = result.replace_all("${PROJECT_NAME}", project.name)
+    result
+
+# --- Interpret commands into project model ---
+
+fn interpret_commands(commands: [CmakeCommand], source_dir: text, build_dir: text) -> CmakeProject:
+    """Walk the command list and build a CmakeProject model."""
+    var project = CmakeProject(
+        name: "project",
+        languages: ["C"],
+        vars: [],
+        targets: [],
+        options: [],
+        source_dir: source_dir,
+        build_dir: build_dir,
+    )
+
+    # First pass: collect variables and options so they are available for expansion
+    for cmd in commands:
+        if cmd.name == "set" and cmd.args.len() >= 2:
+            val var_name = cmd.args[0]
+            val var_value = cmd.args.slice(1, cmd.args.len()).join(" ")
+            project.vars.push(CmakeVar(name: var_name, value: var_value))
+
+        if cmd.name == "option" and cmd.args.len() >= 1:
+            val opt_name = cmd.args[0]
+            var opt_default = "OFF"
+            if cmd.args.len() >= 3:
+                opt_default = cmd.args[cmd.args.len() - 1]
+            project.options.push(CmakeVar(name: opt_name, value: opt_default))
+            project.vars.push(CmakeVar(name: opt_name, value: opt_default))
+
+    # Track if-block state for conditional evaluation
+    var skip_depth = 0
+
+    for cmd in commands:
+        # --- Conditional handling ---
+        if cmd.name == "if":
+            if skip_depth > 0:
+                skip_depth = skip_depth + 1
+                continue
+            # Evaluate condition: simple variable truthiness
+            if cmd.args.len() >= 1:
+                val cond_var = expand_cmake_vars(cmd.args[0], project)
+                val is_true = cond_var != "OFF" and cond_var != "FALSE" and cond_var != "0" and cond_var != "" and cond_var != "NOTFOUND"
+                if not is_true:
+                    skip_depth = 1
+            continue
+
+        if cmd.name == "else":
+            if skip_depth == 1:
+                skip_depth = 0
+            else if skip_depth == 0:
+                skip_depth = 1
+            continue
+
+        if cmd.name == "endif":
+            if skip_depth > 0:
+                skip_depth = skip_depth - 1
+            continue
+
+        if skip_depth > 0:
+            continue
+
+        # --- Non-conditional commands ---
+
+        if cmd.name == "cmake_minimum_required":
+            # Informational only; no action needed
+            continue
+
+        if cmd.name == "project":
+            if cmd.args.len() >= 1:
+                project.name = cmd.args[0]
+            # Check for LANGUAGES keyword
+            var lang_idx = -1
+            var idx = 0
+            for a in cmd.args:
+                if a == "LANGUAGES":
+                    lang_idx = idx
+                idx = idx + 1
+            if lang_idx >= 0 and lang_idx + 1 < cmd.args.len():
+                project.languages = cmd.args.slice(lang_idx + 1, cmd.args.len())
+            continue
+
+        if cmd.name == "set":
+            # Already handled in first pass
+            continue
+
+        if cmd.name == "option":
+            continue
+
+        if cmd.name == "message":
+            # Print message during configure
+            if cmd.args.len() >= 1:
+                var msg_parts = cmd.args
+                # Strip STATUS/WARNING/FATAL_ERROR prefix
+                val first = cmd.args[0]
+                if first == "STATUS" or first == "WARNING" or first == "FATAL_ERROR":
+                    msg_parts = cmd.args.slice(1, cmd.args.len())
+                val msg = expand_cmake_vars(msg_parts.join(" "), project)
+                print "[cmake] {msg}"
+            continue
+
+        if cmd.name == "add_executable":
+            if cmd.args.len() >= 2:
+                val target_name = cmd.args[0]
+                val sources = cmd.args.slice(1, cmd.args.len()).map(expand_cmake_vars(_, project))
+                project.targets.push(CmakeTarget(
+                    name: target_name,
+                    kind: "executable",
+                    sources: sources,
+                    link_libs: [],
+                    include_dirs: [],
+                ))
+            continue
+
+        if cmd.name == "add_library":
+            if cmd.args.len() >= 2:
+                val target_name = cmd.args[0]
+                var lib_kind = "static_library"
+                var src_start = 1
+                if cmd.args.len() >= 3:
+                    val kind_arg = cmd.args[1]
+                    if kind_arg == "STATIC" or kind_arg == "SHARED":
+                        if kind_arg == "SHARED":
+                            lib_kind = "shared_library"
+                        src_start = 2
+                val sources = cmd.args.slice(src_start, cmd.args.len()).map(expand_cmake_vars(_, project))
+                project.targets.push(CmakeTarget(
+                    name: target_name,
+                    kind: lib_kind,
+                    sources: sources,
+                    link_libs: [],
+                    include_dirs: [],
+                ))
+            continue
+
+        if cmd.name == "target_link_libraries":
+            if cmd.args.len() >= 2:
+                val target_name = cmd.args[0]
+                val libs = cmd.args.slice(1, cmd.args.len()).filter(_ != "PUBLIC" and _ != "PRIVATE" and _ != "INTERFACE")
+                for t in project.targets:
+                    if t.name == target_name:
+                        for lib in libs:
+                            t.link_libs.push(expand_cmake_vars(lib, project))
+            continue
+
+        if cmd.name == "target_include_directories":
+            if cmd.args.len() >= 2:
+                val target_name = cmd.args[0]
+                val dirs = cmd.args.slice(1, cmd.args.len()).filter(_ != "PUBLIC" and _ != "PRIVATE" and _ != "INTERFACE")
+                for t in project.targets:
+                    if t.name == target_name:
+                        for d in dirs:
+                            t.include_dirs.push(expand_cmake_vars(d, project))
+            continue
+
+        if cmd.name == "find_program":
+            if cmd.args.len() >= 2:
+                val var_name = cmd.args[0]
+                val prog_name = cmd.args[1]
+                val result = process.run("which", [prog_name])
+                var found_path = prog_name
+                if result.exit_code == 0:
+                    found_path = result.stdout.trim()
+                    print "[cmake] Found {prog_name}: {found_path}"
+                else:
+                    found_path = "{var_name}-NOTFOUND"
+                    print "[cmake] Could not find {prog_name}"
+                project.vars.push(CmakeVar(name: var_name, value: found_path))
+            continue
+
+        if cmd.name == "find_library":
+            if cmd.args.len() >= 2:
+                val var_name = cmd.args[0]
+                val lib_name = cmd.args[1]
+                # Simple heuristic: check common library paths
+                var found = "{var_name}-NOTFOUND"
+                val search_paths = ["/usr/lib", "/usr/local/lib", "/lib"]
+                for sp in search_paths:
+                    if fs.exists("{sp}/lib{lib_name}.a") or fs.exists("{sp}/lib{lib_name}.so"):
+                        found = "-l{lib_name}"
+                        break
+                if found == "{var_name}-NOTFOUND":
+                    # Assume system library as fallback
+                    found = "-l{lib_name}"
+                print "[cmake] find_library({lib_name}): {found}"
+                project.vars.push(CmakeVar(name: var_name, value: found))
+            continue
+
+    project
+
+# --- Makefile generator ---
+
+fn generate_makefile(project: CmakeProject) -> text:
+    """Generate Makefile content from the project model."""
+    var out = "# Generated by simple_cmake\n"
+    out = out + "# Project: {project.name}\n\n"
+
+    # Detect compiler from languages
+    var cc = "cc"
+    var cxx = "c++"
+    for v in project.vars:
+        if v.name == "CMAKE_C_COMPILER":
+            cc = v.value
+        if v.name == "CMAKE_CXX_COMPILER":
+            cxx = v.value
+
+    val has_cxx = project.languages.contains("CXX")
+
+    out = out + "CC = {cc}\n"
+    if has_cxx:
+        out = out + "CXX = {cxx}\n"
+    out = out + "AR = ar\n"
+    out = out + "CFLAGS =\n"
+    if has_cxx:
+        out = out + "CXXFLAGS =\n"
+    out = out + "\n"
+
+    # User variables
+    for v in project.vars:
+        if v.name != "CMAKE_C_COMPILER" and v.name != "CMAKE_CXX_COMPILER":
+            out = out + "{v.name} = {v.value}\n"
+    out = out + "\n"
+
+    # Default target: first executable or first target
+    var default_name = ""
+    for t in project.targets:
+        if t.kind == "executable":
+            default_name = t.name
+            break
+    if default_name.len() == 0 and project.targets.len() > 0:
+        default_name = project.targets[0].name
+
+    if default_name.len() > 0:
+        out = out + ".PHONY: all clean\n"
+        out = out + "all: {default_name}\n\n"
+
+    # Generate rules for each target
+    for t in project.targets:
+        val objs = t.sources.map(source_to_object(_))
+        val objs_str = objs.join(" ")
+        val include_flags = t.include_dirs.map("-I{project.source_dir}/{_}").join(" ")
+
+        if t.kind == "executable":
+            val link_flags = t.link_libs.map(link_lib_flag(_)).join(" ")
+            out = out + "{t.name}: {objs_str}\n"
+            if has_cxx:
+                out = out + "\t$(CXX) $(CXXFLAGS) -o $@ $^ {link_flags}\n\n"
+            else:
+                out = out + "\t$(CC) $(CFLAGS) -o $@ $^ {link_flags}\n\n"
+
+        if t.kind == "static_library":
+            val lib_file = "lib{t.name}.a"
+            out = out + "{lib_file}: {objs_str}\n"
+            out = out + "\t$(AR) rcs $@ $^\n\n"
+
+        # Object file rules
+        for src in t.sources:
+            val obj = source_to_object(src)
+            val src_path = "{project.source_dir}/{src}"
+            val is_cpp = src.ends_with(".cpp") or src.ends_with(".cc") or src.ends_with(".cxx")
+            if is_cpp:
+                out = out + "{obj}: {src_path}\n"
+                out = out + "\t$(CXX) $(CXXFLAGS) {include_flags} -c $< -o $@\n\n"
+            else:
+                out = out + "{obj}: {src_path}\n"
+                out = out + "\t$(CC) $(CFLAGS) {include_flags} -c $< -o $@\n\n"
+
+    # Clean target
+    var all_objs: [text] = []
+    var all_outputs: [text] = []
+    for t in project.targets:
+        for src in t.sources:
+            all_objs.push(source_to_object(src))
+        if t.kind == "executable":
+            all_outputs.push(t.name)
+        if t.kind == "static_library":
+            all_outputs.push("lib{t.name}.a")
+
+    out = out + "clean:\n"
+    out = out + "\trm -f {all_objs.join(" ")} {all_outputs.join(" ")}\n"
+
+    out
+
+# --- Ninja generator ---
+
+fn generate_ninja(project: CmakeProject) -> text:
+    """Generate build.ninja content from the project model."""
+    var out = "# Generated by simple_cmake\n"
+    out = out + "# Project: {project.name}\n\n"
+
+    var cc = "cc"
+    var cxx = "c++"
+    for v in project.vars:
+        if v.name == "CMAKE_C_COMPILER":
+            cc = v.value
+        if v.name == "CMAKE_CXX_COMPILER":
+            cxx = v.value
+
+    val has_cxx = project.languages.contains("CXX")
+
+    out = out + "cc = {cc}\n"
+    if has_cxx:
+        out = out + "cxx = {cxx}\n"
+    out = out + "ar = ar\n"
+    out = out + "cflags =\n"
+    if has_cxx:
+        out = out + "cxxflags =\n"
+    out = out + "\n"
+
+    # Rules
+    out = out + "rule cc\n"
+    out = out + "  command = $cc $cflags $extra_flags -c $in -o $out\n"
+    out = out + "  description = CC $out\n\n"
+
+    if has_cxx:
+        out = out + "rule cxx\n"
+        out = out + "  command = $cxx $cxxflags $extra_flags -c $in -o $out\n"
+        out = out + "  description = CXX $out\n\n"
+
+    out = out + "rule link\n"
+    out = out + "  command = $cc $cflags -o $out $in $libs\n"
+    out = out + "  description = LINK $out\n\n"
+
+    if has_cxx:
+        out = out + "rule link_cxx\n"
+        out = out + "  command = $cxx $cxxflags -o $out $in $libs\n"
+        out = out + "  description = LINK $out\n\n"
+
+    out = out + "rule ar\n"
+    out = out + "  command = $ar rcs $out $in\n"
+    out = out + "  description = AR $out\n\n"
+
+    # Build statements for each target
+    for t in project.targets:
+        val include_flags = t.include_dirs.map("-I{project.source_dir}/{_}").join(" ")
+        var obj_names: [text] = []
+
+        for src in t.sources:
+            val obj = source_to_object(src)
+            obj_names.push(obj)
+            val src_path = "{project.source_dir}/{src}"
+            val is_cpp = src.ends_with(".cpp") or src.ends_with(".cc") or src.ends_with(".cxx")
+            val rule_name = if is_cpp: "cxx" else: "cc"
+            out = out + "build {obj}: {rule_name} {src_path}\n"
+            if include_flags.len() > 0:
+                out = out + "  extra_flags = {include_flags}\n"
+            out = out + "\n"
+
+        val objs_str = obj_names.join(" ")
+
+        if t.kind == "executable":
+            val link_flags = t.link_libs.map(link_lib_flag(_)).join(" ")
+            val link_rule = if has_cxx: "link_cxx" else: "link"
+            out = out + "build {t.name}: {link_rule} {objs_str}\n"
+            if link_flags.len() > 0:
+                out = out + "  libs = {link_flags}\n"
+            out = out + "\n"
+
+        if t.kind == "static_library":
+            out = out + "build lib{t.name}.a: ar {objs_str}\n\n"
+
+    # Default target
+    for t in project.targets:
+        if t.kind == "executable":
+            out = out + "default {t.name}\n"
+            break
+
+    out
+
+# --- Helpers ---
+
+fn source_to_object(src: text) -> text:
+    """Convert source filename to object filename: foo.c -> foo.o"""
+    val base = if src.contains("/"):
+        val parts = src.split("/")
+        parts[parts.len() - 1]
+    else:
+        src
+    # Strip extension and add .o
+    val dot_pos = base.rfind(".")
+    if dot_pos > 0:
+        base.slice(0, dot_pos) + ".o"
+    else:
+        base + ".o"
+
+fn link_lib_flag(lib: text) -> text:
+    """Convert library name to linker flag."""
+    if lib.starts_with("-l") or lib.starts_with("/"):
+        lib
+    else:
+        "-l{lib}"
+
+fn write_build_file(project: CmakeProject, generator: text):
+    """Write the generated build file to the build directory."""
+    if not fs.exists(project.build_dir):
+        fs.mkdir_all(project.build_dir)
+
+    if generator == "Ninja":
+        val content = generate_ninja(project)
+        val path = "{project.build_dir}/build.ninja"
+        fs.write_text(path, content)
+        print "[cmake] Generated {path}"
+    else:
+        val content = generate_makefile(project)
+        val path = "{project.build_dir}/Makefile"
+        fs.write_text(path, content)
+        print "[cmake] Generated {path}"

@@ -1,0 +1,12 @@
+use logic_map_core.*
+
+fn rv32_map_ppn_cases_selftest() -> i32:
+    if _rv32_map_ppn_valid(-1) != 1:
+        return 1
+    if _rv32_map_ppn_valid(4095) != 1:
+        return 1
+    if _rv32_map_ppn_valid(4096) != 0:
+        return 1
+    if _rv32_map_sanitize_ppn(4096) != -1:
+        return 1
+    0

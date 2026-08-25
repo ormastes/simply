@@ -1,0 +1,42 @@
+{{#layout "application"}}
+
+<h1>Groups &mdash; {{template_name}}</h1>
+<a href="/admin/templates" class="btn">&larr; Back to Templates</a>
+
+<h2>Add Group</h2>
+<form method="POST" action="/admin/templates/{{template_id}}/groups" class="form form-inline">
+    <input type="hidden" name="csrf_token" value="{{csrf_token}}">
+    <input type="text" name="name" placeholder="Group name" required>
+    <input type="text" name="description" placeholder="Description">
+    <input type="number" name="sort_order" placeholder="Order" value="0">
+    <button type="submit" class="btn btn-primary">Add</button>
+</form>
+
+<table class="table">
+    <thead>
+        <tr>
+            <th>Order</th>
+            <th>Name</th>
+            <th>Description</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+        {{#each groups}}
+        <tr>
+            <td>{{sort_order}}</td>
+            <td>{{name}}</td>
+            <td>{{description}}</td>
+            <td>
+                <a href="/admin/groups/{{id}}/items" class="btn btn-sm">Items</a>
+                <form method="POST" action="/admin/groups/{{id}}/delete" style="display:inline;">
+                    <input type="hidden" name="csrf_token" value="{{../csrf_token}}">
+                    <button type="submit" class="btn btn-sm btn-danger">Delete</button>
+                </form>
+            </td>
+        </tr>
+        {{/each}}
+    </tbody>
+</table>
+
+{{/layout}}

@@ -1,0 +1,4 @@
+use logic_feature_guard_cases.*
+
+fn rv32_feature_guard_selftest() -> i32:
+    rv32_feature_guard_cases_selftest()

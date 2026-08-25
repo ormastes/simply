@@ -1,0 +1,27 @@
+# @cover src/kernel/event_log.spl 80%
+"""
+# Event Log
+
+The event log is append-only and is the system's only write surface. Appends
+assign monotonic sequence numbers; per-entity views are filters over the log.
+"""
+
+use std.spec
+use kernel.event_log.{new_event_log, append, event_count, events_for}
+
+describe "Event Log — append-only writes":
+    it "starts empty":
+        expect(event_count(new_event_log())).to_equal(0)
+
+    it "appends events and counts them":
+        var log = new_event_log()
+        log = append(log, "journal.post", 1, "{}")
+        log = append(log, "inventory.move", 2, "{}")
+        expect(event_count(log)).to_equal(2)
+
+    it "filters events for one entity":
+        var log = new_event_log()
+        log = append(log, "journal.post", 1, "a")
+        log = append(log, "journal.post", 2, "b")
+        log = append(log, "journal.post", 1, "c")
+        expect(events_for(log, 1).length()).to_equal(2)

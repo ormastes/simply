@@ -1,0 +1,86 @@
+#![allow(unnamed_duplicate_typed_args)]
+@allow(unnamed_duplicate_typed_args)
+# mcpgdb MCP — debug tool runner
+
+extern fn rt_cli_get_args() -> [text]
+
+use std.io_runtime.{read_file}
+use examples.mcpgdb.json_helpers.{extract_id, jsonrpc_error}
+use examples.mcpgdb.state.{load_persisted_state, save_persisted_state}
+use examples.mcpgdb.debug_tools
+
+fn main():
+    val argv = rt_cli_get_args()
+    if argv.len < 3:
+        print jsonrpc_error("null", -32602, "missing request body path")
+        return
+    val body = read_file(argv[2]) ?? ""
+    if body == "":
+        print jsonrpc_error("null", -32602, "empty request body")
+        return
+    val id = extract_id(body)
+    load_persisted_state()
+    val response = dispatch_tool(id, body)
+    save_persisted_state()
+    print response
+
+fn dispatch_tool(id: text, body: text) -> text:
+    if body.contains("\"name\":\"workspace_open\"") or body.contains("\"name\": \"workspace_open\""):
+        return debug_tools.handle_workspace_open(id, body)
+    if body.contains("\"name\":\"workspace_status\"") or body.contains("\"name\": \"workspace_status\""):
+        return debug_tools.handle_workspace_status(id, body)
+    if body.contains("\"name\":\"debug_session_create\"") or body.contains("\"name\": \"debug_session_create\""):
+        return debug_tools.handle_debug_session_create(id, body)
+    if body.contains("\"name\":\"debug_session_list\"") or body.contains("\"name\": \"debug_session_list\""):
+        return debug_tools.handle_debug_session_list(id, body)
+    if body.contains("\"name\":\"debug_session_select\"") or body.contains("\"name\": \"debug_session_select\""):
+        return debug_tools.handle_debug_session_select(id, body)
+    if body.contains("\"name\":\"debug_session_close\"") or body.contains("\"name\": \"debug_session_close\""):
+        return debug_tools.handle_debug_session_close(id, body)
+    if body.contains("\"name\":\"debug_launch\"") or body.contains("\"name\": \"debug_launch\""):
+        return debug_tools.handle_debug_launch(id, body)
+    if body.contains("\"name\":\"debug_attach\"") or body.contains("\"name\": \"debug_attach\""):
+        return debug_tools.handle_debug_attach(id, body)
+    if body.contains("\"name\":\"debug_connect_remote\"") or body.contains("\"name\": \"debug_connect_remote\""):
+        return debug_tools.handle_debug_connect_remote(id, body)
+    if body.contains("\"name\":\"debug_disconnect\"") or body.contains("\"name\": \"debug_disconnect\""):
+        return debug_tools.handle_debug_disconnect(id, body)
+    if body.contains("\"name\":\"debug_restart\"") or body.contains("\"name\": \"debug_restart\""):
+        return debug_tools.handle_debug_restart(id, body)
+    if body.contains("\"name\":\"debug_continue\"") or body.contains("\"name\": \"debug_continue\""):
+        return debug_tools.handle_debug_continue(id, body)
+    if body.contains("\"name\":\"debug_pause\"") or body.contains("\"name\": \"debug_pause\""):
+        return debug_tools.handle_debug_pause(id, body)
+    if body.contains("\"name\":\"debug_step_in\"") or body.contains("\"name\": \"debug_step_in\""):
+        return debug_tools.handle_debug_step_in(id, body)
+    if body.contains("\"name\":\"debug_step_over\"") or body.contains("\"name\": \"debug_step_over\""):
+        return debug_tools.handle_debug_step_over(id, body)
+    if body.contains("\"name\":\"debug_step_out\"") or body.contains("\"name\": \"debug_step_out\""):
+        return debug_tools.handle_debug_step_out(id, body)
+    if body.contains("\"name\":\"breakpoint_set\"") or body.contains("\"name\": \"breakpoint_set\""):
+        return debug_tools.handle_breakpoint_set(id, body)
+    if body.contains("\"name\":\"breakpoint_remove\"") or body.contains("\"name\": \"breakpoint_remove\""):
+        return debug_tools.handle_breakpoint_remove(id, body)
+    if body.contains("\"name\":\"breakpoint_list\"") or body.contains("\"name\": \"breakpoint_list\""):
+        return debug_tools.handle_breakpoint_list(id, body)
+    if body.contains("\"name\":\"thread_list\"") or body.contains("\"name\": \"thread_list\""):
+        return debug_tools.handle_thread_list(id, body)
+    if body.contains("\"name\":\"frame_list\"") or body.contains("\"name\": \"frame_list\""):
+        return debug_tools.handle_frame_list(id, body)
+    if body.contains("\"name\":\"frame_select\"") or body.contains("\"name\": \"frame_select\""):
+        return debug_tools.handle_frame_select(id, body)
+    if body.contains("\"name\":\"variable_list\"") or body.contains("\"name\": \"variable_list\""):
+        return debug_tools.handle_variable_list(id, body)
+    if body.contains("\"name\":\"evaluate\"") or body.contains("\"name\": \"evaluate\""):
+        return debug_tools.handle_evaluate(id, body)
+    if body.contains("\"name\":\"register_read\"") or body.contains("\"name\": \"register_read\""):
+        return debug_tools.handle_register_read(id, body)
+    if body.contains("\"name\":\"register_write\"") or body.contains("\"name\": \"register_write\""):
+        return debug_tools.handle_register_write(id, body)
+    if body.contains("\"name\":\"memory_read\"") or body.contains("\"name\": \"memory_read\""):
+        return debug_tools.handle_memory_read(id, body)
+    if body.contains("\"name\":\"memory_write\"") or body.contains("\"name\": \"memory_write\""):
+        return debug_tools.handle_memory_write(id, body)
+    if body.contains("\"name\":\"debug_command_run\"") or body.contains("\"name\": \"debug_command_run\""):
+        return debug_tools.handle_debug_command_run(id, body)
+    jsonrpc_error(id, -32602, "Unknown debug tool")

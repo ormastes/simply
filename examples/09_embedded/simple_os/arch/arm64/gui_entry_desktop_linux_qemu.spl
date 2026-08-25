@@ -1,0 +1,5 @@
+use arch.arm64.gui_entry_desktop.{gui_entry_desktop_start}
+use common.gpu.simpleos_host_gpu_protocol.{SIMPLEOS_HOST_GPU_BACKEND_VULKAN}
+
+fn spl_start():
+    gui_entry_desktop_start(0u64, SIMPLEOS_HOST_GPU_BACKEND_VULKAN, true)

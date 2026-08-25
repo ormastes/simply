@@ -1,0 +1,74 @@
+#![allow(export_outside_init)]
+# DEMO ONLY — Uses stale API (raw handle passing). Not runnable.
+#!/usr/bin/env simple
+# Tensor Operations with PyTorch FFI
+# Demonstrates arithmetic and activations on cuda:1 (2nd GPU)
+
+use std.torch.{torch_available, TorchTensorWrapper}
+
+fn main():
+    print "=== PyTorch Tensor Operations (CUDA:1) ==="
+    print ""
+    
+    if not torch_available():
+        print "⚠ PyTorch not available (stub mode)"
+        return
+    
+    print "Creating tensors..."
+    val a = TorchTensorWrapper.tensor_ones([3, 3])
+    val b = TorchTensorWrapper.tensor_ones([3, 3])
+    print "  a: ones[3, 3]"
+    print "  b: ones[3, 3]"
+    print ""
+    
+    # Arithmetic operations
+    print "Arithmetic Operations:"
+    print ""
+    
+    print "1. Addition (a + b):"
+    val c = a.add(b.handle)
+    print "   Result shape: {c.shape()}"
+    print "   Elements: {c.numel()}"
+    print ""
+    
+    print "2. Multiplication (a * b):"
+    val d = a.mul(b.handle)
+    print "   Result shape: {d.shape()}"
+    print "   Elements: {d.numel()}"
+    print ""
+    
+    print "3. Matrix Multiplication (a @ b):"
+    val e = a.matmul(b.handle)
+    print "   Result shape: {e.shape()}"
+    print "   Elements: {e.numel()}"
+    print ""
+    
+    # Activation functions
+    print "Activation Functions:"
+    print ""
+    
+    print "4. ReLU activation:"
+    val x = TorchTensorWrapper.tensor_randn([2, 2])
+    val relu_out = x.relu()
+    print "   Input shape: {x.shape()}"
+    print "   Output shape: {relu_out.shape()}"
+    print ""
+    
+    print "5. Sigmoid activation:"
+    val sigmoid_out = x.sigmoid()
+    print "   Output shape: {sigmoid_out.shape()}"
+    print ""
+    
+    print "6. Tanh activation:"
+    val tanh_out = x.tanh()
+    print "   Output shape: {tanh_out.shape()}"
+    print ""
+    
+    print "=== Summary ==="
+    print "All operations executed on cuda:1 (2nd GPU)"
+    print "✓ Arithmetic: add, mul, matmul"
+    print "✓ Activations: relu, sigmoid, tanh"
+    print ""
+    print "✓ Example complete!"
+
+export main

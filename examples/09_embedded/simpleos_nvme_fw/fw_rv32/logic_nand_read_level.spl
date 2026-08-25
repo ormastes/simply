@@ -1,0 +1,454 @@
+# Pure, scalar NAND read-level policy for the no-alloc RV32 firmware.
+
+pub fn rv32_nand_level_erased() -> i64:
+    32
+
+pub fn rv32_nand_level_programmed() -> i64:
+    160
+
+pub fn rv32_nand_reference_default() -> i64:
+    128
+
+pub fn rv32_nand_prevention_read_limit() -> i64:
+    4
+
+fn _rv32_nand_error_count(delta: i64) -> i64:
+    if delta <= 0:
+        return 0
+    if delta >= 25:
+        return 4
+    if delta >= 17:
+        return 3
+    if delta >= 9:
+        return 2
+    1
+
+pub fn rv32_nand_retry_reference(direction: i32, index: i64) -> i64:
+    if index < 0 or index > 3:
+        return -1
+    if direction == -1:
+        if index == 0:
+            return 128
+        if index == 1:
+            return 120
+        if index == 2:
+            return 112
+        return 104
+    if direction == 1:
+        if index == 0:
+            return 128
+        if index == 1:
+            return 136
+        if index == 2:
+            return 144
+        return 152
+    -1
+
+pub fn rv32_nand_error_bits(programmed: i32, stored_level: i64, read_reference: i64) -> i64:
+    if programmed == 1:
+        if stored_level >= read_reference:
+            return 0
+        _rv32_nand_error_count(read_reference - stored_level)
+    elif programmed == 0:
+        if stored_level <= read_reference:
+            return 0
+        _rv32_nand_error_count(stored_level - read_reference)
+    else:
+        4
+
+pub fn rv32_nand_error_mask(error_bits: i64) -> i64:
+    if error_bits <= 0:
+        return 0
+    if error_bits >= 4:
+        return 15
+    (1 << error_bits) - 1
+
+pub fn rv32_nand_sense_data(data: i64, programmed: i32, stored_level: i64, read_reference: i64) -> i64:
+    data ^ rv32_nand_error_mask(rv32_nand_error_bits(programmed, stored_level, read_reference))
+
+pub fn rv32_nand_ecc_correctable(error_bits: i64, budget: i64) -> i32:
+    if error_bits < 0 or budget < 0:
+        return 0
+    if error_bits > 4:
+        return 0
+    if error_bits <= budget:
+        return 1
+    0
+
+pub fn rv32_nand_refresh_allowed(ecc_correctable: i32, recovered_matches: i32) -> i32:
+    if ecc_correctable == 1 and recovered_matches == 1:
+        return 1
+    0
+
+fn _rv32_nand_ecc_parity_pos(pos: i64) -> bool:
+    pos == 1 or pos == 2 or pos == 4 or pos == 8 or pos == 16 or pos == 32
+
+fn _rv32_nand_ecc_data_pos(bit: i64) -> i64:
+    if bit < 0 or bit > 31:
+        return 0
+    var pos = bit + 3
+    if bit >= 1:
+        pos = pos + 1
+    if bit >= 4:
+        pos = pos + 1
+    if bit >= 11:
+        pos = pos + 1
+    if bit >= 26:
+        pos = pos + 1
+    pos
+
+fn _rv32_nand_ecc_parity(value: i64) -> i64:
+    var folded = value
+    folded = folded ^ (folded >> 16)
+    folded = folded ^ (folded >> 8)
+    folded = folded ^ (folded >> 4)
+    folded = folded ^ (folded >> 2)
+    folded = folded ^ (folded >> 1)
+    folded & 1
+
+pub fn rv32_nand_ecc_compute(data: i64) -> i64:
+    var parity: i64 = 0
+    var bit: i64 = 0
+    while bit < 32:
+        val value = (data >> bit) & 1
+        var pos = bit + 3
+        if bit >= 1:
+            pos = pos + 1
+        if bit >= 4:
+            pos = pos + 1
+        if bit >= 11:
+            pos = pos + 1
+        if bit >= 26:
+            pos = pos + 1
+        var p: i64 = 0
+        while p < 6:
+            if (pos & (1 << p)) != 0:
+                parity = parity ^ (value << p)
+            p = p + 1
+        bit = bit + 1
+    val overall = _rv32_nand_ecc_parity(data) ^ _rv32_nand_ecc_parity(parity)
+    parity | (overall << 6)
+
+fn _rv32_nand_ecc_flip_data_pos(data: i64, pos: i64) -> i64:
+    var bit: i64 = 0
+    while bit < 32:
+        if _rv32_nand_ecc_data_pos(bit) == pos:
+            return data ^ (1 << bit)
+        bit = bit + 1
+    data
+
+pub fn rv32_nand_ecc_decode_status(data: i64, stored: i64, error_bits: i64, budget: i64) -> i32:
+    if rv32_nand_ecc_correctable(error_bits, budget) == 0:
+        return 0
+    val recomputed = rv32_nand_ecc_compute(data)
+    val syndrome = (stored ^ recomputed) & 63
+    val overall = _rv32_nand_ecc_parity(data) ^ _rv32_nand_ecc_parity(stored & 63) ^ ((stored >> 6) & 1)
+    if syndrome == 0:
+        return 1
+    if overall == 0:
+        return 0
+    1
+
+pub fn rv32_nand_ecc_decode_data(data: i64, stored: i64) -> i64:
+    val recomputed = rv32_nand_ecc_compute(data)
+    val syndrome = (stored ^ recomputed) & 63
+    val overall = _rv32_nand_ecc_parity(data) ^ _rv32_nand_ecc_parity(stored & 63) ^ ((stored >> 6) & 1)
+    if syndrome != 0 and overall != 0 and not _rv32_nand_ecc_parity_pos(syndrome):
+        return _rv32_nand_ecc_flip_data_pos(data, syndrome)
+    data
+
+pub fn rv32_nand_nominal_level(programmed: i32) -> i64:
+    if programmed == 1:
+        return rv32_nand_level_programmed()
+    if programmed == 0:
+        return rv32_nand_level_erased()
+    -1
+
+pub fn rv32_nand_disturb_level(level: i64, block_read_count: i64, programmed: i32) -> i64:
+    if block_read_count < rv32_nand_prevention_read_limit():
+        return level
+    if block_read_count < 0:
+        return level
+    if programmed != 0 and programmed != 1:
+        return level
+    if programmed == 1:
+        if level <= rv32_nand_level_erased():
+            return rv32_nand_level_erased()
+        val steps: i64 = block_read_count - rv32_nand_prevention_read_limit() + 1
+        if steps >= level - rv32_nand_level_erased():
+            return rv32_nand_level_erased()
+        return level - steps
+    if level >= rv32_nand_level_programmed():
+        return rv32_nand_level_programmed()
+    val steps: i64 = block_read_count - rv32_nand_prevention_read_limit() + 1
+    if steps >= rv32_nand_level_programmed() - level:
+        return rv32_nand_level_programmed()
+    level + steps
+
+pub fn rv32_nand_lifecycle_next(stage: i64, event: i64) -> i64:
+    if stage == 0 and event == 1:
+        return 1
+    if stage == 1 and event == 2:
+        return 2
+    if stage == 2 and event == 3:
+        return 3
+    -1
+
+pub fn rv32_nand_admin_queue_valid(qid: i64, depth: i64) -> i32:
+    if qid == 0 and depth >= 2 and depth <= 64:
+        return 1
+    0
+
+pub fn rv32_nand_io_queue_valid(qid: i64, depth: i64) -> i32:
+    if qid > 0 and qid <= 4 and depth >= 2 and depth <= 64:
+        return 1
+    0
+
+pub fn rv32_nand_media_status(stage: i64, page_state: i64, operation: i64) -> i64:
+    if stage != 3:
+        return 1
+    if page_state != 0 and page_state != 1:
+        return 1
+    if operation == 1:
+        return 0
+    if operation == 2:
+        if page_state == 0:
+            return 0
+        return 2
+    if operation == 3:
+        return 0
+    1
+
+pub fn rv32_nand_queue_next(state: i64, event: i64) -> i64:
+    if state == 0 and event == 1:
+        return 1
+    if state == 1 and event == 2:
+        return 2
+    if state == 2 and event == 3:
+        return 0
+    -1
+
+pub fn rv32_nand_read_level_selftest() -> i32:
+    if rv32_nand_level_erased() != 32 or rv32_nand_level_programmed() != 160:
+        return 1
+    if rv32_nand_reference_default() != 128 or rv32_nand_prevention_read_limit() != 4:
+        return 1
+
+    if rv32_nand_retry_reference(-1, 0) != 128:
+        return 1
+    if rv32_nand_retry_reference(-1, 1) != 120:
+        return 1
+    if rv32_nand_retry_reference(-1, 2) != 112:
+        return 1
+    if rv32_nand_retry_reference(-1, 3) != 104:
+        return 1
+    if rv32_nand_retry_reference(1, 0) != 128:
+        return 1
+    if rv32_nand_retry_reference(1, 1) != 136:
+        return 1
+    if rv32_nand_retry_reference(1, 2) != 144:
+        return 1
+    if rv32_nand_retry_reference(1, 3) != 152:
+        return 1
+    if rv32_nand_retry_reference(-1, -1) != -1:
+        return 1
+    if rv32_nand_retry_reference(-1, 4) != -1:
+        return 1
+    if rv32_nand_retry_reference(0, 0) != -1:
+        return 1
+    if rv32_nand_retry_reference(2, 0) != -1:
+        return 1
+
+    val data: i64 = 0x13579BDF
+    if rv32_nand_error_bits(1, 160, 128) != 0:
+        return 1
+    if rv32_nand_error_bits(1, 159, 160) != 1:
+        return 1
+    if rv32_nand_error_bits(1, 152, 160) != 1:
+        return 1
+    if rv32_nand_error_bits(1, 151, 160) != 2:
+        return 1
+    if rv32_nand_error_bits(1, 144, 160) != 2:
+        return 1
+    if rv32_nand_error_bits(1, 143, 160) != 3:
+        return 1
+    if rv32_nand_error_bits(1, 136, 160) != 3:
+        return 1
+    if rv32_nand_error_bits(1, 135, 160) != 4:
+        return 1
+    if rv32_nand_error_bits(1, 116, 128) != 2:
+        return 1
+    if rv32_nand_error_bits(1, 116, 120) != 1:
+        return 1
+    if rv32_nand_error_bits(1, 112, 112) != 0:
+        return 1
+    if rv32_nand_error_bits(1, 0, 160) != 4:
+        return 1
+    if rv32_nand_error_bits(0, 32, 128) != 0:
+        return 1
+    if rv32_nand_error_bits(0, 128, 128) != 0:
+        return 1
+    if rv32_nand_error_bits(0, 129, 128) != 1:
+        return 1
+    if rv32_nand_error_bits(0, 136, 128) != 1:
+        return 1
+    if rv32_nand_error_bits(0, 137, 128) != 2:
+        return 1
+    if rv32_nand_error_bits(0, 144, 128) != 2:
+        return 1
+    if rv32_nand_error_bits(0, 145, 128) != 3:
+        return 1
+    if rv32_nand_error_bits(0, 152, 128) != 3:
+        return 1
+    if rv32_nand_error_bits(0, 153, 128) != 4:
+        return 1
+    if rv32_nand_error_bits(0, 140, 128) != 2:
+        return 1
+    if rv32_nand_error_bits(0, 140, 136) != 1:
+        return 1
+    if rv32_nand_error_bits(0, 160, 128) != 4:
+        return 1
+    if rv32_nand_error_bits(2, 128, 128) != 4:
+        return 1
+    if rv32_nand_error_mask(0) != 0 or rv32_nand_error_mask(1) != 1:
+        return 1
+    if rv32_nand_error_mask(2) != 3 or rv32_nand_error_mask(3) != 7:
+        return 1
+    if rv32_nand_error_mask(4) != 15 or rv32_nand_error_mask(9) != 15:
+        return 1
+    if rv32_nand_sense_data(data, 1, 160, 128) != data:
+        return 1
+    if rv32_nand_sense_data(data, 1, 116, 128) != (data ^ 3):
+        return 1
+    if rv32_nand_sense_data(data, 1, 112, 112) != data:
+        return 1
+    if rv32_nand_sense_data(data, 0, 140, 128) != (data ^ 3):
+        return 1
+
+    if rv32_nand_ecc_correctable(0, 0) != 1:
+        return 1
+    if rv32_nand_ecc_correctable(4, 4) != 1:
+        return 1
+    if rv32_nand_ecc_correctable(5, 4) != 0:
+        return 1
+    if rv32_nand_ecc_correctable(-1, 4) != 0:
+        return 1
+    if rv32_nand_ecc_correctable(1, -1) != 0:
+        return 1
+    if rv32_nand_refresh_allowed(1, 1) != 1:
+        return 1
+    if rv32_nand_refresh_allowed(1, 0) != 0:
+        return 1
+    if rv32_nand_refresh_allowed(0, 1) != 0:
+        return 1
+    if rv32_nand_refresh_allowed(0, 0) != 0:
+        return 1
+    if rv32_nand_refresh_allowed(2, 1) != 0:
+        return 1
+
+    val ecc_data: i64 = 0x13579BDE
+    val ecc = rv32_nand_ecc_compute(ecc_data)
+    if rv32_nand_ecc_decode_status(ecc_data, ecc, 0, 1) != 1:
+        return 1
+    if rv32_nand_ecc_decode_data(ecc_data, ecc) != ecc_data:
+        return 1
+    val ecc_low = ecc_data ^ 1
+    if rv32_nand_ecc_decode_status(ecc_low, ecc, 1, 1) != 1 or rv32_nand_ecc_decode_data(ecc_low, ecc) != ecc_data:
+        return 1
+    val ecc_mid = ecc_data ^ (1 << 16)
+    if rv32_nand_ecc_decode_status(ecc_mid, ecc, 1, 1) != 1 or rv32_nand_ecc_decode_data(ecc_mid, ecc) != ecc_data:
+        return 1
+    val ecc_high = ecc_data ^ (1 << 31)
+    if rv32_nand_ecc_decode_status(ecc_high, ecc, 1, 1) != 1 or rv32_nand_ecc_decode_data(ecc_high, ecc) != ecc_data:
+        return 1
+    val ecc_double = ecc_data ^ 3
+    if rv32_nand_ecc_decode_status(ecc_double, ecc, 2, 2) != 0:
+        return 1
+    if rv32_nand_ecc_decode_status(ecc_low, ecc, 1, 0) != 0:
+        return 1
+
+    if rv32_nand_nominal_level(0) != 32 or rv32_nand_nominal_level(1) != 160:
+        return 1
+    if rv32_nand_nominal_level(2) != -1:
+        return 1
+    if rv32_nand_disturb_level(32, 3, 0) != 32:
+        return 1
+    if rv32_nand_disturb_level(32, 4, 0) != 33:
+        return 1
+    if rv32_nand_disturb_level(160, 3, 1) != 160:
+        return 1
+    if rv32_nand_disturb_level(160, 4, 1) != 159:
+        return 1
+    if rv32_nand_disturb_level(32, 1000, 0) != 160:
+        return 1
+    if rv32_nand_disturb_level(160, 1000, 1) != 32:
+        return 1
+    if rv32_nand_disturb_level(32, -1, 0) != 32:
+        return 1
+    if rv32_nand_disturb_level(32, 4, 2) != 32:
+        return 1
+
+    if rv32_nand_lifecycle_next(0, 1) != 1:
+        return 1
+    if rv32_nand_lifecycle_next(1, 2) != 2:
+        return 1
+    if rv32_nand_lifecycle_next(2, 3) != 3:
+        return 1
+    if rv32_nand_lifecycle_next(0, 2) != -1:
+        return 1
+    if rv32_nand_lifecycle_next(3, 1) != -1:
+        return 1
+    if rv32_nand_lifecycle_next(-1, 1) != -1:
+        return 1
+    if rv32_nand_admin_queue_valid(0, 2) != 1:
+        return 1
+    if rv32_nand_admin_queue_valid(0, 64) != 1:
+        return 1
+    if rv32_nand_admin_queue_valid(0, 1) != 0:
+        return 1
+    if rv32_nand_admin_queue_valid(0, 65) != 0:
+        return 1
+    if rv32_nand_admin_queue_valid(1, 16) != 0:
+        return 1
+    if rv32_nand_io_queue_valid(1, 2) != 1:
+        return 1
+    if rv32_nand_io_queue_valid(4, 64) != 1:
+        return 1
+    if rv32_nand_io_queue_valid(0, 16) != 0:
+        return 1
+    if rv32_nand_io_queue_valid(5, 16) != 0:
+        return 1
+    if rv32_nand_io_queue_valid(1, 1) != 0:
+        return 1
+    if rv32_nand_media_status(2, 0, 1) != 1:
+        return 1
+    if rv32_nand_media_status(3, 0, 1) != 0:
+        return 1
+    if rv32_nand_media_status(3, 0, 2) != 0:
+        return 1
+    if rv32_nand_media_status(3, 1, 2) != 2:
+        return 1
+    if rv32_nand_media_status(3, 1, 3) != 0:
+        return 1
+    if rv32_nand_media_status(3, 2, 3) != 1:
+        return 1
+    if rv32_nand_media_status(3, 0, 9) != 1:
+        return 1
+
+    if rv32_nand_queue_next(0, 1) != 1:
+        return 1
+    if rv32_nand_queue_next(1, 2) != 2:
+        return 1
+    if rv32_nand_queue_next(2, 3) != 0:
+        return 1
+    if rv32_nand_queue_next(0, 2) != -1:
+        return 1
+    if rv32_nand_queue_next(1, 3) != -1:
+        return 1
+    if rv32_nand_queue_next(2, 1) != -1:
+        return 1
+    if rv32_nand_queue_next(3, 1) != -1:
+        return 1
+    if rv32_nand_queue_next(-1, 1) != -1:
+        return 1
+    0

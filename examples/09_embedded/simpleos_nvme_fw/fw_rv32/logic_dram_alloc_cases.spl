@@ -1,0 +1,18 @@
+use logic_dram_durability_core.*
+
+fn rv32_dram_alloc_cases_selftest() -> i32:
+    if _rv32_dram_effective_cap(16, 16, 16) != 16:
+        return 1
+    if _rv32_dram_effective_cap(99, 16, 16) != 16:
+        return 1
+    if _rv32_dram_effective_cap(-1, 16, 16) != 0:
+        return 1
+    if _rv32_dram_effective_cap(16, 8, 16) != 8:
+        return 1
+    if _rv32_dram_alloc_ok(2, 0, 16) != 1:
+        return 1
+    if _rv32_dram_alloc_ok(17, 0, 16) != 0:
+        return 1
+    if _rv32_dram_alloc_ok(2, 15, 16) != 0:
+        return 1
+    0

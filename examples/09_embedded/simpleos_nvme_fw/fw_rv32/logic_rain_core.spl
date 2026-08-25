@@ -1,0 +1,51 @@
+pub fn _rv32_rain_parity(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64) -> i64:
+    a ^ b ^ c ^ d ^ e ^ f ^ g ^ h
+
+pub fn _rv32_rain_recover_channel(parity: i64, failed: i64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64) -> i64:
+    if failed < 0:
+        return -1
+    if failed >= 8:
+        return -1
+    var acc: i64 = parity
+    if failed != 0:
+        acc = acc ^ a
+    if failed != 1:
+        acc = acc ^ b
+    if failed != 2:
+        acc = acc ^ c
+    if failed != 3:
+        acc = acc ^ d
+    if failed != 4:
+        acc = acc ^ e
+    if failed != 5:
+        acc = acc ^ f
+    if failed != 6:
+        acc = acc ^ g
+    if failed != 7:
+        acc = acc ^ h
+    acc
+
+pub fn _rv32_rain_ppn(group: i64, channel: i64, page: i64) -> i64:
+    if group < 0:
+        return -1
+    if group >= 8:
+        return -1
+    if channel < 0:
+        return -1
+    if channel >= 8:
+        return -1
+    if page < 0:
+        return -1
+    if page >= 64:
+        return -1
+    ((group * 8) + channel) * 64 + page
+
+pub fn _rv32_rain_stripe_idx(ppn: i64) -> i64:
+    if ppn < 0:
+        return -1
+    if ppn >= 4096:
+        return -1
+    val block: i64 = ppn / 64
+    val group: i64 = block / 8
+    val page: i64 = ppn - (block * 64)
+    group * 64 + page

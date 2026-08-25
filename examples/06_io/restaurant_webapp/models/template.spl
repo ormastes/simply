@@ -1,0 +1,73 @@
+use std.database.{DbCodec, DbValue, DbRow, TableSchema, Column, ColumnType, Database}
+use std.web_framework.model.{ActiveModel, Repository}
+use std.web_framework.form_validation.{Validator, Required, MinLength, MaxLength}
+
+class RestaurantTemplate:
+    id: i64
+    name: text
+    description: text
+    template_type: text
+    is_default: bool
+    created_at: text
+    updated_at: text
+
+class RestaurantTemplateCodec:
+    fn table_name() -> text:
+        "templates"
+
+    fn columns() -> List<text>:
+        ["name", "description", "template_type", "is_default", "created_at", "updated_at"]
+
+    fn encode(t: RestaurantTemplate) -> List<DbValue>:
+        [
+            DbValue.text(t.name),
+            DbValue.text(t.description),
+            DbValue.text(t.template_type),
+            DbValue.integer(if t.is_default: 1 else: 0),
+            DbValue.text(t.created_at),
+            DbValue.text(t.updated_at)
+        ]
+
+    fn decode(row: DbRow) -> RestaurantTemplate:
+        RestaurantTemplate(
+            id: row.get_i64("id"),
+            name: row.get_text("name"),
+            description: row.get_text("description"),
+            template_type: row.get_text("template_type"),
+            is_default: row.get_i64("is_default") != 0,
+            created_at: row.get_text("created_at"),
+            updated_at: row.get_text("updated_at")
+        )
+
+    fn schema() -> TableSchema:
+        TableSchema(
+            name: "templates",
+            columns: [
+                Column(name: "id", col_type: ColumnType.integer, primary_key: true, auto_increment: true),
+                Column(name: "name", col_type: ColumnType.text, nullable: false),
+                Column(name: "description", col_type: ColumnType.text, nullable: false),
+                Column(name: "template_type", col_type: ColumnType.text, nullable: false),
+                Column(name: "is_default", col_type: ColumnType.integer, nullable: false),
+                Column(name: "created_at", col_type: ColumnType.text, nullable: false),
+                Column(name: "updated_at", col_type: ColumnType.text, nullable: false)
+            ]
+        )
+
+fn create_template_repository(db: Database) -> Repository<RestaurantTemplate>:
+    Repository<RestaurantTemplate>(db: db, codec: RestaurantTemplateCodec())
+
+fn template_validator() -> Validator:
+    val v = Validator.new()
+    v.add_rule("name", Required())
+    v.add_rule("name", MinLength(length: 1))
+    v.add_rule("name", MaxLength(length: 100))
+    v
+
+fn find_all_templates(repo: Repository<RestaurantTemplate>) -> List<RestaurantTemplate>:
+    repo.find_all()
+
+fn find_templates_by_type(repo: Repository<RestaurantTemplate>, ttype: text) -> List<RestaurantTemplate>:
+    repo.find_where("template_type = ?", [DbValue.text(ttype)])
+
+fn find_template_by_id(repo: Repository<RestaurantTemplate>, id: i64) -> Result<RestaurantTemplate, text>:
+    repo.find_by_id(id)

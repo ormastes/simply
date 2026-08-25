@@ -1,0 +1,32 @@
+# @cover src/kernel/commit_loop.spl 80%
+"""
+# Two-tree Commit Loop
+
+Effects are staged in a working tree, then atomically promoted into the
+committed log — or rolled back, leaving the committed tree untouched.
+"""
+
+use std.spec
+use kernel.event_log.{new_event_log, event_count}
+use kernel.commit_loop.{begin, stage, staged_count, commit, rollback}
+
+describe "Commit loop — stage / commit / rollback":
+    it "stages effects without touching the base log":
+        var tx = begin(new_event_log())
+        tx = stage(tx, "ship", 1, "{}")
+        tx = stage(tx, "post", 1, "{}")
+        expect(staged_count(tx)).to_equal(2)
+        expect(event_count(tx.base)).to_equal(0)
+
+    it "promotes all staged effects on commit":
+        var tx = begin(new_event_log())
+        tx = stage(tx, "ship", 1, "{}")
+        tx = stage(tx, "post", 1, "{}")
+        val log = commit(tx)
+        expect(event_count(log)).to_equal(2)
+
+    it "discards staged effects on rollback":
+        var tx = begin(new_event_log())
+        tx = stage(tx, "ship", 1, "{}")
+        val log = rollback(tx)
+        expect(event_count(log)).to_equal(0)

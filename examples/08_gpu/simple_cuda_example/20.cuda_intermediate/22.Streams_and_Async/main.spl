@@ -1,0 +1,299 @@
+# Exercise 22: Streams and Async Operations
+#
+# The C++ original overlaps transfers and kernels on several CUDA streams.
+# The Rust seed's runtime has NO stream API at all (no rt_cuda_stream_* in
+# compiler_rust/runtime/src/cuda_runtime.rs, no `stream:` slot in the
+# `<<<grid:, block:>>>` grammar, no stream parameter on rt_cuda_launch_kernel),
+# so this module demonstrates what the seed CAN do honestly:
+#
+#   1. in-order execution on the default stream (launch, launch, ..., sync)
+#   2. chunked "pipeline" issue: all chunks enqueued back-to-back, ONE sync
+#   3. two independent producers feeding one consumer kernel
+#   4. CUDA events (rt_cuda_event_*), the one async primitive the seed has,
+#      used to time a launch on the default stream
+#
+# The missing stream slot is filed as a feature request:
+#   doc/08_tracking/bug/kernel_launch_grammar_no_stream_slot_2026-08-25.md
+# and the original multi-stream form is kept in README.md for reference.
+
+use ..gpu_test_helpers.{
+    gpu_setup, gpu_teardown,
+    gpu_upload_f32s, gpu_download_f32s, gpu_alloc_bytes, gpu_free_ptr,
+    gpu_load_ptx, gpu_unload, gpu_launch_1d, gpu_run_1d, gpu_sync_all, grid_for
+}
+
+val BLOCK_SIZE = 256
+
+# CUDA events are available in the seed interpreter (dispatched in
+# compiler_rust/compiler/src/interpreter_extern/mod.rs); stream 0 = default.
+extern fn rt_cuda_event_create() -> i64
+extern fn rt_cuda_event_record(event: i64, stream: i64) -> i64
+extern fn rt_cuda_event_synchronize(event: i64) -> i64
+extern fn rt_cuda_event_elapsed_ns(start_event: i64, end_event: i64) -> i64
+extern fn rt_cuda_event_destroy(event: i64) -> i64
+
+# ----------------------------------------------------------------------------
+# PTX kernels
+# ----------------------------------------------------------------------------
+# scale_kernel(data, scale_bits, n): data[i] *= scale   (scale passed as the
+#   IEEE-754 bit pattern of an f32 in a .u64 slot)
+# add_kernel(a, b, c, n):            c[i] = a[i] + b[i]
+val PTX = """
+.version 7.0
+.target sm_75
+.address_size 64
+
+.visible .entry scale_kernel(.param .u64 data, .param .u64 scale_bits, .param .u64 n)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<8>;
+    .reg .f32 %f<4>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [data];
+    ld.param.u64 %rd2, [scale_bits];
+    ld.param.u64 %rd3, [n];
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r4, %r1, %r2, %r3;
+    cvt.u64.u32 %rd4, %r4;
+    setp.ge.u64 %p1, %rd4, %rd3;
+    @%p1 bra DONE;
+    cvt.u32.u64 %r5, %rd2;
+    mov.b32 %f1, %r5;
+    shl.b64 %rd5, %rd4, 2;
+    add.u64 %rd6, %rd1, %rd5;
+    ld.global.f32 %f2, [%rd6];
+    mul.f32 %f3, %f2, %f1;
+    st.global.f32 [%rd6], %f3;
+DONE:
+    ret;
+}
+
+.visible .entry add_kernel(.param .u64 a, .param .u64 b, .param .u64 c, .param .u64 n)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<8>;
+    .reg .f32 %f<4>;
+    .reg .b64 %rd<12>;
+    ld.param.u64 %rd1, [a];
+    ld.param.u64 %rd2, [b];
+    ld.param.u64 %rd3, [c];
+    ld.param.u64 %rd4, [n];
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r4, %r1, %r2, %r3;
+    cvt.u64.u32 %rd5, %r4;
+    setp.ge.u64 %p1, %rd5, %rd4;
+    @%p1 bra DONE;
+    shl.b64 %rd6, %rd5, 2;
+    add.u64 %rd7, %rd1, %rd6;
+    add.u64 %rd8, %rd2, %rd6;
+    add.u64 %rd9, %rd3, %rd6;
+    ld.global.f32 %f1, [%rd7];
+    ld.global.f32 %f2, [%rd8];
+    add.f32 %f3, %f1, %f2;
+    st.global.f32 [%rd9], %f3;
+DONE:
+    ret;
+}
+"""
+
+# ----------------------------------------------------------------------------
+# Host helpers
+# ----------------------------------------------------------------------------
+
+fn make_data(n: i64, fill: f32) -> [f32]:
+    var out: [f32] = []
+    for i in 0..n:
+        out.push(fill)
+    out
+
+# IEEE-754 bits of an f32 so it can travel in a .u64 kernel parameter.
+fn scale_bits(x: f32) -> i64:
+    val v = x as f64
+    if v == 0.0:
+        return 0
+    var sign = 0
+    var a = v
+    if a < 0.0:
+        sign = 1
+        a = 0.0 - a
+    var e = 0
+    while a >= 2.0:
+        a = a / 2.0
+        e = e + 1
+    while a < 1.0:
+        a = a * 2.0
+        e = e - 1
+    val frac = ((a - 1.0) * 8388608.0 + 0.5) as i64
+    (sign << 31) | ((e + 127) << 23) | frac
+
+# Demo 1: one launch on the default stream, then sync, then download.
+fn demo_single_stream(module: i64, n: i64) -> Result<[f32], text>:
+    val dev = gpu_upload_f32s(make_data(n, 5.0))
+    if dev == 0:
+        return Err("upload failed")
+    val ok = gpu_run_1d(module, "scale_kernel", grid_for(n, BLOCK_SIZE), BLOCK_SIZE, [dev, scale_bits(3.0), n])
+    val out = gpu_download_f32s(dev, n)
+    gpu_free_ptr(dev)
+    if not ok or out.len() != n:
+        return Err("scale launch failed")
+    Ok(out)
+
+# Demo 2: two independent buffers, both launches enqueued before a single sync.
+# On the default stream they execute in order; with real streams they could
+# overlap. Returns [buffer1 (x2), buffer2 (x4)] concatenated.
+fn demo_two_streams(module: i64, n: i64) -> Result<[f32], text>:
+    val d1 = gpu_upload_f32s(make_data(n, 1.0))
+    val d2 = gpu_upload_f32s(make_data(n, 1.0))
+    if d1 == 0 or d2 == 0:
+        return Err("upload failed")
+    val rc1 = gpu_launch_1d(module, "scale_kernel", grid_for(n, BLOCK_SIZE), BLOCK_SIZE, [d1, scale_bits(2.0), n])
+    val rc2 = gpu_launch_1d(module, "scale_kernel", grid_for(n, BLOCK_SIZE), BLOCK_SIZE, [d2, scale_bits(4.0), n])
+    val synced = gpu_sync_all()
+    var out = gpu_download_f32s(d1, n)
+    val second = gpu_download_f32s(d2, n)
+    gpu_free_ptr(d1)
+    gpu_free_ptr(d2)
+    if rc1 != 0 or rc2 != 0 or not synced or out.len() != n or second.len() != n:
+        return Err("two-buffer launch failed")
+    for x in second:
+        out.push(x)
+    Ok(out)
+
+# Demo 3: chunked pipeline. `total` elements are processed as `num_chunks`
+# back-to-back launches over sub-ranges of ONE device buffer (pointer
+# arithmetic: chunk k starts at dev + k*chunk*4), then a single sync.
+fn demo_pipeline(module: i64, total: i64, num_chunks: i64) -> Result<[f32], text>:
+    if num_chunks <= 0 or total % num_chunks != 0:
+        return Err("total must be a multiple of num_chunks")
+    val chunk = total / num_chunks
+    val dev = gpu_upload_f32s(make_data(total, 1.0))
+    if dev == 0:
+        return Err("upload failed")
+    var all_ok = true
+    for k in 0..num_chunks:
+        # chunk k is scaled by (k + 1) so the result reveals chunk boundaries
+        val rc = gpu_launch_1d(module, "scale_kernel", grid_for(chunk, BLOCK_SIZE), BLOCK_SIZE,
+                               [dev + k * chunk * 4, scale_bits((k + 1) as f32), chunk])
+        if rc != 0:
+            all_ok = false
+    val synced = gpu_sync_all()
+    val out = gpu_download_f32s(dev, total)
+    gpu_free_ptr(dev)
+    if not all_ok or not synced or out.len() != total:
+        return Err("pipeline launch failed")
+    Ok(out)
+
+# Demo 4: two producers (scale a by 2, scale b by 3) then one consumer
+# (c = a + b). In-order default-stream semantics guarantee the consumer sees
+# both producers' results.
+fn demo_stream_add(module: i64, n: i64) -> Result<[f32], text>:
+    val a = gpu_upload_f32s(make_data(n, 1.0))
+    val b = gpu_upload_f32s(make_data(n, 1.0))
+    val c = gpu_alloc_bytes(n * 4)
+    if a == 0 or b == 0 or c == 0:
+        return Err("alloc failed")
+    val rc1 = gpu_launch_1d(module, "scale_kernel", grid_for(n, BLOCK_SIZE), BLOCK_SIZE, [a, scale_bits(2.0), n])
+    val rc2 = gpu_launch_1d(module, "scale_kernel", grid_for(n, BLOCK_SIZE), BLOCK_SIZE, [b, scale_bits(3.0), n])
+    val rc3 = gpu_launch_1d(module, "add_kernel", grid_for(n, BLOCK_SIZE), BLOCK_SIZE, [a, b, c, n])
+    val synced = gpu_sync_all()
+    val out = gpu_download_f32s(c, n)
+    gpu_free_ptr(a)
+    gpu_free_ptr(b)
+    gpu_free_ptr(c)
+    if rc1 != 0 or rc2 != 0 or rc3 != 0 or not synced or out.len() != n:
+        return Err("producer/consumer launch failed")
+    Ok(out)
+
+# Demo 5: time one launch with CUDA events on the default stream (stream 0).
+# Returns elapsed nanoseconds (>= 0) or Err when events are unavailable.
+fn demo_event_timing(module: i64, n: i64) -> Result<i64, text>:
+    val dev = gpu_upload_f32s(make_data(n, 1.0))
+    if dev == 0:
+        return Err("upload failed")
+    val start = rt_cuda_event_create()
+    val stop = rt_cuda_event_create()
+    if start <= 0 or stop <= 0:
+        gpu_free_ptr(dev)
+        return Err("event create failed")
+    rt_cuda_event_record(start, 0)
+    val rc = gpu_launch_1d(module, "scale_kernel", grid_for(n, BLOCK_SIZE), BLOCK_SIZE, [dev, scale_bits(2.0), n])
+    rt_cuda_event_record(stop, 0)
+    rt_cuda_event_synchronize(stop)
+    val ns = rt_cuda_event_elapsed_ns(start, stop)
+    rt_cuda_event_destroy(start)
+    rt_cuda_event_destroy(stop)
+    gpu_free_ptr(dev)
+    if rc != 0 or ns < 0:
+        return Err("event timing failed")
+    Ok(ns)
+
+fn count_equal(xs: [f32], expected: f32) -> i64:
+    var c = 0
+    for x in xs:
+        val d = x - expected
+        if d < 0.0001 and d > -0.0001:
+            c = c + 1
+    c
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+
+fn main():
+    val ctx = gpu_setup(0)
+    if ctx == 0:
+        print "No CUDA device available; nothing to run."
+        return
+    val module = gpu_load_ptx(PTX)
+    if module == 0:
+        gpu_teardown(ctx)
+        return
+    val n = 1024
+
+    print "=== Default stream: scale 5.0 x 3.0 ==="
+    match demo_single_stream(module, n):
+        case Ok(r):
+            print "  {count_equal(r, 15.0)}/{n} elements equal 15.0"
+        case Err(e):
+            print "  error: {e}"
+
+    print "=== Two buffers, two launches, one sync ==="
+    match demo_two_streams(module, n):
+        case Ok(r):
+            var first: [f32] = []
+            var second: [f32] = []
+            for i in 0..n:
+                first.push(r[i])
+                second.push(r[n + i])
+            print "  buffer1: {count_equal(first, 2.0)}/{n} equal 2.0, buffer2: {count_equal(second, 4.0)}/{n} equal 4.0"
+        case Err(e):
+            print "  error: {e}"
+
+    print "=== Chunked pipeline: 4 chunks scaled by 1,2,3,4 ==="
+    match demo_pipeline(module, n, 4):
+        case Ok(r):
+            print "  chunk0[0]={r[0]} chunk1[0]={r[256]} chunk2[0]={r[512]} chunk3[0]={r[768]} (expected 1.0 2.0 3.0 4.0)"
+        case Err(e):
+            print "  error: {e}"
+
+    print "=== Producer/consumer: (1x2) + (1x3) ==="
+    match demo_stream_add(module, n):
+        case Ok(r):
+            print "  {count_equal(r, 5.0)}/{n} elements equal 5.0"
+        case Err(e):
+            print "  error: {e}"
+
+    print "=== Event timing on the default stream ==="
+    match demo_event_timing(module, n):
+        case Ok(ns):
+            print "  scale_kernel timed with cuEvent: elapsed >= 0 ns -> {ns >= 0}"
+        case Err(e):
+            print "  error: {e}"
+
+    gpu_unload(module)
+    gpu_teardown(ctx)
+    print "All stream demos complete."

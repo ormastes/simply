@@ -1,0 +1,32 @@
+use logic_wear_scrub_core.*
+
+fn rv32_wear_scrub_cases_selftest() -> i32:
+    if _rv32_wear_counter_clamped(0) != 0:
+        return 1
+    if _rv32_wear_counter_clamped(-1) != 0:
+        return 1
+    if _rv32_scrub_needed(1, 51) != 1:
+        return 1
+    if _rv32_scrub_needed(1, 50) != 0:
+        return 1
+    if _rv32_scrub_needed(0, 99) != 0:
+        return 1
+    if _rv32_wear_level_needed(3, 0) != 1:
+        return 1
+    if _rv32_wear_level_needed(2, 0) != 0:
+        return 1
+    if _rv32_wear_level_needed(-5, 0) != 0:
+        return 1
+    if _rv32_wear_percent_used(50) != 50:
+        return 1
+    if _rv32_wear_percent_used(250) != 100:
+        return 1
+    if _rv32_wear_percent_used(-1) != 0:
+        return 1
+    if _rv32_scrub_result_block(7, 1, 51) != 7:
+        return 1
+    if _rv32_scrub_result_block(7, 1, 50) != -1:
+        return 1
+    if _rv32_scrub_result_block(64, 1, 51) != -1:
+        return 1
+    0

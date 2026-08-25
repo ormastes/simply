@@ -1,0 +1,71 @@
+# Lua Native Module Demo
+#
+# A Simple module compiled to a shared library (.so) that can be loaded by Lua:
+#
+#   1. Plain C-ABI function via LuaJIT FFI direct load:
+#        local ffi = require("ffi")
+#        ffi.cdef[[long long simple_square(long long n);]]
+#        local lib = ffi.load("./libsimpledemo.so")
+#        print(lib.simple_square(7))      -- 49
+#
+#   2. Classic luaopen module (table registration):
+#        local m = require("simpledemo")
+#        print(m.square(7))
+#        (requires luajit + lua_pushcfunction fn-pointer support)
+#
+# Build:
+#   bin/simple run src/app/compile/lua_shared_lib.spl \
+#       examples/06_io/ffi/lua_native_module.spl libsimpledemo.so
+#
+# The @export("C", name:"...") attribute causes the C backend to emit an
+# extern "C" wrapper with the given symbol name (via emit_function_export_wrapper).
+# The shared-lib linker step (link_to_shared) adds -DSPL_SHARED_LIBRARY which
+# triggers the __attribute__((constructor)) auto-init preamble in the C output.
+
+# ============================================================================
+# Lua C API — minimal module-level extern declarations
+# (lua_State is an opaque C struct; Simple represents it as i64 ptr)
+# ============================================================================
+
+extern fn lua_createtable(L: i64, narr: i64, nrec: i64)
+extern fn lua_pushinteger(L: i64, n: i64)
+extern fn lua_setfield(L: i64, idx: i64, k: text)
+
+# ============================================================================
+# Plain C-ABI function: accessible via LuaJIT ffi.cdef
+# ============================================================================
+
+@export("C", name: "simple_square")
+fn simple_square(n: i64) -> i64:
+    """Return n * n. Callable via LuaJIT ffi.cdef[[long long simple_square(long long);]]."""
+    n * n
+
+# ============================================================================
+# Lua C module registration: luaopen entry point
+#
+# Called by Lua's module loader when:  require("simpledemo")
+#
+# NOTE on function pointers: Simple does not yet support taking the address of
+# an exported fn and passing it as a C function pointer to lua_pushcfunction.
+# The luaopen path therefore registers the result of square(0) as a placeholder
+# integer rather than a full closure.  The ffi.cdef path (simple_square above)
+# is the primary hard oracle and works independently.
+# ============================================================================
+
+@export("C", name: "luaopen_simpledemo")
+fn luaopen_simpledemo(L: i64) -> i64:
+    """
+    Lua C module entry point: called by require("simpledemo").
+
+    Creates and returns a Lua table. The 'square_of_7' field holds the literal
+    result 49 (demonstrating that the module initialises correctly).
+    Returns 1 to signal one result value on the Lua stack.
+    """
+    # Create table with 0 array slots, 1 hash slot
+    lua_createtable(L, 0, 1)
+    # Push the pre-computed result value
+    lua_pushinteger(L, 49)
+    # t["square_of_7"] = 49  (index -2 = the table, TOS = the integer)
+    lua_setfield(L, -2, "square_of_7")
+    # Return 1 (the table is on top of the stack)
+    1

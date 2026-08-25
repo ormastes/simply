@@ -1,0 +1,10 @@
+use logic_journal_core.*
+
+fn rv32_journal_append_count_cases_selftest() -> i32:
+    if _rv32_journal_append_count(3, 512) != 4:
+        return 1
+    if _rv32_journal_append_count(512, 512) != 512:
+        return 1
+    if _rv32_journal_append_count(512, 513) != 512:
+        return 1
+    0

@@ -1,0 +1,8 @@
+# llm-process-gen: managed source=codex_release_tools source_sha256=597e07db61bbeaac71c0da6fbf123a1cc0baddd381bf528258cf3c2c573a9b75 content_sha256=c9b63e0d28079df83ac3ae0b2c71d1c5b21a71412a8071cbd97db6fdb1dada13
+skill_tools |skill, source|
+    release, codex
+
+tools |id, type, name, purpose|
+    simple_mcp, mcp, "Simple MCP", "Query workspace structure, symbols, and project context"
+    simple_lsp_mcp, mcp, "Simple LSP MCP", "Resolve definitions, references, hover, and completions"
+    simple_cli, cli, "bin/simple", "Run Simple build, query, test, and verification commands"

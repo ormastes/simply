@@ -1,0 +1,12 @@
+use logic_band_free_cases.*
+use logic_band_mark_cases.*
+use logic_band_rebuild_cases.*
+
+fn rv32_band_state_cases_selftest() -> i32:
+    if rv32_band_mark_cases_selftest() != 0:
+        return 1
+    if rv32_band_free_cases_selftest() != 0:
+        return 1
+    if rv32_band_rebuild_cases_selftest() != 0:
+        return 1
+    0

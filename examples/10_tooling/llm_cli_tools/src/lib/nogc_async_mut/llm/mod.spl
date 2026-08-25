@@ -1,0 +1,389 @@
+# LLM Caret - Public API Module
+#
+# Unified LLM access layer providing Claude-CLI-like chat API.
+# Wraps multiple backends: Claude CLI, Claude API, OpenAI API,
+# OpenAI-compatible endpoints, and local torch models.
+#
+# Usage:
+#   use app.llm_caret.mod.{llm_init_defaults, llm_chat, llm_clear}
+#   llm_init_defaults()
+#   val response = llm_chat("Hello!")
+#   print response
+
+extern fn rt_env_get(key: text) -> text
+extern fn rt_process_run(cmd: text, args: [text]) -> (text, text, i64)
+
+use common.text.{escape_json}
+use std.nogc_async_mut.mcp.helpers.{Q, LB, RB}
+use std.nogc_async_mut.llm.json_helpers.{_unwrap_idx, extract_json_string, extract_json_value, extract_json_int, extract_json_bool}
+
+# ============================================================================
+# Module-level state
+# ============================================================================
+
+var LLM_INITIALIZED = false
+var LLM_PROVIDER = "claude_cli"
+var LLM_MODEL = ""
+var LLM_CLI_PATH = "claude"
+var LLM_API_KEY = ""
+var LLM_BASE_URL = ""
+var LLM_SYSTEM_PROMPT = ""
+var LLM_SESSION_ID = ""
+var LLM_MAX_TURNS = 0
+
+# History
+var LLM_ROLES: [text] = []
+var LLM_CONTENTS: [text] = []
+
+# ============================================================================
+# Initialization
+# ============================================================================
+
+fn llm_init_defaults():
+    LLM_INITIALIZED = true
+    LLM_PROVIDER = "claude_cli"
+    LLM_MODEL = ""
+    LLM_CLI_PATH = "claude"
+    LLM_ROLES = []
+    LLM_CONTENTS = []
+
+fn llm_init(provider: text, model: text):
+    LLM_INITIALIZED = true
+    LLM_PROVIDER = provider
+    LLM_MODEL = model
+    LLM_ROLES = []
+    LLM_CONTENTS = []
+
+fn llm_set_api_key(key: text):
+    LLM_API_KEY = key
+
+fn llm_set_base_url(url: text):
+    LLM_BASE_URL = url
+
+fn llm_set_cli_path(path: text):
+    LLM_CLI_PATH = path
+
+fn llm_system(prompt: text):
+    LLM_SYSTEM_PROMPT = prompt
+
+fn llm_provider() -> text:
+    LLM_PROVIDER
+
+fn llm_model() -> text:
+    LLM_MODEL
+
+fn llm_clear():
+    LLM_ROLES = []
+    LLM_CONTENTS = []
+    LLM_SESSION_ID = ""
+
+# ============================================================================
+# History
+# ============================================================================
+
+fn llm_history_len() -> i64:
+    LLM_ROLES.len()
+
+fn llm_history_role(idx: i64) -> text:
+    if idx >= 0 and idx < LLM_ROLES.len():
+        return LLM_ROLES[idx]
+    ""
+
+fn llm_history_content(idx: i64) -> text:
+    if idx >= 0 and idx < LLM_CONTENTS.len():
+        return LLM_CONTENTS[idx]
+    ""
+
+# ============================================================================
+# Build messages JSON from history
+# ============================================================================
+
+fn _build_messages_json() -> text:
+    var items: [text] = []
+    var i = 0
+    while i < LLM_ROLES.len():
+        var msg_parts = []
+        msg_parts.append(LB())
+        msg_parts.append(Q() + "role" + Q() + ":" + Q() + LLM_ROLES[i] + Q() + ",")
+        msg_parts.append(Q() + "content" + Q() + ":" + Q() + escape_json(LLM_CONTENTS[i]) + Q())
+        msg_parts.append(RB())
+        items = items + [msg_parts.join("")]
+        i = i + 1
+    var parts = []
+    parts.append("[")
+    var j = 0
+    for item in items:
+        if j > 0:
+            parts.append(",")
+        parts.append(item)
+        j = j + 1
+    parts.append("]")
+    parts.join("")
+
+# ============================================================================
+# Chat (main entry point)
+# ============================================================================
+
+fn llm_chat(user_msg: text) -> text:
+    if not LLM_INITIALIZED:
+        return "ERROR: call llm_init_defaults() or llm_init() first"
+    # Add user message to history
+    LLM_ROLES = LLM_ROLES + ["user"]
+    LLM_CONTENTS = LLM_CONTENTS + [user_msg]
+    # Dispatch based on provider
+    var result_content = ""
+    var result_error = ""
+    if LLM_PROVIDER == "claude_cli":
+        val r = _send_claude_cli(user_msg)
+        result_content = r.0
+        result_error = r.1
+    elif LLM_PROVIDER == "claude_api":
+        val r = _send_claude_api()
+        result_content = r.0
+        result_error = r.1
+    elif LLM_PROVIDER == "openai":
+        val r = _send_openai()
+        result_content = r.0
+        result_error = r.1
+    elif LLM_PROVIDER == "codex_cli":
+        val r = _send_codex_cli(user_msg)
+        result_content = r.0
+        result_error = r.1
+    elif LLM_PROVIDER == "gemini_cli":
+        val r = _send_gemini_cli(user_msg)
+        result_content = r.0
+        result_error = r.1
+    else:
+        result_error = "unsupported provider: " + LLM_PROVIDER
+    if result_error != "":
+        return "ERROR: " + result_error
+    # Add assistant response to history
+    LLM_ROLES = LLM_ROLES + ["assistant"]
+    LLM_CONTENTS = LLM_CONTENTS + [result_content]
+    result_content
+
+# ============================================================================
+# Send via Claude CLI
+# ============================================================================
+
+fn _send_claude_cli(prompt: text) -> (text, text):
+    var args: [text] = []
+    args = args + ["--dangerously-skip-permissions"]
+    args = args + ["-p", prompt]
+    args = args + ["--output-format", "json"]
+    if LLM_MODEL != "":
+        args = args + ["--model", LLM_MODEL]
+    if LLM_SYSTEM_PROMPT != "":
+        args = args + ["--system-prompt", LLM_SYSTEM_PROMPT]
+    if LLM_SESSION_ID != "":
+        args = args + ["--resume", LLM_SESSION_ID]
+    if LLM_MAX_TURNS > 0:
+        args = args + ["--max-turns", LLM_MAX_TURNS.to_text()]
+    val result = rt_process_run(LLM_CLI_PATH, args)
+    val stdout = result.0 ?? ""
+    val stderr = result.1 ?? ""
+    val exit_code = result.2
+    if exit_code != 0:
+        var err = "claude CLI error (code " + exit_code.to_text() + ")"
+        if stderr != "":
+            err = err + ": " + stderr
+        return ("", err)
+    # Parse JSON
+    val content = extract_json_string(stdout, "result")
+    val sess = extract_json_string(stdout, "session_id")
+    val is_err = extract_json_bool(stdout, "is_error")
+    if sess != "":
+        LLM_SESSION_ID = sess
+    if is_err:
+        return ("", content)
+    (content, "")
+
+# ============================================================================
+# Send via Claude API
+# ============================================================================
+
+fn _send_claude_api() -> (text, text):
+    var key = LLM_API_KEY
+    if key == "":
+        key = rt_env_get("ANTHROPIC_API_KEY") ?? ""
+    if key == "":
+        return ("", "ANTHROPIC_API_KEY not set")
+    var url = LLM_BASE_URL
+    if url == "":
+        url = "https://api.anthropic.com"
+    url = url + "/v1/messages"
+    var model_val = LLM_MODEL
+    if model_val == "":
+        model_val = "claude-sonnet-4-20250514"
+    val messages = _build_messages_json()
+    # Build body
+    var parts: [text] = []
+    parts = parts + [Q() + "model" + Q() + ":" + Q() + model_val + Q()]
+    parts = parts + [Q() + "max_tokens" + Q() + ":4096"]
+    if LLM_SYSTEM_PROMPT != "":
+        parts = parts + [Q() + "system" + Q() + ":" + Q() + escape_json(LLM_SYSTEM_PROMPT) + Q()]
+    parts = parts + [Q() + "messages" + Q() + ":" + messages]
+    var body_parts = []
+    body_parts.append(LB())
+    var i = 0
+    for part in parts:
+        if i > 0:
+            body_parts.append(",")
+        body_parts.append(part)
+        i = i + 1
+    body_parts.append(RB())
+    val body = body_parts.join("")
+    var hdr_parts = []
+    hdr_parts.append("x-api-key: " + key)
+    hdr_parts.append("anthropic-version: 2023-06-01")
+    hdr_parts.append("content-type: application/json")
+    val headers = hdr_parts.join("\n")
+    val result = rt_http_request("POST", url, headers, body)
+    val resp_body = result.1 ?? ""
+    val http_error = result.2 ?? ""
+    if http_error != "":
+        return ("", "HTTP error: " + http_error)
+    val content = extract_json_string(resp_body, "text")
+    (content, "")
+
+# ============================================================================
+# Send via OpenAI API
+# ============================================================================
+
+fn _send_openai() -> (text, text):
+    var key = LLM_API_KEY
+    if key == "":
+        key = rt_env_get("OPENAI_API_KEY") ?? ""
+    if key == "":
+        return ("", "OPENAI_API_KEY not set")
+    var url = LLM_BASE_URL
+    if url == "":
+        url = "https://api.openai.com"
+    url = url + "/v1/chat/completions"
+    var model_val = LLM_MODEL
+    if model_val == "":
+        model_val = "gpt-4o"
+    val messages = _build_messages_json()
+    var parts: [text] = []
+    parts = parts + [Q() + "model" + Q() + ":" + Q() + model_val + Q()]
+    parts = parts + [Q() + "messages" + Q() + ":" + messages]
+    var body_parts = []
+    body_parts.append(LB())
+    var i = 0
+    for part in parts:
+        if i > 0:
+            body_parts.append(",")
+        body_parts.append(part)
+        i = i + 1
+    body_parts.append(RB())
+    val body = body_parts.join("")
+    var hdr_parts = []
+    hdr_parts.append("Authorization: Bearer " + key)
+    hdr_parts.append("Content-Type: application/json")
+    val headers = hdr_parts.join("\n")
+    val result = rt_http_request("POST", url, headers, body)
+    val resp_body = result.1 ?? ""
+    val http_error = result.2 ?? ""
+    if http_error != "":
+        return ("", "HTTP error: " + http_error)
+    val content = extract_json_string(resp_body, "content")
+    (content, "")
+
+# ============================================================================
+# Direct send (without history management)
+# ============================================================================
+
+# ============================================================================
+# Send via Codex CLI
+# ============================================================================
+
+fn _send_codex_cli(prompt: text) -> (text, text):
+    var args: [text] = []
+    args = args + ["exec"]
+    args = args + ["--json"]
+    args = args + ["--full-auto"]
+    args = args + ["--sandbox", "off"]
+    if LLM_MODEL != "":
+        args = args + ["--model", LLM_MODEL]
+    if LLM_SYSTEM_PROMPT != "":
+        args = args + ["--instructions", LLM_SYSTEM_PROMPT]
+    args = args + [prompt]
+    val result = rt_process_run(LLM_CLI_PATH, args)
+    val stdout = result.0 ?? ""
+    val stderr = result.1 ?? ""
+    val exit_code = result.2
+    if exit_code != 0:
+        var err = "codex CLI error (code " + exit_code.to_text() + ")"
+        if stderr != "":
+            err = err + ": " + stderr
+        return ("", err)
+    # Parse JSONL — find last assistant message
+    var content = ""
+    val lines = stdout.split("\n")
+    for line in lines:
+        val trimmed = line.trim()
+        if trimmed == "":
+            continue
+        val role = extract_json_string(trimmed, "role")
+        if role == "assistant":
+            val text_val = extract_json_string(trimmed, "text")
+            if text_val != "":
+                content = text_val
+        val etype = extract_json_string(trimmed, "type")
+        if etype == "error":
+            val err_msg = extract_json_string(trimmed, "message")
+            return ("", err_msg)
+    (content, "")
+
+# ============================================================================
+# Send via Gemini CLI
+# ============================================================================
+
+fn _send_gemini_cli(prompt: text) -> (text, text):
+    var args: [text] = []
+    args = args + ["--sandbox", "off"]
+    args = args + ["-p", prompt]
+    args = args + ["--output-format", "json"]
+    if LLM_MODEL != "":
+        args = args + ["--model", LLM_MODEL]
+    if LLM_SESSION_ID != "":
+        args = args + ["--resume", LLM_SESSION_ID]
+    val result = rt_process_run(LLM_CLI_PATH, args)
+    val stdout = result.0 ?? ""
+    val stderr = result.1 ?? ""
+    val exit_code = result.2
+    if exit_code != 0:
+        var err = "gemini CLI error (code " + exit_code.to_text() + ")"
+        if stderr != "":
+            err = err + ": " + stderr
+        return ("", err)
+    # Parse JSON — Gemini uses "response" field
+    val content = extract_json_string(stdout, "response")
+    val error_val = extract_json_string(stdout, "error")
+    if error_val != "":
+        return ("", error_val)
+    (content, "")
+
+# ============================================================================
+# Direct send (without history management)
+# ============================================================================
+
+fn llm_send(prompt: text) -> text:
+    if not LLM_INITIALIZED:
+        return "ERROR: call llm_init_defaults() or llm_init() first"
+    if LLM_PROVIDER == "claude_cli":
+        val r = _send_claude_cli(prompt)
+        if r.1 != "":
+            return "ERROR: " + r.1
+        return r.0
+    if LLM_PROVIDER == "codex_cli":
+        val r = _send_codex_cli(prompt)
+        if r.1 != "":
+            return "ERROR: " + r.1
+        return r.0
+    if LLM_PROVIDER == "gemini_cli":
+        val r = _send_gemini_cli(prompt)
+        if r.1 != "":
+            return "ERROR: " + r.1
+        return r.0
+    "ERROR: llm_send only supports claude_cli, codex_cli, gemini_cli providers"

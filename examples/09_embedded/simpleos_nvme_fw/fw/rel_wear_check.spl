@@ -1,0 +1,138 @@
+"""
+rel_wear_check — absolute oracles for the SREA-lite dwell-aware static
+wear-leveling policy rel_wear.spl (contract: doc/05_design/hardware/nand_recovery/
+recovery_algorithms_design.md §6, design §9 lane L7). Known values at known
+points, not self-comparison.
+
+This module is SEPARATE from rel_wear.spl: every RelWearState is built via
+rel_wear.spl's own rel_wear_new() constructor and read back / verdicted here,
+proving no cross-module struct decay and exercising the module's public API only
+(nvme_types.* + nd_types.* + rel_types.* import graph honored transitively).
+
+Oracles:
+  1. No verdict below spread threshold: erase spread <= WL_THRESHOLD (existing
+     nvme_types.spl constant, reused unchanged) always returns Accept, regardless
+     of dwell (even a huge dwell must not override the spread gate).
+  2. Verdict fires at exactly the design threshold: spread == WL_THRESHOLD (2) is
+     the boundary and still Accepts (`<=` in rel_wear_due); spread == WL_THRESHOLD
+     + 1 (3) with dwell >= REL_WL_DWELL_MIN() (8) fires ReclaimNow with arg ==
+     the coldest block's flat index (typed-dims boundary conversion proven).
+  3. Hysteresis (scripted sequence): a verdict fires once on a dwelled cold block;
+     the mount actuates it (rel_wear_on_erase resets that block's dwell clock);
+     re-evaluating rel_wear_due IMMEDIATELY after, with the SAME spread condition
+     still hot, does NOT re-fire (dwell reset to 0 < REL_WL_DWELL_MIN()) — this is
+     the SREA deferral acting as thrash-prevention hysteresis. After enough
+     further elsewhere-erases restore dwell >= REL_WL_DWELL_MIN(), the verdict is
+     allowed to fire again (hysteresis is a delay, not a permanent latch).
+  4. Per-block isolation: two blocks in the SAME RelWearState, one recently
+     erased (small dwell) and one never erased (large dwell), under the SAME
+     spread/total_erases inputs, get DIFFERENT verdicts (Accept vs ReclaimNow) —
+     proving last_global_erase[blk] does not leak across block indices.
+
+Run: bin/simple run examples/09_embedded/simpleos_nvme_fw/fw/rel_wear_check.spl
+Gate: prints "REL WEAR OK" and exits 0.
+"""
+
+use nvme_types.*
+use nd_types.*
+use rel_types.*
+use rel_wear.*
+
+fn kind_of(a: RelAction) -> i64:
+    a.kind
+
+fn arg_of(a: RelAction) -> i64:
+    a.arg
+
+fn main():
+    var fail: i64 = 0
+
+    # ── Oracle 1: no verdict below spread threshold (dwell irrelevant) ────────
+    val st0: RelWearState = rel_wear_new()
+    val blk_a: NdBlock = nd_block(5)
+
+    # spread = 2 (erase_min 10, erase_max 12) — never erased -> dwell huge, but
+    # the spread gate must still short-circuit to Accept.
+    val below: RelAction = rel_wear_due(st0, blk_a, 10, 12, 500)
+    fail = fail + expect_eq(kind_of(below), rel_act_accept(), "spread==2 (<=WL_THRESHOLD) -> Accept despite huge dwell")
+    fail = fail + expect_eq(arg_of(below), 0, "spread<=threshold Accept carries arg 0")
+
+    # spread = 1 — trivially under threshold.
+    val below2: RelAction = rel_wear_due(st0, blk_a, 10, 11, 500)
+    fail = fail + expect_eq(kind_of(below2), rel_act_accept(), "spread==1 (< WL_THRESHOLD) -> Accept")
+
+    # ── Oracle 2: verdict fires at exactly the design threshold ───────────────
+    # Boundary: spread == WL_THRESHOLD (2) exactly -> still Accept (`<=` semantics).
+    val boundary: RelAction = rel_wear_due(st0, blk_a, 10, 10 + WL_THRESHOLD, 500)
+    fail = fail + expect_eq(kind_of(boundary), rel_act_accept(), "spread==WL_THRESHOLD exactly -> Accept (boundary is inclusive of the gate)")
+
+    # One past the boundary: spread == WL_THRESHOLD + 1 (3), block never erased
+    # (dwell == total_erases, well over REL_WL_DWELL_MIN) -> ReclaimNow, arg ==
+    # the coldest block's flat index (41).
+    val blk_cold: NdBlock = nd_block(41)
+    val fires: RelAction = rel_wear_due(st0, blk_cold, 10, 10 + WL_THRESHOLD + 1, 500)
+    fail = fail + expect_eq(kind_of(fires), rel_act_reclaim(), "spread==WL_THRESHOLD+1 with dwelled cold block -> ReclaimNow")
+    fail = fail + expect_eq(arg_of(fires), 41, "ReclaimNow.arg identifies the coldest block (41) via typed-dims .idx boundary conversion")
+
+    # Deferral half of the same boundary: spread exceeds threshold but the cold
+    # block has NOT dwelled long enough (dwell < REL_WL_DWELL_MIN).
+    val st_fresh: RelWearState = rel_wear_on_erase(st0, blk_cold, 495)   # erased 5 ticks ago
+    val deferred: RelAction = rel_wear_due(st_fresh, blk_cold, 10, 10 + WL_THRESHOLD + 1, 500)
+    fail = fail + expect_eq(kind_of(deferred), rel_act_accept(), "spread over threshold but dwell (5) < REL_WL_DWELL_MIN (8) -> Accept (SREA deferral)")
+
+    print "  PROBE oracle2: boundary_kind={kind_of(boundary)} fires_kind={kind_of(fires)} fires_arg={arg_of(fires)} deferred_kind={kind_of(deferred)}"
+
+    # ── Oracle 3: hysteresis — scripted sequence, no immediate re-fire ────────
+    val blk_h: NdBlock = nd_block(9)
+    var hst: RelWearState = rel_wear_new()
+    val h_min: i64 = 10
+    val h_max: i64 = 10 + WL_THRESHOLD + 1   # spread == 3, stays hot for the whole sequence
+
+    # Step 1: block never erased; total_erases has advanced to 20 elsewhere ->
+    # dwell == 20 >= REL_WL_DWELL_MIN -> verdict fires.
+    val step1: RelAction = rel_wear_due(hst, blk_h, h_min, h_max, 20)
+    fail = fail + expect_eq(kind_of(step1), rel_act_reclaim(), "hysteresis step1: dwelled cold block under hot spread -> ReclaimNow")
+    fail = fail + expect_eq(arg_of(step1), 9, "hysteresis step1: verdict identifies block 9")
+
+    # Step 2: the mount actuates the verdict — wear_level_once reclaims/erases
+    # the block, so the erase path calls rel_wear_on_erase to reset its dwell
+    # clock. Model one further elsewhere-erase landing in the same tick (21).
+    hst = rel_wear_on_erase(hst, blk_h, 21)
+
+    # Step 3: re-evaluate IMMEDIATELY with the SAME hot spread — must NOT re-fire.
+    val step3: RelAction = rel_wear_due(hst, blk_h, h_min, h_max, 21)
+    fail = fail + expect_eq(kind_of(step3), rel_act_accept(), "hysteresis step3: immediate re-check after leveling -> Accept (no thrash) even though spread is still hot")
+
+    # Step 4: still not enough dwell shortly after (total_erases 25 -> dwell 4).
+    val step4: RelAction = rel_wear_due(hst, blk_h, h_min, h_max, 25)
+    fail = fail + expect_eq(kind_of(step4), rel_act_accept(), "hysteresis step4: dwell 4 < REL_WL_DWELL_MIN (8) -> still Accept")
+
+    # Step 5: after enough further elsewhere-erases (total_erases 29 -> dwell 8),
+    # the verdict is allowed to fire again — hysteresis delays, does not latch.
+    val step5: RelAction = rel_wear_due(hst, blk_h, h_min, h_max, 29)
+    fail = fail + expect_eq(kind_of(step5), rel_act_reclaim(), "hysteresis step5: dwell restored to 8 -> ReclaimNow fires again (delay, not permanent latch)")
+
+    print "  PROBE oracle3: step1={kind_of(step1)} step3={kind_of(step3)} step4={kind_of(step4)} step5={kind_of(step5)}"
+
+    # ── Oracle 4: per-block isolation ──────────────────────────────────────────
+    var ist: RelWearState = rel_wear_new()
+    val blk_recent: NdBlock = nd_block(3)    # erased recently -> small dwell
+    val blk_stale:  NdBlock = nd_block(50)   # never erased -> large dwell
+    ist = rel_wear_on_erase(ist, blk_recent, 96)   # dwell will be 100-96=4 at total_erases=100
+
+    val iso_recent: RelAction = rel_wear_due(ist, blk_recent, 10, 10 + WL_THRESHOLD + 1, 100)
+    val iso_stale: RelAction = rel_wear_due(ist, blk_stale, 10, 10 + WL_THRESHOLD + 1, 100)
+    fail = fail + expect_eq(kind_of(iso_recent), rel_act_accept(), "isolation: recently-erased block 3 (dwell 4) -> Accept under the SAME state struct")
+    fail = fail + expect_eq(kind_of(iso_stale), rel_act_reclaim(), "isolation: never-erased block 50 (dwell 100) -> ReclaimNow under the SAME state struct")
+    fail = fail + expect_eq(arg_of(iso_stale), 50, "isolation: verdict arg identifies block 50, not block 3")
+
+    # Block 3's own entry is unaffected by block 50's (never written) entry.
+    fail = fail + expect_eq(ist.last_global_erase[3], 96, "isolation: block 3's last_global_erase entry untouched by block 50 lookups")
+    fail = fail + expect_eq(ist.last_global_erase[50], 0, "isolation: block 50's entry stays at its zero default (never erased)")
+
+    print "  PROBE oracle4: iso_recent={kind_of(iso_recent)} iso_stale={kind_of(iso_stale)} iso_stale_arg={arg_of(iso_stale)}"
+
+    if fail == 0:
+        print "REL WEAR OK"
+    else:
+        print "REL WEAR FAIL ({fail})"

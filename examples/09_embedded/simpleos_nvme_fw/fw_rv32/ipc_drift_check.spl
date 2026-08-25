@@ -1,0 +1,300 @@
+"""
+ipc_drift_check — host-only source-of-truth drift check between fw_rv32's IPC
+layout constants and live functions from logic_ipc_layout_core.spl and
+logic_nand_region_core.spl (wave-3 4-core IPC design contract:
+doc/05_design/hardware/nvme_fw_multicore/fourcore_ipc_index_handle_design.md
+§3 region map, §4 rings, §5 buf pool).
+
+This file validates:
+1. Design-doc literal constants against live fns (same pattern as const_drift_check.spl)
+2. Region-overlap invariants (ring_base(5)+RING_WORDS <= BUF_POOL_BASE, etc.)
+3. Cross-check NAND geometry duplicated in logic_nand_region_core.spl against fw/nvme_types.spl
+
+Deliberately NOT part of the boot-linked import graph: logic.spl / entry.spl
+never `use ipc_drift_check`, so the freestanding rv32 boot path stays fully
+decoupled (no arrays, per README.md / the rv32 no-alloc constraint). Run host-only:
+
+  bin/simple run examples/09_embedded/simpleos_nvme_fw/fw_rv32/ipc_drift_check.spl
+
+Gate: prints "IPC DRIFT CHECK PASS" and exits rc=0; any oracle failure prints
+"IPC DRIFT CHECK FAIL" and exits rc=1 (rc IS meaningful).
+"""
+
+use logic_ipc_layout_core.*
+use logic_nand_region_core.*
+use std.io_runtime.{exit}
+
+# ── Design-doc literal assertions (live-derivation style) ──────────────────────
+
+fn _check_shm_words() -> i32:
+    # IPC_SHM_WORDS = 8452 (wave-4 coroutine_statemachine_design.md §1: the
+    # 4-word COROSTATE region appended at the end bumps 8448 -> 8452)
+    if ipc_shm_words() != 8452:
+        return 1
+    0
+
+fn _check_ring_depth() -> i32:
+    # RING_DEPTH = 8 (from design doc §4, power of two)
+    if ring_depth() != 8:
+        return 1
+    0
+
+fn _check_msg_words() -> i32:
+    # MSG_WORDS = 4 (from design doc §4, message slot size)
+    if msg_words() != 4:
+        return 1
+    0
+
+fn _check_ring_hdr_words() -> i32:
+    # RING_HDR_WORDS = 4 (from design doc §4, head/tail/drop/reserved)
+    if ring_hdr_words() != 4:
+        return 1
+    0
+
+fn _check_ring_words() -> i32:
+    # RING_WORDS = 36 (from design doc §4, total per ring)
+    # Derived: RING_HDR_WORDS (4) + RING_DEPTH (8) * MSG_WORDS (4) = 4 + 32 = 36
+    if ring_words() != 36:
+        return 1
+    0
+
+fn _check_ring_base_0() -> i32:
+    # ring_base(0) = 4 (first ring starts at word 4, right after 4 header words)
+    if ring_base(0) != 4:
+        return 1
+    0
+
+fn _check_ring_base_5() -> i32:
+    # ring_base(5) = 184 (design doc §4: ring_base(r) = 4 + r*36, so 4 + 5*36 = 184)
+    if ring_base(5) != 184:
+        return 1
+    0
+
+fn _check_buf_pool_base() -> i32:
+    # BUF_POOL_BASE = 220 (from design doc §3, buf pool word offset)
+    if buf_pool_base() != 220:
+        return 1
+    0
+
+fn _check_buf_pool_capacity() -> i32:
+    # BUF_SLOTS = 16 (from design doc §5, fixed pool capacity)
+    if buf_pool_capacity() != 16:
+        return 1
+    0
+
+fn _check_nand_state_base() -> i32:
+    # NAND_STATE_BASE = 256 (from design doc §3, NAND state region start)
+    if nand_state_base() != 256:
+        return 1
+    0
+
+fn _check_nand_data_base() -> i32:
+    # NAND_DATA_BASE = 4352 (from design doc §3, NAND data region start)
+    if nand_data_base() != 4352:
+        return 1
+    0
+
+fn _check_ipc_null_idx() -> i32:
+    # IPC_NULL_IDX = -1 (from design doc §2 rule 3, sentinel)
+    if ipc_null_idx() != -1:
+        return 1
+    0
+
+fn _check_gate_magic() -> i32:
+    # GATE_MAGIC = 0x4E564D45 (from design doc §3, magic word for gate)
+    if gate_magic() != 0x4E564D45:
+        return 1
+    0
+
+fn _check_ipc_gate_idx() -> i32:
+    # IPC_GATE_IDX = 0 (from design doc §3, gate word at index 0)
+    if ipc_gate_idx() != 0:
+        return 1
+    0
+
+fn _check_ipc_census_idx() -> i32:
+    # IPC_CENSUS_IDX = 1 (from design doc §3, census word at index 1)
+    if ipc_census_idx() != 1:
+        return 1
+    0
+
+fn _check_ipc_err_count_idx() -> i32:
+    # IPC_ERR_COUNT_IDX = 2 (from design doc §3, error count word at index 2)
+    if ipc_err_count_idx() != 2:
+        return 1
+    0
+
+# ── Region-overlap invariants (stronger than literals) ───────────────────────────
+
+fn _check_ring_pool_overlap() -> i32:
+    # ring_base(5) + RING_WORDS <= BUF_POOL_BASE
+    # Last ring ends at word 219, buf pool starts at 220 — no overlap.
+    val ring5_end: i64 = ring_base(5) + ring_words()
+    if ring5_end > buf_pool_base():
+        return 1
+    0
+
+fn _check_pool_nand_state_overlap() -> i32:
+    # BUF_POOL_BASE + 34 <= NAND_STATE_BASE
+    # Buf pool uses 34 words (220..253), NAND state starts at 256.
+    val pool_end: i64 = buf_pool_base() + 34
+    if pool_end > nand_state_base():
+        return 1
+    0
+
+fn _check_nand_state_data_continuity() -> i32:
+    # NAND_STATE_BASE + 4096 == NAND_DATA_BASE
+    # State region is 4096 words (0..4095), data region starts at 4352.
+    val state_end: i64 = nand_state_base() + 4096
+    if state_end != nand_data_base():
+        return 1
+    0
+
+fn _check_nand_data_corostate_continuity() -> i32:
+    # NAND_DATA_BASE + 4096 == COROSTATE_BASE (wave-4: replaces the old
+    # NAND_DATA_BASE + 4096 == IPC_SHM_WORDS invariant now that the
+    # COROSTATE region sits between the NAND data region and the shm end).
+    # Data region is 4096 words, COROSTATE region starts at 8448.
+    val data_end: i64 = nand_data_base() + 4096
+    if data_end != corostate_base():
+        return 1
+    0
+
+fn _check_corostate_shm_end() -> i32:
+    # COROSTATE_BASE + 4 == IPC_SHM_WORDS (4 corostate words, core 0..3,
+    # then the region ends).
+    val corostate_end: i64 = corostate_base() + 4
+    if corostate_end != ipc_shm_words():
+        return 1
+    0
+
+fn _check_corostate_idx_0() -> i32:
+    # corostate_idx(0) == 8448 (HIL core's word, at COROSTATE_BASE)
+    if corostate_idx(0) != 8448:
+        return 1
+    0
+
+fn _check_corostate_idx_3() -> i32:
+    # corostate_idx(3) == 8451 (NAND core's word, last valid core)
+    if corostate_idx(3) != 8451:
+        return 1
+    0
+
+fn _check_corostate_idx_4_invalid() -> i32:
+    # corostate_idx(4) == -1 (out of range: only core 0..3 exist)
+    if corostate_idx(4) != -1:
+        return 1
+    0
+
+fn _check_corostate_idx_neg1_invalid() -> i32:
+    # corostate_idx(-1) == -1 (fail-closed: negative core ids rejected too)
+    if corostate_idx(-1) != -1:
+        return 1
+    0
+
+# ── Cross-check NAND geometry (design-doc literals, rv32 side) ───────────────────
+# These pin logic_nand_region_core.spl's duplicated geometry to the design-doc
+# §3 literals. The fw/ <-> rv32 LIVE drift guard (deriving from fw/nvme_types.spl)
+# is const_drift_check.spl — if fw/ canonical geometry moves, THAT check fails;
+# if the rv32 duplicate moves, THIS one fails. Together they close the loop.
+
+fn _check_num_pages() -> i32:
+    if NUM_PAGES() != 4096:
+        return 1
+    0
+
+fn _check_num_blocks() -> i32:
+    if NUM_BLOCKS() != 64:
+        return 1
+    0
+
+fn _check_pages_per_block() -> i32:
+    if PAGES_PER_BLOCK() != 64:
+        return 1
+    0
+
+fn _check_nand_geometry_consistency() -> i32:
+    # NUM_PAGES == NUM_BLOCKS * PAGES_PER_BLOCK (consistency check)
+    if NUM_PAGES() != NUM_BLOCKS() * PAGES_PER_BLOCK():
+        return 1
+    0
+
+# ── Main selftest ────────────────────────────────────────────────────────────────
+
+fn ipc_fw_rv32_drift_selftest() -> i32:
+    # Literals
+    if _check_shm_words() != 0:
+        return 1
+    if _check_ring_depth() != 0:
+        return 1
+    if _check_msg_words() != 0:
+        return 1
+    if _check_ring_hdr_words() != 0:
+        return 1
+    if _check_ring_words() != 0:
+        return 1
+    if _check_ring_base_0() != 0:
+        return 1
+    if _check_ring_base_5() != 0:
+        return 1
+    if _check_buf_pool_base() != 0:
+        return 1
+    if _check_buf_pool_capacity() != 0:
+        return 1
+    if _check_nand_state_base() != 0:
+        return 1
+    if _check_nand_data_base() != 0:
+        return 1
+    if _check_ipc_null_idx() != 0:
+        return 1
+    if _check_gate_magic() != 0:
+        return 1
+    if _check_ipc_gate_idx() != 0:
+        return 1
+    if _check_ipc_census_idx() != 0:
+        return 1
+    if _check_ipc_err_count_idx() != 0:
+        return 1
+
+    # Region-overlap invariants
+    if _check_ring_pool_overlap() != 0:
+        return 1
+    if _check_pool_nand_state_overlap() != 0:
+        return 1
+    if _check_nand_state_data_continuity() != 0:
+        return 1
+    if _check_nand_data_corostate_continuity() != 0:
+        return 1
+    if _check_corostate_shm_end() != 0:
+        return 1
+
+    # COROSTATE bounds (wave-4)
+    if _check_corostate_idx_0() != 0:
+        return 1
+    if _check_corostate_idx_3() != 0:
+        return 1
+    if _check_corostate_idx_4_invalid() != 0:
+        return 1
+    if _check_corostate_idx_neg1_invalid() != 0:
+        return 1
+
+    # NAND geometry
+    if _check_num_pages() != 0:
+        return 1
+    if _check_num_blocks() != 0:
+        return 1
+    if _check_pages_per_block() != 0:
+        return 1
+    if _check_nand_geometry_consistency() != 0:
+        return 1
+
+    0
+
+fn main():
+    val fail: i32 = ipc_fw_rv32_drift_selftest()
+    if fail == 0:
+        print "IPC DRIFT CHECK PASS"
+        exit(0)
+    else:
+        print "IPC DRIFT CHECK FAIL"
+        exit(1)

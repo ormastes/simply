@@ -1,0 +1,21 @@
+# UBS Dimension — Document / Comms
+#
+# Owns discussion and artifacts attached to any business object. Every entity has
+# a native contextual thread (not a copy in a separate chat tool), so "show me
+# every discussion that touched this PO" is a query, not an archaeology dig.
+
+struct Thread:
+    val entity: i64
+    val notes: [text]
+
+fn thread(entity: i64) -> Thread:
+    var n: [text] = []
+    return Thread { entity: entity, notes: n }
+
+fn note(t: Thread, text_value: text) -> Thread:
+    var n = t.notes
+    n.push(text_value)
+    return Thread { entity: t.entity, notes: n }
+
+fn note_count(t: Thread) -> i64:
+    return t.notes.length()

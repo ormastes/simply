@@ -1,0 +1,30 @@
+use logic_reactor_lock_core.*
+use logic_reactor_fg_core.*
+use logic_reactor_bg_core.*
+
+fn _rv32_reactor_sanitize_owner(owner: i64) -> i64:
+    _rv32_reactor_sanitize_owner_impl(owner)
+
+fn _rv32_reactor_acquire(owner: i64, requested: i64) -> i32:
+    _rv32_reactor_acquire_impl(owner, requested)
+
+fn _rv32_reactor_conflicts_after(owner: i64, requested: i64, conflicts: i64) -> i64:
+    _rv32_reactor_conflicts_after_impl(owner, requested, conflicts)
+
+fn _rv32_reactor_release(owner: i64, released: i64) -> i64:
+    _rv32_reactor_release_impl(owner, released)
+
+fn _rv32_reactor_fg_tick(pending: i64, owner: i64) -> i64:
+    _rv32_reactor_fg_tick_impl(pending, owner)
+
+fn _rv32_reactor_service(pending: i64, guard_limit: i64) -> i64:
+    _rv32_reactor_service_impl(pending, guard_limit)
+
+fn _rv32_reactor_bg_needed(free_blocks: i64) -> i32:
+    _rv32_reactor_bg_needed_impl(free_blocks)
+
+fn _rv32_reactor_gc_sweep(reclaimable: i64) -> i64:
+    _rv32_reactor_gc_sweep_impl(reclaimable)
+
+fn _rv32_reactor_power_cycle_read(checkpointed: i64, dirty: i64) -> i64:
+    _rv32_reactor_power_cycle_read_impl(checkpointed, dirty)

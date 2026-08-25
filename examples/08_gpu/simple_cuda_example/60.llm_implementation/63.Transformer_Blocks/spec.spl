@@ -1,0 +1,110 @@
+# 63. Transformer Blocks - Tests
+#
+# CPU-reference checks for LayerNorm, GELU, residual add, the linear layer
+# and the pre-norm block shape. No assertion depends on kernel output (a
+# `<<<>>>` launch is a no-op on the Rust seed).
+
+use std.gpu.*
+
+fn layer_norm_cpu(x: [f32], rows: i64, dim: i64, gamma: [f32], beta: [f32], eps: f64) -> [f32]:
+    var out: [f32] = []
+    for r in 0..rows:
+        var mean = 0.0
+        for d in 0..dim:
+            mean = mean + (x[r * dim + d] as f64)
+        mean = mean / (dim as f64)
+        var variance = 0.0
+        for d in 0..dim:
+            val c = (x[r * dim + d] as f64) - mean
+            variance = variance + c * c
+        variance = variance / (dim as f64)
+        val inv = 1.0 / (variance + eps).sqrt()
+        for d in 0..dim:
+            val n = ((x[r * dim + d] as f64) - mean) * inv
+            out.push((n * (gamma[d] as f64) + (beta[d] as f64)) as f32)
+    out
+
+fn gelu_scalar(x: f64) -> f64:
+    val c = (2.0 / 3.141592653589793).sqrt()
+    0.5 * x * (1.0 + (c * (x + 0.044715 * x * x * x)).tanh())
+
+fn residual_add_cpu(x: [f32], r: [f32]) -> [f32]:
+    var out: [f32] = []
+    for i in 0..x.len():
+        out.push(x[i] + r[i])
+    out
+
+fn linear_cpu(x: [f32], rows: i64, in_dim: i64, w: [f32], b: [f32], out_dim: i64) -> [f32]:
+    var out: [f32] = []
+    for r in 0..rows:
+        for o in 0..out_dim:
+            var acc = b[o] as f64
+            for i in 0..in_dim:
+                acc = acc + (x[r * in_dim + i] as f64) * (w[i * out_dim + o] as f64)
+            out.push(acc as f32)
+    out
+
+fn close(a: f64, b: f64) -> bool:
+    val d = a - b
+    val ad = if d < 0.0: 0.0 - d else: d
+    ad < 0.001
+
+describe "Transformer blocks":
+
+    describe "layer norm":
+
+        it "gives each row zero mean and unit variance":
+            val x: [f32] = [1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0]
+            val out = layer_norm_cpu(x, 2, 4, [1.0, 1.0, 1.0, 1.0], [0.0, 0.0, 0.0, 0.0], 0.00001)
+            expect(out.len()).to_equal(8)
+            for r in 0..2:
+                var mean = 0.0
+                var var_ = 0.0
+                for d in 0..4:
+                    mean = mean + (out[r * 4 + d] as f64)
+                mean = mean / 4.0
+                for d in 0..4:
+                    val c = (out[r * 4 + d] as f64) - mean
+                    var_ = var_ + c * c
+                expect(close(mean, 0.0)).to_equal(true)
+                expect(close(var_ / 4.0, 1.0)).to_equal(true)
+
+        it "applies gamma and beta":
+            val out = layer_norm_cpu([1.0, 3.0], 1, 2, [2.0, 2.0], [5.0, 5.0], 0.00001)
+            # normalised row is [-1, 1] -> [-1*2+5, 1*2+5]
+            expect(close(out[0] as f64, 3.0)).to_equal(true)
+            expect(close(out[1] as f64, 7.0)).to_equal(true)
+
+    describe "gelu":
+
+        it "is zero at zero and near-identity for large positive x":
+            expect(close(gelu_scalar(0.0), 0.0)).to_equal(true)
+            expect(close(gelu_scalar(5.0), 5.0)).to_equal(true)
+
+        it "is small and negative for negative x":
+            val g = gelu_scalar(-1.0)
+            expect(g < 0.0 and g > -0.2).to_equal(true)
+
+    describe "residual and linear":
+
+        it "adds the residual element-wise":
+            val out = residual_add_cpu([1.0, 2.0], [10.0, 20.0])
+            expect(close(out[1] as f64, 22.0)).to_equal(true)
+
+        it "computes x W + b":
+            # x = [1, 2] (1x2); W = identity (2x2); b = [0.5, 0.5]
+            val out = linear_cpu([1.0, 2.0], 1, 2, [1.0, 0.0, 0.0, 1.0], [0.5, 0.5], 2)
+            expect(close(out[0] as f64, 1.5)).to_equal(true)
+            expect(close(out[1] as f64, 2.5)).to_equal(true)
+
+        it "keeps the model width through the feed-forward pair":
+            val rows = 3
+            val d_model = 4
+            val d_ff = 8
+            val w1: [f32] = [for i in 0..(d_model * d_ff): 0.1]
+            val w2: [f32] = [for i in 0..(d_ff * d_model): 0.1]
+            val x: [f32] = [for i in 0..(rows * d_model): 1.0]
+            val hidden = linear_cpu(x, rows, d_model, w1, [for i in 0..d_ff: 0.0], d_ff)
+            val out = linear_cpu(hidden, rows, d_ff, w2, [for i in 0..d_model: 0.0], d_model)
+            expect(hidden.len()).to_equal(rows * d_ff)
+            expect(out.len()).to_equal(rows * d_model)

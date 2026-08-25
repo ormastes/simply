@@ -1,0 +1,41 @@
+#![allow(REQC001)]
+#![allow(REQC004)]
+#![allow(unnamed_duplicate_typed_args)]
+"""
+# Compat Tools
+
+Tests for compat tools functionality.
+"""
+use std.spec.*
+
+use examples.browser.test.compat.test_manifest.{TestManifest}
+use examples.browser.test.compat.chrome_compare.{render_simple_test}
+
+describe "browser compat tools":
+    """
+    ## Browser Compat Tools Tests
+
+    Validates browser compat tools functionality.
+    """
+
+
+    it "scans compatibility html manifest recursively":
+        val manifest = TestManifest.from_directory("examples/browser/test/compat/html")
+        expect manifest.test_count() > 20
+        expect manifest.categories().contains("flexbox") == true
+        expect manifest.categories().contains("grid") == true
+
+    it "renders html to non-empty pixel buffer":
+        val html = "<html><body style='margin:0'><div style='width:64px;height:64px;background:#ff0000'></div></body></html>"
+        val pixels = render_simple_test(html, 128, 128)
+        expect pixels.len() == 128 * 128
+
+        var non_white = false
+        var i = 0
+        while i < pixels.len():
+            if pixels[i] != 0xFFFFFFFF:
+                non_white = true
+                i = pixels.len()
+            else:
+                i = i + 1
+        expect non_white == true

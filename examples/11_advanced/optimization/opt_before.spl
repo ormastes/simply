@@ -1,0 +1,95 @@
+# Performance Issues Example - BEFORE Optimization
+# This code has several performance problems
+
+import perf.profiler
+import perf.benchmark
+
+# Problem 1: String concatenation in loop
+fn build_report(items: List<text>) -> text:
+    var report = "Report:\n"
+    for item in items:
+        report = report + "- " + item + "\n"  # ❌ Slow: O(n²) string concatenation
+    report
+
+# Problem 2: Repeated function calls in loop
+fn process_data(data: List<i64>) -> List<i64>:
+    var result = []
+    for i in 0..data.len():  # ❌ Calls .len() every iteration
+        if data[i] > data.len() / 2:  # ❌ Calls .len() twice per iteration!
+            result.push(data[i] * 2)
+    result
+
+# Problem 3: Nested loops without optimization
+fn find_duplicates(items: List<i64>) -> List<i64>:
+    var duplicates = []
+    for i in 0..items.len():  # ❌ O(n²) algorithm
+        for j in (i + 1)..items.len():
+            if items[i] == items[j]:
+                duplicates.push(items[i])
+    duplicates
+
+# Problem 4: Recursive function without memoization
+fn fibonacci(n: i64) -> i64:
+    if n <= 1:
+        return n
+    fibonacci(n - 1) + fibonacci(n - 2)  # ❌ Exponential time!
+
+# Problem 5: Dict lookup in tight loop
+fn sum_values(data: List<text>, lookup: Dict<text, i64>) -> i64:
+    var total = 0
+    for item in data:
+        for _ in 0..100:  # ❌ Nested loop with repeated lookups
+            if lookup.contains_key(item):
+                total = total + lookup[item]  # ❌ Double lookup!
+    total
+
+# Benchmark the slow code
+fn main():
+    print "=== BEFORE Optimization ==="
+    print ""
+
+    var suite = benchmark.BenchSuite.create("Slow Code")
+
+    # Test 1: String concatenation
+    val items = [for i in 0..100: "Item {i}"]
+    val r1 = suite.run_bench("build_report", 100, \:
+        build_report(items)
+    )
+    suite.add_result(r1)
+
+    # Test 2: Repeated function calls
+    val data = [for i in 0..100: i]
+    val r2 = suite.run_bench("process_data", 100, \:
+        process_data(data)
+    )
+    suite.add_result(r2)
+
+    # Test 3: Nested loops
+    val small_data = [for i in 0..50: i % 10]
+    val r3 = suite.run_bench("find_duplicates", 10, \:
+        find_duplicates(small_data)
+    )
+    suite.add_result(r3)
+
+    # Test 4: Fibonacci (small n to avoid timeout)
+    val r4 = suite.run_bench("fibonacci", 100, \:
+        fibonacci(15)
+    )
+    suite.add_result(r4)
+
+    # Test 5: Dict lookups
+    val keys = [for i in 0..20: "key{i}"]
+    var lookup = {}
+    for k in keys:
+        lookup[k] = 42
+
+    val r5 = suite.run_bench("sum_values", 10, \:
+        sum_values(keys, lookup)
+    )
+    suite.add_result(r5)
+
+    print suite.report()
+    suite.save("benchmark_before.json")
+
+    print ""
+    print "Next: Run the optimized version to see improvements!"

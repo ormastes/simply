@@ -1,0 +1,167 @@
+# 62. Attention Mechanisms
+#
+# Causal scaled dot-product attention, the core of every decoder-only LLM:
+#   scores = Q K^T / sqrt(d_k)      (seq x seq)
+#   scores[i, j] = -inf  for j > i  (causal mask)
+#   weights = softmax_rows(scores)
+#   out = weights V                 (seq x d_v)
+#
+# C/CUDA equivalent (62.Attention_Mechanisms): one thread per (row, col) of
+# the score matrix, then a per-row softmax with a block-wide max/sum
+# reduction, then a second matmul for weights * V.
+#
+# The CPU reference model always runs and is the checked result. The score
+# kernel is a `@gpu_kernel` in module 12's std.gpu style whose output is
+# compared against the CPU model and reported honestly (a `<<<>>>` launch is
+# a no-op on the Rust seed, so it reads back zeros and prints MISMATCH).
+
+use std.gpu.*
+
+# ============================================================================
+# CPU reference model (f64 math, f32 storage; row-major flat arrays)
+# ============================================================================
+
+# scores[i * seq + j] = sum_d q[i*dk+d] * k[j*dk+d] * scale
+fn attention_scores_cpu(q: [f32], k: [f32], seq_len: i64, d_k: i64) -> [f32]:
+    val scale = 1.0 / (d_k as f64).sqrt()
+    var scores: [f32] = []
+    for i in 0..seq_len:
+        for j in 0..seq_len:
+            var dot = 0.0
+            for d in 0..d_k:
+                dot = dot + (q[i * d_k + d] as f64) * (k[j * d_k + d] as f64)
+            scores.push((dot * scale) as f32)
+    scores
+
+# Future positions get a very negative score so softmax gives them weight 0.
+fn causal_mask_cpu(scores: [f32], seq_len: i64) -> [f32]:
+    var out: [f32] = []
+    for i in 0..seq_len:
+        for j in 0..seq_len:
+            if j > i:
+                out.push(-1.0e9)
+            else:
+                out.push(scores[i * seq_len + j])
+    out
+
+# Numerically stable row softmax: subtract the row max before exp.
+fn softmax_rows_cpu(scores: [f32], rows: i64, cols: i64) -> [f32]:
+    var out: [f32] = []
+    for i in 0..rows:
+        var row_max = scores[i * cols] as f64
+        for j in 0..cols:
+            val v = scores[i * cols + j] as f64
+            if v > row_max:
+                row_max = v
+        var total = 0.0
+        var exps: [f64] = []
+        for j in 0..cols:
+            val e = ((scores[i * cols + j] as f64) - row_max).exp()
+            exps.push(e)
+            total = total + e
+        for j in 0..cols:
+            out.push((exps[j] / total) as f32)
+    out
+
+# out[i * d_v + d] = sum_j weights[i*seq+j] * v[j*d_v+d]
+fn weighted_sum_cpu(weights: [f32], v: [f32], seq_len: i64, d_v: i64) -> [f32]:
+    var out: [f32] = []
+    for i in 0..seq_len:
+        for d in 0..d_v:
+            var acc = 0.0
+            for j in 0..seq_len:
+                acc = acc + (weights[i * seq_len + j] as f64) * (v[j * d_v + d] as f64)
+            out.push(acc as f32)
+    out
+
+fn causal_attention_cpu(q: [f32], k: [f32], v: [f32], seq_len: i64, d_k: i64) -> [f32]:
+    val scores = causal_mask_cpu(attention_scores_cpu(q, k, seq_len, d_k), seq_len)
+    weighted_sum_cpu(softmax_rows_cpu(scores, seq_len, seq_len), v, seq_len, d_k)
+
+# Deterministic test matrix: m[i] = ((i * 7) % 11) * 0.1
+fn make_matrix(rows: i64, cols: i64) -> [f32]:
+    var m: [f32] = []
+    for i in 0..(rows * cols):
+        m.push((((i * 7) % 11) as f64 * 0.1) as f32)
+    m
+
+fn arrays_close(a: [f32], b: [f32], tol: f32) -> bool:
+    if a.len() != b.len():
+        return false
+    for i in 0..a.len():
+        val diff = a[i] - b[i]
+        val ad = if diff < 0.0: 0.0 - diff else: diff
+        if ad > tol:
+            return false
+    true
+
+# ============================================================================
+# GPU kernel (std.gpu, module-12 pattern): one thread per score element
+# ============================================================================
+
+@gpu_kernel
+fn attention_scores_kernel(q: GpuPtr, k: GpuPtr, scores: GpuPtr, seq_len: i64, d_k: i64, scale: f32):
+    val row = gpu_block_id_y() * gpu_block_dim_y() + gpu_local_id_y()
+    val col = gpu_block_id_x() * gpu_block_dim_x() + gpu_local_id_x()
+    if row < seq_len and col < seq_len:
+        var dot: f32 = 0.0
+        var d = 0
+        while d < d_k:
+            dot = dot + gpu_load_f32(q, row * d_k + d) * gpu_load_f32(k, col * d_k + d)
+            d = d + 1
+        gpu_store_f32(scores, row * seq_len + col, dot * scale)
+
+fn run_gpu_scores(q: [f32], k: [f32], seq_len: i64, d_k: i64) -> Result<[f32], GpuError>:
+    gpu_init()?
+    gpu_set_device(0)?
+    val d_q = gpu_alloc(q.len() * 4)?
+    val d_k_buf = gpu_alloc(k.len() * 4)?
+    val d_s = gpu_alloc(seq_len * seq_len * 4)?
+    gpu_upload_f32(d_q, q)?
+    gpu_upload_f32(d_k_buf, k)?
+    val block = 16
+    val grid = (seq_len + block - 1) / block
+    val scale = (1.0 / (d_k as f64).sqrt()) as f32
+    attention_scores_kernel<<<grid: (grid, grid, 1), block: (block, block, 1)>>>(d_q, d_k_buf, d_s, seq_len, d_k, scale)
+    gpu_sync()?
+    val out = gpu_download_f32(d_s, seq_len * seq_len)?
+    gpu_free(d_q)?
+    gpu_free(d_k_buf)?
+    gpu_free(d_s)?
+    Ok(out)
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn main():
+    val seq_len = 4
+    val d_k = 8
+    print "=== Causal Scaled Dot-Product Attention ==="
+    print "seq_len {seq_len}, d_k {d_k}"
+
+    val q = make_matrix(seq_len, d_k)
+    val k = make_matrix(seq_len, d_k)
+    val v = make_matrix(seq_len, d_k)
+
+    val scores = attention_scores_cpu(q, k, seq_len, d_k)
+    val weights = softmax_rows_cpu(causal_mask_cpu(scores, seq_len), seq_len, seq_len)
+    val out = causal_attention_cpu(q, k, v, seq_len, d_k)
+
+    print "CPU scores: {scores.len()} values ({seq_len} x {seq_len})"
+    var row0_sum = 0.0
+    for j in 0..seq_len:
+        row0_sum = row0_sum + (weights[j] as f64)
+    print "  softmax row 0 sum = {(row0_sum * 1000.0 + 0.5) as i64} / 1000"
+    print "  causal: weight[0,1] = {weights[1]}, weight[0,0] = {weights[0]}"
+    print "  output shape: [{seq_len}, {d_k}] ({out.len()} values)"
+
+    match run_gpu_scores(q, k, seq_len, d_k):
+        case Ok(gpu_scores):
+            if arrays_close(gpu_scores, scores, 0.001):
+                print "GPU scores: PASSED (matches CPU reference)"
+            else:
+                print "GPU scores: MISMATCH vs CPU reference (launch is a no-op on this engine)"
+        case Err(e):
+            print "GPU scores skipped: {e.to_text()}"
+    print "=== Done ==="

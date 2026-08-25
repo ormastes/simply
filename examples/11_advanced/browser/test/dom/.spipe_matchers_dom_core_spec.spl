@@ -1,0 +1,378 @@
+#![allow(REQC001)]
+#![allow(REQC004)]
+#![allow(unnamed_duplicate_typed_args)]
+"""
+# Dom Core
+
+Tests for dom core functionality.
+"""
+# DOM Core Tests
+#
+# Category: Browser Platform DOM
+# Status: Active
+#
+# Validates the core DOM tree operations: node creation, tree manipulation,
+# traversal, querying, cloning, and text content extraction.
+# Tests operate on Document and NodeStore directly.
+#
+# Run with: bin/simple test examples/browser/test/dom/dom_core_spec.spl
+
+use std.spec
+use examples.browser.entity.dom.node_types.{DomNode, NodeKind, Element, TextNode, Comment}
+use examples.browser.entity.dom.attribute_types.{Attr}
+use examples.browser.feature.dom.document.{Document, NodeStore}
+use examples.browser.feature.dom.element.{ElementOps}
+use examples.browser.shared.logging.{Logger, LogLevel}
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+fn make_doc() -> Document:
+    val logger = Logger.new("test-dom", LogLevel.Error)
+    Document.new("about:blank", logger)
+
+# ============================================================================
+# Document creation
+# ============================================================================
+
+describe "DOM Core":
+    """
+    ## Dom Core Tests
+
+    Validates DOM Core functionality.
+    """
+
+    context "document creation":
+        it "creates document with root node":
+            var doc = make_doc()
+            # root_id is the <html> element (id 2)
+            expect doc.root_id > 0
+            val root = doc.node_store.get_node(doc.root_id)
+            expect root.? == true
+
+    # ========================================================================
+    # Node creation
+    # ========================================================================
+
+    context "createElement":
+        it "createElement returns valid node id":
+            var doc = make_doc()
+            val div_id = doc.createElement("div")
+            expect div_id > 0
+
+        it "createElement sets tag name":
+            var doc = make_doc()
+            val div_id = doc.createElement("div")
+            val el = doc.node_store.get_element(div_id)
+            if val Some(e) = el:
+                expect e.tag_name == "div"
+            else:
+                expect "element should exist" == ""
+
+    context "createTextNode":
+        it "createTextNode creates text content":
+            var doc = make_doc()
+            val text_id = doc.createTextNode("Hello world")
+            val node = doc.node_store.get_node(text_id)
+            if val Some(n) = node:
+                expect n.data == "Hello world"
+            else:
+                expect "text node should exist" == ""
+            val tn = doc.node_store.get_text(text_id)
+            if val Some(t) = tn:
+                expect t.content == "Hello world"
+            else:
+                expect "text data should exist" == ""
+
+    context "createComment":
+        it "createComment creates comment node":
+            var doc = make_doc()
+            val cmt_id = doc.createComment("a comment")
+            val node = doc.node_store.get_node(cmt_id)
+            if val Some(n) = node:
+                expect n.data == "a comment"
+            else:
+                expect "comment node should exist" == ""
+            val cm = doc.node_store.get_comment(cmt_id)
+            if val Some(c) = cm:
+                expect c.content == "a comment"
+            else:
+                expect "comment data should exist" == ""
+
+    # ========================================================================
+    # Tree manipulation
+    # ========================================================================
+
+    context "appendChild":
+        it "appendChild adds child to parent":
+            var doc = make_doc()
+            val div_id = doc.createElement("div")
+            val result = doc.appendChild(doc.body_id, div_id)
+            val child_node = doc.node_store.get_node(div_id)
+            if val Some(cn) = child_node:
+                expect cn.parent_id == doc.body_id
+            else:
+                expect "child should exist" == ""
+
+        it "appendChild updates parent children list":
+            var doc = make_doc()
+            val div_id = doc.createElement("div")
+            val span_id = doc.createElement("span")
+            doc.appendChild(doc.body_id, div_id)
+            doc.appendChild(doc.body_id, span_id)
+            val body_node = doc.node_store.get_node(doc.body_id)
+            if val Some(bn) = body_node:
+                expect bn.children.len() == 2
+                expect bn.children.get(0) == div_id
+                expect bn.children.get(1) == span_id
+            else:
+                expect "body should exist" == ""
+
+    context "insertBefore":
+        it "insertBefore inserts at correct position":
+            var doc = make_doc()
+            val first = doc.createElement("div")
+            val last = doc.createElement("span")
+            val middle = doc.createElement("p")
+            doc.appendChild(doc.body_id, first)
+            doc.appendChild(doc.body_id, last)
+            doc.insertBefore(doc.body_id, middle, last)
+            val body_node = doc.node_store.get_node(doc.body_id)
+            if val Some(bn) = body_node:
+                expect bn.children.len() == 3
+                expect bn.children.get(0) == first
+                expect bn.children.get(1) == middle
+                expect bn.children.get(2) == last
+            else:
+                expect "body should exist" == ""
+
+    context "removeChild":
+        it "removeChild removes from parent":
+            var doc = make_doc()
+            val div_id = doc.createElement("div")
+            doc.appendChild(doc.body_id, div_id)
+            doc.removeChild(doc.body_id, div_id)
+            val child_node = doc.node_store.get_node(div_id)
+            if val Some(cn) = child_node:
+                expect cn.parent_id == -1
+            else:
+                expect "node should still exist" == ""
+
+        it "removeChild updates children list":
+            var doc = make_doc()
+            val a = doc.createElement("div")
+            val b = doc.createElement("span")
+            doc.appendChild(doc.body_id, a)
+            doc.appendChild(doc.body_id, b)
+            doc.removeChild(doc.body_id, a)
+            val body_node = doc.node_store.get_node(doc.body_id)
+            if val Some(bn) = body_node:
+                expect bn.children.len() == 1
+                expect bn.children.get(0) == b
+            else:
+                expect "body should exist" == ""
+
+    context "replaceChild":
+        it "replaceChild swaps nodes":
+            var doc = make_doc()
+            val old_child = doc.createElement("div")
+            val new_child = doc.createElement("span")
+            doc.appendChild(doc.body_id, old_child)
+            doc.replaceChild(doc.body_id, new_child, old_child)
+            val body_node = doc.node_store.get_node(doc.body_id)
+            if val Some(bn) = body_node:
+                expect bn.children.len() == 1
+                expect bn.children.get(0) == new_child
+            else:
+                expect "body should exist" == ""
+            # Old child should be detached
+            val old_node = doc.node_store.get_node(old_child)
+            if val Some(nd) = old_node:
+                expect nd.parent_id == -1
+            else:
+                expect "old node should still exist" == ""
+
+    # ========================================================================
+    # Traversal
+    # ========================================================================
+
+    context "traversal":
+        it "firstChild returns first child id":
+            var doc = make_doc()
+            val a = doc.createElement("div")
+            val b = doc.createElement("span")
+            doc.appendChild(doc.body_id, a)
+            doc.appendChild(doc.body_id, b)
+            val first = doc.firstChild(doc.body_id)
+            if val Some(fid) = first:
+                expect fid == a
+            else:
+                expect "firstChild should return a value" == ""
+
+        it "lastChild returns last child id":
+            var doc = make_doc()
+            val a = doc.createElement("div")
+            val b = doc.createElement("span")
+            doc.appendChild(doc.body_id, a)
+            doc.appendChild(doc.body_id, b)
+            val last = doc.lastChild(doc.body_id)
+            if val Some(lid) = last:
+                expect lid == b
+            else:
+                expect "lastChild should return a value" == ""
+
+        it "nextSibling returns next sibling":
+            var doc = make_doc()
+            val a = doc.createElement("div")
+            val b = doc.createElement("span")
+            doc.appendChild(doc.body_id, a)
+            doc.appendChild(doc.body_id, b)
+            val next = doc.nextSibling(a)
+            if val Some(nid) = next:
+                expect nid == b
+            else:
+                expect "nextSibling should return a value" == ""
+
+        it "previousSibling returns previous sibling":
+            var doc = make_doc()
+            val a = doc.createElement("div")
+            val b = doc.createElement("span")
+            doc.appendChild(doc.body_id, a)
+            doc.appendChild(doc.body_id, b)
+            val prev = doc.previousSibling(b)
+            if val Some(pid) = prev:
+                expect pid == a
+            else:
+                expect "previousSibling should return a value" == ""
+
+        it "parentNode returns parent id":
+            var doc = make_doc()
+            val div_id = doc.createElement("div")
+            doc.appendChild(doc.body_id, div_id)
+            val parent = doc.parentNode(div_id)
+            if val Some(pid) = parent:
+                expect pid == doc.body_id
+            else:
+                expect "parentNode should return body_id" == ""
+
+    # ========================================================================
+    # hasChildNodes
+    # ========================================================================
+
+    context "hasChildNodes":
+        it "hasChildNodes returns true for parent with children":
+            var doc = make_doc()
+            val div_id = doc.createElement("div")
+            doc.appendChild(doc.body_id, div_id)
+            expect doc.hasChildNodes(doc.body_id) == true
+
+        it "hasChildNodes returns false for empty node":
+            var doc = make_doc()
+            val div_id = doc.createElement("div")
+            expect doc.hasChildNodes(div_id) == false
+
+    # ========================================================================
+    # cloneNode
+    # ========================================================================
+
+    context "cloneNode":
+        it "cloneNode shallow copies node":
+            var doc = make_doc()
+            val div_id = doc.createElement("div")
+            ElementOps.setAttribute(doc, div_id, "class", "test")
+            val child = doc.createElement("span")
+            doc.appendChild(div_id, child)
+            val clone_id = doc.cloneNode(div_id, false)
+            # Clone should have same tag
+            val clone_el = doc.node_store.get_element(clone_id)
+            if val Some(ce) = clone_el:
+                expect ce.tag_name == "div"
+            else:
+                expect "clone element should exist" == ""
+            # Shallow clone should have no children
+            val clone_node = doc.node_store.get_node(clone_id)
+            if val Some(cn) = clone_node:
+                expect cn.children.len() == 0
+            else:
+                expect "clone node should exist" == ""
+
+        it "cloneNode deep copies subtree":
+            var doc = make_doc()
+            val div_id = doc.createElement("div")
+            val child = doc.createElement("span")
+            doc.appendChild(div_id, child)
+            val text_id = doc.createTextNode("hello")
+            doc.appendChild(child, text_id)
+            val clone_id = doc.cloneNode(div_id, true)
+            # Deep clone should have children
+            val clone_node = doc.node_store.get_node(clone_id)
+            if val Some(cn) = clone_node:
+                expect cn.children.len() == 1
+                # The cloned child should also have a child
+                val cloned_child_id = cn.children.get(0)
+                val cloned_child = doc.node_store.get_node(cloned_child_id)
+                if val Some(cc) = cloned_child:
+                    expect cc.children.len() == 1
+                else:
+                    expect "cloned child should exist" == ""
+            else:
+                expect "clone node should exist" == ""
+
+    # ========================================================================
+    # Query methods
+    # ========================================================================
+
+    context "getElementById":
+        it "getElementById finds element by id attribute":
+            var doc = make_doc()
+            val div_id = doc.createElement("div")
+            ElementOps.setAttribute(doc, div_id, "id", "main")
+            doc.appendChild(doc.body_id, div_id)
+            val found = doc.getElementById("main")
+            if val Some(fid) = found:
+                expect fid == div_id
+            else:
+                expect "getElementById should find the element" == ""
+
+    context "getElementsByTagName":
+        it "getElementsByTagName finds all matching elements":
+            var doc = make_doc()
+            val d1 = doc.createElement("div")
+            val d2 = doc.createElement("div")
+            val s1 = doc.createElement("span")
+            doc.appendChild(doc.body_id, d1)
+            doc.appendChild(doc.body_id, d2)
+            doc.appendChild(doc.body_id, s1)
+            val divs = doc.getElementsByTagName("div")
+            # At least 2 divs we created (plus possibly the initial html/head/body)
+            expect divs.len() > 1
+            var found_d1 = false
+            var found_d2 = false
+            var i = 0
+            while i < divs.len():
+                if divs.get(i) == d1:
+                    found_d1 = true
+                if divs.get(i) == d2:
+                    found_d2 = true
+                i = i + 1
+            expect found_d1 == true
+            expect found_d2 == true
+
+    # ========================================================================
+    # textContent
+    # ========================================================================
+
+    context "textContent":
+        it "textContent returns recursive text":
+            var doc = make_doc()
+            val div_id = doc.createElement("div")
+            val t1 = doc.createTextNode("Hello ")
+            val span_id = doc.createElement("span")
+            val t2 = doc.createTextNode("world")
+            doc.appendChild(doc.body_id, div_id)
+            doc.appendChild(div_id, t1)
+            doc.appendChild(div_id, span_id)
+            doc.appendChild(span_id, t2)
+            val text = ElementOps.textContent(doc, div_id)
+            expect text == "Hello world"

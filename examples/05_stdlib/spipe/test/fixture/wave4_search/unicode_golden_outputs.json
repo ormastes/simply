@@ -1,0 +1,13 @@
+{
+  "schema": "spipe-unicode-golden-outputs-v1",
+  "unicode_version": "17.0.0",
+  "vectors": [
+    {"id":"canonical-compose","input":"Å","normalized":"å","tokens":[{"term":"å","position":1}]},
+    {"id":"final-sigma","input":"ΟΣ","normalized":"ος","tokens":[{"term":"ος","position":1}]},
+    {"id":"nonfinal-sigma","input":"ΟΣΑ","normalized":"οσα","tokens":[{"term":"οσα","position":1}]},
+    {"id":"dotted-capital-i","input":"İ","normalized":"i̇","tokens":[{"term":"i̇","position":1}]},
+    {"id":"hangul-compose","input":"가","normalized":"가","tokens":[{"term":"가","position":1}]},
+    {"id":"unicode17-tolong-siki","input":"𑶰","normalized":"𑶰","tokens":[{"term":"𑶰","position":1}]},
+    {"id":"stopword-gap","input":"Alpha the BETA","normalized":"alpha the beta","tokens":[{"term":"alpha","position":1},{"term":"beta","position":3}]}
+  ]
+}

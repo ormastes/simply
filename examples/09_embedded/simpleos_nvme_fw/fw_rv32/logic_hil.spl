@@ -1,0 +1,4 @@
+use logic_hil_cases.*
+
+fn rv32_hil_selftest() -> i32:
+    rv32_hil_cases_selftest()

@@ -1,0 +1,108 @@
+# Thin GUI entry for the canonical Simple Web HTML/CSS standards showcase.
+# The reusable runner owns rendering validation and fails closed on blank or
+# uniform output before opening a native window.
+# Also supports WM-client mode when SIMPLE_WM_APP_MODE=client is set.
+
+# NOTE: sibling-relative import (not examples.ui.web_render_file_gui): the seed
+# resolver only matches dot-form numbered dirs (NN.name), so the examples.ui.*
+# path fails at module load under src/compiler_rust/target/bootstrap/simple
+# ("Cannot resolve module: examples.ui.web_render_file_gui"). The sibling form
+# resolves file-relative and works in both lanes.
+# Resolution/DPI convention: same as web_render_file_gui.spl (SHOWCASE_RESOLUTION
+# default "4k"=3840x2160, "8k"=7680x4320, or "WIDTHxHEIGHT"; SHOWCASE_DPI
+# default 300, reported only — see the engine-gap note in that file's header).
+use web_render_file_gui.{run_web_standards_showcase, showcase_resolution_dims, showcase_dpi}
+use std.gc_async_mut.gpu.browser_engine.simple_web_renderer.{simple_web_render_html_to_pixels_with_engine2d_backend}
+use std.io_runtime.{env_get, getpid, file_write, read_file, file_exists}
+use std.common.image.ppm_decode.{encode_ppm_p6}
+use std.nogc_sync_mut.sffi.io.{file_write_bytes}
+use std.nogc_sync_mut.concurrent.thread.{thread_sleep}
+use common.ui.wm_app_process_contract.{WM_APP_MODE_ENV, WM_BRIDGE_FILE_ENV, WM_FRAME_FILE_ENV, WM_EVENT_FILE_ENV, WM_FRAME_SEQ_FILE_ENV, WM_CLIENT_HOLD_ENV, wm_app_mode_is_client, wm_web_standards_showcase_bridge_request_sized_with_backend, wm_fs_bridge_encode, wm_web_standards_showcase_event_path, wm_web_standards_showcase_frame_seq_path}
+
+val SHOWCASE_BACKEND_ENV: text = "SIMPLE_GUI_BACKEND"
+
+val SHOWCASE_DIMS = showcase_resolution_dims()
+val RW: i32 = SHOWCASE_DIMS.w
+val RH: i32 = SHOWCASE_DIMS.h
+val W: i32 = SHOWCASE_DIMS.w
+val H: i32 = SHOWCASE_DIMS.h
+val SHOWCASE_DPI_VALUE: i32 = showcase_dpi()
+
+# Same SHOWCASE_PPM_SCALE contract as widget_showcase_gui.showcase_ppm_scale():
+# only 8/4/2 accepted, anything else = 1 (full size).
+fn wm_frame_scale() -> i32:
+    val raw = env_get("SHOWCASE_PPM_SCALE") ?? ""
+    if raw == "8":
+        return 8
+    if raw == "4":
+        return 4
+    if raw == "2":
+        return 2
+    1
+
+fn run_wm_client_web_standards() -> i64:
+    val bridge_path = env_get(WM_BRIDGE_FILE_ENV) ?? ""
+    val frame_path = env_get(WM_FRAME_FILE_ENV) ?? ""
+    val html_path = "examples/06_io/ui/browser_common_elements_showcase.html"
+
+    if bridge_path == "" or frame_path == "":
+        print "[wm-web-standards-client] error=missing-bridge-env"
+        return 2
+
+    if not file_exists(html_path):
+        print "[wm-web-standards-client] error=html-not-found path={html_path}"
+        return 1
+
+    # Bridge FIRST, frame second: the host's bridge wait must not sit behind
+    # the (interpreted, slow) HTML layout+render. SHOWCASE_PPM_SCALE shrinks
+    # the rendered frame directly (8 => 480x270 from the 4k default).
+    val frame_scale = wm_frame_scale()
+    val frame_w = RW / frame_scale
+    val frame_h = RH / frame_scale
+    val configured_backend = (env_get(SHOWCASE_BACKEND_ENV) ?? "").trim()
+    val requested_backend = if configured_backend == "": "cpu_simd" else: configured_backend
+    val pid = getpid()
+    val req = wm_web_standards_showcase_bridge_request_sized_with_backend(
+        pid,
+        frame_path,
+        frame_w + 8,
+        frame_h + 32,
+        requested_backend
+    )
+    if not file_write(bridge_path, wm_fs_bridge_encode(req)):
+        print "[wm-web-standards-client] error=bridge-write-failed path={bridge_path}"
+        return 1
+
+    val raw_html = read_file(html_path)
+    val pixels = simple_web_render_html_to_pixels_with_engine2d_backend(raw_html, frame_w, frame_h, requested_backend)
+
+    if pixels.len() != frame_w * frame_h:
+        print "[wm-web-standards-client] error=render-failed pixels={pixels.len()}"
+        return 1
+
+    val bytes = encode_ppm_p6(frame_w.to_u32(), frame_h.to_u32(), pixels)
+    if bytes.len() == 0 or not file_write_bytes(frame_path, bytes):
+        print "[wm-web-standards-client] error=frame-write-failed path={frame_path}"
+        return 1
+
+    val seq_path = wm_web_standards_showcase_frame_seq_path(frame_path)
+    if not file_write(seq_path, "1"):
+        print "[wm-web-standards-client] error=seq-write-failed path={seq_path}"
+        return 1
+
+    print "[wm-web-standards-client] source=web_standards_showcase_gui.spl pid={pid} bridge={bridge_path} frame={frame_path}"
+
+    if (env_get(WM_CLIENT_HOLD_ENV) ?? "") == "1":
+        while true:
+            thread_sleep(100)
+
+    0
+
+fn main() -> i64:
+    if wm_app_mode_is_client(env_get(WM_APP_MODE_ENV) ?? ""):
+        return run_wm_client_web_standards()
+    val asset_root = (env_get("SIMPLE_ASSET_ROOT") ?? "").trim()
+    var html_path = "examples/06_io/ui/browser_common_elements_showcase.html"
+    if asset_root != "":
+        html_path = asset_root + "/examples/06_io/ui/browser_common_elements_showcase.html"
+    run_web_standards_showcase(true, html_path)

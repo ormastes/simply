@@ -1,0 +1,225 @@
+# @cover src/core/note_writer.spl 80%
+# Unit tests for note_writer module
+
+use src.core.note_writer.{create_note, edit_note, delete_note, move_note, rewrite_links}
+use std.io_runtime.{read_file, write_file, file_exists, file_delete, process_run}
+
+# --- Fixture helpers ---
+
+val TEST_VAULT = "/tmp/obsidian_test_vault"
+
+fn setup_test_vault():
+    var stdout = ""
+    var stderr = ""
+    var rc: i64 = 0
+    (stdout, stderr, rc) = process_run("rm", ["-rf", TEST_VAULT])
+    (stdout, stderr, rc) = process_run("mkdir", ["-p", TEST_VAULT])
+
+fn teardown_test_vault():
+    var stdout = ""
+    var stderr = ""
+    var rc: i64 = 0
+    (stdout, stderr, rc) = process_run("rm", ["-rf", TEST_VAULT])
+
+fn write_test_note(rel_path: text, content: text):
+    var base = TEST_VAULT
+    if not base.ends_with("/"):
+        base = base + "/"
+    val full = base + rel_path
+    # Ensure parent dirs
+    val slash_idx = full.last_index_of("/")
+    match slash_idx:
+        Some(i):
+            val dir = full.substring(0, i)
+            var stdout = ""
+            var stderr = ""
+            var rc: i64 = 0
+            (stdout, stderr, rc) = process_run("mkdir", ["-p", dir])
+        nil: pass_dn
+    write_file(full, content)
+
+fn read_test_note(rel_path: text) -> text:
+    var base = TEST_VAULT
+    if not base.ends_with("/"):
+        base = base + "/"
+    read_file(base + rel_path) ?? ""
+
+fn test_note_exists(rel_path: text) -> bool:
+    var base = TEST_VAULT
+    if not base.ends_with("/"):
+        base = base + "/"
+    file_exists(base + rel_path)
+
+# --- Tests ---
+
+describe "note_writer":
+    """Tests for vault note write operations"""
+
+    context "create_note":
+        """Creating new notes"""
+
+        it "creates a new note file":
+            setup_test_vault()
+            val ok = create_note(TEST_VAULT, "new_note.md", "# Hello\n\nWorld")
+            expect(ok).to_equal(true)
+            val content = read_test_note("new_note.md")
+            expect(content).to_equal("# Hello\n\nWorld")
+            teardown_test_vault()
+
+        it "creates note with nested directories":
+            setup_test_vault()
+            val ok = create_note(TEST_VAULT, "daily/2024/01/note.md", "Daily note content")
+            expect(ok).to_equal(true)
+            val content = read_test_note("daily/2024/01/note.md")
+            expect(content).to_equal("Daily note content")
+            teardown_test_vault()
+
+        it "fails if note already exists":
+            setup_test_vault()
+            write_test_note("existing.md", "original content")
+            val ok = create_note(TEST_VAULT, "existing.md", "new content")
+            expect(ok).to_equal(false)
+            val content = read_test_note("existing.md")
+            expect(content).to_equal("original content")
+            teardown_test_vault()
+
+    context "edit_note":
+        """Editing existing notes"""
+
+        it "appends content to existing note":
+            setup_test_vault()
+            write_test_note("edit_test.md", "Line 1")
+            val ok = edit_note(TEST_VAULT, "edit_test.md", "Line 2", "append")
+            expect(ok).to_equal(true)
+            val content = read_test_note("edit_test.md")
+            expect(content).to_contain("Line 1")
+            expect(content).to_contain("Line 2")
+            teardown_test_vault()
+
+        it "prepends content to existing note":
+            setup_test_vault()
+            write_test_note("edit_test.md", "Original")
+            val ok = edit_note(TEST_VAULT, "edit_test.md", "Prepended", "prepend")
+            expect(ok).to_equal(true)
+            val content = read_test_note("edit_test.md")
+            expect(content).to_start_with("Prepended")
+            expect(content).to_contain("Original")
+            teardown_test_vault()
+
+        it "overwrites content of existing note":
+            setup_test_vault()
+            write_test_note("edit_test.md", "Old content")
+            val ok = edit_note(TEST_VAULT, "edit_test.md", "New content", "overwrite")
+            expect(ok).to_equal(true)
+            val content = read_test_note("edit_test.md")
+            expect(content).to_equal("New content")
+            teardown_test_vault()
+
+        it "inserts content after heading":
+            setup_test_vault()
+            write_test_note("headed.md", "# Title\n\nIntro\n\n## Section\n\nBody text")
+            val ok = edit_note(TEST_VAULT, "headed.md", "## Section\n---\nInserted line", "insert_after_heading")
+            expect(ok).to_equal(true)
+            val content = read_test_note("headed.md")
+            expect(content).to_contain("Inserted line")
+            teardown_test_vault()
+
+        it "fails if note does not exist":
+            setup_test_vault()
+            val ok = edit_note(TEST_VAULT, "nonexistent.md", "content", "append")
+            expect(ok).to_equal(false)
+            teardown_test_vault()
+
+    context "delete_note":
+        """Deleting notes"""
+
+        it "deletes an existing note":
+            setup_test_vault()
+            write_test_note("to_delete.md", "content")
+            expect(test_note_exists("to_delete.md")).to_equal(true)
+            val ok = delete_note(TEST_VAULT, "to_delete.md")
+            expect(ok).to_equal(true)
+            expect(test_note_exists("to_delete.md")).to_equal(false)
+            teardown_test_vault()
+
+        it "fails if note does not exist":
+            setup_test_vault()
+            val ok = delete_note(TEST_VAULT, "ghost.md")
+            expect(ok).to_equal(false)
+            teardown_test_vault()
+
+    context "move_note":
+        """Moving notes and updating wikilinks"""
+
+        it "moves note to new path":
+            setup_test_vault()
+            write_test_note("source.md", "# Source\n\nContent")
+            val count = move_note(TEST_VAULT, "source.md", "dest.md")
+            expect(count).to_be_greater_than(-1)
+            expect(test_note_exists("source.md")).to_equal(false)
+            expect(test_note_exists("dest.md")).to_equal(true)
+            val content = read_test_note("dest.md")
+            expect(content).to_contain("Source")
+            teardown_test_vault()
+
+        it "moves note and updates wikilinks":
+            setup_test_vault()
+            write_test_note("old_name.md", "# Old Note")
+            write_test_note("referrer.md", "See [[old_name]] for details")
+            val count = move_note(TEST_VAULT, "old_name.md", "new_name.md")
+            expect(count).to_equal(1)
+            val referrer = read_test_note("referrer.md")
+            expect(referrer).to_contain("[[new_name]]")
+            teardown_test_vault()
+
+        it "updates aliased wikilinks on move":
+            setup_test_vault()
+            write_test_note("project.md", "# Project")
+            write_test_note("index.md", "Link: [[project|My Project]]")
+            val count = move_note(TEST_VAULT, "project.md", "renamed_project.md")
+            expect(count).to_equal(1)
+            val index = read_test_note("index.md")
+            expect(index).to_contain("[[renamed_project|My Project]]")
+            teardown_test_vault()
+
+        it "fails if source does not exist":
+            setup_test_vault()
+            val count = move_note(TEST_VAULT, "nonexistent.md", "dest.md")
+            expect(count).to_equal(-1)
+            teardown_test_vault()
+
+        it "fails if destination already exists":
+            setup_test_vault()
+            write_test_note("src.md", "source")
+            write_test_note("dst.md", "dest")
+            val count = move_note(TEST_VAULT, "src.md", "dst.md")
+            expect(count).to_equal(-2)
+            teardown_test_vault()
+
+        it "skips link update when name unchanged":
+            setup_test_vault()
+            write_test_note("note.md", "# Note")
+            write_test_note("other.md", "See [[note]]")
+            val count = move_note(TEST_VAULT, "note.md", "subdir/note.md")
+            expect(count).to_equal(0)
+            expect(test_note_exists("subdir/note.md")).to_equal(true)
+            teardown_test_vault()
+
+    context "rewrite_links":
+        """Unit tests for link rewriting logic"""
+
+        it "rewrites simple wikilinks":
+            val result = rewrite_links("See [[old]] and more", "old", "new")
+            expect(result).to_equal("See [[new]] and more")
+
+        it "rewrites aliased wikilinks":
+            val result = rewrite_links("See [[old|alias]] end", "old", "new")
+            expect(result).to_equal("See [[new|alias]] end")
+
+        it "rewrites multiple occurrences":
+            val result = rewrite_links("[[old]] then [[old]]", "old", "new")
+            expect(result).to_equal("[[new]] then [[new]]")
+
+        it "leaves unrelated links unchanged":
+            val result = rewrite_links("[[other]] stays", "old", "new")
+            expect(result).to_equal("[[other]] stays")

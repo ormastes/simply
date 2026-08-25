@@ -1,0 +1,371 @@
+"""
+ftl_map — DFTL-style L2P map with a bounded write-back LRU cache.
+
+l2p[] is the authoritative flash-resident map (all LBAs, LBA_COUNT entries).
+A 64-slot write-back cache sits in front: reads are served from cache on hit;
+on miss the LRU slot is evicted (dirty writeback -> l2p) and the entry loaded.
+Writes (update) go into cache only, marked dirty; flush() drains all dirty
+slots to l2p.
+"""
+
+use nvme_types.*
+
+val MAP_CACHE_CAP: i64 = 64
+val MAP_CACHE_ENTRY_BYTES: i64 = 32
+val MAP_CACHE_DRAM_BUDGET_BYTES: i64 = 2048
+val MAP_COUNTER_MAX: i64 = 1000000000000000000
+
+# ── pure free helpers (no mutation, array passed by value for reading only) ───
+
+fn ftl_fill(size: i64, fill: i64) -> [i64]:
+    var arr: [i64] = []
+    var i: i64 = 0
+    while i < size:
+        arr.push(fill)
+        i = i + 1
+    arr
+
+fn ftl_map_cap_limit(cap: i64) -> i64:
+    if cap < 0:
+        return 0
+    if cap > MAP_CACHE_CAP:
+        return MAP_CACHE_CAP
+    cap
+
+fn ftl_map_array_cap(cap: i64, arr_len: i64) -> i64:
+    val lim: i64 = ftl_map_cap_limit(cap)
+    if lim > arr_len:
+        return arr_len
+    lim
+
+# Return index of slot with minimum c_age (LRU). Ties: lowest index wins.
+fn ftl_lru_slot(c_age: [i64], cap: i64) -> i64:
+    val lim: i64 = ftl_map_array_cap(cap, c_age.len())
+    if lim <= 0:
+        return UNMAP
+    var lru: i64 = 0
+    var min_age: i64 = c_age[0]
+    var i: i64 = 1
+    while i < lim:
+        if c_age[i] < min_age:
+            min_age = c_age[i]
+            lru = i
+        i = i + 1
+    lru
+
+# Return cache slot index whose c_lba matches lba, or UNMAP if not present.
+fn ftl_cache_find(c_lba: [i64], cap: i64, lba: i64) -> i64:
+    var found: i64 = UNMAP
+    var i: i64 = 0
+    val lim: i64 = ftl_map_array_cap(cap, c_lba.len())
+    while i < lim:
+        if c_lba[i] == lba:
+            found = i
+        i = i + 1
+    found
+
+fn ftl_map_lba_valid(lba: i64) -> bool:
+    lba >= 0 and lba < LBA_COUNT
+
+fn ftl_map_ppn_valid(ppn: i64) -> bool:
+    ppn == UNMAP or ppn_in_range(ppn)
+
+fn ftl_map_sanitize_ppn(ppn: i64) -> i64:
+    if ftl_map_ppn_valid(ppn):
+        return ppn
+    UNMAP
+
+fn ftl_map_counter_next(v: i64) -> i64:
+    if v < 0:
+        return 1
+    if v >= MAP_COUNTER_MAX:
+        return MAP_COUNTER_MAX
+    v + 1
+
+# ── struct ────────────────────────────────────────────────────────────────────
+
+struct L2pMap:
+    l2p:     [i64]   # length LBA_COUNT — authoritative map; UNMAP if unmapped
+    c_lba:   [i64]   # cache slot -> lba  (UNMAP = empty)
+    c_ppn:   [i64]   # cache slot -> ppn
+    c_dirty: [i64]   # 1 if cache entry is newer than l2p
+    c_age:   [i64]   # LRU age stamp (higher = more recently used)
+    cap:     i64     # cache capacity = 64
+    tick:    i64     # monotonic counter, incremented on every cache touch
+    hits:    i64
+    misses:  i64
+    evicts:  i64
+
+fn ftl_map_new() -> L2pMap:
+    val cap: i64 = MAP_CACHE_CAP
+    L2pMap(
+        l2p:     ftl_fill(LBA_COUNT, UNMAP),
+        c_lba:   ftl_fill(cap, UNMAP),
+        c_ppn:   ftl_fill(cap, UNMAP),
+        c_dirty: ftl_fill(cap, 0),
+        c_age:   ftl_fill(cap, 0),
+        cap:     cap,
+        tick:    0,
+        hits:    0,
+        misses:  0,
+        evicts:  0
+    )
+
+# ── impl ──────────────────────────────────────────────────────────────────────
+
+impl L2pMap:
+    me l2p_ready(lba: i64) -> bool:
+        ftl_map_lba_valid(lba) and lba < me.l2p.len()
+
+    me cache_slot_ready(slot: i64) -> bool:
+        slot >= 0 and slot < me.c_lba.len() and slot < me.c_ppn.len() and slot < me.c_dirty.len() and slot < me.c_age.len()
+
+    # Look up lba. Cache hit -> return cached ppn.
+    # Cache miss -> evict LRU (dirty writeback if needed), load from l2p, return.
+    me lookup(lba: i64) -> i64:
+        if not me.l2p_ready(lba):
+            return UNMAP
+        val found: i64 = ftl_cache_find(me.c_lba, me.cap, lba)
+        var lru: i64 = 0
+        var el: i64 = 0
+        if me.cache_slot_ready(found):
+            me.hits = ftl_map_counter_next(me.hits)
+            me.tick = ftl_map_counter_next(me.tick)
+            me.c_age[found] = me.tick
+            return ftl_map_sanitize_ppn(me.c_ppn[found])
+        me.misses = ftl_map_counter_next(me.misses)
+        lru = ftl_lru_slot(me.c_age, me.cap)
+        if lru == UNMAP:
+            return ftl_map_sanitize_ppn(me.l2p[lba])
+        if not me.cache_slot_ready(lru):
+            return ftl_map_sanitize_ppn(me.l2p[lba])
+        if me.c_dirty[lru] != 0:
+            el = me.c_lba[lru]
+            if me.l2p_ready(el) and ftl_map_ppn_valid(me.c_ppn[lru]):
+                me.l2p[el] = me.c_ppn[lru]
+            me.evicts = ftl_map_counter_next(me.evicts)
+        me.tick = ftl_map_counter_next(me.tick)
+        me.c_lba[lru] = lba
+        me.c_ppn[lru] = ftl_map_sanitize_ppn(me.l2p[lba])
+        me.c_dirty[lru] = 0
+        me.c_age[lru] = me.tick
+        me.c_ppn[lru]
+
+    # Write lba->ppn into cache (dirty). Does NOT touch l2p directly.
+    # Evicts LRU with dirty writeback if cache is full and lba not already cached.
+    me update(lba: i64, ppn: i64):
+        if not me.l2p_ready(lba):
+            return
+        if not ftl_map_ppn_valid(ppn):
+            return
+        val found: i64 = ftl_cache_find(me.c_lba, me.cap, lba)
+        var lru: i64 = 0
+        var el: i64 = 0
+        if me.cache_slot_ready(found):
+            me.tick = ftl_map_counter_next(me.tick)
+            me.c_ppn[found] = ppn
+            me.c_dirty[found] = 1
+            me.c_age[found] = me.tick
+        if not me.cache_slot_ready(found):
+            lru = ftl_lru_slot(me.c_age, me.cap)
+            if lru == UNMAP:
+                me.l2p[lba] = ppn
+                return
+            if not me.cache_slot_ready(lru):
+                return
+            if me.c_dirty[lru] != 0:
+                el = me.c_lba[lru]
+                if me.l2p_ready(el) and ftl_map_ppn_valid(me.c_ppn[lru]):
+                    me.l2p[el] = me.c_ppn[lru]
+                me.evicts = ftl_map_counter_next(me.evicts)
+            me.tick = ftl_map_counter_next(me.tick)
+            me.c_lba[lru] = lba
+            me.c_ppn[lru] = ppn
+            me.c_dirty[lru] = 1
+            me.c_age[lru] = me.tick
+
+    # Power-loss: drop the volatile write-back cache (all slots, including dirty
+    # entries that were never flushed) but KEEP the flash-resident l2p[]. Un-flushed
+    # dirty updates are lost here and must be recovered from the journal (WAL replay).
+    me crash_volatile():
+        var i: i64 = 0
+        val lim: i64 = ftl_map_cap_limit(me.cap)
+        while i < lim and me.cache_slot_ready(i):
+            me.c_lba[i] = UNMAP
+            me.c_ppn[i] = UNMAP
+            me.c_dirty[i] = 0
+            me.c_age[i] = 0
+            i = i + 1
+        me.tick = 0
+
+    # Authoritative (flash-resident) mapping for an lba, bypassing the cache.
+    # Valid only after flush(); used to rebuild volatile state on recovery.
+    me l2p_entry(lba: i64) -> i64:
+        if not me.l2p_ready(lba):
+            return UNMAP
+        ftl_map_sanitize_ppn(me.l2p[lba])
+
+    # Drain all dirty cache entries to l2p and clear dirty flags.
+    me flush():
+        var i: i64 = 0
+        var fl: i64 = 0
+        val lim: i64 = ftl_map_cap_limit(me.cap)
+        while i < lim and i < me.c_dirty.len() and i < me.c_lba.len() and i < me.c_ppn.len():
+            if me.c_dirty[i] != 0:
+                fl = me.c_lba[i]
+                if me.l2p_ready(fl) and ftl_map_ppn_valid(me.c_ppn[i]):
+                    me.l2p[fl] = me.c_ppn[i]
+                me.c_dirty[i] = 0
+            i = i + 1
+
+    me hit_count() -> i64:
+        if me.hits < 0:
+            return 0
+        me.hits
+
+    me miss_count() -> i64:
+        if me.misses < 0:
+            return 0
+        me.misses
+
+    me evict_count() -> i64:
+        if me.evicts < 0:
+            return 0
+        me.evicts
+
+# ── selftest ──────────────────────────────────────────────────────────────────
+
+fn ftl_map_selftest() -> i64:
+    var failures: i64 = 0
+    var m: L2pMap = ftl_map_new()
+    failures = failures + expect_eq(m.cap * MAP_CACHE_ENTRY_BYTES, MAP_CACHE_DRAM_BUDGET_BYTES, "map cache fits DRAM budget")
+
+    # 1. update then lookup — must be served from cache (no l2p write yet)
+    m.update(10, 100)
+    val hit_val: i64 = m.lookup(10)
+    failures = failures + expect_eq(hit_val, 100, "cache hit after update")
+    failures = failures + expect_eq(m.hit_count(), 1, "hits == 1 after cache hit")
+    m.hits = -3
+    failures = failures + expect_eq(m.hit_count(), 0, "corrupted negative cache hits clamp to zero")
+    failures = failures + expect_eq(m.lookup(10), 100, "corrupted negative cache hits still serves hit")
+    failures = failures + expect_eq(m.hit_count(), 1, "corrupted negative cache hits increments from zero")
+    m.hits = 1
+
+    # 2. flush() persists to l2p
+    m.flush()
+    failures = failures + expect_eq(m.l2p[10], 100, "l2p[10]==100 after flush")
+
+    # 3. unmapped lba returns UNMAP
+    val unmap_val: i64 = m.lookup(999)
+    failures = failures + expect_eq(unmap_val, UNMAP, "unmapped lba returns UNMAP")
+    failures = failures + expect_eq(m.miss_count(), 1, "miss_count == 1 after unmapped lookup")
+    m.misses = -4
+    failures = failures + expect_eq(m.miss_count(), 0, "corrupted negative cache misses clamp to zero")
+    failures = failures + expect_eq(m.lookup(998), UNMAP, "corrupted negative cache misses still serves miss")
+    failures = failures + expect_eq(m.miss_count(), 1, "corrupted negative cache misses increments from zero")
+    m.misses = 1
+    failures = failures + expect_eq(m.lookup(LBA_COUNT), UNMAP, "out-of-range lookup fails closed")
+    failures = failures + expect_eq(m.miss_count(), 1, "out-of-range lookup does not touch cache")
+    m.update(LBA_COUNT, 123)
+    m.flush()
+    failures = failures + expect_eq(m.l2p_entry(LBA_COUNT), UNMAP, "out-of-range update is inert")
+    failures = failures + expect_eq(m.l2p_entry(-1), UNMAP, "negative l2p entry fails closed")
+    m.update(44, NUM_PAGES)
+    m.flush()
+    failures = failures + expect_eq(m.l2p_entry(44), UNMAP, "invalid ppn update is inert")
+    m.c_lba[0] = 45
+    m.c_ppn[0] = NUM_PAGES
+    m.c_dirty[0] = 1
+    m.flush()
+    failures = failures + expect_eq(m.l2p_entry(45), UNMAP, "invalid cached ppn writeback is inert")
+    m.c_lba[1] = 46
+    m.c_ppn[1] = NUM_PAGES
+    m.c_dirty[1] = 0
+    failures = failures + expect_eq(m.lookup(46), UNMAP, "invalid cached ppn lookup fails closed")
+    m.crash_volatile()
+    m.l2p[47] = NUM_PAGES
+    failures = failures + expect_eq(m.lookup(47), UNMAP, "invalid l2p ppn lookup fails closed")
+    failures = failures + expect_eq(m.l2p_entry(47), UNMAP, "invalid l2p ppn entry fails closed")
+    m.cap = MAP_CACHE_CAP + 8
+    m.c_lba[63] = 48
+    m.c_ppn[63] = 2048
+    m.c_dirty[63] = 1
+    m.flush()
+    failures = failures + expect_eq(m.l2p_entry(48), 2048, "oversized cache cap flush clamps to real slots")
+    m.cap = 0
+    m.update(49, 2049)
+    failures = failures + expect_eq(m.l2p_entry(49), 2049, "zero cache cap update writes through")
+    failures = failures + expect_eq(m.lookup(49), 2049, "zero cache cap lookup reads backing map")
+    m.cap = MAP_CACHE_CAP
+    var short_age: [i64] = []
+    short_age.push(9)
+    failures = failures + expect_eq(ftl_lru_slot(short_age, MAP_CACHE_CAP), 0, "truncated cache age LRU stays in bounds")
+    var short_lba: [i64] = []
+    short_lba.push(55)
+    failures = failures + expect_eq(ftl_cache_find(short_lba, MAP_CACHE_CAP, 55), 0, "truncated cache find stays in bounds")
+    failures = failures + expect_eq(ftl_cache_find(short_lba, MAP_CACHE_CAP, 56), UNMAP, "truncated cache miss fails closed")
+    m.c_lba = []
+    m.c_dirty[0] = 1
+    m.c_ppn[0] = 2050
+    m.flush()
+    failures = failures + expect_eq(m.l2p_entry(50), UNMAP, "truncated cache lba flush fails closed")
+    m.c_lba = ftl_fill(MAP_CACHE_CAP, UNMAP)
+    m.c_lba[0] = 51
+    m.c_ppn = []
+    failures = failures + expect_eq(m.lookup(51), UNMAP, "truncated cache ppn lookup fails closed")
+    m.update(51, 2051)
+    failures = failures + expect_eq(m.l2p_entry(51), UNMAP, "truncated cache ppn update fails closed")
+    m.c_ppn = ftl_fill(MAP_CACHE_CAP, UNMAP)
+    m.l2p = []
+    failures = failures + expect_eq(m.lookup(52), UNMAP, "truncated l2p lookup fails closed")
+    m.update(52, 2052)
+    failures = failures + expect_eq(m.l2p_entry(52), UNMAP, "truncated l2p update is inert")
+    m.l2p = ftl_fill(LBA_COUNT, UNMAP)
+
+    # 4. force >cap distinct updates; assert evictions happened and data is correct
+    var j: i64 = 0
+    while j < 80:
+        m.update(j, j + 1000)
+        j = j + 1
+    m.flush()
+    # lba=0 was evicted early (first dirty eviction); its ppn must be 1000
+    failures = failures + expect_eq(m.l2p[0], 1000, "l2p[0]==1000 after eviction+flush")
+    val ev: i64 = m.evict_count()
+    var evicts_ok: i64 = 0
+    if ev > 0:
+        evicts_ok = 1
+    failures = failures + expect_eq(evicts_ok, 1, "evictions > 0 after >cap updates")
+    m.evicts = -5
+    failures = failures + expect_eq(m.evict_count(), 0, "corrupted negative cache evictions clamp to zero")
+    m.c_lba[0] = 7
+    m.c_ppn[0] = 1007
+    m.c_dirty[0] = 7
+    m.c_age[0] = -100
+    m.update(200, 1200)
+    failures = failures + expect_eq(m.evict_count(), 1, "corrupted negative cache evictions increments from zero")
+    failures = failures + expect_eq(m.l2p_entry(7), 1007, "corrupted nonzero dirty flag writes back on eviction")
+    m.c_lba[0] = 8
+    m.c_ppn[0] = 1008
+    m.c_dirty[0] = 7
+    m.flush()
+    failures = failures + expect_eq(m.l2p_entry(8), 1008, "corrupted nonzero dirty flag flushes to l2p")
+    failures = failures + expect_eq(m.c_dirty[0], 0, "flush clears corrupted nonzero dirty flag")
+
+    var sat: L2pMap = ftl_map_new()
+    sat.update(1, 101)
+    sat.hits = MAP_COUNTER_MAX
+    sat.tick = MAP_COUNTER_MAX
+    failures = failures + expect_eq(sat.lookup(1), 101, "saturated cache hit still serves cached value")
+    failures = failures + expect_eq(sat.hit_count(), MAP_COUNTER_MAX, "cache hit counter saturates")
+    failures = failures + expect_eq(sat.c_age[0], MAP_COUNTER_MAX, "cache tick saturates on hit")
+    sat.misses = MAP_COUNTER_MAX
+    failures = failures + expect_eq(sat.lookup(2), UNMAP, "saturated cache miss still serves backing map")
+    failures = failures + expect_eq(sat.miss_count(), MAP_COUNTER_MAX, "cache miss counter saturates")
+    var sat_evict: L2pMap = ftl_map_new()
+    sat_evict.cap = 1
+    sat_evict.update(0, 100)
+    sat_evict.evicts = MAP_COUNTER_MAX
+    sat_evict.update(1, 101)
+    failures = failures + expect_eq(sat_evict.evict_count(), MAP_COUNTER_MAX, "cache eviction counter saturates")
+
+    failures

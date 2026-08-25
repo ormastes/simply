@@ -1,0 +1,249 @@
+# Production 2D shapes GUI smoke.
+#
+# Renders the framebuffer at the window size. Do not rely on the host window
+# backend to scale a smaller buffer; some platforms show that as a tiny dot or
+# small corner image.
+
+use std.io.window_winit.{WinitLoop, WinitWindow, WinitInput, winit_loop_new, winit_loop_free, winit_window_new, winit_window_free, winit_present_rgba, winit_poll_input}
+use common.image.ppm_decode.{encode_ppm_p6}
+use std.nogc_sync_mut.sffi.io.{file_write_bytes}
+
+use std.io_runtime.{env_get, process_run}
+
+val W: i32 = 320
+val H: i32 = 240
+val S: i32 = 4
+val BG: u32 = 0xFF101822u32
+
+fn simple_bin() -> text:
+    val env_binary = env_get("SIMPLE_BINARY") ?? ""
+    if env_binary != "":
+        return env_binary
+    val env_bin = env_get("SIMPLE_BIN") ?? ""
+    if env_bin != "":
+        return env_bin
+    "src/compiler_rust/target/gui/debug/simple"
+
+fn set_px(mut buf: [u32], x: i32, y: i32, col: u32):
+    if x >= 0 and x < W and y >= 0 and y < H:
+        buf[y * W + x] = col
+
+fn fill_rect(mut buf: [u32], x: i32, y: i32, rw: i32, rh: i32, col: u32):
+    var yy = y
+    while yy < y + rh:
+        if yy >= 0 and yy < H:
+            var xx = x
+            while xx < x + rw:
+                set_px(buf, xx, yy, col)
+                xx = xx + 1
+        yy = yy + 1
+
+fn fill_gradient_rect(mut buf: [u32], x: i32, y: i32, rw: i32, rh: i32, top: u32, bot: u32):
+    var yy = 0
+    while yy < rh:
+        val denom = if rh <= 1: 1 else: rh - 1
+        val tr = ((top >> 16) & 0xFFu32).to_i32()
+        val tg = ((top >> 8) & 0xFFu32).to_i32()
+        val tb = (top & 0xFFu32).to_i32()
+        val br = ((bot >> 16) & 0xFFu32).to_i32()
+        val bgc = ((bot >> 8) & 0xFFu32).to_i32()
+        val bb = (bot & 0xFFu32).to_i32()
+        val rr = (tr + (br - tr) * yy / denom).to_u32()
+        val rg = (tg + (bgc - tg) * yy / denom).to_u32()
+        val rb = (tb + (bb - tb) * yy / denom).to_u32()
+        fill_rect(buf, x, y + yy, rw, 1, 0xFF000000u32 | (rr << 16) | (rg << 8) | rb)
+        yy = yy + 1
+
+fn fill_circle(mut buf: [u32], cx: i32, cy: i32, r: i32, col: u32):
+    val rr = r * r
+    var y = cy - r
+    while y <= cy + r:
+        var x = cx - r
+        while x <= cx + r:
+            val dx = x - cx
+            val dy = y - cy
+            if dx * dx + dy * dy <= rr:
+                set_px(buf, x, y, col)
+            x = x + 1
+        y = y + 1
+
+fn fill_round_rect(mut buf: [u32], x: i32, y: i32, rw: i32, rh: i32, radius: i32, col: u32):
+    val r2 = radius * radius
+    var yy = y
+    while yy < y + rh:
+        var xx = x
+        while xx < x + rw:
+            var dx = 0
+            if xx < x + radius:
+                dx = x + radius - xx
+            elif xx >= x + rw - radius:
+                dx = xx - (x + rw - radius - 1)
+            var dy = 0
+            if yy < y + radius:
+                dy = y + radius - yy
+            elif yy >= y + rh - radius:
+                dy = yy - (y + rh - radius - 1)
+            if dx == 0 or dy == 0 or dx * dx + dy * dy <= r2:
+                set_px(buf, xx, yy, col)
+            xx = xx + 1
+        yy = yy + 1
+
+fn glyph_rows(ch: text) -> [i32]:
+    if ch == "A": return [14, 17, 17, 31, 17, 17, 17]
+    if ch == "C": return [14, 17, 16, 16, 16, 17, 14]
+    if ch == "D": return [30, 17, 17, 17, 17, 17, 30]
+    if ch == "E": return [31, 16, 16, 30, 16, 16, 31]
+    if ch == "G": return [14, 17, 16, 23, 17, 17, 15]
+    if ch == "I": return [31, 4, 4, 4, 4, 4, 31]
+    if ch == "L": return [16, 16, 16, 16, 16, 16, 31]
+    if ch == "M": return [17, 27, 21, 21, 17, 17, 17]
+    if ch == "N": return [17, 25, 21, 19, 17, 17, 17]
+    if ch == "O": return [14, 17, 17, 17, 17, 17, 14]
+    if ch == "P": return [30, 17, 17, 30, 16, 16, 16]
+    if ch == "R": return [30, 17, 17, 30, 20, 18, 17]
+    if ch == "S": return [15, 16, 16, 14, 1, 1, 30]
+    if ch == "T": return [31, 4, 4, 4, 4, 4, 4]
+    if ch == "U": return [17, 17, 17, 17, 17, 17, 14]
+    if ch == "2": return [14, 17, 1, 2, 4, 8, 31]
+    [0, 0, 0, 0, 0, 0, 0]
+
+fn draw_text(mut buf: [u32], x: i32, y: i32, s: text, px: i32, col: u32):
+    var cx = x
+    var i = 0
+    while i < s.len():
+        val ch = s.substring(i, i + 1)
+        if ch == " ":
+            cx = cx + 4 * px
+        else:
+            val rows = glyph_rows(ch)
+            var row = 0
+            while row < 7:
+                val bits = rows[row]
+                var bit = 0
+                while bit < 5:
+                    if ((bits >> (4 - bit)) & 1) == 1:
+                        fill_rect(buf, cx + bit * px, y + row * px, px, px, col)
+                    bit = bit + 1
+                row = row + 1
+            cx = cx + 6 * px
+        i = i + 1
+
+fn draw_scene() -> [u32]:
+    var px: [u32] = [BG; W * H]
+    draw_text(px, 88, 16, "SIMPLE 2D", 4, 0xFFFFFFFFu32)
+    fill_rect(px, 24, 56, 72, 72, 0xFF8B2E35u32)
+    fill_circle(px, 226, 92, 48, 0xFF43A047u32)
+    fill_rect(px, 24, 162, 256, 10, 0xFF1E88E5u32)
+    fill_gradient_rect(px, 24, 188, 132, 44, 0xFFFFD54Fu32, 0xFF7B1FA2u32)
+    fill_round_rect(px, 178, 186, 116, 46, 16, 0xFF00ACC1u32)
+    draw_text(px, 36, 136, "RECT", 3, 0xFFFFFFFFu32)
+    draw_text(px, 184, 136, "CIRCLE", 3, 0xFFFFFFFFu32)
+    draw_text(px, 44, 204, "GRAD", 3, 0xFF101822u32)
+    draw_text(px, 204, 204, "ROUND", 3, 0xFF101822u32)
+    px
+
+fn pack(src: [u32]) -> [i64]:
+    var out: [i64] = [0; src.len()]
+    var i = 0
+    while i < src.len():
+        out[i] = src[i].to_i64() & 0xFFFFFF
+        i = i + 1
+    out
+
+# Nearest-neighbor upscale a WxH RGBA buffer to (W*S)x(H*S).
+fn upscale(src: [u32]) -> [u32]:
+    val bw = W * S
+    val bh = H * S
+    var out: [u32] = [BG; bw * bh]
+    var by = 0
+    while by < bh:
+        val sy = by / S
+        var bx = 0
+        while bx < bw:
+            val sx = bx / S
+            out[by * bw + bx] = src[sy * W + sx]
+            bx = bx + 1
+        by = by + 1
+    out
+
+fn preview(px: [u32]):
+    print "ASCII preview (320x240 -> 40x15):"
+    var ry = 0
+    while ry < 15:
+        var line = ""
+        var rx = 0
+        while rx < 40:
+            val c = px[((ry * H) / 15) * W + (rx * W) / 40]
+            var ch = "."
+            if c == 0xFF8B2E35u32:
+                ch = "R"
+            elif c == 0xFF43A047u32:
+                ch = "G"
+            elif c == 0xFF1E88E5u32:
+                ch = "B"
+            elif c == 0xFFFFB300u32:
+                ch = "Y"
+            elif c == 0xFF00ACC1u32:
+                ch = "C"
+            elif c == 0xFFFFFFFFu32:
+                ch = "W"
+            line = line + ch
+            rx = rx + 1
+        print line
+        ry = ry + 1
+
+fn run_high() -> i64:
+    val result = process_run(simple_bin(), ["run", "examples/ui/engine2d_shapes_high_gui.spl"])
+    if result.0 != "":
+        print result.0
+    if result.1 != "":
+        eprint result.1
+    result.2
+
+fn main() -> i64:
+    if (env_get("SIMPLE_GUI_DPI") ?? "low") == "high":
+        return run_high()
+
+    print "Engine2D shapes GUI — production framebuffer: render {W}x{H} -> window {W * S}x{H * S}"
+    val pixels = draw_scene()
+    print "Rendered {pixels.len()} px"
+    preview(pixels)
+
+    val ppm_path = env_get("SHAPES_PPM") ?? ""
+    if ppm_path != "":
+        val bytes = encode_ppm_p6(W.to_u32(), H.to_u32(), pixels)
+        if file_write_bytes(ppm_path, bytes):
+            print "wrote {ppm_path} ({bytes.len()} bytes)"
+        else:
+            print "failed to write {ppm_path}"
+
+    if (env_get("SIMPLE_GUI") ?? "") != "1":
+        print "No GUI requested (use scripts/macos-gui-run.shs to open a window); headless only."
+        return 0
+
+    val lp = winit_loop_new()
+    if not lp.is_valid:
+        print "No GUI runtime available."
+        return 0
+    val bw = W * S
+    val bh = H * S
+    val win = winit_window_new(lp, bw, bh, "Simple 2D Shapes")
+    if not win.is_valid:
+        winit_loop_free(lp)
+        return 0
+    val big = upscale(pixels)
+    val packed = pack(big)
+    var running = true
+    var iters = 0
+    while running and iters < 2000000:
+        winit_present_rgba(win, bw.to_i64(), bh.to_i64(), packed)
+        val input = winit_poll_input(lp)
+        if input.close:
+            running = false
+        for k in input.keys:
+            if k == 27:
+                running = false
+        iters = iters + 1
+    winit_window_free(win)
+    winit_loop_free(lp)
+    return 0

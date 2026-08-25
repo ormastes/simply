@@ -1,0 +1,53 @@
+# Pure Engine2D line drawing smoke across selected backends.
+#
+# This is intentionally line-only and backend-direct. It does not use manual
+# software pixels or Electron/SVG.
+#
+# Run:
+#   bin/simple run examples/ui/engine2d_line_backend_test.spl --backend=cpu_simd
+#   bin/simple run examples/ui/engine2d_line_backend_test.spl --backend=metal
+
+use std.sffi.cli.{cli_get_args}
+use std.io_runtime.{process_run, env_get}
+
+fn _simple_binary() -> text:
+    val env_binary = env_get("SIMPLE_BINARY") ?? ""
+    if env_binary != "":
+        return env_binary
+    val env_bin = env_get("SIMPLE_BIN") ?? ""
+    if env_bin != "":
+        return env_bin
+    "src/compiler_rust/target/release/simple"
+
+fn _entry(backend: text) -> text:
+    if backend == "metal":
+        return "examples/ui/engine2d_line_metal_entry.spl"
+    "examples/ui/engine2d_line_cpu_simd_entry.spl"
+
+fn _selected(args: [text]) -> [text]:
+    var sel = "cpu_simd"
+    for a in args:
+        if a.index_of("--backend=") == 0:
+            sel = a.substring(10, a.len())
+        elif a == "cpu_simd" or a == "metal" or a == "all":
+            sel = a
+    if sel == "all":
+        return ["cpu_simd", "metal"]
+    [sel]
+
+fn main() -> i64:
+    print "=== Engine2D line drawing smoke ==="
+    val backends = _selected(cli_get_args())
+    var passed = 0
+    for backend in backends:
+        val result = process_run(_simple_binary(), ["run", _entry(backend)])
+        if result.0.len() > 0:
+            print result.0
+        if result.1.len() > 0:
+            print result.1
+        if result.2 == 0:
+            passed = passed + 1
+    print "=== summary: {passed}/{backends.len()} backend(s) passed ==="
+    if passed > 0:
+        return 0
+    1

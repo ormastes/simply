@@ -1,0 +1,106 @@
+# Text Generation — from scratch
+# Chapter 5: "Build a Large Language Model From Scratch" (Rasbt)
+#
+# Implements greedy decoding, temperature sampling, and top-k filtering.
+
+use std.pure.tensor.{PureTensor, tensor_from_data}
+use examples.simple_deeplearning_study.lib.util.math_helpers.{dl_exp}
+use examples.simple_deeplearning_study.lib.prim.softmax.{study_softmax_1d}
+use examples.simple_deeplearning_study.lib.gpt.gpt_model.{StudyGPT}
+use examples.simple_deeplearning_study.lib.gpt.gpt_config.{GPTConfig}
+
+# Greedy decoding: always pick the highest-probability token
+fn generate_greedy(model: StudyGPT, start_ids: [i64], max_new_tokens: i64) -> [i64]:
+    var ids = start_ids
+    var step = 0
+    while step < max_new_tokens:
+        # Truncate to context length
+        var context = ids
+        if context.len() > model.config.ctx_len:
+            var truncated: [i64] = []
+            val offset = context.len() - model.config.ctx_len
+            var i = offset
+            while i < context.len():
+                truncated.push(context[i])
+                i = i + 1
+            context = truncated
+
+        # Forward pass to get logits
+        val logits = model.forward(context)
+
+        # Get logits for last position
+        val last_row = logits.shape[0] - 1
+        val vocab_size = logits.shape[1]
+
+        # Find argmax
+        var best_id = 0
+        var best_val = logits.get([last_row, 0])
+        var v = 1
+        while v < vocab_size:
+            val score = logits.get([last_row, v])
+            if score > best_val:
+                best_val = score
+                best_id = v
+            v = v + 1
+
+        ids.push(best_id)
+        step = step + 1
+    ids
+
+# Temperature sampling: divide logits by temperature before softmax
+# Higher temperature = more random, lower = more deterministic
+fn generate_with_temperature(
+    model: StudyGPT,
+    start_ids: [i64],
+    max_new_tokens: i64,
+    temperature: f64,
+    seed: i64
+) -> [i64]:
+    var ids = start_ids
+    var rng = seed
+    var step = 0
+    while step < max_new_tokens:
+        # Truncate to context length
+        var context = ids
+        if context.len() > model.config.ctx_len:
+            var truncated: [i64] = []
+            val offset = context.len() - model.config.ctx_len
+            var i = offset
+            while i < context.len():
+                truncated.push(context[i])
+                i = i + 1
+            context = truncated
+
+        val logits = model.forward(context)
+        val last_row = logits.shape[0] - 1
+        val vocab_size = logits.shape[1]
+
+        # Extract last row and apply temperature
+        var last_logits: [f64] = []
+        var v = 0
+        while v < vocab_size:
+            last_logits.push(logits.get([last_row, v]) / temperature)
+            v = v + 1
+
+        # Softmax to get probabilities
+        val logit_tensor = tensor_from_data(last_logits, [vocab_size])
+        val probs = study_softmax_1d(logit_tensor)
+
+        # Sample from distribution using cumulative probability
+        rng = (rng * 1103515245 + 12345) % 2147483648
+        val rand_val = (rng as f64) / 2147483648.0
+        var cumulative = 0.0
+        var chosen = vocab_size - 1
+        v = 0
+        while v < vocab_size:
+            cumulative = cumulative + probs.data[v]
+            if cumulative > rand_val:
+                chosen = v
+                v = vocab_size  # break
+            v = v + 1
+
+        ids.push(chosen)
+        step = step + 1
+    ids
+
+export generate_greedy, generate_with_temperature

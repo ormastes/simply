@@ -1,0 +1,59 @@
+# 17. Memory Hierarchy - Tests
+#
+# Hardware-independent checks: the CPU reference matmul, the host helpers,
+# and the tile geometry. Device results are exercised by main.spl.
+
+use std.gpu.*
+use self.main.{create_matrix, create_identity, matmul_cpu, tiles_for, count_mismatches, TILE_SIZE}
+
+describe "Memory Hierarchy - Matrix Multiply":
+
+    describe "host helpers":
+
+        it "creates a filled matrix":
+            val m = create_matrix(3, 4, 2.5)
+            expect(m.len()).to_equal(12)
+            expect(m[0]).to_equal(2.5)
+            expect(m[11]).to_equal(2.5)
+
+        it "creates an identity matrix":
+            val id = create_identity(4)
+            expect(id[0]).to_equal(1.0)
+            expect(id[5]).to_equal(1.0)
+            expect(id[1]).to_equal(0.0)
+            expect(id[4]).to_equal(0.0)
+
+    describe "CPU reference":
+
+        it "multiplying by identity is a no-op":
+            val n = 8
+            val a = create_matrix(n, n, 3.0)
+            val r = matmul_cpu(a, create_identity(n), n)
+            expect(count_mismatches(r, a, 0.001)).to_equal(0)
+
+        it "multiplies two constant matrices":
+            val n = 16
+            val r = matmul_cpu(create_matrix(n, n, 2.0), create_matrix(n, n, 3.0), n)
+            # every entry is sum over k of 2*3 = 6 * 16
+            expect(r[0]).to_equal(96.0)
+            expect(r[n * n - 1]).to_equal(96.0)
+
+        it "counts mismatches":
+            val a = [1.0, 2.0, 3.0]
+            val b = [1.0, 2.5, 3.0]
+            expect(count_mismatches(a, b, 0.001)).to_equal(1)
+            expect(count_mismatches(a, a, 0.001)).to_equal(0)
+
+    describe "tile geometry":
+
+        it "uses 16x16 tiles":
+            expect(TILE_SIZE).to_equal(16)
+
+        it "rounds the tile count up":
+            expect(tiles_for(16)).to_equal(1)
+            expect(tiles_for(20)).to_equal(2)
+            expect(tiles_for(64)).to_equal(4)
+
+        it "covers a non-aligned matrix":
+            val n = 20
+            expect(tiles_for(n) * TILE_SIZE >= n).to_equal(true)

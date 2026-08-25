@@ -1,0 +1,735 @@
+# Main Application Shell
+# Manages the full smux event loop, layout, and rendering.
+# Layout: MenuBar | Main Content (scrollable) | QuickTextBar | MobileKeybar | StatusBar
+#
+# Self-contained TUI rendering via direct ANSI output.
+# No dependency on std.ui.* or app.ui.* framework modules.
+
+use quick_text.{QuickTextEntry, QuickTextPanel}
+use mobile_keys.{MobileKeybar, should_show_keybar}
+use nerd_font.{icon_or_ascii, has_nerd_font}
+use notification.{Notification, notify}
+use tmux_hooks.{TmuxHookManager, TmuxHookEvent}
+use tmux.{tmux_is_available}
+use llm_hooks.{LlmDoneHookConfig, HookAction, run_llm_done_hook, make_continue_message}
+use render_buffer.{ansi_move, ansi_clear_line, ansi_clear_screen, ansi_hide_cursor, ansi_show_cursor, ansi_enable_alt_screen, ansi_disable_alt_screen, ansi_reset}
+
+# Terminal I/O externs
+extern fn native_term_write(data: text) -> i64
+extern fn native_term_flush() -> i32
+extern fn native_term_read_timeout(max_len: i64, timeout_ms: i64) -> text
+extern fn native_term_poll(timeout_ms: i64) -> bool
+extern fn native_enable_raw_mode() -> i32
+extern fn native_disable_raw_mode() -> i32
+
+use std.io_runtime.{env_get, process_run}
+
+# ============================================================================
+# Terminal Size
+# ============================================================================
+
+fn get_terminal_size() -> (i32, i32):
+    """Get (width, height). Tries stty, then env vars, then fallback 80x24."""
+    # Try stty size (returns "rows cols")
+    val (stty_out, stty_err, stty_code) = process_run("/bin/sh", ["-c", "stty size 2>/dev/null"])
+    if stty_code == 0 and stty_out != "" and stty_out != nil:
+        val parts = stty_out.trim().split(" ")
+        if parts.len() >= 2:
+            val h = parts[0].to_int() as i32
+            val w = parts[1].to_int() as i32
+            if w > 0 and h > 0:
+                return (w, h)
+    # Try environment variables
+    val cols = env_get("COLUMNS")
+    val rows = env_get("LINES")
+    if cols != "" and cols != nil and rows != "" and rows != nil:
+        val w = cols.to_int() as i32
+        val h = rows.to_int() as i32
+        if w > 0 and h > 0:
+            return (w, h)
+    return (80, 24)
+
+# ============================================================================
+# App State
+# ============================================================================
+
+enum AppMode:
+    Normal
+    Input
+    Menu
+    QuickText
+
+    fn name() -> text:
+        match self:
+            AppMode.Normal => "NORMAL"
+            AppMode.Input => "INPUT"
+            AppMode.Menu => "MENU"
+            AppMode.QuickText => "QUICK"
+
+# ============================================================================
+# App Configuration
+# ============================================================================
+
+struct SmuxConfig:
+    title: text
+    theme: text
+    mobile_keybar_mode: text
+    nerd_font: bool
+    quick_texts: [QuickTextEntry]
+    hook_script: text
+    hook_timeout_ms: i64
+    auto_continue: bool
+    notification_mode: text
+    tmux_hooks_enabled: bool
+
+    static fn defaults() -> SmuxConfig:
+        var qt: [QuickTextEntry] = []
+        qt.push(QuickTextEntry(label: "Continue", snippet: "Please continue.", shortcut: "1"))
+        qt.push(QuickTextEntry(label: "Approve", snippet: "Looks good, proceed.", shortcut: "2"))
+        qt.push(QuickTextEntry(label: "Fix tests", snippet: "Fix the failing tests.", shortcut: "3"))
+        SmuxConfig(
+            title: "smux",
+            theme: "dark",
+            mobile_keybar_mode: "auto",
+            nerd_font: true,
+            quick_texts: qt,
+            hook_script: "hooks/check_done.spl",
+            hook_timeout_ms: 30000,
+            auto_continue: true,
+            notification_mode: "auto",
+            tmux_hooks_enabled: true
+        )
+
+# ============================================================================
+# Smux Application
+# ============================================================================
+
+class SmuxApp:
+    config: SmuxConfig
+    mode: AppMode
+    running: bool
+    width: i32
+    height: i32
+    content_lines: [text]
+    input_buffer: text
+    status_message: text
+    scroll_offset: i32
+    render_needed: bool
+    raw_mode_active: bool
+    paused: bool
+    platform_name: text
+    has_tmux_env: bool
+    use_nerd: bool
+    quick_text_panel: QuickTextPanel
+    keybar: MobileKeybar
+    tmux_hook_mgr: TmuxHookManager
+    backend_name: text
+
+    static fn create(config: SmuxConfig, platform_name: text) -> SmuxApp:
+        SmuxApp.create_with_backend(config, platform_name, "tui")
+
+    static fn create_with_backend(config: SmuxConfig, platform_name: text, backend_name: text) -> SmuxApp:
+        val tmux_env = env_get("TMUX")
+        val has_tmux = tmux_env != "" and tmux_env != nil
+        val use_nerd = config.nerd_font and has_nerd_font()
+        val show_kb = should_show_keybar(platform_name, config.mobile_keybar_mode)
+
+        # Build quick text panel from config entries
+        var qt_panel = QuickTextPanel.create()
+        var qi = 0
+        while qi < config.quick_texts.len():
+            val qt = config.quick_texts[qi]
+            qt_panel.add_entry(qt.label, qt.snippet, qt.shortcut)
+            qi = qi + 1
+
+        # Build mobile keybar
+        var kb = MobileKeybar.create()
+        kb.set_visible(show_kb)
+
+        # Build tmux hook manager
+        var tmux_mgr = TmuxHookManager.create()
+
+        SmuxApp(
+            config: config,
+            mode: AppMode.Normal,
+            running: false,
+            width: 80,
+            height: 24,
+            content_lines: [],
+            input_buffer: "",
+            status_message: "Ready",
+            scroll_offset: 0,
+            render_needed: true,
+            raw_mode_active: false,
+            paused: false,
+            platform_name: platform_name,
+            has_tmux_env: has_tmux,
+            use_nerd: use_nerd,
+            quick_text_panel: qt_panel,
+            keybar: kb,
+            tmux_hook_mgr: tmux_mgr,
+            backend_name: backend_name
+        )
+
+    # ===================================================================
+    # Lifecycle
+    # ===================================================================
+
+    me init() -> Result<(), text>:
+        val size = get_terminal_size()
+        self.width = size.0
+        self.height = size.1
+        if self.width <= 0:
+            self.width = 80
+        if self.height <= 0:
+            self.height = 24
+
+        # Enable raw mode + alt screen
+        val code = native_enable_raw_mode()
+        if code != 0:
+            val (out, err, fc) = process_run("/bin/sh", ["-c", "stty raw -echo 2>/dev/null"])
+            if fc != 0:
+                return Err("Failed to enable raw mode")
+        self.raw_mode_active = true
+
+        # Alt screen + hide cursor
+        var setup = ansi_enable_alt_screen()
+        setup = "{setup}{ansi_hide_cursor()}"
+
+        # Enable mouse tracking and bracketed paste
+        setup = "{setup}\u{001b}[?1006h"   # SGR mouse
+        setup = "{setup}\u{001b}[?1003h"   # All mouse events
+        setup = "{setup}\u{001b}[?2004h"   # Bracketed paste
+        native_term_write(setup)
+        native_term_flush()
+
+        # Register tmux hooks if in tmux session
+        if self.config.tmux_hooks_enabled and self.has_tmux_env:
+            self.tmux_hook_mgr.register_hooks()
+
+        self.running = true
+        self.render_needed = true
+
+        # Welcome message
+        val nerd_tag = if self.use_nerd: "yes" else: "no"
+        self.content_lines.push("Welcome to smux - Simple Mux Terminal GUI")
+        self.content_lines.push("Platform: {self.platform_name} | Nerd Font: {nerd_tag}")
+        if self.has_tmux_env:
+            val hook_tag = if self.config.tmux_hooks_enabled: "enabled" else: "disabled"
+            self.content_lines.push("tmux: detected (hooks {hook_tag})")
+        self.content_lines.push("")
+        self.content_lines.push("Keybindings:")
+        self.content_lines.push("  i       - Enter input mode")
+        self.content_lines.push("  Esc     - Return to normal mode")
+        self.content_lines.push("  Tab     - Toggle quick text panel")
+        self.content_lines.push("  Alt+1-9 - Send quick text")
+        self.content_lines.push("  d       - Check LLM done hook")
+        self.content_lines.push("  q       - Quit (in normal mode)")
+        self.content_lines.push("  Ctrl+C  - Force quit")
+        self.content_lines.push("  Up/Down - Scroll")
+        self.content_lines.push("")
+
+        return Ok(())
+
+    me shutdown():
+        # Disable mouse tracking and bracketed paste
+        var cleanup = "\u{001b}[?2004l"    # Disable bracketed paste
+        cleanup = "{cleanup}\u{001b}[?1003l"    # Disable mouse
+        cleanup = "{cleanup}\u{001b}[?1006l"    # Disable SGR mouse
+
+        # Unregister tmux hooks
+        if self.has_tmux_env:
+            self.tmux_hook_mgr.unregister_hooks()
+
+        # Show cursor + leave alt screen
+        cleanup = "{cleanup}{ansi_show_cursor()}"
+        cleanup = "{cleanup}{ansi_disable_alt_screen()}"
+        native_term_write(cleanup)
+        native_term_flush()
+
+        if self.raw_mode_active:
+            val code = native_disable_raw_mode()
+            if code != 0:
+                process_run("/bin/sh", ["-c", "stty cooked echo 2>/dev/null"])
+            self.raw_mode_active = false
+
+        self.running = false
+
+    # ===================================================================
+    # Main Event Loop
+    # ===================================================================
+
+    me run():
+        val init_result = self.init()
+        if init_result.is_err():
+            print "smux: Failed to initialize: {init_result.unwrap_err()}"
+            return
+
+        while self.running:
+            if self.render_needed and not self.paused:
+                self._render_frame()
+                self.render_needed = false
+
+            # Poll input (raw terminal)
+            val has_input = native_term_poll(50)
+            if has_input:
+                val raw_data = native_term_read_timeout(4096, 50)
+                # Guard: native_term_read_timeout may return error codes (-1, -2)
+                # instead of text in some PTY environments
+                val data = "{raw_data}"
+                if data.len() > 0 and data != "-1" and data != "-2" and data != "nil":
+                    self._handle_input(data)
+
+            # Poll tmux hooks
+            if self.has_tmux_env and self.config.tmux_hooks_enabled:
+                self._poll_tmux_hooks()
+
+            # Check for viewport resize
+            val new_size = get_terminal_size()
+            if new_size.0 > 0 and new_size.1 > 0:
+                if new_size.0 != self.width or new_size.1 != self.height:
+                    self.width = new_size.0
+                    self.height = new_size.1
+                    self.render_needed = true
+
+        self.shutdown()
+
+    # ===================================================================
+    # Tmux Hook Polling
+    # ===================================================================
+
+    me _poll_tmux_hooks():
+        val events = self.tmux_hook_mgr.poll_events()
+        var i = 0
+        while i < events.len():
+            val event = events[i]
+            match event:
+                TmuxHookEvent.PaneResized =>
+                    self.render_needed = true
+                TmuxHookEvent.PaneFocused =>
+                    self.paused = false
+                    self.render_needed = true
+                TmuxHookEvent.PaneLostFocus =>
+                    self.paused = true
+                TmuxHookEvent.WindowChanged =>
+                    self.render_needed = true
+                TmuxHookEvent.CopyMode =>
+                    self.status_message = "Copy mode"
+                    self.render_needed = true
+                _ => ()
+            i = i + 1
+
+    # ===================================================================
+    # Notification
+    # ===================================================================
+
+    me _fire_notification(title: text, body: text):
+        if self.config.notification_mode == "never":
+            return
+        val n = Notification.with_title(title, body)
+        notify(n, self.platform_name, self.has_tmux_env)
+
+    # ===================================================================
+    # LLM Done Hook
+    # ===================================================================
+
+    me _check_llm_done():
+        val script = self.config.hook_script
+        if script == "":
+            self.status_message = "No hook script configured"
+            self.render_needed = true
+            return
+
+        self.status_message = "Running LLM done check..."
+        self.render_needed = true
+        self._render_frame()
+        self.render_needed = false
+
+        val cfg = LlmDoneHookConfig(
+            script_path: script,
+            timeout_ms: self.config.hook_timeout_ms,
+            auto_continue: self.config.auto_continue,
+            notification_mode: self.config.notification_mode
+        )
+        val result = run_llm_done_hook(cfg, ".")
+
+        if result.should_notify():
+            self._fire_notification("smux", "LLM agent needs attention")
+
+        if result.should_continue():
+            val msg = make_continue_message()
+            self.content_lines.push("[LLM Hook] Auto-continue: {msg}")
+            self.status_message = "LLM: auto-continuing"
+        else:
+            self.content_lines.push("[LLM Hook] Check complete")
+            self.status_message = "LLM hook done"
+
+        self.render_needed = true
+
+    # ===================================================================
+    # Input Handling
+    # ===================================================================
+
+    me _handle_input(data: text):
+        var pos = 0
+        val len = data.len()
+
+        while pos < len:
+            val ch = data[pos]
+
+            if ch == "\u{001b}":
+                if pos + 1 < len and data[pos + 1] == "[":
+                    val csi_result = _parse_csi_simple(data, pos + 2)
+                    self._handle_csi_event(csi_result.0, csi_result.1)
+                    pos = csi_result.2
+                elif pos + 1 < len:
+                    val alt_key = data[pos + 1]
+                    self._handle_alt_key(alt_key)
+                    pos = pos + 2
+                else:
+                    self._handle_escape()
+                    pos = pos + 1
+            elif ch == "\x03":
+                self.running = false
+                pos = pos + 1
+            elif ch == "\x11":
+                self.running = false
+                pos = pos + 1
+            elif ch == "\r" or ch == "\n":
+                self._handle_enter()
+                pos = pos + 1
+            elif ch == "\t":
+                self._handle_tab()
+                pos = pos + 1
+            elif ch == "\x7f":
+                self._handle_backspace()
+                pos = pos + 1
+            else:
+                self._handle_char(ch)
+                pos = pos + 1
+
+    me _handle_csi_event(event_type: text, param: text):
+        match event_type:
+            "up" =>
+                if self.mode.name() == "NORMAL":
+                    self._scroll_up(1)
+            "down" =>
+                if self.mode.name() == "NORMAL":
+                    self._scroll_down(1)
+            "mouse_scroll_up" =>
+                self._scroll_up(3)
+            "mouse_scroll_down" =>
+                self._scroll_down(3)
+            "mouse_click" =>
+                self._handle_mouse_click(param)
+            _ =>
+                ()
+        self.render_needed = true
+
+    me _handle_mouse_click(param: text):
+        val parts = param.split(";")
+        if parts.len() >= 3:
+            val x = parts[1].to_int() as i32
+            val y = parts[2].to_int() as i32
+
+            # Check quick text panel hit
+            if self.quick_text_panel.is_visible():
+                var qt_row = self.height - 1
+                if self.keybar.is_visible():
+                    qt_row = qt_row - 1
+                if y == qt_row:
+                    val idx = self.quick_text_panel.hit_test(x)
+                    if idx >= 0:
+                        val snippet = self.quick_text_panel.get_snippet(idx)
+                        if snippet != "":
+                            self.content_lines.push("> {snippet}")
+                            self.status_message = "Sent: {snippet}"
+
+            # Check mobile keybar hit
+            if self.keybar.is_visible():
+                if y == self.height - 1:
+                    val key_val = self.keybar.hit_test(x)
+                    if key_val != "":
+                        self.status_message = "Key: {key_val}"
+
+    me _handle_alt_key(key: text):
+        if key >= "1" and key <= "9":
+            val idx = key.to_int() - 1
+            val snippet = self.quick_text_panel.get_snippet(idx as i32)
+            if snippet != "":
+                self.content_lines.push("> {snippet}")
+                self.status_message = "Sent: {snippet}"
+                self.render_needed = true
+        elif key == "q":
+            self.quick_text_panel.toggle()
+            self.render_needed = true
+
+    me _handle_escape():
+        if self.mode.name() == "INPUT":
+            self.mode = AppMode.Normal
+            self.status_message = "Normal mode"
+        elif self.quick_text_panel.is_visible():
+            self.quick_text_panel.hide()
+        self.render_needed = true
+
+    me _handle_enter():
+        if self.mode.name() == "INPUT" and self.input_buffer.len() > 0:
+            self.content_lines.push("> {self.input_buffer}")
+            self.input_buffer = ""
+            self.render_needed = true
+        elif self.mode.name() == "NORMAL":
+            self.mode = AppMode.Input
+            self.status_message = "Input mode (Esc to exit)"
+            self.render_needed = true
+
+    me _handle_tab():
+        self.quick_text_panel.toggle()
+        self.render_needed = true
+
+    me _handle_backspace():
+        if self.mode.name() == "INPUT" and self.input_buffer.len() > 0:
+            self.input_buffer = self.input_buffer[0:self.input_buffer.len() - 1]
+            self.render_needed = true
+
+    me _handle_char(ch: text):
+        if self.mode.name() == "INPUT":
+            self.input_buffer = "{self.input_buffer}{ch}"
+            self.render_needed = true
+        elif ch == "i":
+            self.mode = AppMode.Input
+            self.status_message = "Input mode (Esc to exit)"
+            self.render_needed = true
+        elif ch == "q":
+            self.running = false
+        elif ch == "d":
+            self._check_llm_done()
+
+    me _scroll_up(amount: i32):
+        self.scroll_offset = self.scroll_offset - amount
+        if self.scroll_offset < 0:
+            self.scroll_offset = 0
+        self.render_needed = true
+
+    me _scroll_down(amount: i32):
+        self.scroll_offset = self.scroll_offset + amount
+        val max_offset = self.content_lines.len() as i32 - self._content_height()
+        if max_offset > 0 and self.scroll_offset > max_offset:
+            self.scroll_offset = max_offset
+        if self.scroll_offset < 0:
+            self.scroll_offset = 0
+        self.render_needed = true
+
+    # ===================================================================
+    # Direct ANSI Rendering (self-contained, no UI framework needed)
+    # ===================================================================
+
+    me _render_frame():
+        val esc = "\u{001b}"
+        var output = ansi_hide_cursor()
+
+        # 1. Menu bar (row 1) — reverse video
+        output = "{output}{ansi_move(1, 1)}{ansi_clear_line()}"
+        output = "{output}{esc}[7m"
+        val term_icon = icon_or_ascii("terminal", ">", self.use_nerd)
+        val file_icon = icon_or_ascii("file", "F", self.use_nerd)
+        val gear_icon = icon_or_ascii("gear", "V", self.use_nerd)
+        val help_icon = icon_or_ascii("question", "?", self.use_nerd)
+        var menu_text = " {term_icon} {self.config.title}  {file_icon} File  {gear_icon} View  {help_icon} Help"
+        # Pad to full width
+        while menu_text.len() < self.width:
+            menu_text = "{menu_text} "
+        output = "{output}{menu_text}{esc}[0m"
+
+        # 2. Content area (rows 2 to height-bottom_bars)
+        val content_h = self._content_height()
+        var row = 0
+        while row < content_h:
+            val line_idx = row + self.scroll_offset
+            val screen_row = row + 2
+            output = "{output}{ansi_move(screen_row, 1)}{ansi_clear_line()}"
+            if line_idx >= 0 and line_idx < self.content_lines.len() as i32:
+                output = "{output}{self.content_lines[line_idx]}"
+            row = row + 1
+
+        var next_row = content_h + 2
+
+        # 3. Input line (when in input mode)
+        if self.mode.name() == "INPUT":
+            output = "{output}{ansi_move(next_row, 1)}{ansi_clear_line()}"
+            output = "{output}{esc}[36m>{esc}[0m {self.input_buffer}"
+            next_row = next_row + 1
+
+        # 4. Quick text bar (when visible)
+        if self.quick_text_panel.is_visible():
+            output = "{output}{ansi_move(next_row, 1)}{ansi_clear_line()}"
+            output = "{output}{self.quick_text_panel.render(self.width as i32, self.use_nerd)}"
+            next_row = next_row + 1
+
+        # 5. Mobile keybar (when visible)
+        if self.keybar.is_visible():
+            output = "{output}{ansi_move(next_row, 1)}{ansi_clear_line()}"
+            output = "{output}{self.keybar.render(self.width as i32)}"
+            next_row = next_row + 1
+
+        # 6. Status bar (last row) — reverse video
+        output = "{output}{ansi_move(self.height, 1)}{ansi_clear_line()}"
+        output = "{output}{esc}[7m"
+        var mode_icon = ""
+        if self.mode.name() == "NORMAL":
+            mode_icon = icon_or_ascii("check", "N", self.use_nerd)
+        elif self.mode.name() == "INPUT":
+            mode_icon = icon_or_ascii("send", "I", self.use_nerd)
+        elif self.mode.name() == "MENU":
+            mode_icon = icon_or_ascii("gear", "M", self.use_nerd)
+        else:
+            mode_icon = icon_or_ascii("arrow_right", "Q", self.use_nerd)
+        val mode_str = "[{mode_icon} {self.mode.name()}]"
+        val size_str = "{self.width}x{self.height}"
+        var status_text = " {mode_str} {self.status_message}"
+        # Right-align size string
+        val gap = self.width - status_text.len() - size_str.len() - 1
+        if gap > 0:
+            var padding = 0
+            while padding < gap:
+                status_text = "{status_text} "
+                padding = padding + 1
+        status_text = "{status_text}{size_str} "
+        output = "{output}{status_text}{esc}[0m"
+
+        native_term_write(output)
+        native_term_flush()
+
+    fn _content_height() -> i32:
+        var h = self.height - 2  # menu + status
+        if self.keybar.is_visible():
+            h = h - 1
+        if self.quick_text_panel.is_visible():
+            h = h - 1
+        if self.mode.name() == "INPUT":
+            h = h - 1
+        if h < 1:
+            h = 1
+        return h
+
+# ============================================================================
+# Factory Functions (interpreter-safe — avoids cross-module static method calls)
+# ============================================================================
+
+fn smux_config_defaults() -> SmuxConfig:
+    """Create default SmuxConfig. Use this instead of SmuxConfig.defaults() cross-module."""
+    var qt: [QuickTextEntry] = []
+    qt.push(QuickTextEntry(label: "Continue", snippet: "Please continue.", shortcut: "1"))
+    qt.push(QuickTextEntry(label: "Approve", snippet: "Looks good, proceed.", shortcut: "2"))
+    qt.push(QuickTextEntry(label: "Fix tests", snippet: "Fix the failing tests.", shortcut: "3"))
+    SmuxConfig(
+        title: "smux",
+        theme: "dark",
+        mobile_keybar_mode: "auto",
+        nerd_font: true,
+        quick_texts: qt,
+        hook_script: "hooks/check_done.spl",
+        hook_timeout_ms: 30000,
+        auto_continue: true,
+        notification_mode: "auto",
+        tmux_hooks_enabled: true
+    )
+
+fn smux_app_create(config: SmuxConfig, platform_name: text, backend_name: text) -> SmuxApp:
+    """Create SmuxApp. Use this instead of SmuxApp.create_with_backend() cross-module."""
+    val tmux_env = env_get("TMUX")
+    val has_tmux = tmux_env != "" and tmux_env != nil
+    val use_nerd = config.nerd_font and has_nerd_font()
+    val show_kb = should_show_keybar(platform_name, config.mobile_keybar_mode)
+
+    var qt_panel = QuickTextPanel.create()
+    var qi = 0
+    while qi < config.quick_texts.len():
+        val qt = config.quick_texts[qi]
+        qt_panel.add_entry(qt.label, qt.snippet, qt.shortcut)
+        qi = qi + 1
+
+    var kb = MobileKeybar.create()
+    kb.set_visible(show_kb)
+
+    var tmux_mgr = TmuxHookManager.create()
+
+    SmuxApp(
+        config: config,
+        mode: AppMode.Normal,
+        running: false,
+        width: 80,
+        height: 24,
+        content_lines: [],
+        input_buffer: "",
+        status_message: "Ready",
+        scroll_offset: 0,
+        render_needed: true,
+        raw_mode_active: false,
+        paused: false,
+        platform_name: platform_name,
+        has_tmux_env: has_tmux,
+        use_nerd: use_nerd,
+        quick_text_panel: qt_panel,
+        keybar: kb,
+        tmux_hook_mgr: tmux_mgr,
+        backend_name: backend_name
+    )
+
+# ============================================================================
+# CSI Parser
+# ============================================================================
+
+fn _parse_csi_simple(data: text, start: i32) -> (text, text, i32):
+    val len = data.len()
+    var pos = start
+
+    if pos < len and data[pos] == "<":
+        return _parse_sgr_simple(data, pos + 1)
+
+    var params = ""
+    while pos < len:
+        val ch = data[pos]
+        if (ch >= "0" and ch <= "9") or ch == ";":
+            params = "{params}{ch}"
+            pos = pos + 1
+        else:
+            break
+
+    if pos < len:
+        val final_ch = data[pos]
+        pos = pos + 1
+        match final_ch:
+            "A" => return ("up", params, pos)
+            "B" => return ("down", params, pos)
+            "C" => return ("right", params, pos)
+            "D" => return ("left", params, pos)
+            "H" => return ("home", params, pos)
+            "F" => return ("end", params, pos)
+            _ => return ("unknown", params, pos)
+
+    return ("unknown", params, pos)
+
+fn _parse_sgr_simple(data: text, start: i32) -> (text, text, i32):
+    val len = data.len()
+    var pos = start
+    var params = ""
+
+    while pos < len:
+        val ch = data[pos]
+        if ch == "M" or ch == "m":
+            pos = pos + 1
+            val parts = params.split(";")
+            if parts.len() >= 1:
+                val cb = parts[0].to_int()
+                val is_scroll = (cb & 64) != 0
+                if is_scroll:
+                    val btn_code = cb & 3
+                    if btn_code == 0:
+                        return ("mouse_scroll_up", params, pos)
+                    else:
+                        return ("mouse_scroll_down", params, pos)
+            return ("mouse_click", params, pos)
+        params = "{params}{ch}"
+        pos = pos + 1
+
+    return ("unknown", params, pos)

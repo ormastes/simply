@@ -1,0 +1,60 @@
+fn _rv32_abort_sqid(cdw10: u32) -> i64:
+    (cdw10 & 65535) as i64
+
+fn _rv32_abort_cid(cdw10: u32) -> i64:
+    ((cdw10 >> 16) & 65535) as i64
+
+fn _rv32_abort_qid_valid(qid: i64) -> i32:
+    if qid == 0:
+        return 1
+    if qid < 1:
+        return 0
+    if qid > 8:
+        return 0
+    1
+
+fn _rv32_abort_cid_valid(cid: i64) -> i32:
+    if cid < 0:
+        return 0
+    if cid > 65535:
+        return 0
+    1
+
+pub fn _rv32_abort_status(nsid: i64, cdw10: u32, cdw11: i64, cdw12: i64, sq_active: i32) -> i64:
+    if nsid != 0:
+        return 2
+    if cdw11 != 0:
+        return 2
+    if cdw12 != 0:
+        return 2
+    val sqid: i64 = _rv32_abort_sqid(cdw10)
+    if _rv32_abort_qid_valid(sqid) == 0:
+        return 3
+    if sqid != 0 and sq_active == 0:
+        return 3
+    0
+
+pub fn _rv32_abort_data(status: i64) -> i64:
+    if status == 0:
+        return 1
+    0
+
+pub fn _rv32_abort_recorded_sqid(prev_sqid: i64, status: i64, cdw10: u32) -> i64:
+    if status != 0:
+        return prev_sqid
+    _rv32_abort_sqid(cdw10)
+
+pub fn _rv32_abort_recorded_cid(prev_cid: i64, status: i64, cdw10: u32) -> i64:
+    if status != 0:
+        return prev_cid
+    _rv32_abort_cid(cdw10)
+
+pub fn _rv32_abort_get_sqid(last_sqid: i64) -> i64:
+    if _rv32_abort_qid_valid(last_sqid) == 0:
+        return -1
+    last_sqid
+
+pub fn _rv32_abort_get_cid(last_cid: i64) -> i64:
+    if _rv32_abort_cid_valid(last_cid) == 0:
+        return -1
+    last_cid

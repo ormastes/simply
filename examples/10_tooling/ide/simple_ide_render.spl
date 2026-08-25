@@ -1,0 +1,19 @@
+# Minimal reusable IDE render example.
+#
+# Demonstrates how an embedded/sample IDE can render editor content through the
+# shared editor GUI backend and common WebRender envelope without host-only APIs.
+
+use std.editor.backend.gui_backend.*
+use std.editor.buffer.buffer.*
+use std.editor.common.types.*
+use common.ui.web_render_api.{WEB_RENDER_TARGET_PURE_SIMPLE, WebRenderRequest, web_render_to_artifact}
+
+fn main() -> i64:
+    val buffer = EditorBuffer.from_text(EditorBufferId(value: 1), "# Embedded IDE\n\nfn main() -> i64:\n    0\n")
+    val body = gui_render_editor_area(buffer, "markdown", EditorViewport(top_row: 0, left_col: 0, width: 80, height: 8))
+    val req = WebRenderRequest.html(WEB_RENDER_TARGET_PURE_SIMPLE, "Embedded Simple IDE", body, "", "", 800, 600)
+    val artifact = web_render_to_artifact(req)
+    print "target={artifact.target}"
+    print "has_editor_source={artifact.html.contains(\"gui-editor-source\")}"
+    print "has_markdown_language={artifact.html.contains(\"data-language=\\\"markdown\\\"\")}"
+    0

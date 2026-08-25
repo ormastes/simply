@@ -1,0 +1,128 @@
+#!/usr/bin/env simple
+# Test Library SMF with Object Files
+#
+# This example demonstrates creating a library with both SMF and object files,
+# then using it for linking.
+
+use compiler.linker.lib_smf_writer.{LibSmfBuilder}
+use compiler.linker.lib_smf_reader.{LibSmfReader}
+use app.io.{file_exists, shell}
+
+fn main():
+    print "========================================="
+    print "Library SMF with Object Files Test"
+    print "========================================="
+    print ""
+
+    # Step 1: Create a simple test module
+    print "[1/6] Creating test module..."
+    val test_smf_path = "/tmp/test_module.smf"
+    val test_obj_path = "/tmp/test_module.o"
+
+    # Create dummy SMF data (in real scenario, this would be compiled)
+    val smf_content = "SMF_TEST_DATA_v1.0"
+    val smf_write = shell("echo '{smf_content}' > '{test_smf_path}'")
+    if smf_write.exit_code != 0:
+        print "Error: Failed to create test SMF"
+        exit(1)
+
+    # Create dummy object data (in real scenario, this would be compiled)
+    val obj_content = "OBJ_TEST_DATA_v1.0"
+    val obj_write = shell("echo '{obj_content}' > '{test_obj_path}'")
+    if obj_write.exit_code != 0:
+        print "Error: Failed to create test object"
+        exit(1)
+
+    print "✓ Test files created"
+    print ""
+
+    # Step 2: Create library with object file
+    print "[2/6] Building library with object file..."
+    var builder = LibSmfBuilder.new()
+    builder.set_verbose(true)
+
+    val add_result = builder.add_module_with_object(
+        "test/module",
+        test_smf_path,
+        test_obj_path
+    )
+
+    if add_result.is_err():
+        print "Error: {add_result.unwrap_err()}"
+        exit(1)
+
+    print "✓ Module added to builder"
+    print ""
+
+    # Step 3: Write library
+    print "[3/6] Writing library archive..."
+    val lib_path = "/tmp/test_lib.lsm"
+    val write_result = builder.write(lib_path)
+
+    if write_result.is_err():
+        print "Error: {write_result.unwrap_err()}"
+        exit(1)
+
+    print "✓ Library written to {lib_path}"
+    print ""
+
+    # Step 4: Read library back
+    print "[4/6] Reading library..."
+    val reader_result = LibSmfReader.open(lib_path)
+
+    if reader_result.is_err():
+        print "Error: {reader_result.unwrap_err()}"
+        exit(1)
+
+    val reader = reader_result.unwrap()
+    reader.set_verbose(true)
+
+    print "✓ Library opened"
+    print ""
+
+    # Step 5: Extract SMF
+    print "[5/6] Extracting SMF module..."
+    val smf_result = reader.get_module("test/module")
+
+    if smf_result.is_err():
+        print "Error: {smf_result.unwrap_err()}"
+        exit(1)
+
+    val smf_data = smf_result.unwrap()
+    print "✓ SMF extracted: {smf_data.len()} bytes"
+    print ""
+
+    # Step 6: Extract object file
+    print "[6/6] Extracting object file..."
+    val obj_result = reader.get_object("test/module")
+
+    if obj_result.is_err():
+        print "Error: {obj_result.unwrap_err()}"
+        exit(1)
+
+    val obj_data = obj_result.unwrap()
+    print "✓ Object extracted: {obj_data.len()} bytes"
+    print ""
+
+    # Verify module has object
+    val has_obj = reader.has_object("test/module")
+    print "Module has object: {has_obj}"
+    print ""
+
+    # Cleanup
+    reader.close()
+
+    print "========================================="
+    print "Test Complete - All Steps Passed!"
+    print "========================================="
+    print ""
+
+    print "Summary:"
+    print "  ✓ Created test module files"
+    print "  ✓ Built library with object file"
+    print "  ✓ Wrote library archive"
+    print "  ✓ Read library back"
+    print "  ✓ Extracted SMF module"
+    print "  ✓ Extracted object file"
+    print ""
+    print "The hybrid SMF + object library format is working!"

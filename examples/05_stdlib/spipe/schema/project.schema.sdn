@@ -1,0 +1,15 @@
+schema: spipe.project
+version: 1
+record: project
+identity: uid
+fields:
+  uid: opaque_uid(P)
+  key: semantic_key
+  title: text
+  root_path: project_relative_path
+  revision: immutable_revision
+  trust_scope: enum(untrusted_data,reviewed_reference,executable_policy)
+  visibility: enum(public,project,private,restricted)
+  status: enum(active,unavailable,deprecated)
+  aliases: sorted_unique(text)
+  metadata_hash: sha256|null

@@ -1,0 +1,411 @@
+# engine2d_shapes_gui.spl — anti-aliased 2D shapes in an on-screen window (pure Simple).
+#
+# High-definition software rasterizer: each shape is drawn from its signed
+# distance field (SDF) with 1px coverage anti-aliasing, so edges stay crisp at
+# any resolution with no visible jaggies — and with no 4x supersampling cost.
+# Shapes are drawn only over their bounding box (cost scales with shape area,
+# not image area x shape count), which keeps high resolutions fast enough to
+# render under the interpreter.
+#
+# Two DPI modes (env SIMPLE_GUI_DPI, default "low"):
+#   low  — 160x120. Fast; intended for LLM/headless UI debugging. Prints an
+#          ASCII thumbnail so the layout can be checked from text alone.
+#   high — 320x240 anti-aliased render, presented to a 640x480 window (2x). What
+#          a user actually sees; ~90s to raster under the interpreter (instant on
+#          the native-compiled path).
+#
+# Launch on macOS (opens a real window via a .app bundle so it composites):
+#   SIMPLE_GUI_DPI=high scripts/macos-gui-run.shs examples/ui/engine2d_shapes_gui.spl
+#
+# Headless (render only, prints pixel count + ASCII preview in low mode):
+#   SIMPLE_EXECUTION_MODE=interpret bin/simple run examples/ui/engine2d_shapes_gui.spl
+
+use std.io.window_winit.{WinitLoop, WinitWindow, winit_loop_new, winit_loop_free, winit_window_new, winit_window_free, winit_present_rgba, winit_poll_close_requested}
+
+use std.io_runtime.{env_get, write_file}
+
+# Logical layout space (160x120); shape coordinates scale to the output size.
+val LOGICAL_W: i32 = 160
+val LOGICAL_H: i32 = 120
+
+val BG: u32 = 0xFF101822u32
+val SQUARE_COL: u32 = 0xFFE53935u32
+val CIRCLE_COL: u32 = 0xFF43A047u32
+val LINE_COL: u32 = 0xFF1E88E5u32
+val ROUND_COL: u32 = 0xFF00ACC1u32
+
+# ---------------------------------------------------------------------------
+# Float + SDF helpers
+# ---------------------------------------------------------------------------
+
+fn fabs(x: f64) -> f64:
+    if x < 0.0:
+        return 0.0 - x
+    x
+fn fmin(a: f64, b: f64) -> f64:
+    if a < b:
+        return a
+    b
+fn fmax(a: f64, b: f64) -> f64:
+    if a > b:
+        return a
+    b
+fn clamp01(x: f64) -> f64:
+    if x < 0.0:
+        return 0.0
+    if x > 1.0:
+        return 1.0
+    x
+fn clampi(v: i32, lo: i32, hi: i32) -> i32:
+    if v < lo:
+        return lo
+    if v > hi:
+        return hi
+    v
+
+# 1px-soft coverage from a signed distance (negative = inside).
+fn cov(sd: f64) -> f64:
+    clamp01(0.5 - sd)
+
+fn blend(bg: u32, col: u32, c: f64) -> u32:
+    if c <= 0.0:
+        return bg
+    val ic = 1.0 - c
+    val br = ((bg >> 16) & 0xFFu32).to_f64()
+    val bgc = ((bg >> 8) & 0xFFu32).to_f64()
+    val bb = (bg & 0xFFu32).to_f64()
+    val cr = ((col >> 16) & 0xFFu32).to_f64()
+    val cg = ((col >> 8) & 0xFFu32).to_f64()
+    val cb = (col & 0xFFu32).to_f64()
+    val rr = (br * ic + cr * c).to_u32()
+    val rg = (bgc * ic + cg * c).to_u32()
+    val rb = (bb * ic + cb * c).to_u32()
+    0xFF000000u32 | (rr << 16) | (rg << 8) | rb
+
+# ---------------------------------------------------------------------------
+# Shape fills (each loops only over its own bounding box)
+# ---------------------------------------------------------------------------
+
+fn fill_round_box(buf: [u32], w: i32, h: i32, cx: f64, cy: f64, hx: f64, hy: f64, r: f64, col: u32, grad: bool, top: u32, bot: u32):
+    val x0 = clampi((cx - hx - 1.0).to_i32(), 0, w)
+    val x1 = clampi((cx + hx + 2.0).to_i32(), 0, w)
+    val y0 = clampi((cy - hy - 1.0).to_i32(), 0, h)
+    val y1 = clampi((cy + hy + 2.0).to_i32(), 0, h)
+    var y = y0
+    while y < y1:
+        val py = y.to_f64() + 0.5
+        val qy = fabs(py - cy) - hy + r
+        var x = x0
+        while x < x1:
+            val px = x.to_f64() + 0.5
+            val qx = fabs(px - cx) - hx + r
+            val ax = fmax(qx, 0.0)
+            val ay = fmax(qy, 0.0)
+            val sd = (ax * ax + ay * ay).sqrt() + fmin(fmax(qx, qy), 0.0) - r
+            val c = cov(sd)
+            if c > 0.0:
+                var fcol = col
+                if grad:
+                    val t = clamp01((py - (cy - hy)) / (2.0 * hy))
+                    val gr = (((top >> 16) & 0xFFu32).to_f64() * (1.0 - t) + ((bot >> 16) & 0xFFu32).to_f64() * t).to_u32()
+                    val gg = (((top >> 8) & 0xFFu32).to_f64() * (1.0 - t) + ((bot >> 8) & 0xFFu32).to_f64() * t).to_u32()
+                    val gb = ((top & 0xFFu32).to_f64() * (1.0 - t) + (bot & 0xFFu32).to_f64() * t).to_u32()
+                    fcol = 0xFF000000u32 | (gr << 16) | (gg << 8) | gb
+                val idx = y * w + x
+                buf[idx] = blend(buf[idx], fcol, c)
+            x = x + 1
+        y = y + 1
+
+fn fill_circle(buf: [u32], w: i32, h: i32, cx: f64, cy: f64, r: f64, col: u32):
+    val x0 = clampi((cx - r - 1.0).to_i32(), 0, w)
+    val x1 = clampi((cx + r + 2.0).to_i32(), 0, w)
+    val y0 = clampi((cy - r - 1.0).to_i32(), 0, h)
+    val y1 = clampi((cy + r + 2.0).to_i32(), 0, h)
+    var y = y0
+    while y < y1:
+        val py = y.to_f64() + 0.5
+        val dy = py - cy
+        var x = x0
+        while x < x1:
+            val px = x.to_f64() + 0.5
+            val dx = px - cx
+            val sd = (dx * dx + dy * dy).sqrt() - r
+            val c = cov(sd)
+            if c > 0.0:
+                val idx = y * w + x
+                buf[idx] = blend(buf[idx], col, c)
+            x = x + 1
+        y = y + 1
+
+fn fill_segment(buf: [u32], w: i32, h: i32, ax: f64, ay: f64, bx: f64, by: f64, th: f64, col: u32):
+    val x0 = clampi((fmin(ax, bx) - th - 1.0).to_i32(), 0, w)
+    val x1 = clampi((fmax(ax, bx) + th + 2.0).to_i32(), 0, w)
+    val y0 = clampi((fmin(ay, by) - th - 1.0).to_i32(), 0, h)
+    val y1 = clampi((fmax(ay, by) + th + 2.0).to_i32(), 0, h)
+    val bax = bx - ax
+    val bay = by - ay
+    val bb = bax * bax + bay * bay
+    var y = y0
+    while y < y1:
+        val py = y.to_f64() + 0.5
+        var x = x0
+        while x < x1:
+            val px = x.to_f64() + 0.5
+            val pax = px - ax
+            val pay = py - ay
+            val hh = clamp01((pax * bax + pay * bay) / bb)
+            val dx = pax - bax * hh
+            val dy = pay - bay * hh
+            val sd = (dx * dx + dy * dy).sqrt() - th
+            val c = cov(sd)
+            if c > 0.0:
+                val idx = y * w + x
+                buf[idx] = blend(buf[idx], col, c)
+            x = x + 1
+        y = y + 1
+
+# ---------------------------------------------------------------------------
+# Bitmap text (5x7 font) — each glyph row is a 5-bit mask, leftmost bit = 16.
+# ---------------------------------------------------------------------------
+
+val TEXT_COL: u32 = 0xFFFFFFFFu32
+
+fn glyph_rows(ch: text) -> [i32]:
+    if ch == "A": return [14, 17, 17, 31, 17, 17, 17]
+    if ch == "C": return [14, 17, 16, 16, 16, 17, 14]
+    if ch == "D": return [30, 17, 17, 17, 17, 17, 30]
+    if ch == "E": return [31, 16, 16, 30, 16, 16, 31]
+    if ch == "G": return [14, 17, 16, 23, 17, 17, 15]
+    if ch == "I": return [31, 4, 4, 4, 4, 4, 31]
+    if ch == "L": return [16, 16, 16, 16, 16, 16, 31]
+    if ch == "M": return [17, 27, 21, 21, 17, 17, 17]
+    if ch == "N": return [17, 25, 21, 19, 17, 17, 17]
+    if ch == "O": return [14, 17, 17, 17, 17, 17, 14]
+    if ch == "P": return [30, 17, 17, 30, 16, 16, 16]
+    if ch == "R": return [30, 17, 17, 30, 20, 18, 17]
+    if ch == "S": return [15, 16, 16, 14, 1, 1, 30]
+    if ch == "T": return [31, 4, 4, 4, 4, 4, 4]
+    if ch == "U": return [17, 17, 17, 17, 17, 17, 14]
+    if ch == "2": return [14, 17, 1, 2, 4, 8, 31]
+    [0, 0, 0, 0, 0, 0, 0]
+
+# Fill a solid ps x ps block (text pixels are crisp, no AA needed).
+fn fill_block(buf: [u32], w: i32, h: i32, x: i32, y: i32, ps: i32, col: u32):
+    var yy = y
+    val ye = y + ps
+    while yy < ye:
+        if yy >= 0 and yy < h:
+            var xx = x
+            val xe = x + ps
+            while xx < xe:
+                if xx >= 0 and xx < w:
+                    buf[yy * w + xx] = col
+                xx = xx + 1
+        yy = yy + 1
+
+fn draw_text(buf: [u32], w: i32, h: i32, x: i32, y: i32, s: text, ps: i32, col: u32):
+    var cx = x
+    var i = 0
+    while i < s.len():
+        val ch = s.substring(i, i + 1)
+        if ch == " ":
+            cx = cx + 4 * ps
+        else:
+            val rows = glyph_rows(ch)
+            var r = 0
+            while r < 7:
+                val bits = rows[r]
+                var c = 0
+                while c < 5:
+                    if ((bits >> (4 - c)) & 1) == 1:
+                        fill_block(buf, w, h, cx + c * ps, y + r * ps, ps, col)
+                    c = c + 1
+                r = r + 1
+            cx = cx + 6 * ps
+        i = i + 1
+
+fn fill_rect_fast(buf: [u32], w: i32, h: i32, x: i32, y: i32, rw: i32, rh: i32, col: u32):
+    val x0 = clampi(x, 0, w)
+    val y0 = clampi(y, 0, h)
+    val x1 = clampi(x + rw, 0, w)
+    val y1 = clampi(y + rh, 0, h)
+    var yy = y0
+    while yy < y1:
+        val base = yy * w
+        var xx = x0
+        while xx < x1:
+            buf[base + xx] = col
+            xx = xx + 1
+        yy = yy + 1
+
+fn fill_circle_fast(buf: [u32], w: i32, h: i32, cx: i32, cy: i32, r: i32, col: u32):
+    val x0 = clampi(cx - r, 0, w)
+    val y0 = clampi(cy - r, 0, h)
+    val x1 = clampi(cx + r + 1, 0, w)
+    val y1 = clampi(cy + r + 1, 0, h)
+    val rr = r * r
+    var y = y0
+    while y < y1:
+        val dy = y - cy
+        var x = x0
+        while x < x1:
+            val dx = x - cx
+            if dx * dx + dy * dy <= rr:
+                buf[y * w + x] = col
+            x = x + 1
+        y = y + 1
+
+fn render_scene_fast(w: i32, h: i32) -> [u32]:
+    var buf: [u32] = [BG; w * h]
+    val sx = w / LOGICAL_W
+    val sy = h / LOGICAL_H
+    val s = if sx < 1: 1 else: sx
+    fill_rect_fast(buf, w, h, 10 * sx, 28 * sy, 36 * sx, 36 * sy, SQUARE_COL)
+    fill_circle_fast(buf, w, h, 112 * sx, 46 * sy, 24 * s, CIRCLE_COL)
+    fill_rect_fast(buf, w, h, 10 * sx, 82 * sy, 140 * sx, 5 * sy, LINE_COL)
+    fill_rect_fast(buf, w, h, 10 * sx, 94 * sy, 66 * sx, 22 * sy, 0xFFFFB300u32)
+    fill_rect_fast(buf, w, h, 86 * sx, 94 * sy, 62 * sx, 22 * sy, ROUND_COL)
+    # Keep the low-DPI smoke path allocation-light; high mode still renders labels.
+    fill_rect_fast(buf, w, h, 44 * sx, 10 * sy, 68 * sx, 6 * sy, TEXT_COL)
+    buf
+
+fn render_scene(w: i32, h: i32) -> [u32]:
+    var buf: [u32] = [BG; w * h]
+    val s = w.to_f64() / LOGICAL_W.to_f64()
+    # square (rounded a touch)
+    fill_round_box(buf, w, h, 28.0 * s, 46.0 * s, 18.0 * s, 18.0 * s, 3.0 * s, SQUARE_COL, false, 0u32, 0u32)
+    # circle
+    fill_circle(buf, w, h, 112.0 * s, 46.0 * s, 24.0 * s, CIRCLE_COL)
+    # line
+    fill_segment(buf, w, h, 10.0 * s, 84.0 * s, 150.0 * s, 84.0 * s, 2.5 * s, LINE_COL)
+    # vertical gradient rect (amber -> purple)
+    fill_round_box(buf, w, h, 43.0 * s, 105.0 * s, 33.0 * s, 11.0 * s, 2.0 * s, 0u32, true, 0xFFFFB300u32, 0xFF8E24AAu32)
+    # rounded rect
+    fill_round_box(buf, w, h, 117.0 * s, 105.0 * s, 31.0 * s, 11.0 * s, 10.0 * s, ROUND_COL, false, 0u32, 0u32)
+    # text — title (larger) + a label per primitive (smaller so they fit)
+    val ps = clampi((2.0 * s).to_i32(), 1, 8)
+    val lp = clampi((1.4 * s).to_i32(), 1, 6)
+    draw_text(buf, w, h, (44.0 * s).to_i32(), (8.0 * s).to_i32(), "SIMPLE 2D", ps, TEXT_COL)
+    draw_text(buf, w, h, (14.0 * s).to_i32(), (68.0 * s).to_i32(), "RECT", lp, TEXT_COL)
+    draw_text(buf, w, h, (92.0 * s).to_i32(), (68.0 * s).to_i32(), "CIRCLE", lp, TEXT_COL)
+    draw_text(buf, w, h, (26.0 * s).to_i32(), (100.0 * s).to_i32(), "GRAD", lp, TEXT_COL)
+    draw_text(buf, w, h, (100.0 * s).to_i32(), (100.0 * s).to_i32(), "ROUND", lp, TEXT_COL)
+    buf
+
+# ---------------------------------------------------------------------------
+# Debug preview + window plumbing
+# ---------------------------------------------------------------------------
+
+fn ascii_preview(px: [u32], w: i32, h: i32):
+    val cols = 60
+    val rows = 24
+    print "ASCII preview ({w}x{h} -> {cols}x{rows}): .=bg R=square G=circle B=line Y/P=gradient C=rounded"
+    var ry = 0
+    while ry < rows:
+        var line = ""
+        var rx = 0
+        while rx < cols:
+            val c = px[((ry * h) / rows) * w + (rx * w) / cols]
+            val r = ((c >> 16) & 0xFFu32).to_i32()
+            val g = ((c >> 8) & 0xFFu32).to_i32()
+            val b = (c & 0xFFu32).to_i32()
+            var ch = " "
+            if r + g + b < 90:
+                ch = "."
+            elif b > g + 50 and b > r:
+                ch = "B"
+            elif g > 120 and b > 120 and r < 120:
+                ch = "C"
+            elif r > 170 and g > 120 and b < 110:
+                ch = "Y"
+            elif r > 120 and b > 120 and g < 110:
+                ch = "P"
+            elif r > g and r > b:
+                ch = "R"
+            elif g > r and g > b:
+                ch = "G"
+            line = line + ch
+            rx = rx + 1
+        print line
+        ry = ry + 1
+
+fn write_ppm(px: [u32], w: i32, h: i32, path: text):
+    # Row-based to keep the parts array small (h entries, not w*h): per-pixel
+    # push into a w*h array is O(n^2) under the interpreter and stalls.
+    var rows: [text] = ["P3\n{w} {h}\n255\n"]
+    var y = 0
+    while y < h:
+        val base = y * w
+        var toks: [text] = []
+        var x = 0
+        while x < w:
+            val p = px[base + x]
+            val r = ((p >> 16) & 0xFFu32).to_i32()
+            val g = ((p >> 8) & 0xFFu32).to_i32()
+            val b = (p & 0xFFu32).to_i32()
+            toks = toks.push("{r} {g} {b}")
+            x = x + 1
+        rows = rows.push(toks.join(" ") + "\n")
+        y = y + 1
+    write_file(path, rows.join(""))
+
+fn pack_pixels(src: [u32]) -> [i64]:
+    # softbuffer treats each u32 as 0x00RRGGBB; mask to 24-bit RGB.
+    var out: [i64] = [0; src.len()]
+    var i = 0
+    while i < src.len():
+        out[i] = src[i].to_i64() & 0xFFFFFF
+        i = i + 1
+    out
+
+fn main() -> i64:
+    val high = env_get("SIMPLE_GUI_DPI") == "high"
+    # out_w/out_h = render (framebuffer) size; win_w/win_h = on-screen window size.
+    var out_w = LOGICAL_W
+    var out_h = LOGICAL_H
+    var win_w = 480
+    var win_h = 360
+    if high:
+        out_w = 320
+        out_h = 240
+        win_w = 640
+        win_h = 480
+    val mode = if high: "high" else: "low"
+    print "Engine2D shapes GUI — {mode} DPI: render {out_w}x{out_h} -> window {win_w}x{win_h}, anti-aliased SDF raster"
+    val pixels = if high: render_scene(out_w, out_h) else: render_scene_fast(out_w, out_h)
+    print "Rendered {pixels.len()} px"
+    val ppm_path = env_get("SIMPLE_DUMP_PPM") ?? ""
+    if ppm_path != "":
+        write_ppm(pixels, out_w, out_h, ppm_path)
+        print "Wrote framebuffer to {ppm_path}"
+    if not high:
+        ascii_preview(pixels, out_w, out_h)
+
+    if env_get("SIMPLE_GUI") != "1":
+        print "No GUI requested (use scripts/macos-gui-run.shs to open a window); headless only."
+        return 0
+
+    val lp = winit_loop_new()
+    if not lp.is_valid:
+        print "No GUI runtime available."
+        return 0
+    val win = winit_window_new(lp, win_w.to_i64(), win_h.to_i64(), "Simple — anti-aliased 2D shapes ({mode})")
+    if not win.is_valid:
+        print "Window creation failed."
+        winit_loop_free(lp)
+        return 0
+    val packed = pack_pixels(pixels)
+    winit_present_rgba(win, out_w.to_i64(), out_h.to_i64(), packed)
+    # Poll continuously (never sleep): the interpreter owns the main thread, so
+    # AppKit needs a handler between frames or the window never composites.
+    var running = true
+    var iters = 0
+    while running and iters < 2000000:
+        if winit_poll_close_requested(lp):
+            running = false
+        if iters % 200 == 0:
+            winit_present_rgba(win, out_w.to_i64(), out_h.to_i64(), packed)
+        iters = iters + 1
+    winit_window_free(win)
+    winit_loop_free(lp)
+    return 0

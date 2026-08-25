@@ -1,0 +1,16 @@
+pub fn _rv32_namespace_cmd_valid(nsid: i64, lba: i64, nblocks: i64, capacity_blocks: i64) -> i32:
+    if nsid != 1:
+        return 1
+    if lba < 0:
+        return 1
+    if nblocks <= 0:
+        return 1
+    if capacity_blocks <= 0:
+        return 1
+    if lba >= capacity_blocks:
+        return 1
+    if nblocks > capacity_blocks:
+        return 1
+    if lba > capacity_blocks - nblocks:
+        return 1
+    0

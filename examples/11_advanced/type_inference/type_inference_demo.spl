@@ -1,0 +1,170 @@
+#!/usr/bin/env simple
+# Type Inference Demo
+#
+# Demonstrates Simple's type inference capabilities enhanced in Phase 3.2:
+# - Pattern binding in comprehensions
+# - Pattern binding in match expressions
+# - Element type extraction for iterables
+
+# ============================================================================
+# Pattern Binding in List Comprehensions
+# ============================================================================
+
+fn demo_comprehension_patterns():
+    """Pattern binding extracts variables from complex iterables."""
+    print "=== List Comprehension Pattern Binding ==="
+
+    # Simple pattern: bind single variable
+    val numbers = [1, 2, 3, 4, 5]
+    val doubled = [for x in numbers: x * 2]
+    print "Doubled: {doubled}"
+
+    # Tuple pattern: bind multiple variables
+    val pairs = [(1, "one"), (2, "two"), (3, "three")]
+    val first_values = [for (num, _) in pairs: num]
+    print "First values: {first_values}"
+
+    # Filtered comprehension with pattern
+    val even_pairs = [for (num, name) in pairs if num % 2 == 0: name]
+    print "Even names: {even_pairs}"
+
+# ============================================================================
+# Pattern Binding in Match Expressions
+# ============================================================================
+
+enum Result<T>:
+    """Simple result type for demonstration."""
+    Ok(T)
+    Err(text)
+
+fn demo_match_patterns():
+    """Match expressions bind pattern variables with type inference."""
+    print ""
+    print "=== Match Expression Pattern Binding ==="
+
+    # Match with enum destructuring
+    val success = Result.Ok(42)
+    val failure = Result.Err("something went wrong")
+
+    val result1 = match success:
+        case Ok(value):
+            "Got value: {value}"
+        case Err(msg):
+            "Error: {msg}"
+
+    print result1
+
+    val result2 = match failure:
+        case Ok(value):
+            "Got value: {value}"
+        case Err(msg):
+            "Error: {msg}"
+
+    print result2
+
+# ============================================================================
+# Element Type Extraction
+# ============================================================================
+
+fn demo_element_extraction():
+    """Type system extracts element types from iterables."""
+    print ""
+    print "=== Element Type Extraction ==="
+
+    # Arrays: extract element type
+    val int_array = [1, 2, 3, 4, 5]
+    var sum = 0
+    for x in int_array:
+        # Type system infers x: i64 from array element type
+        sum = sum + x
+    print "Sum of array: {sum}"
+
+    # String iteration: elements are single characters
+    val message = "Hello"
+    print "Characters:"
+    for ch in message:
+        print "  {ch}"
+
+# ============================================================================
+# Nested Patterns
+# ============================================================================
+
+enum Tree:
+    """Binary tree for pattern matching demo."""
+    Leaf(i64)
+    Node(Tree, i64, Tree)
+
+fn sum_tree(tree: Tree) -> i64:
+    """Recursively sum tree using pattern matching."""
+    match tree:
+        case Leaf(value):
+            value
+        case Node(left, value, right):
+            # Pattern binds left, value, right variables
+            sum_tree(left) + value + sum_tree(right)
+
+fn demo_nested_patterns():
+    """Complex nested pattern binding."""
+    print ""
+    print "=== Nested Pattern Matching ==="
+
+    val tree = Tree.Node(
+        Tree.Leaf(1),
+        10,
+        Tree.Node(Tree.Leaf(2), 20, Tree.Leaf(3))
+    )
+
+    val total = sum_tree(tree)
+    print "Tree sum: {total}"  # 1 + 10 + 2 + 20 + 3 = 36
+
+# ============================================================================
+# Type Inference with Lambdas
+# ============================================================================
+
+fn demo_lambda_inference():
+    """Lambda parameters infer types from context."""
+    print ""
+    print "=== Lambda Type Inference ==="
+
+    val numbers = [1, 2, 3, 4, 5]
+
+    # Lambda parameter x infers type from numbers
+    val squares = numbers.map(_1 * _1)
+    print "Squares: {squares}"
+
+    # Filter with inferred bool return type
+    val evens = numbers.filter(_ % 2 == 0)
+    print "Evens: {evens}"
+
+    # Chained operations
+    val result = numbers
+        .filter(_ > 2)
+        .map(_ * 10)
+    print "Filtered and scaled: {result}"
+
+# ============================================================================
+# Main Demo
+# ============================================================================
+
+fn main():
+    print "Type Inference Demonstration"
+    print "Enhanced in Phase 3.2 (Type System Helpers)"
+    print ""
+
+    demo_comprehension_patterns()
+    demo_match_patterns()
+    demo_element_extraction()
+    demo_nested_patterns()
+    demo_lambda_inference()
+
+    print ""
+    print "✓ All type inference demos completed"
+    print ""
+    print "Key features demonstrated:"
+    print "  - Pattern binding in comprehensions"
+    print "  - Pattern binding in match expressions"
+    print "  - Element type extraction from iterables"
+    print "  - Nested pattern destructuring"
+    print "  - Lambda type inference from context"
+
+main()

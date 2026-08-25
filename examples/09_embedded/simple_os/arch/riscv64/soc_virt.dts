@@ -1,0 +1,100 @@
+/dts-v1/;
+
+/*
+ * Device tree for the Simple-generated RV64 K26 product SoC.
+ *
+ * Matches the SoC exactly as of soc_top_64.spl:
+ *   - 1 hart, rv64imac with S/U mode, Sv39, and PMP
+ *   - DDR     @ 0x8000_0000  (256 MiB)
+ *   - CLINT   @ 0x0200_0000  (msip / mtimecmp / mtime)
+ *   - PLIC    @ 0x0C00_0000  (riscv,plic0; UART source 10;
+ *                             M-mode and S-mode contexts)
+ *   - UART    @ 0x1000_0000  (ns16550a, byte-wide regs, PLIC source 10)
+ *
+ * The product CPU resets directly to OpenSBI at 0x8000_0000. OpenSBI enters
+ * Linux at 0x8020_0000 and uses the fixed DTB address 0x8800_0000.
+ *
+ * The ZynqMP PL clock, CLINT, and UART all run at 100 MHz.
+ */
+
+/ {
+	#address-cells = <2>;
+	#size-cells = <2>;
+	compatible = "simple,soc-virt";
+	model = "simple-soc-rv64";
+
+	chosen {
+		bootargs = "console=ttyS0,115200 earlycon=ns16550a,mmio,0x10000000";
+		stdout-path = "/soc/uart@10000000";
+		/* Valid defaults for direct dtc use. build_rv64_linux_assets.shs
+		 * replaces both cells in a temporary copy after compression. */
+		linux,initrd-start = <0x0 0x88200000>;
+		linux,initrd-end   = <0x0 0x8820033d>;
+	};
+
+	memory@80000000 {
+		device_type = "memory";
+		/* 256 MiB; must match the generated Wishbone and K26 DDR windows. */
+		reg = <0x0 0x80000000 0x0 0x10000000>;
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		timebase-frequency = <100000000>;
+
+		cpu0: cpu@0 {
+			device_type = "cpu";
+			reg = <0>;
+			status = "okay";
+			compatible = "riscv";
+			riscv,isa = "rv64imac";
+			mmu-type = "riscv,sv39";
+
+			cpu0_intc: interrupt-controller {
+				#interrupt-cells = <1>;
+				interrupt-controller;
+				compatible = "riscv,cpu-intc";
+			};
+		};
+	};
+
+	soc {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		compatible = "simple-bus";
+		ranges;
+
+		clint0: clint@2000000 {
+			compatible = "riscv,clint0";
+			reg = <0x0 0x2000000 0x0 0x10000>;
+			/* 3 = M-mode software irq (msip), 7 = M-mode timer irq */
+			interrupts-extended = <&cpu0_intc 3 &cpu0_intc 7>;
+		};
+
+		plic0: plic@c000000 {
+			compatible = "riscv,plic0";
+			reg = <0x0 0xc000000 0x0 0x00400000>;
+			#address-cells = <0>;
+			#interrupt-cells = <1>;
+			interrupt-controller;
+			/* The generated PLIC implements UART source 10. */
+			riscv,ndev = <10>;
+			interrupts-extended = <&cpu0_intc 11 &cpu0_intc 9>;
+		};
+
+		uart0: uart@10000000 {
+			compatible = "ns16550a";
+			reg = <0x0 0x10000000 0x0 0x100>;
+			/* Byte-wide registers at byte offsets (IER=+1, LSR=+5) */
+			reg-shift = <0>;
+			reg-io-width = <1>;
+			/* PLIC source 10 */
+			interrupts = <10>;
+			interrupt-parent = <&plic0>;
+			clock-frequency = <100000000>;
+			current-speed = <115200>;
+			status = "okay";
+		};
+	};
+};

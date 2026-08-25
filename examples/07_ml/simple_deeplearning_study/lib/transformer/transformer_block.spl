@@ -1,0 +1,47 @@
+# Transformer Block — from scratch
+# Chapter 4: "Build a Large Language Model From Scratch" (Rasbt)
+#
+# Pre-norm architecture (GPT-2 style):
+#   x = x + MHA(LayerNorm(x))
+#   x = x + FFN(LayerNorm(x))
+#
+# Uses pre-normalization (norm before sublayer) rather than post-norm.
+
+use std.pure.tensor.{PureTensor, tensor_from_data}
+use std.pure.tensor_ops.{add}
+use examples.simple_deeplearning_study.lib.prim.layer_norm.{StudyLayerNorm}
+use examples.simple_deeplearning_study.lib.attention.multi_head_attention.{StudyMultiHeadAttention}
+use examples.simple_deeplearning_study.lib.transformer.feed_forward.{StudyFeedForward}
+
+class StudyTransformerBlock:
+    ln1: StudyLayerNorm               # Pre-attention norm
+    mha: StudyMultiHeadAttention      # Multi-head attention
+    ln2: StudyLayerNorm               # Pre-FFN norm
+    ffn: StudyFeedForward             # Feed-forward network
+
+    static fn create(d_model: i64, num_heads: i64, drop_rate: f64) -> StudyTransformerBlock:
+        StudyTransformerBlock(
+            ln1: StudyLayerNorm.create(d_model),
+            mha: StudyMultiHeadAttention.create(d_model, num_heads, drop_rate),
+            ln2: StudyLayerNorm.create(d_model),
+            ffn: StudyFeedForward.create(d_model, d_model * 4, drop_rate)
+        )
+
+    # Forward: x [seq_len, d_model] -> [seq_len, d_model]
+    fn forward(x: PureTensor<f64>) -> PureTensor<f64>:
+        # Sub-layer 1: Multi-Head Attention with residual
+        val normed1 = self.ln1.forward(x)
+        val attn_out = self.mha.forward(normed1)
+        var out = add(x, attn_out)      # Residual connection
+
+        # Sub-layer 2: Feed-Forward with residual
+        val normed2 = self.ln2.forward(out)
+        val ff_out = self.ffn.forward(normed2)
+        out = add(out, ff_out)           # Residual connection
+
+        out
+
+fn study_transformer_block_create(d_model: i64, num_heads: i64, drop_rate: f64) -> StudyTransformerBlock:
+    StudyTransformerBlock.create(d_model, num_heads, drop_rate)
+
+export StudyTransformerBlock, study_transformer_block_create

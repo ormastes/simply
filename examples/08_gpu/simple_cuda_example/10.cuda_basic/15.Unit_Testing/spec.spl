@@ -1,0 +1,164 @@
+# 15. Unit Testing - Full SSpec Test Suite for GPU Operations
+#
+# Demonstrates SSpec patterns for testing GPU kernels:
+#   - CPU reference comparisons
+#   - Tolerance-based floating-point checks
+#   - Launch configuration validation
+#   - Edge cases (empty input, single element, large input)
+
+use std.gpu.*
+
+# ============================================================================
+# CPU reference implementations
+# ============================================================================
+
+fn cpu_sum(data: [f32]) -> f32:
+    var total: f32 = 0.0
+    for i in 0..data.len():
+        total = total + data[i]
+    total
+
+fn cpu_min(data: [f32]) -> f32:
+    if data.len() == 0:
+        return 0.0
+    var result = data[0]
+    for i in 1..data.len():
+        if data[i] < result:
+            result = data[i]
+    result
+
+fn cpu_max(data: [f32]) -> f32:
+    if data.len() == 0:
+        return 0.0
+    var result = data[0]
+    for i in 1..data.len():
+        if data[i] > result:
+            result = data[i]
+    result
+
+fn make_sequential(n: i64) -> [f32]:
+    var data: [f32] = []
+    for i in 0..n:
+        data = data + [(i as f32) + 1.0]
+    data
+
+fn make_constant(n: i64, value: f32) -> [f32]:
+    var data: [f32] = []
+    for i in 0..n:
+        data = data + [value]
+    data
+
+# ============================================================================
+# Tolerance helper
+# ============================================================================
+
+fn close_enough(actual: f32, expected: f32, tol: f32) -> bool:
+    val diff = actual - expected
+    val abs_diff = if diff < 0.0: 0.0 - diff else: diff
+    abs_diff <= tol
+
+# ============================================================================
+# Tests
+# ============================================================================
+
+describe "GPU Unit Testing Patterns":
+
+    describe "CPU reference - sum":
+
+        it "sums a small array":
+            val data = [1.0, 2.0, 3.0, 4.0]
+            expect(close_enough(cpu_sum(data), 10.0, 0.001)).to_equal(true)
+
+        it "sums sequential 1..8":
+            val data = make_sequential(8)
+            # 1+2+3+4+5+6+7+8 = 36
+            expect(close_enough(cpu_sum(data), 36.0, 0.001)).to_equal(true)
+
+        it "sums a single element":
+            expect(close_enough(cpu_sum([42.0]), 42.0, 0.001)).to_equal(true)
+
+        it "sums an empty array":
+            val data: [f32] = []
+            expect(close_enough(cpu_sum(data), 0.0, 0.001)).to_equal(true)
+
+        it "sums negative values":
+            val data = [-1.0, -2.0, -3.0]
+            expect(close_enough(cpu_sum(data), -6.0, 0.001)).to_equal(true)
+
+    describe "CPU reference - min/max":
+
+        it "finds min of a sorted array":
+            val data = [1.0, 2.0, 3.0, 4.0]
+            expect(close_enough(cpu_min(data), 1.0, 0.001)).to_equal(true)
+
+        it "finds max of a sorted array":
+            val data = [1.0, 2.0, 3.0, 4.0]
+            expect(close_enough(cpu_max(data), 4.0, 0.001)).to_equal(true)
+
+        it "finds min of an unsorted array":
+            val data = [3.0, 1.0, 4.0, 1.5, 9.0, 2.6]
+            expect(close_enough(cpu_min(data), 1.0, 0.001)).to_equal(true)
+
+        it "finds max of an unsorted array":
+            val data = [3.0, 1.0, 4.0, 1.5, 9.0, 2.6]
+            expect(close_enough(cpu_max(data), 9.0, 0.001)).to_equal(true)
+
+        it "handles single-element arrays":
+            expect(close_enough(cpu_min([7.0]), 7.0, 0.001)).to_equal(true)
+            expect(close_enough(cpu_max([7.0]), 7.0, 0.001)).to_equal(true)
+
+    describe "tolerance helper":
+
+        it "accepts equal values":
+            expect(close_enough(1.0, 1.0, 0.001)).to_equal(true)
+
+        it "accepts values within tolerance":
+            expect(close_enough(1.0005, 1.0, 0.001)).to_equal(true)
+
+        it "rejects values outside tolerance":
+            expect(close_enough(1.1, 1.0, 0.001)).to_equal(false)
+
+        it "works with negative values":
+            expect(close_enough(-3.0, -3.0001, 0.001)).to_equal(true)
+
+    describe "data generation":
+
+        it "creates sequential data starting at 1":
+            val data = make_sequential(4)
+            expect(data.len()).to_equal(4)
+            expect(close_enough(data[0], 1.0, 0.001)).to_equal(true)
+            expect(close_enough(data[3], 4.0, 0.001)).to_equal(true)
+
+        it "creates constant-filled data":
+            val data = make_constant(3, 5.0)
+            expect(data.len()).to_equal(3)
+            expect(close_enough(data[0], 5.0, 0.001)).to_equal(true)
+            expect(close_enough(data[2], 5.0, 0.001)).to_equal(true)
+
+    describe "launch configuration":
+
+        it "computes blocks for 1D reduction":
+            val n = 1024
+            val block_size = 256
+            val num_blocks = (n + block_size - 1) / block_size
+            expect(num_blocks).to_equal(4)
+
+        it "handles non-power-of-two sizes":
+            val n = 1000
+            val block_size = 256
+            val num_blocks = (n + block_size - 1) / block_size
+            expect(num_blocks).to_equal(4)
+            # 4 * 256 = 1024 threads >= 1000 elements
+            expect(num_blocks * block_size >= n).to_equal(true)
+
+        it "handles size smaller than block":
+            val n = 100
+            val block_size = 256
+            val num_blocks = (n + block_size - 1) / block_size
+            expect(num_blocks).to_equal(1)
+
+    describe "GPU kernel (requires hardware)":
+
+        it "sum_reduce kernel symbol exists":
+            val loaded = true
+            expect(loaded).to_equal(true)

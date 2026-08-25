@@ -1,0 +1,59 @@
+# Minimal standalone freestanding repro for
+# doc/08_tracking/bug/freestanding_text_concat_chain_drops_operands_2026-08-05.md
+#
+# Two `_start` checks, asserted via serial output (same mechanism
+# gui_entry_desktop.spl / memory_leveling_qemu_entry.spl use -- extern
+# serial_println):
+#   1. `build_chain`: a text `+` chain with 3+ operands (`a + ":" + b +
+#      "\n"`) over plain `text`-typed locals. This case was ALWAYS correct
+#      (both operands of the middle `+` are STRING-typed, so MIR routes it
+#      through `rt_string_concat` directly).
+#   2. `build_chain_substring`: mirrors the actual field bug's call shape --
+#      `name`/`prop_val` come from `.substring(...).trim()` with no explicit
+#      `text` annotation, so they infer `TypeId::ANY`. The middle `+`
+#      (ANY + ANY) then routes through `rt_any_add`, whose freestanding
+#      implementation (`examples/09_embedded/simple_os/arch/*/boot/
+#      baremetal_stubs.c`) used to do raw `left + right` pointer arithmetic
+#      instead of checking the heap tag and dispatching to
+#      `rt_string_concat` -- silently dropping the concatenated text. Fixed
+#      2026-08-05.
+#
+# Build with the same flags as scripts/check/check-simpleos-wm-fullscreen-
+# evidence.shs (--backend cranelift --target x86_64-unknown-none), then run
+# under QEMU and grep the serial log for the PASS/FAIL markers below.
+
+extern fn serial_println(msg: text)
+
+fn build_chain(a: text, b: text) -> text:
+    val r = a + ":" + b + "\n"
+    return r
+
+fn build_chain_substring(body: text, dd: i64, colon: i64, semi: i64) -> text:
+    # Mirrors the real bug's call shape: `name`/`prop_val` are
+    # `.substring(...).trim()` results (slice-derived), not fresh literals,
+    # exactly as in `_css_collect_custom_props`'s
+    # `name + ":" + prop_val + "\n"`.
+    val name = body.substring(dd, colon).trim()
+    val prop_val = body.substring(colon + 1, semi).trim()
+    val entry = name + ":" + prop_val + "\n"
+    return entry
+
+fn _start():
+    val a = "hello"
+    val b = "world"
+    val r = build_chain(a, b)
+    val n = r.len()
+    serial_println("[concat-probe] len=" + n.to_string() + " val=" + r)
+    if n == 12:
+        serial_println("[concat-probe] PASS")
+    else:
+        serial_println("[concat-probe] FAIL")
+
+    val body = "  --radius-sm:8px;"
+    val e = build_chain_substring(body, 2, 13, 17)
+    val en = e.len()
+    serial_println("[concat-probe-slice] len=" + en.to_string() + " val=" + e)
+    if en == 16:
+        serial_println("[concat-probe-slice] PASS")
+    else:
+        serial_println("[concat-probe-slice] FAIL")

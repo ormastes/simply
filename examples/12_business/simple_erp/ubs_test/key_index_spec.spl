@@ -1,0 +1,60 @@
+# @cover src/kernel/key_index.spl 80%
+"""
+# Key Index — indexed idempotency membership
+
+Idempotency keys are checked on every write, so membership must be cheap. A
+16-bucket hash index answers has/add in O(bucket). Adds are idempotent, keys
+that collide in one bucket are both found, and a volume loop of adds and misses
+resolves correctly.
+"""
+
+use std.spec
+use kernel.key_index.{KeyIndex, key_index_new, key_hash, key_index_has, key_index_add}
+
+describe "Key index — add / has":
+    it "reports a hit after add and a miss otherwise":
+        var idx = key_index_new()
+        idx = key_index_add(idx, "sale-1")
+        expect(key_index_has(idx, "sale-1")).to_equal(true)
+        expect(key_index_has(idx, "sale-2")).to_equal(false)
+
+    it "treats a duplicate add as idempotent":
+        var idx = key_index_new()
+        idx = key_index_add(idx, "dup")
+        idx = key_index_add(idx, "dup")
+        expect(key_index_has(idx, "dup")).to_equal(true)
+        # a second add of a present key is a no-op, not a second entry
+        idx = key_index_add(idx, "other")
+        expect(key_index_has(idx, "other")).to_equal(true)
+
+describe "Key index — bucket collisions":
+    it "finds two colliding keys in the same bucket":
+        # "ab" and "ba" have the same char-code sum, hence the same bucket.
+        expect(key_hash("ab")).to_equal(key_hash("ba"))
+        var idx = key_index_new()
+        idx = key_index_add(idx, "ab")
+        idx = key_index_add(idx, "ba")
+        expect(key_index_has(idx, "ab")).to_equal(true)
+        expect(key_index_has(idx, "ba")).to_equal(true)
+
+describe "Key index — volume":
+    it "finds all 200 added keys and rejects 200 absent keys":
+        var idx = key_index_new()
+        var i = 0
+        while i < 200:
+            idx = key_index_add(idx, "key{i}")
+            i = i + 1
+        var all_found = true
+        var j = 0
+        while j < 200:
+            if !key_index_has(idx, "key{j}"):
+                all_found = false
+            j = j + 1
+        expect(all_found).to_equal(true)
+        var none_found = true
+        var m = 0
+        while m < 200:
+            if key_index_has(idx, "absent{m}"):
+                none_found = false
+            m = m + 1
+        expect(none_found).to_equal(true)

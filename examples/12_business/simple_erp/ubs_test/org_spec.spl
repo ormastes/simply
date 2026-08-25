@@ -1,0 +1,67 @@
+# @cover src/framework/org.spl 80%
+"""
+# Org Model — roles and approval chains as registry data
+
+Roles and ordered approval chains are registered DATA, mirroring the lane
+registry pattern: default roles reproduce the admin/operator/auditor
+semantics, custom roles are a plain registration, and chains are strictly
+order-sensitive.
+"""
+
+use std.spec
+use framework.registry.{default_lanes, lane_def}
+use framework.org.{RoleDef, role_def, role_def_with, default_roles, org_role_can, ApprovalChain, chain_satisfied, chain_next}
+
+describe "Org — default roles mirror admin/operator/auditor semantics":
+    it "lets operator write a registered lane action but not an unregistered one":
+        val roles = default_roles()
+        val lanes = default_lanes()
+        assert_true(org_role_can(roles, lanes, "operator", "sale.write"))
+        assert_false(org_role_can(roles, lanes, "operator", "clinic.write"))
+
+    it "keeps auditor read-only":
+        val roles = default_roles()
+        val lanes = default_lanes()
+        assert_true(org_role_can(roles, lanes, "auditor", "audit.read"))
+        assert_true(org_role_can(roles, lanes, "auditor", "report.read"))
+        assert_false(org_role_can(roles, lanes, "auditor", "sale.write"))
+
+    it "lets admin write registered lanes and its extra actions":
+        val roles = default_roles()
+        val lanes = default_lanes()
+        assert_true(org_role_can(roles, lanes, "admin", "sale.write"))
+        assert_true(org_role_can(roles, lanes, "admin", "ledger.close"))
+
+describe "Org — custom roles via registry data":
+    it "grants a custom read-only role its registered extra action":
+        var extra: [text] = []
+        extra.push("report.read")
+        var roles = default_roles()
+        roles.push(role_def_with("clerk", false, extra))
+        val lanes = default_lanes()
+        assert_true(org_role_can(roles, lanes, "clerk", "report.read"))
+        assert_false(org_role_can(roles, lanes, "clerk", "sale.write"))
+
+    it "denies unknown roles regardless of action":
+        val roles = default_roles()
+        val lanes = default_lanes()
+        assert_false(org_role_can(roles, lanes, "ghost", "sale.write"))
+        assert_false(org_role_can(roles, lanes, "ghost", "report.read"))
+
+describe "Org — approval chains are order-sensitive":
+    it "is satisfied only when approvals match required order exactly":
+        val chain = ApprovalChain { required_roles: ["manager", "finance"] }
+        assert_true(chain_satisfied(chain, ["manager", "finance"]))
+        assert_false(chain_satisfied(chain, ["finance", "manager"]))
+
+    it "reports the next required role and empties out once satisfied":
+        val chain = ApprovalChain { required_roles: ["manager", "finance"] }
+        var empty: [text] = []
+        expect(chain_next(chain, empty)).to_equal("manager")
+        var one: [text] = []
+        one.push("manager")
+        expect(chain_next(chain, one)).to_equal("finance")
+        var two: [text] = []
+        two.push("manager")
+        two.push("finance")
+        expect(chain_next(chain, two)).to_equal("")

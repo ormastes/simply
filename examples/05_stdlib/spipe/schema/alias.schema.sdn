@@ -1,0 +1,12 @@
+schema: spipe.alias
+version: 1
+record: alias
+identity: value_kind_scope_target
+fields:
+  value: alias_text
+  kind: enum(artifact_key,section_key,heading_slug,canonical_path,feature,component,layer,tag,project_key)
+  target_uid: opaque_uid
+  project_uid: opaque_uid(P)|null
+  status: enum(active,deprecated)
+  created_at_revision: immutable_revision|null
+  replaced_by: alias_text|null

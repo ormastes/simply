@@ -1,0 +1,188 @@
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { spawnSync } from "node:child_process";
+import test from "node:test";
+import {
+  ALPHABETIC_RANGES, DECIMAL_NUMBER_RANGES, MARK_RANGES, CASED_RANGES,
+  CASE_IGNORABLE_RANGES, CANONICAL_COMBINING_CLASS, CANONICAL_DECOMPOSITIONS,
+  CANONICAL_COMPOSITIONS, DEFAULT_LOWERCASE, HANGUL_NFC, UNICODE_TABLE_METADATA,
+  unicodeIsAlphabetic, unicodeIsDecimalNumber, unicodeIsMark, unicodeIsTokenCodePoint,
+  unicodeCanonicalCombiningClass, unicodeNormalizeNfc, unicodeDefaultLowercase
+} from "../../src/search/generated/unicode_17_0_0.js";
+
+const root = resolve(import.meta.dirname, "../../../../..");
+const fixture = resolve(import.meta.dirname, "../fixture/wave4_search");
+const manifestPath = join(fixture, "unicode_17_0_0_manifest.json");
+const sourceDir = resolve(root, "examples/05_stdlib/spipe/tools/unicode/ucd/17.0.0");
+const generator = resolve(root, "examples/05_stdlib/spipe/tools/unicode/generate_unicode_tables.mjs");
+const sha = (bytes) => createHash("sha256").update(bytes).digest("hex");
+const cpText = (values) => String.fromCodePoint(...values);
+
+const rangeContains = (ranges, cp) => {
+  let lo = 0, hi = ranges.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >>> 1, range = ranges[mid];
+    if (cp < range[0]) hi = mid - 1;
+    else if (cp > range[1]) lo = mid + 1;
+    else return true;
+  }
+  return false;
+};
+const cccMap = new Map(CANONICAL_COMBINING_CLASS);
+const decompositionMap = new Map(CANONICAL_DECOMPOSITIONS);
+const compositionMap = new Map(CANONICAL_COMPOSITIONS.map(([a, b, c]) => [`${a}:${b}`, c]));
+const lowercaseMap = new Map(DEFAULT_LOWERCASE.map(([cp, mapping, conditional_mapping, condition]) => [cp, { mapping, conditional_mapping, condition }]));
+const ccc = (cp) => cccMap.get(cp) ?? 0;
+
+function decomposeOne(cp, output) {
+  const h = HANGUL_NFC;
+  const sIndex = cp - h.s_base, nCount = h.v_count * h.t_count, sCount = h.l_count * nCount;
+  if (sIndex >= 0 && sIndex < sCount) {
+    output.push(h.l_base + Math.floor(sIndex / nCount), h.v_base + Math.floor((sIndex % nCount) / h.t_count));
+    if (sIndex % h.t_count) output.push(h.t_base + (sIndex % h.t_count));
+    return;
+  }
+  const mapping = decompositionMap.get(cp);
+  if (mapping) for (const part of mapping) decomposeOne(part, output);
+  else output.push(cp);
+}
+
+function canonicalOrder(values) {
+  for (let i = 1; i < values.length; i++) {
+    const cls = ccc(values[i]);
+    if (!cls) continue;
+    let j = i;
+    while (j > 0 && ccc(values[j - 1]) > cls) {
+      [values[j - 1], values[j]] = [values[j], values[j - 1]];
+      j--;
+    }
+  }
+  return values;
+}
+
+function composePair(a, b) {
+  const h = HANGUL_NFC, nCount = h.v_count * h.t_count;
+  const lIndex = a - h.l_base, vIndex = b - h.v_base;
+  if (lIndex >= 0 && lIndex < h.l_count && vIndex >= 0 && vIndex < h.v_count)
+    return h.s_base + (lIndex * h.v_count + vIndex) * h.t_count;
+  const sIndex = a - h.s_base, tIndex = b - h.t_base;
+  if (sIndex >= 0 && sIndex < h.l_count * nCount && sIndex % h.t_count === 0 && tIndex > 0 && tIndex < h.t_count)
+    return a + tIndex;
+  return compositionMap.get(`${a}:${b}`);
+}
+
+function nfc(text) {
+  const decomposed = [];
+  for (const cp of [...text].map((v) => v.codePointAt(0))) decomposeOne(cp, decomposed);
+  canonicalOrder(decomposed);
+  if (!decomposed.length) return "";
+  const output = [decomposed[0]];
+  let starterIndex = 0, starter = output[0], lastClass = 0;
+  for (let i = 1; i < decomposed.length; i++) {
+    const cp = decomposed[i], cls = ccc(cp), composite = composePair(starter, cp);
+    if (composite !== undefined && (lastClass < cls || lastClass === 0)) {
+      output[starterIndex] = starter = composite;
+    } else {
+      if (cls === 0) { starterIndex = output.length; starter = cp; }
+      output.push(cp);
+      lastClass = cls;
+    }
+  }
+  return cpText(output);
+}
+
+function finalSigma(values, index) {
+  let before = false;
+  for (let i = index - 1; i >= 0; i--) {
+    if (rangeContains(CASE_IGNORABLE_RANGES, values[i])) continue;
+    before = rangeContains(CASED_RANGES, values[i]); break;
+  }
+  if (!before) return false;
+  for (let i = index + 1; i < values.length; i++) {
+    if (rangeContains(CASE_IGNORABLE_RANGES, values[i])) continue;
+    return !rangeContains(CASED_RANGES, values[i]);
+  }
+  return true;
+}
+
+function defaultLower(text) {
+  const values = [...nfc(text)].map((v) => v.codePointAt(0)), output = [];
+  for (let i = 0; i < values.length; i++) {
+    const entry = lowercaseMap.get(values[i]);
+    if (!entry) output.push(values[i]);
+    else if (entry.condition === "Final_Sigma" && finalSigma(values, i)) output.push(...entry.conditional_mapping);
+    else output.push(...entry.mapping);
+  }
+  return nfc(cpText(output));
+}
+
+test("manifest pins official UCD sources, generator, license, and generated bytes", () => {
+  const manifest = JSON.parse(readFileSync(manifestPath));
+  assert.equal(manifest.unicode_version, "17.0.0");
+  assert.equal(manifest.license.spdx, "Unicode-3.0");
+  assert.equal(manifest.contracts.case_folding_used, false);
+  assert.equal(manifest.generator.sha256, sha(readFileSync(generator)));
+  for (const source of manifest.sources) assert.equal(source.sha256, sha(readFileSync(join(sourceDir, source.name))));
+  for (const generated of manifest.generated) assert.equal(generated.sha256, sha(readFileSync(resolve(root, generated.file))));
+  assert.equal(UNICODE_TABLE_METADATA.generator_sha256, manifest.generator.sha256);
+});
+
+test("checked-in tables regenerate byte-for-byte without host Unicode semantics", () => {
+  const dir = mkdtempSync(join(tmpdir(), "spipe-ucd17-"));
+  try {
+    const js = join(dir, "unicode.js"), simple = join(dir, "unicode.spl"), manifest = join(dir, "manifest.json");
+    const run = spawnSync(process.execPath, [generator, "--ucd-dir", sourceDir, "--js-out", js, "--simple-out", simple, "--manifest-out", manifest], { encoding: "utf8" });
+    assert.equal(run.status, 0, run.stderr);
+    assert.deepEqual(readFileSync(js), readFileSync(resolve(root, "examples/05_stdlib/spipe/src/search/generated/unicode_17_0_0.js")));
+    assert.deepEqual(readFileSync(simple), readFileSync(resolve(root, "src/lib/common/search/generated/unicode_17_0_0.spl")));
+    assert.deepEqual(readFileSync(manifest), readFileSync(manifestPath));
+    assert.doesNotMatch(readFileSync(generator, "utf8"), /\.normalize\s*\(/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("table-driven NFC passes the complete UCD 17 normalization corpus", () => {
+  const corpus = readFileSync(join(sourceDir, "NormalizationTest.txt"), "utf8");
+  let cases = 0;
+  for (const raw of corpus.split(/\r?\n/)) {
+    const line = raw.replace(/#.*/, "").trim();
+    if (!line || line.startsWith("@")) continue;
+    const [c1, c2, c3, c4, c5] = line.split(";").slice(0, 5).map((field) => cpText(field.trim().split(/\s+/).filter(Boolean).map((v) => Number.parseInt(v, 16))));
+    assert.equal(nfc(c1), c2, `NFC(c1) at case ${cases}`);
+    assert.equal(nfc(c2), c2, `NFC(c2) at case ${cases}`);
+    assert.equal(nfc(c3), c2, `NFC(c3) at case ${cases}`);
+    assert.equal(nfc(c4), c4, `NFC(c4) at case ${cases}`);
+    assert.equal(nfc(c5), c4, `NFC(c5) at case ${cases}`);
+    assert.equal(unicodeNormalizeNfc(c1), c2, `generated NFC(c1) at case ${cases}`);
+    cases++;
+  }
+  assert.ok(cases > 19000, `expected complete corpus, got ${cases}`);
+});
+
+test("default lowercase and token categories use only pinned tables", () => {
+  assert.equal(defaultLower("ΟΣ"), "ος");
+  assert.equal(defaultLower("ΟΣΑ"), "οσα");
+  assert.equal(defaultLower("İ"), "i\u0307");
+  assert.equal(defaultLower("A\u030A"), "å");
+  for (const cp of [0x41, 0x03B1, 0x4E00]) assert.equal(rangeContains(ALPHABETIC_RANGES, cp), true);
+  assert.equal(rangeContains(DECIMAL_NUMBER_RANGES, 0x0665), true);
+  assert.equal(rangeContains(MARK_RANGES, 0x0301), true);
+  assert.equal(rangeContains(ALPHABETIC_RANGES, 0x11DB0), true, "Unicode 17 Tolong Siki proves the pinned revision");
+});
+
+test("generated adapter API matches the independent table harness", () => {
+  for (const sample of ["", "ASCII", "A\u030A", "ΟΣ", "ΟΣΑ", "İ", "각", "\u0F73"] ) {
+    assert.equal(unicodeNormalizeNfc(sample), nfc(sample));
+    assert.equal(unicodeDefaultLowercase(sample), defaultLower(sample));
+  }
+  for (const cp of [0, 0x41, 0x5F, 0x301, 0x665, 0x11DB0, 0x10FFFF]) {
+    assert.equal(unicodeIsAlphabetic(cp), rangeContains(ALPHABETIC_RANGES, cp));
+    assert.equal(unicodeIsDecimalNumber(cp), rangeContains(DECIMAL_NUMBER_RANGES, cp));
+    assert.equal(unicodeIsMark(cp), rangeContains(MARK_RANGES, cp));
+    assert.equal(unicodeIsTokenCodePoint(cp), cp === 0x5F || rangeContains(ALPHABETIC_RANGES, cp) || rangeContains(DECIMAL_NUMBER_RANGES, cp) || rangeContains(MARK_RANGES, cp));
+    assert.equal(unicodeCanonicalCombiningClass(cp), ccc(cp));
+  }
+  assert.throws(() => unicodeNormalizeNfc("\uD800"), /Unicode scalar/);
+});

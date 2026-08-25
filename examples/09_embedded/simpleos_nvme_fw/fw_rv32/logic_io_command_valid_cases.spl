@@ -1,0 +1,14 @@
+use logic_io_command_core.*
+
+fn rv32_io_command_valid_cases_selftest() -> i32:
+    if _rv32_io_command_valid(1, 1, 0, 1, 7) != 0:
+        return 1
+    if _rv32_io_command_valid(2, 2, 0, 1, 0) != 0:
+        return 1
+    if _rv32_io_command_valid(3, 0, 0, 0, 0) != 0:
+        return 1
+    if _rv32_io_command_valid(4, 8, 3071, 1, 0) != 0:
+        return 1
+    if _rv32_io_command_valid(5, 9, 10, 1, 0) != 0:
+        return 1
+    0

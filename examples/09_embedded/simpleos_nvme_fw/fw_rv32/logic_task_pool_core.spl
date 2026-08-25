@@ -1,0 +1,26 @@
+fn _rv32_task_pool_acquire_valid(cap: i64, live: i64, slot_used: i64, slot_gen: i64) -> i32:
+    if cap <= 0:
+        return 0
+    if live < 0:
+        return 0
+    if live >= cap:
+        return 0
+    if slot_used != 0:
+        return 0
+    if slot_gen < 0:
+        return 0
+    if slot_gen >= 2147483647:
+        return 0
+    1
+
+pub fn _rv32_task_pool_write_status(cmd_status: i64, cap: i64, live: i64, slot_used: i64, slot_gen: i64) -> i64:
+    if cmd_status != 0:
+        return cmd_status
+    if _rv32_task_pool_acquire_valid(cap, live, slot_used, slot_gen) == 0:
+        return 130
+    0
+
+pub fn _rv32_task_pool_write_data(prev: i64, new_data: i64, status: i64) -> i64:
+    if status != 0:
+        return prev
+    new_data

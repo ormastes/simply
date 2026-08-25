@@ -1,0 +1,116 @@
+app:
+    title: "Theme Showcase"
+    theme: glass_dark
+
+layout:
+    type: vbox
+    id: root
+    children:
+        menu:
+            type: menubar
+            id: menu
+            items:
+                0:
+                    label: "Theme"
+                1:
+                    label: "Widgets"
+                2:
+                    label: "Help"
+        content:
+            type: hbox
+            id: content
+            children:
+                left_panel:
+                    type: panel
+                    id: left_panel
+                    title: "Navigation"
+                    width: 25
+                    children:
+                        nav_list:
+                            type: list
+                            id: nav_list
+                            items:
+                                0:
+                                    label: "Home"
+                                1:
+                                    label: "Settings"
+                                2:
+                                    label: "Profile"
+                                3:
+                                    label: "Logs"
+                                4:
+                                    label: "About"
+                        nav_tabs:
+                            type: tabs
+                            id: nav_tabs
+                            items:
+                                0:
+                                    label: "Tab A"
+                                1:
+                                    label: "Tab B"
+                                2:
+                                    label: "Tab C"
+                right_panel:
+                    type: panel
+                    id: right_panel
+                    title: "Widget Gallery"
+                    flex: 1
+                    children:
+                        gallery_header:
+                            type: text
+                            id: gallery_header
+                            content: "All widgets with current theme"
+                        sep1:
+                            type: divider
+                            id: sep1
+                        primary_btn:
+                            type: button
+                            id: primary_btn
+                            label: "Primary Action"
+                            action: "primary"
+                        opt_enabled:
+                            type: checkbox
+                            id: opt_enabled
+                            label: "Option enabled"
+                            checked: true
+                        opt_disabled:
+                            type: checkbox
+                            id: opt_disabled
+                            label: "Option disabled"
+                            checked: false
+                        text_input:
+                            type: input
+                            id: text_input
+                            placeholder: "Type here..."
+                        load_progress:
+                            type: progress
+                            id: load_progress
+                            value: 60
+                        sep2:
+                            type: divider
+                            id: sep2
+                        file_tree:
+                            type: tree
+                            id: file_tree
+                            children:
+                                folder_a:
+                                    type: treenode
+                                    id: folder_a
+                                    label: "Folder A"
+                                    expanded: true
+                                    children:
+                                        file_1:
+                                            type: treenode
+                                            id: file_1
+                                            label: "File 1"
+                                            expanded: false
+                                folder_b:
+                                    type: treenode
+                                    id: folder_b
+                                    label: "Folder B"
+                                    expanded: false
+        status:
+            type: statusbar
+            id: status
+            left: "DARK THEME"
+            right: "Theme Showcase"

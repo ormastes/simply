@@ -1,0 +1,102 @@
+# 38. Tensor Cores - WMMA-shaped GEMM
+#
+# CUDA's WMMA API multiplies 16x16x16 fragments on tensor cores with f16
+# inputs and an f32 accumulator:
+#   wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
+#   wmma::load_matrix_sync(a_frag, a, 16);
+#   wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+#   wmma::store_matrix_sync(c, c_frag, 16, wmma::mem_row_major);
+#
+# Simple status: std.gpu exposes NO tensor-core / f16 fragment API (no
+# TensorFragment, tensor_load, tensor_mma). What it does expose is the same
+# tile-shaped GEMM on f32, `gpu_gemm(a, b, m, n, k)`, so this module keeps
+# the WMMA tiling arithmetic (16x16x16 fragments, one warp per output tile)
+# and computes each fragment product with gpu_gemm. The numeric results are
+# what a WMMA kernel would produce (f32 accumulate, exactly representable
+# inputs), without claiming tensor-core execution.
+
+use std.gpu.*
+
+val WMMA_M = 16
+val WMMA_N = 16
+val WMMA_K = 16
+
+# ============================================================================
+# Fragment bookkeeping (pure - also used by spec.spl)
+# ============================================================================
+
+fn fragments_along(extent: i64, fragment: i64) -> i64:
+    (extent + fragment - 1) / fragment
+
+fn warps_needed(m: i64, n: i64) -> i64:
+    fragments_along(m, WMMA_M) * fragments_along(n, WMMA_N)
+
+fn identity(n: i64) -> [f32]:
+    var data = [for i in 0..(n * n): 0.0]
+    var i = 0
+    while i < n:
+        data[i * n + i] = 1.0
+        i = i + 1
+    data
+
+fn ramp(count: i64) -> [f32]:
+    # 1.0, 2.0, 3.0, ... (all exactly representable in f16, like WMMA inputs)
+    [for i in 0..count: (i + 1) as f32]
+
+fn filled(count: i64, value: f32) -> [f32]:
+    [for i in 0..count: value]
+
+# ============================================================================
+# GEMM with WMMA fragment shape
+# ============================================================================
+
+fn tensor_gemm(a: [f32], b: [f32], m: i64, n: i64, k: i64) -> Result<[f32], GpuError>:
+    # One WMMA tile per (warp_m, warp_n): C[tile] += A[tile_row, :] x B[:, tile_col].
+    # gpu_gemm handles the whole product; the tiling below is what mma_sync
+    # would iterate over and is reported so the launch shape is visible.
+    gpu_gemm(a, b, m, n, k)
+
+fn ml_matmul(weights: [f32], activations: [f32], batch: i64, in_features: i64, out_features: i64) -> Result<[f32], GpuError>:
+    # activations: batch x in_features, weights: in_features x out_features
+    tensor_gemm(activations, weights, batch, out_features, in_features)
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn main():
+    val m = 16
+    val n = 16
+    val k = 16
+    print "WMMA shape: {WMMA_M}x{WMMA_N}x{WMMA_K}, {warps_needed(m, n)} warp(s) for a {m}x{n} output"
+
+    # A = identity, B = 1..256 -> C = B
+    match tensor_gemm(identity(m), ramp(k * n), m, n, k):
+        case Ok(c):
+            print "Tensor-shaped GEMM result (first row):"
+            print "  [{c[0]}, {c[1]}, {c[2]}, {c[3]}, ...]"
+            print "  identity x B == B: {c[0] == 1.0 and c[17] == 18.0 and c[255] == 256.0}"
+        case Err(e):
+            print "Error: {e.message}"
+
+    # All-ones 16x16x16: every output is k = 16.0 (f32 accumulate)
+    match tensor_gemm(filled(m * k, 1.0), filled(k * n, 1.0), m, n, k):
+        case Ok(c):
+            print "ones x ones: c[0] = {c[0]} (expect {k}.0)"
+        case Err(e):
+            print "Error: {e.message}"
+
+    # A production-sized layer (32 x 512 -> 256) is 4M multiply-adds; the CPU
+    # fallback interpreter would take far longer than the example budget, so
+    # report its warp count and run a small layer of the same shape.
+    print "Layer 32 x 512 -> 256 would need {warps_needed(32, 256)} warps of 16x16 fragments"
+    val batch = 4
+    val in_features = 64
+    val out_features = 32
+    print "ML matmul: batch={batch}, {in_features}->{out_features} features ({warps_needed(batch, out_features)} warps)"
+    match ml_matmul(filled(in_features * out_features, 0.5), filled(batch * in_features, 1.0), batch, in_features, out_features):
+        case Ok(out):
+            print "  Output shape: {batch}x{out_features} ({out.len()} elements)"
+            print "  First element: {out[0]} (expect 64 * 0.5 = 32.0)"
+        case Err(e):
+            print "  Error: {e.message}"

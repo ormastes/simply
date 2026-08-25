@@ -1,0 +1,28 @@
+# hello_standalone — minimal Simple app exposing an LLM-friendly GUI
+# control surface without SimpleOS or an Electron host.
+#
+# Run:    bin/simple run examples/hello_standalone/main.spl
+# Drive:  curl http://127.0.0.1:8765/api/test/ready
+#         curl http://127.0.0.1:8765/api/test/ui/snapshot
+#         curl http://127.0.0.1:8765/api/test/elements
+#
+# The same /api/test/* verbs also drive:
+#   - the host WM web backend   (src/app/ui.web/async_server.spl)
+#   - the TUI web backend       (src/app/ui.tui_web/server.spl)
+#   - the SimpleOS compositor   (via COMP_TEST_API_REQ opcode)
+
+use nogc_sync_mut.ui.session.{UISession}
+use common.ui.builder.{build_tree, panel, text_widget, button}
+use app.ui.standalone.bootstrap.{run_test_api_server, StandaloneOptions}
+
+fn main():
+    val root = panel("root", "hello_standalone", [
+        text_widget("greeting", "Hello from a standalone Simple app."),
+        text_widget("hint", "Query /api/test/ui/snapshot to inspect this tree."),
+        button("noop", "Invoke noop", "noop")
+    ])
+    val tree = build_tree(root).with_title("hello_standalone")
+    val session = UISession.new(tree)
+
+    val opts = StandaloneOptions.new_with_title("127.0.0.1:8765", "hello_standalone")
+    run_test_api_server(session, opts)

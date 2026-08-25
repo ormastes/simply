@@ -1,0 +1,116 @@
+# 15. Unit Testing - GPU Kernel Testing with SSpec
+#
+# Demonstrates how to test GPU kernels using Simple's built-in SSpec framework.
+# Includes a simple reduction kernel and its CPU reference implementation.
+#
+# C/CUDA equivalent:
+#   __global__ void sum_reduce(float *input, float *output, int n) {
+#       __shared__ float sdata[256];
+#       int tid = threadIdx.x;
+#       int i = blockIdx.x * blockDim.x + threadIdx.x;
+#       sdata[tid] = (i < n) ? input[i] : 0.0f;
+#       __syncthreads();
+#       for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+#           if (tid < s) sdata[tid] += sdata[tid + s];
+#           __syncthreads();
+#       }
+#       if (tid == 0) output[blockIdx.x] = sdata[0];
+#   }
+
+use std.gpu.*
+
+# ============================================================================
+# CPU reference: sum reduction
+# ============================================================================
+
+fn cpu_sum(data: [f32]) -> f32:
+    var total: f32 = 0.0
+    for i in 0..data.len():
+        total = total + data[i]
+    total
+
+fn cpu_min(data: [f32]) -> f32:
+    if data.len() == 0:
+        return 0.0
+    var result = data[0]
+    for i in 1..data.len():
+        if data[i] < result:
+            result = data[i]
+    result
+
+fn cpu_max(data: [f32]) -> f32:
+    if data.len() == 0:
+        return 0.0
+    var result = data[0]
+    for i in 1..data.len():
+        if data[i] > result:
+            result = data[i]
+    result
+
+# ============================================================================
+# GPU kernel: block-level sum reduction using shared memory
+# ============================================================================
+
+@gpu_kernel
+fn sum_reduce(input: GpuPtr, output: GpuPtr, n: i64):
+    # Each block reduces its portion of the input into a single value.
+    val sdata = gpu_shared_array_f32(256)
+
+    val tid = gpu_local_id_x()
+    val global_id = gpu_block_id_x() * gpu_block_dim_x() + gpu_local_id_x()
+
+    # Load input into shared memory (out-of-bounds threads load 0)
+    if global_id < n:
+        gpu_shared_store_f32(sdata, tid, gpu_load_f32(input, global_id))
+    else:
+        gpu_shared_store_f32(sdata, tid, 0.0)
+
+    gpu_barrier()
+
+    # Tree reduction within the block
+    var stride = gpu_block_dim_x() / 2
+    while stride > 0:
+        if tid < stride:
+            val a = gpu_shared_load_f32(sdata, tid)
+            val b = gpu_shared_load_f32(sdata, tid + stride)
+            gpu_shared_store_f32(sdata, tid, a + b)
+        gpu_barrier()
+        stride = stride / 2
+
+    # Thread 0 writes the block result
+    if tid == 0:
+        gpu_store_f32(output, gpu_block_id_x(), gpu_shared_load_f32(sdata, 0))
+
+# ============================================================================
+# Tolerance helper
+# ============================================================================
+
+fn close_enough(actual: f32, expected: f32, tol: f32) -> bool:
+    val diff = actual - expected
+    val abs_diff = if diff < 0.0: 0.0 - diff else: diff
+    abs_diff <= tol
+
+# ============================================================================
+# Main -- run a quick self-test
+# ============================================================================
+
+fn main():
+    print "=== GPU Kernel Unit Testing Demo ==="
+    print ""
+
+    # CPU reference test
+    val data = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+    val expected_sum = cpu_sum(data)
+    print "CPU sum of {data.len()} elements: {expected_sum}"
+    print "Expected: 36.0"
+    print "Match: {close_enough(expected_sum, 36.0, 0.001)}"
+
+    val expected_min = cpu_min(data)
+    val expected_max = cpu_max(data)
+    print "CPU min: {expected_min}, max: {expected_max}"
+
+    print ""
+    print "To run the full SSpec test suite:"
+    print "  bin/simple test examples/08_gpu/simple_cuda_example/10.cuda_basic/15.Unit_Testing/spec.spl"
+    print ""
+    print "=== Done ==="

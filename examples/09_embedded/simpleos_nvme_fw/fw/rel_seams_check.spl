@@ -1,0 +1,165 @@
+"""
+rel_seams_check — the three reliability-engine prerequisite seams, with absolute
+oracles (known values at known points, not self-comparison). These seams are the
+detail-design prerequisites named in
+doc/04_architecture/hardware/nand_recovery/reliability_engine_architecture.md §3:
+
+  1. FilRead.corrected — the coarse ECC decode outcome (0 = clean, 1 = corrected,
+     2 = uncorrectable) surfaced additively on every FIL read, so a policy can
+     observe correction events. Proven two ways: via fault injection on the default
+     behavioural backend, AND from GENUINE Vt physics on the emulator backend (a
+     drooped programmed cell raises the physics bit-error count with NO inject call).
+
+  2. fil.read_at_vref(ppn, offset) — a read executed at a shifted read reference
+     that RESTORES the prior reference afterwards (set→read→restore, atomic). On a
+     retention-drifted worn page it returns different data than the default-vref
+     read; the default reference is restored so a subsequent normal read is
+     unchanged. On the default NandDevice backend (no Vref actuator) it is exactly a
+     plain read — asserted, not faked.
+
+  3. Soft-observability re-export — NandEmu re-exports vt_histogram / read_margin
+     from the NeChip, passed through Fil and Ftl. A half-programmed page shows two
+     lobes through the FULL Ftl→Fil→Fmc→NandEmu→NeChip chain; a fresh programmed
+     page has a positive read margin.
+
+Addresses stay within the S1 window (blocks 0-7, pages 0-3) so nothing fold-aliases.
+
+Run: bin/simple run examples/09_embedded/simpleos_nvme_fw/fw/rel_seams_check.spl
+Gate: prints "REL SEAMS OK" and exits 0.
+"""
+
+use nvme_types.*
+use fil.*
+use ftl.*
+
+# 1 iff any histogram bin in [lo, hi) has a non-zero population (a lobe is present).
+fn lobe_present(h: [i64], lo: i64, hi: i64) -> i64:
+    var code: i64 = lo
+    while code < hi:
+        if h[code] > 0:
+            return 1
+        code = code + 1
+    0
+
+fn is_pos(v: i64) -> i64:
+    if v > 0:
+        return 1
+    0
+
+fn main():
+    var fail: i64 = 0
+
+    # ── Seam 1a: corrected via fault injection on the default backend ─────────
+    # corrected is ADDITIVE — `code` keeps its NAND_* meaning; corrected is the
+    # coarse 0/1/2 outcome. A clean read is 0, a single injected flip is 1
+    # (corrected), a double flip is 2 (uncorrectable).
+    var fil: Fil = fil_new()
+    val ppn: i64 = block_first_ppn(2) + 3
+    fail = fail + expect_eq(fil.program(ppn, 42, 7, 0xAB), NAND_OK, "program clean page")
+
+    val r0: FilRead = fil.read(ppn)
+    fail = fail + expect_eq(r0.corrected, 0, "clean read -> corrected 0")
+    fail = fail + expect_eq(r0.code, NAND_OK, "clean read code unchanged (additive field)")
+
+    fil.inject_read_bitflip(ppn, 1)
+    val r1: FilRead = fil.read(ppn)
+    fail = fail + expect_eq(r1.corrected, 1, "single-bit error -> corrected 1")
+    fail = fail + expect_eq(r1.code, NAND_ECC_FIXED, "single-bit code still NAND_ECC_FIXED")
+
+    fil.inject_read_bitflip(ppn, 2)
+    val r2: FilRead = fil.read(ppn)
+    fail = fail + expect_eq(r2.corrected, 2, "double-bit error -> corrected 2")
+    fail = fail + expect_eq(r2.code, NAND_ECC_FAIL, "double-bit code still NAND_ECC_FAIL")
+    fil.inject_read_bitflip(ppn, 0)
+
+    # Out-of-range read fails closed AND reports corrected 2 (uncorrectable).
+    val roor: FilRead = fil.read(NUM_PAGES)
+    fail = fail + expect_eq(roor.corrected, 2, "out-of-range read -> corrected 2")
+
+    # ── Seam 1b: corrected from GENUINE Vt physics (no inject call) ───────────
+    # A page programmed 0xFE has exactly ONE programmed (0) cell in column 0 (bit 0)
+    # among seven erased (1) cells. Retention drift only droops programmed cells, so
+    # under heavy wear+age that single cell flips 0->1: the page senses 0xFF, one bit
+    # off the written 0xFE. The physics bit-error count is 1 => corrected 1, WITHOUT
+    # any fault injection. A page programmed 0x00 (eight programmed cells) instead
+    # droops to 0xFF, eight bits off => uncorrectable => corrected 2.
+    var pemu: Fil = fil_new_emu()
+    val pfe: i64 = block_first_ppn(0)               # block 0, page 0 (in-window)
+    fail = fail + expect_eq(pemu.program(pfe, 100, 1, 0xFE), NAND_OK, "physics: program 0xFE")
+    val pf0: FilRead = pemu.read(pfe)
+    fail = fail + expect_eq(pf0.data, 0xFE, "physics: fresh 0xFE reads back exactly")
+    fail = fail + expect_eq(pf0.corrected, 0, "physics: fresh page -> corrected 0")
+
+    pemu.emu_set_block_wear(0, 3000)                # heavily P/E-cycled block
+    pemu.emu_advance_time_s(31536000.0)             # age one year
+    val pf1: FilRead = pemu.read(pfe)
+    print "  PROBE physics-1bit: data={pf1.data} code={pf1.code} corrected={pf1.corrected}"
+    fail = fail + expect_eq(pf1.corrected, 1, "physics single-cell drift -> corrected 1 (no inject)")
+    fail = fail + expect_eq(pf1.code, NAND_ECC_FIXED, "physics single-cell drift -> NAND_ECC_FIXED")
+
+    var pemu2: Fil = fil_new_emu()
+    val pz: i64 = block_first_ppn(0)
+    fail = fail + expect_eq(pemu2.program(pz, 100, 1, 0x00), NAND_OK, "physics: program 0x00")
+    pemu2.emu_set_block_wear(0, 3000)
+    pemu2.emu_advance_time_s(31536000.0)
+    val pf2: FilRead = pemu2.read(pz)
+    fail = fail + expect_eq(pf2.corrected, 2, "physics multi-cell drift -> corrected 2 (uncorrectable)")
+
+    # ── Seam 2: read_at_vref shifts the reference then restores it ────────────
+    var vemu: Fil = fil_new_emu()
+    val rp: i64 = block_first_ppn(0)
+    fail = fail + expect_eq(vemu.program(rp, 100, 1, 0x00), NAND_OK, "vref: program all-zero page")
+    fail = fail + expect_eq(vemu.read(rp).data, 0x00, "vref: fresh page reads 0x00")
+
+    vemu.emu_set_block_wear(0, 3000)
+    vemu.emu_advance_time_s(31536000.0)             # age one year -> drift
+
+    val aged: FilRead = vemu.read(rp)               # default reference (vref = 128)
+    val clean: FilRead = vemu.read_at_vref(rp, -20) # shifted reference (vref = 108)
+    val after: FilRead = vemu.read(rp)              # default reference again
+    print "  PROBE read_at_vref: aged={aged.data} clean={clean.data} after={after.data}"
+
+    fail = fail + expect_eq(aged.data, 0xFF, "vref: drifted page reads 0xFF at default reference")
+    fail = fail + expect_eq(clean.data, 0x00, "vref: read_at_vref(-20) recovers 0x00")
+    var differ: i64 = 0
+    if aged.data != clean.data:
+        differ = 1
+    fail = fail + expect_eq(differ, 1, "vref: shifted-reference read differs from default-reference read")
+    fail = fail + expect_eq(after.data, 0xFF, "vref: prior reference restored -> next normal read unchanged (0xFF)")
+
+    # Default NandDevice backend has no Vref actuator: read_at_vref == plain read.
+    var dfil: Fil = fil_new()
+    val dp: i64 = block_first_ppn(3) + 1
+    fail = fail + expect_eq(dfil.program(dp, 9, 9, 0x5A), NAND_OK, "vref-default: program page")
+    val dread: FilRead = dfil.read(dp)
+    val dvref: FilRead = dfil.read_at_vref(dp, -20)
+    fail = fail + expect_eq(dvref.data, dread.data, "vref-default: read_at_vref returns the plain read data")
+    fail = fail + expect_eq(dvref.code, dread.code, "vref-default: read_at_vref returns the plain read code")
+
+    # ── Seam 3: vt_histogram two lobes + read_margin positive (full chain) ────
+    # A half-programmed page (0xAA -> four programmed, four erased cells in column 0,
+    # the rest of the page erased) shows an erased lobe below the read reference (128)
+    # and a programmed lobe at/above it. Read through the FIL seam first.
+    var hfil: Fil = fil_new_emu()
+    val hp: i64 = block_first_ppn(1)
+    fail = fail + expect_eq(hfil.program(hp, 5, 5, 0xAA), NAND_OK, "hist: program half-programmed page")
+    val hist: [i64] = hfil.emu_vt_histogram(hp)
+    fail = fail + expect_eq(hist.len(), 256, "hist: 256-bin histogram returned through FIL")
+    fail = fail + expect_eq(lobe_present(hist, 0, 128), 1, "hist: erased lobe present (bins < 128)")
+    fail = fail + expect_eq(lobe_present(hist, 128, 256), 1, "hist: programmed lobe present (bins >= 128)")
+    fail = fail + expect_eq(is_pos(hfil.emu_read_margin(hp)), 1, "hist: read_margin positive on fresh page")
+
+    # Same observability through the FULL Ftl -> Fil -> Fmc -> NandEmu -> NeChip chain.
+    var htl: Ftl = ftl_new_emu()
+    fail = fail + expect_eq(htl.write(0, 0xAA), SC_SUCCESS, "chain: write half-programmed page via FTL")
+    val cppn: i64 = htl.lba_ppn(0)
+    val chist: [i64] = htl.emu_vt_histogram(cppn)
+    fail = fail + expect_eq(chist.len(), 256, "chain: 256-bin histogram returned through FTL")
+    fail = fail + expect_eq(lobe_present(chist, 0, 128), 1, "chain: erased lobe present through full passthrough")
+    fail = fail + expect_eq(lobe_present(chist, 128, 256), 1, "chain: programmed lobe present through full passthrough")
+    fail = fail + expect_eq(is_pos(htl.emu_read_margin(cppn)), 1, "chain: read_margin positive through full passthrough")
+
+    if fail == 0:
+        print "REL SEAMS OK"
+    else:
+        print "REL SEAMS FAIL ({fail})"

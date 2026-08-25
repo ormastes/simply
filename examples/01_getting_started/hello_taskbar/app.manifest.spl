@@ -1,0 +1,38 @@
+# hello_taskbar — Wave 6 demo manifest
+#
+# Cross-platform sample: a pinned app that can be launched from the
+# taskbar-only shell on either host (via wm.launch RPC) or SimpleOS
+# (via WmService spawn). The `ui_backend: Auto` selector resolves at
+# spawn time: SimpleWeb on SimpleOS / hosts without Electron, Electron
+# on hosts where it is available.
+
+use os.desktop.app_manifest.{
+    UiBackendKind, HostCaps, resolve_backend,
+    host_caps_simpleos, host_caps_host
+}
+
+# ---------------------------------------------------------------------
+# Manifest fields (kept free-form for Wave 6 — a future wave promotes
+# these into the AppManifest struct once all 28 default entries are
+# updated at once)
+# ---------------------------------------------------------------------
+
+val APP_ID: text = "examples/hello_taskbar"
+val DISPLAY_NAME: text = "Hello Taskbar"
+val ICON: text = "hello"
+val REQUESTED_BACKEND: UiBackendKind = UiBackendKind.Auto
+
+fn resolve_for_host(host: HostCaps) -> Result<UiBackendKind, text>:
+    """Resolve the effective backend for a given host, translating
+    AppManifestError into a plain text so callers can surface a diagnostic
+    without pulling the AppManifestError enum into their scope."""
+    val r = resolve_backend(REQUESTED_BACKEND, host)
+    match r:
+        Ok(kind): Ok(kind)
+        Err(_): Err("{DISPLAY_NAME}: Electron not available on this host")
+
+fn resolve_for_simpleos() -> Result<UiBackendKind, text>:
+    resolve_for_host(host_caps_simpleos())
+
+fn resolve_for_local_host(electron_available: bool) -> Result<UiBackendKind, text>:
+    resolve_for_host(host_caps_host(electron_available))

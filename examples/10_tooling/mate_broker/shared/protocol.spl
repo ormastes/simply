@@ -1,0 +1,30 @@
+# shared/protocol — Broker↔Agent message protocol
+
+# Message types
+val MSG_REGISTER = "register"
+val MSG_BID_REQUEST = "bid_request"
+val MSG_BID_RESPONSE = "bid_response"
+val MSG_AWARD = "award"
+val MSG_COMPLETE = "complete"
+val MSG_STATUS = "status"
+
+fn protocol_format_register(agent_id: text, capabilities: text) -> text:
+    "type: " + MSG_REGISTER + "\nagent_id: " + agent_id + "\ncapabilities: " + capabilities
+
+fn protocol_format_bid_request(task_id: text, required_caps: text) -> text:
+    "type: " + MSG_BID_REQUEST + "\ntask_id: " + task_id + "\nrequired_caps: " + required_caps
+
+fn protocol_format_award(task_id: text, agent_id: text) -> text:
+    "type: " + MSG_AWARD + "\ntask_id: " + task_id + "\nagent_id: " + agent_id
+
+fn protocol_format_complete(task_id: text, agent_id: text, result: text) -> text:
+    "type: " + MSG_COMPLETE + "\ntask_id: " + task_id + "\nagent_id: " + agent_id + "\nresult: " + result
+
+fn protocol_parse_type(message: text) -> text:
+    val lines = message.split("\n")
+    for line in lines:
+        val trimmed = line.trim()
+        if trimmed.starts_with("type:"):
+            val tlen = trimmed.len()
+            return trimmed[5:tlen].trim()
+    ""

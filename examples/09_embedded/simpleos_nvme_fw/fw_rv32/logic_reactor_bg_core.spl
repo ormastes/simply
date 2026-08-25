@@ -1,0 +1,16 @@
+pub fn _rv32_reactor_bg_needed_impl(free_blocks: i64) -> i32:
+    if free_blocks < 4:
+        return 1
+    0
+
+pub fn _rv32_reactor_gc_sweep_impl(reclaimable: i64) -> i64:
+    if reclaimable <= 0:
+        return 0
+    if reclaimable > 3:
+        return 3
+    reclaimable
+
+pub fn _rv32_reactor_power_cycle_read_impl(checkpointed: i64, dirty: i64) -> i64:
+    if dirty != 0:
+        return checkpointed
+    checkpointed

@@ -1,0 +1,50 @@
+# feature/worker/worker — Agent worker: register, accept, execute, report
+
+fn worker_register(id: text, capabilities: text, max_concurrent: i64, priority: i64):
+    BK_AGENT_IDS = BK_AGENT_IDS + [id]
+    BK_AGENT_CAPS = BK_AGENT_CAPS + [capabilities]
+    BK_AGENT_MAX_CONCURRENT = BK_AGENT_MAX_CONCURRENT + [max_concurrent]
+    BK_AGENT_PRIORITIES = BK_AGENT_PRIORITIES + [priority]
+    BK_AGENT_LOADS = BK_AGENT_LOADS + [0]
+    BK_AGENT_STATUSES = BK_AGENT_STATUSES + ["idle"]
+    BK_AGENT_COUNT = BK_AGENT_COUNT + 1
+
+fn worker_set_status(agent_id: text, status: text):
+    var i = 0
+    while i < BK_AGENT_COUNT:
+        if BK_AGENT_IDS[i] == agent_id:
+            BK_AGENT_STATUSES[i] = status
+            return
+        i = i + 1
+
+fn worker_increment_load(agent_id: text):
+    var i = 0
+    while i < BK_AGENT_COUNT:
+        if BK_AGENT_IDS[i] == agent_id:
+            BK_AGENT_LOADS[i] = BK_AGENT_LOADS[i] + 1
+            if BK_AGENT_LOADS[i] >= BK_AGENT_MAX_CONCURRENT[i]:
+                BK_AGENT_STATUSES[i] = "busy"
+            return
+        i = i + 1
+
+fn worker_decrement_load(agent_id: text):
+    var i = 0
+    while i < BK_AGENT_COUNT:
+        if BK_AGENT_IDS[i] == agent_id:
+            if BK_AGENT_LOADS[i] > 0:
+                BK_AGENT_LOADS[i] = BK_AGENT_LOADS[i] - 1
+            if BK_AGENT_LOADS[i] < BK_AGENT_MAX_CONCURRENT[i]:
+                BK_AGENT_STATUSES[i] = "idle"
+            return
+        i = i + 1
+
+fn worker_list_text() -> text:
+    if BK_AGENT_COUNT == 0:
+        return "  (no agents registered)"
+    var parts: [text] = []
+    var i = 0
+    while i < BK_AGENT_COUNT:
+        val line = "  " + BK_AGENT_IDS[i] + " [" + BK_AGENT_STATUSES[i] + "] load=" + BK_AGENT_LOADS[i].to_text() + "/" + BK_AGENT_MAX_CONCURRENT[i].to_text() + " caps=[" + BK_AGENT_CAPS[i] + "]"
+        parts.push(line)
+        i = i + 1
+    parts.join("\n")

@@ -1,0 +1,96 @@
+#![allow(unnamed_duplicate_typed_args)]
+@allow(unnamed_duplicate_typed_args)
+# mcpgdb MCP — merged C/C++ debugger and clangd example
+
+use std.io_runtime.{file_delete, env_get, write_file, process_run}
+use examples.mcpgdb.json_helpers.{read_stdin_message, write_stdout_message, extract_id, extract_field, has_method, jsonrpc_result, jsonrpc_error, LB, RB, shell_bin, shell_quote}
+use examples.mcpgdb.protocol.{make_init_response, make_tools_list}
+
+fn main():
+    while true:
+        val msg = read_stdin_message()
+        if msg == "":
+            return
+        val id = extract_id(msg)
+        val method = detect_method(msg)
+        var response = ""
+        if method == "initialize":
+            response = make_init_response(id)
+        elif method == "initialized" or method == "notifications/initialized" or method == "notifications/cancelled" or method == "notifications/roots/list_changed":
+            response = ""
+        elif method == "shutdown":
+            response = jsonrpc_result(id, "null")
+        elif method == "ping":
+            response = jsonrpc_result(id, LB() + RB())
+        elif method == "tools/list":
+            response = make_tools_list(id)
+        elif method == "tools/call":
+            response = run_tool_runner(id, msg)
+        else:
+            if id != "" and id != "null":
+                response = jsonrpc_error(id, -32601, "Method not found: " + method)
+        if response != "":
+            write_stdout_message(response)
+
+fn detect_method(msg: text) -> text:
+    if has_method(msg, "initialize"):
+        return "initialize"
+    if has_method(msg, "initialized"):
+        return "initialized"
+    if has_method(msg, "notifications/initialized"):
+        return "notifications/initialized"
+    if has_method(msg, "shutdown"):
+        return "shutdown"
+    if has_method(msg, "ping"):
+        return "ping"
+    if has_method(msg, "tools/list"):
+        return "tools/list"
+    if has_method(msg, "tools/call"):
+        return "tools/call"
+    if has_method(msg, "notifications/cancelled"):
+        return "notifications/cancelled"
+    if has_method(msg, "notifications/roots/list_changed"):
+        return "notifications/roots/list_changed"
+    extract_field(msg, "method")
+
+fn simple_binary() -> text:
+    val env_value = env_get("SIMPLE_BINARY") ?? ""
+    if env_value != "":
+        return env_value
+    "bin/simple"
+
+fn temp_request_path() -> text:
+    val (stdout, _stderr, code) = process_run(shell_bin(), ["-c", "mktemp /tmp/mcpgdb_request.XXXXXX"])
+    if code != 0:
+        return ""
+    stdout.trim()
+
+fn body_has_tool(body: text, name: text) -> bool:
+    body.contains("\"name\":\"" + name + "\"") or body.contains("\"name\": \"" + name + "\"")
+
+fn runner_for_body(body: text) -> text:
+    if body_has_tool(body, "clangd_open") or body_has_tool(body, "clangd_definition") or body_has_tool(body, "clangd_references") or body_has_tool(body, "clangd_hover") or body_has_tool(body, "clangd_completion") or body_has_tool(body, "clangd_type_definition") or body_has_tool(body, "clangd_symbols") or body_has_tool(body, "clangd_diagnostics"):
+        return "src/app/mcpgdb/clangd_runner.spl"
+    "src/app/mcpgdb/debug_runner.spl"
+
+fn run_tool_runner(id: text, body: text) -> text:
+    val request_path = temp_request_path()
+    if request_path == "":
+        return jsonrpc_error(id, -32603, "failed to allocate temp request file")
+    if not write_file(request_path, body):
+        return jsonrpc_error(id, -32603, "failed to write temp request file")
+    val runner = runner_for_body(body)
+    val cmd = "MCPGDB_REQUEST_PATH=" + shell_quote(request_path) + " " + shell_quote(simple_binary()) + " " + shell_quote(runner)
+    val (stdout, stderr, code) = process_run(shell_bin(), ["-c", cmd])
+    file_delete(request_path)
+    if code != 0:
+        var message = stderr.trim()
+        if message == "":
+            message = stdout.trim()
+        if message == "":
+            message = "tool runner failed"
+        return jsonrpc_error(id, -32603, message)
+    val response = stdout.trim()
+    if response == "":
+        return jsonrpc_error(id, -32603, "tool runner returned empty response")
+    response

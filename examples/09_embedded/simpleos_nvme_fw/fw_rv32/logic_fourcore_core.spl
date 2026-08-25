@@ -1,0 +1,89 @@
+# logic_fourcore_core — pure routing/step logic for the wave-3 4-core NVMe FW
+# IPC pipeline (design contract: doc/05_design/hardware/nvme_fw_multicore/
+# fourcore_ipc_index_handle_design.md §6 four-core partition, §8 dataplane
+# selftest). No shm/memory access here — these are pure scalar fns consumed
+# by the host harness (ipc_fourcore_check.spl) and, once L6 lands, the rv32
+# per-hart drivers, matching the split already used by
+# logic_ipc_ring_core.spl / logic_buf_pool_core.spl / logic_nand_region_core.spl.
+# Freestanding-safe: no arrays, no structs, no module-level var/val
+# initializers (fw_rv32 boot-import-graph rule — see const_drift_check.spl
+# header). Every fn is fail-closed: an invalid/unroutable input returns -1
+# (or, for i32 validity predicates, 0), never a silent/garbage success.
+
+use logic_ipc_layout_core.*
+use logic_ipc_msg_core.*
+use logic_map_core.*
+
+# ── HIL/FTL/FIL command routing (§4 opcode table) ────────────────────────────
+
+# HIL->FTL opcode -> FTL->FIL opcode. OP_FLUSH completes at FTL itself (no
+# FIL hop, design §4/§8) so it routes to -1, same as any unrecognized opcode
+# — the FTL driver distinguishes the two cases itself (a real OP_FLUSH gets a
+# synthesized ST_OK completion; anything else is a defensive fail-closed
+# error, never silently forwarded).
+fn ftl_route_opcode(op: i64) -> i64:
+    if op == OP_WRITE():
+        return OP_PROG()
+    if op == OP_READ():
+        return OP_RD()
+    if op == OP_FLUSH():
+        return -1
+    -1
+
+# Flat v1 LBA->PPN map (design §8): bounds 0 <= lba < LBA_COUNT (3072,
+# fw/nvme_types.spl). Reuses logic_map_core.spl's live bound fn
+# (_rv32_map_lba_valid) rather than re-declaring the literal, so this file
+# can never drift from the same bound const_drift_check.spl guards.
+# Invalid lba -> -1 (fail-closed; the FTL driver must synthesize an
+# ST_BOUNDS completion directly, bypassing FIL/NAND, when it sees -1).
+fn ftl_map_ppn(lba: i64) -> i64:
+    if _rv32_map_lba_valid(lba) == 0:
+        return -1
+    lba
+
+# FTL->FIL opcode -> FIL->NAND opcode.
+fn fil_route_opcode(op: i64) -> i64:
+    if op == OP_PROG():
+        return NOP_PROG()
+    if op == OP_RD():
+        return NOP_READ()
+    if op == OP_ERASE():
+        return NOP_ERASE()
+    -1
+
+# Sanitize a status word arriving from the NAND side before it is relayed
+# upstream: pass through any value in the legal message-status range (§4:
+# ST_OK/ST_ERR/ST_MEDIA/ST_BOUNDS, 0..3), else collapse to ST_ERR — never
+# forward an out-of-range status to FTL/HIL.
+fn fil_status_of_nand(st: i64) -> i64:
+    if msg_status_valid(st) == 0:
+        return ST_ERR()
+    st
+
+# Selftest data oracle (design §8): arbitrary but FIXED — hil_expect_data(lba)
+# is the exact value the host/rv32 selftest writes to and reads back from
+# lba. The check asserts these literals directly.
+fn hil_expect_data(lba: i64) -> i64:
+    0x1000 + lba * 3
+
+# ── halt protocol (§6) ────────────────────────────────────────────────────────
+
+# shm word index 3 (the reserved header word) doubles as the halt flag: hart0
+# writes 1 after the selftest script completes; harts 1-3 poll it and exit
+# their loop once it is set AND their own input ring(s) are empty. Reuses
+# ipc_reserved_idx() rather than re-declaring the literal 3, so this and
+# logic_ipc_layout_core.spl can never drift apart on the word index.
+fn IPC_HALT_IDX() -> i64:
+    ipc_reserved_idx()
+
+# Pure per-core halt decision: halt only once the global halt flag is set AND
+# this core's own input ring (or the aggregate of its rings) is empty.
+# `in_ring_empty` is an i32 0/1 the caller derives from its own
+# ring_empty()/aggregate check — kept here so the actual halt POLICY (both
+# conditions must hold) lives in one pure, testable place.
+fn core_should_halt(halt_word: i64, in_ring_empty: i32) -> i32:
+    if halt_word != 1:
+        return 0
+    if in_ring_empty != 1:
+        return 0
+    1

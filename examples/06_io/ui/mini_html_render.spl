@@ -1,0 +1,788 @@
+# mini_html_render.spl — a small but REAL HTML renderer in pure Simple.
+#
+# Parses HTML into a flat node arena (avoiding the interpreter's nested-field
+# push bug), applies inline styles, does block-flow layout with word-wrapped
+# text, and paints boxes + text to Engine2D. Unlike the substring-heuristic web
+# renderer, this lays out and draws the document so real pages render with
+# visible structure and text.
+#
+# Two interpreter bugs are worked around here (both worth a seed fix):
+#   * text.index_of(needle, pos) IGNORES pos -> use find_from() (substring+find).
+#   * obj.field.push() on an array element does not persist -> use a flat arena
+#     of nodes keyed by integer parent index; only ever append to the top array.
+#
+# Renders HTML to pixels: parse -> CSS cascade -> block layout -> paint text+boxes.
+#   SIMPLE_EXECUTION_MODE=interpret bin/simple run examples/ui/mini_html_render.spl <file.html>
+
+use std.io_runtime.{read_file, file_exists}
+use std.sffi.cli.{cli_get_args}
+
+# ---------------------------------------------------------------------------
+# Flat node arena
+# ---------------------------------------------------------------------------
+
+class HNode:
+    tag: text          # lowercased tag, "#text", or "#root"
+    text_data: text    # text for #text nodes
+    style_attr: text   # raw style="" value
+    class_attr: text
+    id_attr: text
+    parent: i64        # index of parent in the arena (-1 for root)
+
+fn mk_node(tag: text, parent: i64) -> HNode:
+    HNode(tag: tag, text_data: "", style_attr: "", class_attr: "", id_attr: "", parent: parent)
+
+# ---------------------------------------------------------------------------
+# Position-aware string find (works around index_of(needle,pos) ignoring pos)
+# ---------------------------------------------------------------------------
+
+fn find_from(s: text, needle: text, pos: i32) -> i32:
+    if pos <= 0:
+        return s.index_of(needle)
+    if pos >= s.len():
+        return -1
+    val sub = s.substring(pos, s.len())
+    val rel = sub.index_of(needle)
+    if rel < 0:
+        return -1
+    pos + rel
+
+fn is_void(tag: text) -> bool:
+    tag == "meta" or tag == "br" or tag == "img" or tag == "input" or tag == "link" or tag == "hr" or tag == "area" or tag == "base" or tag == "col" or tag == "embed" or tag == "source" or tag == "track" or tag == "wbr"
+
+# ---------------------------------------------------------------------------
+# Attribute extraction (reads class/id/style out of the raw tag inner text)
+# ---------------------------------------------------------------------------
+
+fn attr_value(inner: text, name: text) -> text:
+    # find name= and read the quoted value; simple, tolerant
+    val key = name + "="
+    val kpos = inner.index_of(key)
+    if kpos < 0:
+        return ""
+    var i = kpos + key.len()
+    if i >= inner.len():
+        return ""
+    val q = inner.substring(i, i + 1)
+    if q == "\"" or q == "'":
+        val sub = inner.substring(i + 1, inner.len())
+        val end = sub.index_of(q)
+        if end < 0:
+            return ""
+        return sub.substring(0, end)
+    # unquoted: read to whitespace
+    val sub = inner.substring(i, inner.len())
+    var j = 0
+    while j < sub.len():
+        val c = sub.substring(j, j + 1)
+        if c == " " or c == "\t" or c == "\n" or c == "\r" or c == "/":
+            break
+        j = j + 1
+    sub.substring(0, j)
+
+fn tag_name_of(inner: text) -> text:
+    var j = 0
+    val m = inner.len()
+    while j < m:
+        val c = inner.substring(j, j + 1)
+        if c == " " or c == "\t" or c == "\n" or c == "\r" or c == "/":
+            break
+        j = j + 1
+    val nm = inner.substring(0, j)
+    nm.lower()
+
+# ---------------------------------------------------------------------------
+# Parser -> arena
+# ---------------------------------------------------------------------------
+
+fn parse_html(html: text) -> [HNode]:
+    var nodes: [HNode] = []
+    nodes.push(mk_node("#root", -1))
+    var pstack: [i64] = [0]
+    var pos = 0
+    val n = html.len()
+    while pos < n:
+        val lt = find_from(html, "<", pos)
+        if lt < 0:
+            val tail = html.substring(pos, n)
+            if tail.trim().len() > 0:
+                var tn = mk_node("#text", pstack[pstack.len() - 1])
+                tn.text_data = tail
+                nodes.push(tn)
+            break
+        if lt > pos:
+            val txt = html.substring(pos, lt)
+            if txt.trim().len() > 0:
+                var tn = mk_node("#text", pstack[pstack.len() - 1])
+                tn.text_data = txt
+                nodes.push(tn)
+        # comment?
+        val c4 = if lt + 4 <= n: html.substring(lt, lt + 4) else: ""
+        if c4 == "<!--":
+            val cend = find_from(html, "-->", lt)
+            if cend < 0:
+                break
+            pos = cend + 3
+            continue
+        val gt = find_from(html, ">", lt)
+        if gt < 0:
+            break
+        val inner = html.substring(lt + 1, gt)
+        pos = gt + 1
+        if inner.len() == 0:
+            continue
+        val first = inner.substring(0, 1)
+        if first == "!":
+            continue
+        if first == "/":
+            val cname = inner.substring(1, inner.len()).trim().lower()
+            var k = pstack.len() - 1
+            var found = -1
+            while k >= 1:
+                val pidx = pstack[k]
+                if nodes[pidx].tag == cname:
+                    found = k
+                    break
+                k = k - 1
+            if found >= 1:
+                while pstack.len() > found:
+                    pstack.pop()
+            continue
+        val name = tag_name_of(inner)
+        var node = mk_node(name, pstack[pstack.len() - 1])
+        node.class_attr = attr_value(inner, "class")
+        node.id_attr = attr_value(inner, "id")
+        node.style_attr = attr_value(inner, "style")
+        nodes.push(node)
+        val self_close = inner.substring(inner.len() - 1, inner.len()) == "/"
+        if name == "style":
+            val sclose = find_from(html, "</style", pos)
+            if sclose >= 0:
+                val sgt = find_from(html, ">", sclose)
+                pos = if sgt >= 0: sgt + 1 else: sclose
+            continue
+        if name == "script":
+            val cclose = find_from(html, "</script", pos)
+            if cclose >= 0:
+                val cgt = find_from(html, ">", cclose)
+                pos = if cgt >= 0: cgt + 1 else: cclose
+            continue
+        if not is_void(name) and not self_close:
+            pstack.push(nodes.len() - 1)
+    nodes
+
+# ---------------------------------------------------------------------------
+# Minimal CSS color parsing (#rgb, #rrggbb, rgb()/rgba(), a few names)
+# ---------------------------------------------------------------------------
+
+fn hex_val(c: text) -> i32:
+    if c == "0": return 0
+    if c == "1": return 1
+    if c == "2": return 2
+    if c == "3": return 3
+    if c == "4": return 4
+    if c == "5": return 5
+    if c == "6": return 6
+    if c == "7": return 7
+    if c == "8": return 8
+    if c == "9": return 9
+    val l = c.lower()
+    if l == "a": return 10
+    if l == "b": return 11
+    if l == "c": return 12
+    if l == "d": return 13
+    if l == "e": return 14
+    if l == "f": return 15
+    0
+
+fn argb(r: i32, g: i32, b: i32) -> u32:
+    0xFF000000u32 | ((r.to_u32()) << 16) | ((g.to_u32()) << 8) | b.to_u32()
+
+# returns packed u32, or 0 for "none/transparent/empty"
+fn parse_color(raw: text) -> u32:
+    val s = raw.trim().lower()
+    if s.len() == 0 or s == "transparent" or s == "none" or s == "inherit":
+        return 0u32
+    if s == "white": return argb(255, 255, 255)
+    if s == "black": return argb(0, 0, 0)
+    if s == "red": return argb(220, 50, 50)
+    if s.substring(0, 1) == "#":
+        val h = s.substring(1, s.len())
+        if h.len() >= 6:
+            val r = hex_val(h.substring(0, 1)) * 16 + hex_val(h.substring(1, 2))
+            val g = hex_val(h.substring(2, 3)) * 16 + hex_val(h.substring(3, 4))
+            val b = hex_val(h.substring(4, 5)) * 16 + hex_val(h.substring(5, 6))
+            return argb(r, g, b)
+        if h.len() >= 3:
+            val r = hex_val(h.substring(0, 1)) * 17
+            val g = hex_val(h.substring(1, 2)) * 17
+            val b = hex_val(h.substring(2, 3)) * 17
+            return argb(r, g, b)
+        return 0u32
+    if s.substring(0, 3) == "rgb":
+        val lp = s.index_of("(")
+        val rp = s.index_of(")")
+        if lp >= 0 and rp > lp:
+            val inside = s.substring(lp + 1, rp)
+            val parts = inside.split(",")
+            if parts.len() >= 3:
+                return argb(parse_int(parts[0]), parse_int(parts[1]), parse_int(parts[2]))
+    0u32
+
+fn parse_int(s: text) -> i32:
+    val t = s.trim()
+    var i = 0
+    var v = 0
+    var any = false
+    while i < t.len():
+        val c = t.substring(i, i + 1)
+        if c >= "0" and c <= "9":
+            v = v * 10 + hex_val(c)
+            any = true
+        else:
+            if any:
+                break
+        i = i + 1
+    v
+
+# read a property value from a declaration block "a: b; c: d"
+fn decl_get(decls: text, prop: text) -> text:
+    val key = prop + ":"
+    val dl = decls.lower()
+    val kpos = dl.index_of(key)
+    if kpos < 0:
+        return ""
+    val after = decls.substring(kpos + key.len(), decls.len())
+    val semi = after.index_of(";")
+    val v = if semi >= 0: after.substring(0, semi) else: after
+    v.trim()
+
+# ---------------------------------------------------------------------------
+# Computed style
+# ---------------------------------------------------------------------------
+
+class Style:
+    bg: u32
+    fg: u32
+    font_size: i32
+    pad_l: i32
+    pad_t: i32
+    pad_r: i32
+    pad_b: i32
+    margin_t: i32
+    margin_b: i32
+    display: text       # block / inline / none
+    text_align: text
+    bold: bool
+
+fn default_style() -> Style:
+    Style(bg: 0u32, fg: argb(20, 20, 24), font_size: 16, pad_l: 0, pad_t: 0, pad_r: 0, pad_b: 0, margin_t: 0, margin_b: 0, display: "block", text_align: "left", bold: false)
+
+fn inherit_style(p: Style) -> Style:
+    Style(bg: 0u32, fg: p.fg, font_size: p.font_size, pad_l: 0, pad_t: 0, pad_r: 0, pad_b: 0, margin_t: 0, margin_b: 0, display: "block", text_align: p.text_align, bold: p.bold)
+
+fn is_inline_tag(tag: text) -> bool:
+    tag == "a" or tag == "span" or tag == "b" or tag == "strong" or tag == "em" or tag == "i" or tag == "small" or tag == "code" or tag == "#text"
+
+fn is_heading(tag: text) -> bool:
+    tag == "h1" or tag == "h2" or tag == "h3" or tag == "h4" or tag == "h5" or tag == "h6"
+
+# apply a declaration block onto a style
+fn apply_decls(st: Style, decls: text):
+    if decls.len() == 0:
+        return
+    val bg = decl_get(decls, "background-color")
+    if bg.len() > 0:
+        st.bg = parse_color(bg)
+    val bgs = decl_get(decls, "background")
+    if bgs.len() > 0 and st.bg == 0u32:
+        st.bg = parse_color(bgs)
+    val col = decl_get(decls, "color")
+    if col.len() > 0:
+        val cv = parse_color(col)
+        if cv != 0u32:
+            st.fg = cv
+    val fs = decl_get(decls, "font-size")
+    if fs.len() > 0:
+        val v = parse_int(fs)
+        if v > 0:
+            st.font_size = v
+    val ta = decl_get(decls, "text-align")
+    if ta.len() > 0:
+        st.text_align = ta
+    val fw = decl_get(decls, "font-weight")
+    if fw.len() > 0:
+        if fw == "bold" or fw == "700" or fw == "600" or fw == "800":
+            st.bold = true
+    val pad = decl_get(decls, "padding")
+    if pad.len() > 0:
+        val p = parse_int(pad)
+        st.pad_l = p
+        st.pad_t = p
+        st.pad_r = p
+        st.pad_b = p
+    val mb = decl_get(decls, "margin-bottom")
+    if mb.len() > 0:
+        st.margin_b = parse_int(mb)
+
+# default per-tag tweaks (block/inline, heading sizes, spacing)
+fn tag_defaults(st: Style, tag: text):
+    if is_inline_tag(tag):
+        st.display = "inline"
+    if tag == "h1":
+        st.font_size = 34
+        st.bold = true
+        st.margin_t = 10
+        st.margin_b = 10
+    elif tag == "h2":
+        st.font_size = 26
+        st.bold = true
+        st.margin_t = 8
+        st.margin_b = 8
+    elif tag == "h3":
+        st.font_size = 20
+        st.bold = true
+        st.margin_t = 6
+        st.margin_b = 6
+    elif tag == "p":
+        st.margin_t = 6
+        st.margin_b = 6
+    elif tag == "header" or tag == "footer" or tag == "nav" or tag == "section" or tag == "table" or tag == "tr" or tag == "div" or tag == "ul" or tag == "li":
+        st.display = "block"
+
+# ---------------------------------------------------------------------------
+# CSS rules from <style> blocks
+# ---------------------------------------------------------------------------
+
+class Rules:
+    sels: [text]
+    decls: [text]
+
+fn extract_css(html: text) -> Rules:
+    var sels: [text] = []
+    var decls: [text] = []
+    var pos = 0
+    var guard = 0
+    while guard < 1000:
+        guard = guard + 1
+        val sp = find_from(html, "<style", pos)
+        if sp < 0:
+            break
+        val open = find_from(html, ">", sp)
+        if open < 0:
+            break
+        val close = find_from(html, "</style", open)
+        if close < 0:
+            break
+        val css = html.substring(open + 1, close)
+        # split into "selector { decls }" chunks
+        var cp = 0
+        while cp < css.len():
+            val brace = find_from(css, "{", cp)
+            if brace < 0:
+                break
+            val endb = find_from(css, "}", brace)
+            if endb < 0:
+                break
+            val sel_raw = css.substring(cp, brace)
+            val sel = sel_raw.trim()
+            val decl_raw = css.substring(brace + 1, endb)
+            val decl = decl_raw.trim()
+            if sel.len() > 0:
+                sels.push(sel)
+                decls.push(decl)
+            cp = endb + 1
+        pos = close + 1
+    Rules(sels: sels, decls: decls)
+
+# does a single simple selector match this node? (rightmost token only)
+fn simple_match(sel: text, tag: text, cls: text, id: text) -> bool:
+    val s = sel.trim()
+    if s.len() == 0:
+        return false
+    # strip pseudo (:hover, :nth-child(..))
+    var base = s
+    val colon = base.index_of(":")
+    if colon >= 0:
+        base = base.substring(0, colon)
+    if base.substring(0, 1) == ".":
+        val want = base.substring(1, base.len())
+        return class_has(cls, want)
+    if base.substring(0, 1) == "#":
+        return id == base.substring(1, base.len())
+    val dot = base.index_of(".")
+    if dot >= 0:
+        val t = base.substring(0, dot)
+        val want = base.substring(dot + 1, base.len())
+        return t == tag and class_has(cls, want)
+    base == tag
+
+fn class_has(cls: text, want: text) -> bool:
+    if cls == want:
+        return true
+    val parts = cls.split(" ")
+    var i = 0
+    while i < parts.len():
+        if parts[i] == want:
+            return true
+        i = i + 1
+    false
+
+# rightmost compound of a (possibly descendant) selector, after splitting commas
+fn selector_matches(sel: text, tag: text, cls: text, id: text) -> bool:
+    val groups = sel.split(",")
+    var g = 0
+    while g < groups.len():
+        val gg = groups[g].trim()
+        val sp = gg.last_index_of(" ")
+        val right = if sp >= 0: gg.substring(sp + 1, gg.len()) else: gg
+        if simple_match(right, tag, cls, id):
+            return true
+        g = g + 1
+    false
+
+# ---------------------------------------------------------------------------
+# Compute styles (cascade: inherit -> tag defaults -> matched rules -> inline)
+# ---------------------------------------------------------------------------
+
+fn compute_styles(nodes: [HNode], rules: Rules) -> [Style]:
+    var styles: [Style] = []
+    var i = 0
+    while i < nodes.len():
+        val nd = nodes[i]
+        var st = if nd.parent >= 0: inherit_style(styles[nd.parent]) else: default_style()
+        tag_defaults(st, nd.tag)
+        var r = 0
+        while r < rules.sels.len():
+            if selector_matches(rules.sels[r], nd.tag, nd.class_attr, nd.id_attr):
+                apply_decls(st, rules.decls[r])
+            r = r + 1
+        if nd.style_attr.len() > 0:
+            apply_decls(st, nd.style_attr)
+        styles.push(st)
+        i = i + 1
+    styles
+
+# ---------------------------------------------------------------------------
+# Tiny 5x7 bitmap font + plain [u32] framebuffer rasterizer
+# ---------------------------------------------------------------------------
+# Each glyph is 7 rows; each row's low 5 bits are pixels (bit 4 = leftmost).
+# Uppercase and lowercase share shapes to stay lean. Layout geometry is derived
+# from glyph_scale() so wrapping matches exactly what fb_text draws.
+
+val FONT_CHARSET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .,:;!?-_()[]/\\'\"+=#%&@*<>"
+
+# returns the 7 row bitmasks for a glyph index into FONT_CHARSET
+fn glyph_rows(gi: i32) -> [i32]:
+    if gi == 0:  return [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001]  # A
+    if gi == 1:  return [0b11110, 0b10001, 0b11110, 0b10001, 0b10001, 0b10001, 0b11110]  # B
+    if gi == 2:  return [0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110]  # C
+    if gi == 3:  return [0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110]  # D
+    if gi == 4:  return [0b11111, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000, 0b11111]  # E
+    if gi == 5:  return [0b11111, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000, 0b10000]  # F
+    if gi == 6:  return [0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01110]  # G
+    if gi == 7:  return [0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001, 0b10001]  # H
+    if gi == 8:  return [0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110]  # I
+    if gi == 9:  return [0b00111, 0b00010, 0b00010, 0b00010, 0b10010, 0b10010, 0b01100]  # J
+    if gi == 10: return [0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001]  # K
+    if gi == 11: return [0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111]  # L
+    if gi == 12: return [0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001]  # M
+    if gi == 13: return [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001]  # N
+    if gi == 14: return [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110]  # O
+    if gi == 15: return [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000]  # P
+    if gi == 16: return [0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101]  # Q
+    if gi == 17: return [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001]  # R
+    if gi == 18: return [0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110]  # S
+    if gi == 19: return [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100]  # T
+    if gi == 20: return [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110]  # U
+    if gi == 21: return [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100]  # V
+    if gi == 22: return [0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001]  # W
+    if gi == 23: return [0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b01010, 0b10001]  # X
+    if gi == 24: return [0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100]  # Y
+    if gi == 25: return [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111]  # Z
+    if gi == 26: return [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110]  # 0
+    if gi == 27: return [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110]  # 1
+    if gi == 28: return [0b01110, 0b10001, 0b00001, 0b00110, 0b01000, 0b10000, 0b11111]  # 2
+    if gi == 29: return [0b11111, 0b00010, 0b00100, 0b00110, 0b00001, 0b10001, 0b01110]  # 3
+    if gi == 30: return [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010]  # 4
+    if gi == 31: return [0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110]  # 5
+    if gi == 32: return [0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110]  # 6
+    if gi == 33: return [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000]  # 7
+    if gi == 34: return [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110]  # 8
+    if gi == 35: return [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100]  # 9
+    if gi == 36: return [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000]  # space
+    if gi == 37: return [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00100]  # .
+    if gi == 38: return [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00100, 0b01000]  # ,
+    if gi == 39: return [0b00000, 0b00100, 0b00000, 0b00000, 0b00000, 0b00100, 0b00000]  # :
+    if gi == 40: return [0b00000, 0b00100, 0b00000, 0b00000, 0b00000, 0b00100, 0b01000]  # ;
+    if gi == 41: return [0b00100, 0b00100, 0b00100, 0b00100, 0b00000, 0b00000, 0b00100]  # !
+    if gi == 42: return [0b01110, 0b10001, 0b00010, 0b00100, 0b00100, 0b00000, 0b00100]  # ?
+    if gi == 43: return [0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000]  # -
+    if gi == 44: return [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b11111]  # _
+    if gi == 45: return [0b00010, 0b00100, 0b01000, 0b01000, 0b01000, 0b00100, 0b00010]  # (
+    if gi == 46: return [0b01000, 0b00100, 0b00010, 0b00010, 0b00010, 0b00100, 0b01000]  # )
+    if gi == 47: return [0b01110, 0b01000, 0b01000, 0b01000, 0b01000, 0b01000, 0b01110]  # [
+    if gi == 48: return [0b01110, 0b00010, 0b00010, 0b00010, 0b00010, 0b00010, 0b01110]  # ]
+    if gi == 49: return [0b00001, 0b00010, 0b00010, 0b00100, 0b01000, 0b01000, 0b10000]  # /
+    if gi == 50: return [0b10000, 0b01000, 0b01000, 0b00100, 0b00010, 0b00010, 0b00001]  # \
+    if gi == 51: return [0b00100, 0b00100, 0b01000, 0b00000, 0b00000, 0b00000, 0b00000]  # '
+    if gi == 52: return [0b01010, 0b01010, 0b01010, 0b00000, 0b00000, 0b00000, 0b00000]  # "
+    if gi == 53: return [0b00000, 0b00100, 0b00100, 0b11111, 0b00100, 0b00100, 0b00000]  # +
+    if gi == 54: return [0b00000, 0b00000, 0b11111, 0b00000, 0b11111, 0b00000, 0b00000]  # =
+    if gi == 55: return [0b01010, 0b11111, 0b01010, 0b01010, 0b11111, 0b01010, 0b00000]  # #
+    if gi == 56: return [0b11001, 0b11010, 0b00100, 0b01000, 0b10011, 0b00011, 0b00000]  # %
+    if gi == 57: return [0b01100, 0b10010, 0b01100, 0b10101, 0b10010, 0b01101, 0b00000]  # &
+    if gi == 58: return [0b01110, 0b10001, 0b10101, 0b10110, 0b10000, 0b01110, 0b00000]  # @
+    if gi == 59: return [0b00100, 0b10101, 0b01110, 0b00100, 0b01110, 0b10101, 0b00100]  # *
+    if gi == 60: return [0b00010, 0b00100, 0b01000, 0b10000, 0b01000, 0b00100, 0b00010]  # <
+    if gi == 61: return [0b01000, 0b00100, 0b00010, 0b00001, 0b00010, 0b00100, 0b01000]  # >
+    [0b11111, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11111]  # unknown -> box
+
+# integer nearest scale based on font size; 16->2, 34->4
+fn glyph_scale(fs: i32) -> i32:
+    var s = fs / 8
+    if s < 1:
+        s = 1
+    s
+
+# write `color` to a single framebuffer pixel (clipped)
+fn fb_put(fb: [u32], fbw: i32, fbh: i32, x: i32, y: i32, color: u32):
+    if x < 0 or y < 0 or x >= fbw or y >= fbh:
+        return
+    fb[y * fbw + x] = color
+
+fn fb_clear(fb: [u32], color: u32):
+    var i = 0
+    val n = fb.len()
+    while i < n:
+        fb[i] = color
+        i = i + 1
+
+# clipped filled rectangle
+fn fb_rect(fb: [u32], fbw: i32, fbh: i32, x: i32, y: i32, w: i32, h: i32, color: u32):
+    var x0 = x
+    var y0 = y
+    var x1 = x + w
+    var y1 = y + h
+    if x0 < 0:
+        x0 = 0
+    if y0 < 0:
+        y0 = 0
+    if x1 > fbw:
+        x1 = fbw
+    if y1 > fbh:
+        y1 = fbh
+    var py = y0
+    while py < y1:
+        val row = py * fbw
+        var px = x0
+        while px < x1:
+            fb[row + px] = color
+            px = px + 1
+        py = py + 1
+
+# draw one glyph at (x,y) scaled by `scale`
+fn fb_glyph(fb: [u32], fbw: i32, fbh: i32, x: i32, y: i32, gi: i32, color: u32, scale: i32):
+    val rows = glyph_rows(gi)
+    var ry = 0
+    while ry < 7:
+        val bits = rows[ry]
+        var rx = 0
+        while rx < 5:
+            val mask = 1 << (4 - rx)
+            if (bits & mask) != 0:
+                # fill a scale x scale block
+                val bx0 = x + rx * scale
+                val by0 = y + ry * scale
+                var dy = 0
+                while dy < scale:
+                    val yy = by0 + dy
+                    if yy >= 0 and yy < fbh:
+                        val row = yy * fbw
+                        var dx = 0
+                        while dx < scale:
+                            val xx = bx0 + dx
+                            if xx >= 0 and xx < fbw:
+                                fb[row + xx] = color
+                            dx = dx + 1
+                    dy = dy + 1
+            rx = rx + 1
+        ry = ry + 1
+
+# draw a string; advances 6*scale px per char (5px glyph + 1px gap)
+fn fb_text(fb: [u32], fbw: i32, fbh: i32, x: i32, y: i32, s: text, color: u32, scale: i32):
+    var i = 0
+    val n = s.len()
+    var cx = x
+    val adv = 6 * scale
+    while i < n:
+        val ch = s.substring(i, i + 1).upper()
+        if cx < fbw:
+            val gi = FONT_CHARSET.index_of(ch)
+            if gi >= 0 and gi != 36:
+                fb_glyph(fb, fbw, fbh, cx, y, gi, color, scale)
+        cx = cx + adv
+        i = i + 1
+
+# ---------------------------------------------------------------------------
+# Block layout (parallel arrays; recursion returns box height)
+# ---------------------------------------------------------------------------
+# Geometry derived from glyph_scale so wrapping matches fb_text exactly.
+
+fn char_w(fs: i32) -> i32:
+    6 * glyph_scale(fs)
+
+fn line_h(fs: i32) -> i32:
+    9 * glyph_scale(fs)
+
+fn layout(nodes: [HNode], styles: [Style], i: i32, x: i32, y: i32, w: i32, bx: [i32], by: [i32], bw: [i32], bh: [i32]) -> i32:
+    bx[i] = x
+    by[i] = y
+    bw[i] = w
+    val st = styles[i]
+    if nodes[i].tag == "#text":
+        val txt: text = nodes[i].text_data.trim()
+        val txt_len = nodes[i].text_data.trim().len()
+        val cw = char_w(st.font_size)
+        var cpl = w / cw
+        if cpl < 1:
+            cpl = 1
+        var lines = (txt_len + cpl - 1) / cpl
+        if lines < 1:
+            lines = 1
+        val h = lines * line_h(st.font_size)
+        bh[i] = h
+        return h
+    val ix = x + st.pad_l
+    var iw = w - st.pad_l - st.pad_r
+    if iw < 1:
+        iw = 1
+    var cy = y + st.pad_t
+    var c = i + 1
+    while c < nodes.len():
+        if nodes[c].parent == i:
+            val cst = styles[c]
+            cy = cy + cst.margin_t
+            val ch = layout(nodes, styles, c, ix, cy, iw, bx, by, bw, bh)
+            cy = cy + ch + cst.margin_b
+        c = c + 1
+    var h = (cy - y) + st.pad_b
+    if h < 1:
+        h = 1
+    bh[i] = h
+    h
+
+# ---------------------------------------------------------------------------
+# Paint directly into a [u32] framebuffer (no Engine2D)
+# ---------------------------------------------------------------------------
+
+fn paint(nodes: [HNode], styles: [Style], bx: [i32], by: [i32], bw: [i32], bh: [i32], fb: [u32], fbw: i32, fbh: i32):
+    # backgrounds first (document order = back to front)
+    var i = 0
+    while i < nodes.len():
+        val st = styles[i]
+        if nodes[i].tag != "#text" and st.bg != 0u32 and by[i] < fbh:
+            fb_rect(fb, fbw, fbh, bx[i], by[i], bw[i], bh[i], st.bg)
+        i = i + 1
+    # text on top
+    i = 0
+    while i < nodes.len():
+        if nodes[i].tag == "#text":
+            val st = styles[i]
+            val txt: text = nodes[i].text_data.trim()
+            if txt.len() > 0 and by[i] < fbh:
+                val scale = glyph_scale(st.font_size)
+                val cw = char_w(st.font_size)
+                var cpl = bw[i] / cw
+                if cpl < 1:
+                    cpl = 1
+                var off = 0
+                var ly = by[i]
+                val lh = line_h(st.font_size)
+                while off < txt.len() and ly < fbh:
+                    var endc = off + cpl
+                    if endc > txt.len():
+                        endc = txt.len()
+                    val line = txt.substring(off, endc)
+                    fb_text(fb, fbw, fbh, bx[i], ly, line, st.fg, scale)
+                    off = endc
+                    ly = ly + lh
+        i = i + 1
+
+# ---------------------------------------------------------------------------
+# ASCII preview of the framebuffer (so the render can be checked from text)
+# ---------------------------------------------------------------------------
+
+fn ascii_preview(px: [u32], w: i32, h: i32):
+    val cols = 70
+    val rows = 30
+    print "ASCII preview ({w}x{h}):"
+    var ry = 0
+    while ry < rows:
+        var line = ""
+        var rx = 0
+        while rx < cols:
+            val sx = (rx * w) / cols
+            val sy = (ry * h) / rows
+            val c = px[sy * w + sx]
+            val r = ((c >> 16) & 0xFFu32).to_i32()
+            val g = ((c >> 8) & 0xFFu32).to_i32()
+            val b = (c & 0xFFu32).to_i32()
+            val lum = (r + g + b) / 3
+            var ch = " "
+            if lum > 200:
+                ch = "#"
+            elif lum > 120:
+                ch = "+"
+            elif lum > 50:
+                ch = ":"
+            elif lum > 15:
+                ch = "."
+            line = line + ch
+            rx = rx + 1
+        print line
+        ry = ry + 1
+
+# ---------------------------------------------------------------------------
+# Render entry
+# ---------------------------------------------------------------------------
+
+fn render_html_pixels(html: text, w: i32, h: i32) -> [u32]:
+    val nodes = parse_html(html)
+    print "  phase: parsed {nodes.len()} nodes"
+    val rules = extract_css(html)
+    val styles = compute_styles(nodes, rules)
+    print "  phase: styled"
+    var bx: [i32] = [0; nodes.len()]
+    var by: [i32] = [0; nodes.len()]
+    var bw: [i32] = [0; nodes.len()]
+    var bh: [i32] = [0; nodes.len()]
+    layout(nodes, styles, 0, 0, 0, w, bx, by, bw, bh)
+    print "  phase: laid out"
+    val white = argb(255, 255, 255)
+    var fb: [u32] = [white; w * h]
+    print "  phase: fb allocated"
+    paint(nodes, styles, bx, by, bw, bh, fb, w, h)
+    print "  phase: painted"
+    fb
+
+fn html_path() -> text:
+    val args = cli_get_args()
+    var i = 0
+    while i < args.len():
+        if args[i].ends_with(".html"):
+            return args[i]
+        i = i + 1
+    "examples/ui/sample_page.html"
+
+fn main() -> i64:
+    val path = html_path()
+    if not file_exists(path):
+        print "not found: {path}"
+        return 1
+    val html = read_file(path)
+    print "rendering {path} ({html.len()} bytes)"
+    val px = render_html_pixels(html, 200, 260)
+    print "rendered {px.len()} px"
+    ascii_preview(px, 200, 260)
+    0

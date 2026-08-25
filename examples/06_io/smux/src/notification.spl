@@ -1,0 +1,75 @@
+# Cross-Platform Notifications
+# Sends notifications via the most appropriate mechanism for the current platform.
+
+use std.io_runtime.{process_run}
+extern fn rt_term_write(data: text) -> i64
+extern fn rt_term_flush() -> i32
+
+# ============================================================================
+# Notification
+# ============================================================================
+
+struct Notification:
+    title: text
+    body: text
+    urgency: text  # "low", "normal", "critical"
+
+    static fn simple(body: text) -> Notification:
+        Notification(title: "smux", body: body, urgency: "normal")
+
+    static fn with_title(title: text, body: text) -> Notification:
+        Notification(title: title, body: body, urgency: "normal")
+
+# ============================================================================
+# Send Functions (by platform)
+# ============================================================================
+
+fn notify(notification: Notification, platform_name: text, has_tmux: bool):
+    # Always try terminal bell
+    _notify_bell()
+
+    # Platform-specific notification
+    match platform_name:
+        "linux" => _notify_linux(notification)
+        "macos" => _notify_macos(notification)
+        "android" => _notify_android(notification)
+        "ios" => _notify_ios(notification)
+        "windows" => _notify_windows(notification)
+        _ => ()
+
+    # tmux notification if available
+    if has_tmux:
+        _notify_tmux(notification)
+
+fn _notify_bell():
+    rt_term_write("\x07")
+    rt_term_flush()
+
+fn _notify_linux(n: Notification):
+    process_run("notify-send", ["-u", n.urgency, n.title, n.body])
+
+fn _notify_macos(n: Notification):
+    val script = 'display notification "{n.body}" with title "{n.title}"'
+    process_run("osascript", ["-e", script])
+
+fn _notify_android(n: Notification):
+    process_run("termux-notification", [
+        "--title", n.title,
+        "--content", n.body
+    ])
+
+fn _notify_ios(n: Notification):
+    # iOS: bell + terminal title change (best we can do)
+    _notify_bell()
+    _set_terminal_title("{n.title}: {n.body}")
+
+fn _notify_windows(n: Notification):
+    val ps_cmd = "[System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms'); [System.Windows.Forms.MessageBox]::Show('{n.body}', '{n.title}')"
+    process_run("powershell", ["-Command", ps_cmd])
+
+fn _notify_tmux(n: Notification):
+    process_run("tmux", ["display-message", "{n.title}: {n.body}"])
+
+fn _set_terminal_title(title: text):
+    rt_term_write("\u{001b}]0;{title}\x07")
+    rt_term_flush()

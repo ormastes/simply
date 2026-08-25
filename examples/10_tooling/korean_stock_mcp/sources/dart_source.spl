@@ -1,0 +1,148 @@
+#![allow(unnamed_duplicate_typed_args)]
+# Korean Stock MCP - DART Data Source
+#
+# REST calls to https://opendart.fss.or.kr/api/
+# Requires DART_API_KEY environment variable.
+
+val DART_API_BASE = "https://opendart.fss.or.kr/api"
+
+# ============================================================================
+# Company Info
+# ============================================================================
+
+fn dart_get_company_info(corp_code: text, api_key: text) -> text:
+    val url = DART_API_BASE + "/company.json?crtfc_key=" + api_key + "&corp_code=" + corp_code
+    val headers: [text] = ["Accept: application/json", "User-Agent: Mozilla/5.0"]
+    var status: i64 = 0
+    var resp_body = ""
+    var error = ""
+    (status, resp_body, error) = rt_http_request("GET", url, headers, "")
+    if status < 200 or status >= 300:
+        if error != "":
+            return "ERROR: DART API request failed: " + error
+        return "ERROR: DART API returned status " + str(status)
+
+    # Check for API error status
+    val api_status = extract_field(resp_body, "status")
+    if api_status != "000":
+        val api_msg = extract_field(resp_body, "message")
+        return "ERROR: DART API error: " + api_msg
+
+    # Extract company info fields
+    val corp_name = extract_field(resp_body, "corp_name")
+    val corp_name_eng = extract_field(resp_body, "corp_name_eng")
+    val stock_code = extract_field(resp_body, "stock_code")
+    val ceo_nm = extract_field(resp_body, "ceo_nm")
+    val corp_cls = extract_field(resp_body, "corp_cls")
+    val est_dt = extract_field(resp_body, "est_dt")
+    val adres = extract_field(resp_body, "adres")
+    val hm_url = extract_field(resp_body, "hm_url")
+    val induty_code = extract_field(resp_body, "induty_code")
+    val acc_mt = extract_field(resp_body, "acc_mt")
+
+    var results: [text] = []
+    results.push("Company Information")
+    results.push("==================")
+    results.push("Name: " + corp_name)
+    results.push("English Name: " + corp_name_eng)
+    results.push("Stock Code: " + stock_code)
+    results.push("CEO: " + ceo_nm)
+    var corp_class = "Unknown"
+    if corp_cls == "Y":
+        corp_class = "KOSPI"
+    elif corp_cls == "K":
+        corp_class = "KOSDAQ"
+    elif corp_cls == "N":
+        corp_class = "KONEX"
+    elif corp_cls == "E":
+        corp_class = "Others"
+    results.push("Market: " + corp_class)
+    results.push("Established: " + est_dt)
+    results.push("Address: " + adres)
+    results.push("Website: " + hm_url)
+    results.push("Industry Code: " + induty_code)
+    results.push("Fiscal Month: " + acc_mt)
+    results.join("\n")
+
+# ============================================================================
+# Financial Statements
+# ============================================================================
+
+fn dart_get_financial_statements(corp_code: text, api_key: text, year: text, report_type: text) -> text:
+    var reprt_code = "11011"  # annual
+    if report_type == "semi":
+        reprt_code = "11012"
+    elif report_type == "quarterly" or report_type == "q1":
+        reprt_code = "11013"
+    elif report_type == "q3":
+        reprt_code = "11014"
+
+    val url = DART_API_BASE + "/fnlttSinglAcnt.json?crtfc_key=" + api_key + "&corp_code=" + corp_code + "&bsns_year=" + year + "&reprt_code=" + reprt_code
+    val headers: [text] = ["Accept: application/json", "User-Agent: Mozilla/5.0"]
+    var status: i64 = 0
+    var resp_body = ""
+    var error = ""
+    (status, resp_body, error) = rt_http_request("GET", url, headers, "")
+    if status < 200 or status >= 300:
+        if error != "":
+            return "ERROR: DART API request failed: " + error
+        return "ERROR: DART API returned status " + str(status)
+
+    val api_status = extract_field(resp_body, "status")
+    if api_status != "000":
+        val api_msg = extract_field(resp_body, "message")
+        return "ERROR: DART API error: " + api_msg
+
+    var results: [text] = []
+    results.push("Financial Statements (" + year + ", " + report_type + ")")
+    results.push("=" .repeat(50))
+    results.push("Account | Current Period | Prior Period")
+    results.push("--------|----------------|-------------")
+
+    # Parse financial statement entries
+    var search_pos = 0
+    var count = 0
+    val acct_key = Q() + "account_nm" + Q()
+    while search_pos < resp_body.len() and count < 30:
+        val remaining = mcp_substr(resp_body, search_pos, resp_body.len())
+        val found_result = remaining.index_of(acct_key)
+        var found_idx = -1
+        match found_result:
+            Some(i): found_idx = i
+            nil: break
+        if found_idx < 0:
+            break
+
+        val abs_pos = search_pos + found_idx
+        var obj_start = abs_pos
+        while obj_start > 0:
+            if mcp_char_at(resp_body, obj_start) == "{":
+                break
+            obj_start = obj_start - 1
+        var obj_end = abs_pos
+        var depth = 0
+        while obj_end < resp_body.len():
+            val ch = mcp_char_at(resp_body, obj_end)
+            if ch == "{":
+                depth = depth + 1
+            elif ch == "}":
+                depth = depth - 1
+                if depth == 0:
+                    obj_end = obj_end + 1
+                    break
+            obj_end = obj_end + 1
+
+        val obj = mcp_substr(resp_body, obj_start, obj_end)
+        val account = extract_field(obj, "account_nm")
+        val current_amount = extract_field(obj, "thstrm_amount")
+        val prior_amount = extract_field(obj, "frmtrm_amount")
+
+        results.push(account + " | " + format_krw(current_amount) + " | " + format_krw(prior_amount))
+        count = count + 1
+
+        search_pos = obj_end
+
+    if count == 0:
+        results.push("(No financial data available)")
+
+    results.join("\n")

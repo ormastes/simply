@@ -1,0 +1,8 @@
+use arch.common.host_gpu_ivshmem_probe_entry.{host_gpu_ivshmem_probe_main_profile}
+use common.gpu.simpleos_host_gpu_protocol.{SIMPLEOS_HOST_GPU_BACKEND_VULKAN}
+
+extern fn rt_qemu_exit_success()
+
+fn spl_start():
+    host_gpu_ivshmem_probe_main_profile(SIMPLEOS_HOST_GPU_BACKEND_VULKAN, true)
+    rt_qemu_exit_success()

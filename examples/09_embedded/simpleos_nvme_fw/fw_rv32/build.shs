@@ -1,0 +1,771 @@
+#!/bin/sh
+# Build a bootable rv32 ELF for the NVMe-firmware direct smoke (gap-closure P9).
+#
+# Default mode is intentionally small: compile the scalar Simple firmware logic
+# to an rv32 object, then link a tiny direct `_start` that calls its self-test.
+# Set NVME_RV32_BUILD_OS_BOOT=1 to exercise the stock rv32 OS boot path and its
+# optional firmware hook.
+#
+# STATUS (2026-07-07): direct mode builds and boots under qemu-system-riscv32;
+# OS boot mode remains available as an explicit slower diagnostic path.
+#
+# Usage: sh examples/09_embedded/simpleos_nvme_fw/fw_rv32/build.shs
+set -e
+cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
+MODE="${1:-}"
+# Simple's default integer is i64, so 64-bit `/` and `%` in firmware logic lower
+# to the libgcc soft-arithmetic helpers (__divdi3/__moddi3). Bare-metal rv32 has
+# no implicit libgcc, so link the ABI-matching archive explicitly; as an archive
+# only the referenced members are pulled in, and --gc-sections drops the rest.
+# The compiler's emitted firmware object is soft-float (ilp32, no f/d ext) --
+# verified via `readlink -f build/test-artifacts/nvme_fw_rv32.o | riscv64-unknown-elf-readelf -A -`
+# -> Tag_RISCV_arch: rv32i2p1_m2p0_a2p1_c2p0. The libgcc archive AND the start
+# stub below must match this ABI or ld.lld rejects the link ("cannot link
+# object files with different floating-point ABI").
+LIBGCC="$(riscv64-unknown-elf-gcc -march=rv32imac -mabi=ilp32 -print-libgcc-file-name)"
+QEMU_HOST_MODE="${NVME_RV32_QEMU_HOST:-0}"
+SERVICE_MODE="${NVME_RV32_SERVICE:-0}"
+[ "$QEMU_HOST_MODE" = "1" ] && SERVICE_MODE=1
+OUT="${NVME_RV32_OUT:-build/nvme_fw_rv32.elf}"
+if [ "$QEMU_HOST_MODE" = "1" ] && [ -z "${NVME_RV32_OUT:-}" ]; then
+  OUT="build/nvme_fw_rv32_qemu_host.elf"
+elif [ "$SERVICE_MODE" = "1" ] && [ -z "${NVME_RV32_OUT:-}" ]; then
+  OUT="build/nvme_fw_rv32_service.elf"
+fi
+OBJ="build/test-artifacts/nvme_fw_rv32.o"
+START_OBJ="build/test-artifacts/nvme_fw_rv32_start.o"
+START_ASM="build/test-artifacts/nvme_fw_rv32_start.S"
+BOOT="src/os/kernel/arch/riscv32/boot.spl"
+ENTRY_DIR="build/os/generated"
+ENTRY="$ENTRY_DIR/nvme_fw_boot_root.spl"
+DIRECT_ENTRY="$ENTRY_DIR/nvme_fw_direct_entry.spl"
+BOOT_STUB_LINK="$ENTRY_DIR/boot"
+TIMEOUT_SECS="${NVME_RV32_BUILD_TIMEOUT_SECS:-300}"
+SIMPLE_BIN="${NVME_RV32_SIMPLE_BIN:-bin/simple}"
+if [ ! -x "$SIMPLE_BIN" ]; then
+  echo "NVME_RV32_BUILD_FAILED missing Simple runtime: $SIMPLE_BIN" >&2
+  echo "Set NVME_RV32_SIMPLE_BIN to a self-hosted Simple binary." >&2
+  exit 127
+fi
+OS_BOOT_BUILD="${NVME_RV32_BUILD_OS_BOOT:-0}"
+LOG_DIR="build/test-artifacts"
+OUT_LOG="$LOG_DIR/nvme_fw_rv32_build.out"
+ERR_LOG="$LOG_DIR/nvme_fw_rv32_build.err"
+PID_FILE="$LOG_DIR/nvme_fw_rv32_build.pid"
+BG_OUT_LOG="$LOG_DIR/nvme_fw_rv32_background.out"
+BG_ERR_LOG="$LOG_DIR/nvme_fw_rv32_background.err"
+
+# Wave-3 4-core SMP mode (design contract: doc/05_design/hardware/
+# nvme_fw_multicore/fourcore_ipc_index_handle_design.md §9, lane spec L6b).
+# NVME_RV32_SMP=1 selects an ADDITIVE branch below and links a 4-hart _start
+# stub instead of the default single-hart direct-firmware path. The default
+# path (SMP_MODE unset) is completely unchanged by this branch.
+#
+# SMP still uses its collision-checked flattened image because entry_smp.spl
+# overlays wave-3 entry/runtime owners. The default direct build preserves the
+# logic modules: shared core helpers are explicitly public, so case modules no
+# longer depend on flattening to reach private names.
+SMP_MODE="${NVME_RV32_SMP:-0}"
+SMP_OUT="build/nvme_fw_rv32_smp.elf"
+SMP_ENTRY_DIR="build/os/generated_smp"
+SMP_DIRECT_ENTRY="$SMP_ENTRY_DIR/nvme_fw_smp_direct_entry.spl"
+SMP_OBJ="build/test-artifacts/nvme_fw_rv32_smp.o"
+SMP_START_OBJ="build/test-artifacts/nvme_fw_rv32_smp_start.o"
+SMP_START_ASM="build/test-artifacts/nvme_fw_rv32_smp_start.S"
+SMP_OUT_LOG="$LOG_DIR/nvme_fw_rv32_smp_build.out"
+SMP_ERR_LOG="$LOG_DIR/nvme_fw_rv32_smp_build.err"
+SMP_NAMES_SEEN="$LOG_DIR/nvme_fw_rv32_smp_names_seen.txt"
+SMP_NAMES_NEW="$LOG_DIR/nvme_fw_rv32_smp_names_new.txt"
+SMP_NAMES_DUP="$LOG_DIR/nvme_fw_rv32_smp_names_dup.txt"
+SMP_TMP_APPEND="$LOG_DIR/nvme_fw_rv32_smp_append_tmp.spl"
+
+if ! grep -q "rt_rv32_boot_optional_nvme_fw_selftest" "$BOOT"; then
+  echo "NVME_RV32_BOOT_NOT_WIRED: add rt_rv32_boot_optional_nvme_fw_selftest() to $BOOT before building $OUT"
+  exit 2
+fi
+
+mkdir -p "$LOG_DIR"
+mkdir -p "$ENTRY_DIR"
+
+if [ "$MODE" = "--status" ]; then
+  LAST_PHASE="$(grep -ahE '\[native-build\]|\[BOOTSTRAP-PHASE\]|NVME_RV32_BUILD_FAILED' "$OUT_LOG" "$ERR_LOG" "$BG_OUT_LOG" "$BG_ERR_LOG" 2>/dev/null | tail -n 1 || true)"
+  LAST_DONE="$(grep -ahE '\[BOOTSTRAP-PHASE\].*:done|NVME_RV32_BUILD_DONE|NVME_RV32_BUILD_FAILED' "$OUT_LOG" "$ERR_LOG" "$BG_OUT_LOG" "$BG_ERR_LOG" 2>/dev/null | tail -n 1 || true)"
+  if [ -f "$OUT" ]; then
+    echo "NVME_RV32_BUILD_STATUS built out=$OUT"
+    exit 0
+  fi
+  if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    echo "NVME_RV32_BUILD_STATUS running pid=$(cat "$PID_FILE") out=$BG_OUT_LOG err=$BG_ERR_LOG last_done=$LAST_DONE last_phase=$LAST_PHASE"
+    exit 0
+  fi
+  if [ -f "$PID_FILE" ]; then
+    echo "NVME_RV32_BUILD_STATUS stopped pid=$(cat "$PID_FILE") missing=$OUT out_log=$OUT_LOG err_log=$ERR_LOG bg_out=$BG_OUT_LOG bg_err=$BG_ERR_LOG last_done=$LAST_DONE last_phase=$LAST_PHASE"
+    exit 1
+  fi
+  echo "NVME_RV32_BUILD_STATUS missing out=$OUT out_log=$OUT_LOG err_log=$ERR_LOG"
+  exit 1
+fi
+
+if [ "$MODE" = "--background" ]; then
+  if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    echo "NVME_RV32_BUILD_BACKGROUND already-running pid=$(cat "$PID_FILE")"
+    exit 0
+  fi
+  setsid sh examples/09_embedded/simpleos_nvme_fw/fw_rv32/build.shs >"$BG_OUT_LOG" 2>"$BG_ERR_LOG" < /dev/null &
+  echo $! >"$PID_FILE"
+  echo "NVME_RV32_BUILD_BACKGROUND pid=$(cat "$PID_FILE") out=$BG_OUT_LOG err=$BG_ERR_LOG"
+  exit 0
+fi
+
+if [ "$SMP_MODE" = "1" ]; then
+  rm -rf "$SMP_ENTRY_DIR"
+  mkdir -p "$SMP_ENTRY_DIR"
+
+  # smp_check_collisions LABEL FILE: fails the build (fail-closed) if FILE
+  # defines a top-level `fn`/`val` name already seen in an earlier appended
+  # file. This is the guard that would have caught the underscore-private
+  # collision class above BEFORE it reached the compiler as an opaque HIR
+  # error, and it protects future edits to any of the appended files.
+  : >"$SMP_NAMES_SEEN"
+  smp_check_collisions() {
+    grep -oE '^(fn|val) [A-Za-z_][A-Za-z0-9_]*' "$2" | awk '{print $2}' | sort -u >"$SMP_NAMES_NEW"
+    comm -12 "$SMP_NAMES_SEEN" "$SMP_NAMES_NEW" >"$SMP_NAMES_DUP"
+    if [ -s "$SMP_NAMES_DUP" ]; then
+      echo "NVME_RV32_SMP_FLATTEN_COLLISION source=$1 names=$(tr '\n' ',' <"$SMP_NAMES_DUP")" >&2
+      exit 1
+    fi
+    cat "$SMP_NAMES_SEEN" "$SMP_NAMES_NEW" | sort -u >"$SMP_NAMES_SEEN.tmp"
+    mv "$SMP_NAMES_SEEN.tmp" "$SMP_NAMES_SEEN"
+  }
+
+  # 1) Base = the SAME flattened concat the default (non-SMP) build produces
+  #    below (all logic*.spl except logic.spl/logic_check.spl, then logic.spl
+  #    with its `use` lines stripped, then the direct-entry footer).
+  #    Regenerated here (rather than depending on a prior default build
+  #    having produced $DIRECT_ENTRY) so `NVME_RV32_SMP=1` alone is
+  #    sufficient to build.
+  : >"$SMP_DIRECT_ENTRY"
+  for logic_src in examples/09_embedded/simpleos_nvme_fw/fw_rv32/logic*.spl; do
+    case "$(basename "$logic_src")" in
+      logic.spl|logic_check.spl) continue ;;
+    esac
+    sed '/^[[:space:]]*#/d; /^[[:space:]]*$/d; s/-> i32:/-> i64:/g; s/: i32/: i64/g' "$logic_src" >>"$SMP_DIRECT_ENTRY"
+    printf '\n' >>"$SMP_DIRECT_ENTRY"
+  done
+  sed '/^[[:space:]]*#/d; /^[[:space:]]*$/d; /^[[:space:]]*use /d; s/-> i32:/-> i64:/g; s/: i32/: i64/g' \
+    examples/09_embedded/simpleos_nvme_fw/fw_rv32/logic.spl >>"$SMP_DIRECT_ENTRY"
+  cat >>"$SMP_DIRECT_ENTRY" <<'EOF_SMP_BASE_FOOTER'
+
+@export("C", name: "rt_rv32_boot_optional_nvme_fw_selftest")
+fn rt_rv32_boot_optional_nvme_fw_selftest() -> i64:
+    nvme_fw_rv32_logic_selftest()
+
+fn main() -> i64:
+    nvme_fw_rv32_logic_selftest()
+EOF_SMP_BASE_FOOTER
+  printf '\n' >>"$SMP_DIRECT_ENTRY"
+  grep -oE '^(fn|val) [A-Za-z_][A-Za-z0-9_]*' "$SMP_DIRECT_ENTRY" | awk '{print $2}' | sort -u >"$SMP_NAMES_SEEN"
+
+  # NOTE (found + verified during L6-fix via the collision guard itself,
+  # 2026-07-19): the wave-3 IPC/pool/fourcore/coro pure-logic core files
+  # (logic_ipc_layout_core.spl, logic_ipc_msg_core.spl, logic_ipc_ring_core.spl,
+  # logic_buf_pool_core.spl, logic_nand_region_core.spl, logic_fourcore_core.spl,
+  # logic_coro_core.spl) already match the `logic*.spl` glob in step 1 above and
+  # are therefore ALREADY part of the base flatten -- appending them again here
+  # would be a hard duplicate-definition collision (confirmed: all of
+  # logic_ipc_layout_core.spl's 38 top-level names, and every other core file's
+  # names, collide with the base on first append attempt). No separate append
+  # step for them is needed or correct.
+
+  # 2) entry.spl's boot-selftest wrapper: entry_smp.spl's hart0 path calls
+  #    nvme_fw_rv32_selftest() (design §6, "run the existing single-hart
+  #    regression guard first"), which is NOT part of the base flatten above
+  #    -- the default DIRECT_ENTRY intentionally omits entry.spl and calls
+  #    the raw nvme_fw_rv32_logic_selftest() instead, since its own _start
+  #    asm prints the PASS banner itself. Pull in only what entry_smp.spl
+  #    needs (nvme_fw_rv32_selftest + its private _emit_* helpers) via an
+  #    awk paragraph filter; entry.spl's `_uart_put`, `main`, and
+  #    `rt_rv32_boot_optional_nvme_fw_selftest` paragraphs are dropped here
+  #    because they duplicate definitions already present (entry_smp.spl
+  #    defines its own `_uart_put`; the base footer above already defines
+  #    `main` and `rt_rv32_boot_optional_nvme_fw_selftest`) -- real
+  #    collisions found+fixed during L6-fix, confirmed by the same
+  #    collision-guard grep run on every other appended file.
+  # NOTE: each `if` test is kept on its own statement (not chained with a
+  # multi-line `&&` pattern) -- gawk does not auto-continue a bare top-level
+  # PATTERN expression across a newline after `&&` (verified empirically: it
+  # silently splits into separate always-true rules instead of erroring).
+  awk 'BEGIN{RS=""; ORS="\n\n"}
+       {
+         keep = 1
+         if ($0 ~ /^extern fn rt_riscv_uart_put/) keep = 0
+         if ($0 ~ /^use logic\./) keep = 0
+         if ($0 ~ /^fn _uart_put\(/) keep = 0
+         if ($0 ~ /^@export\("C", name: "rt_rv32_boot_optional_nvme_fw_selftest"\)/) keep = 0
+         if ($0 ~ /^fn main\(\)/) keep = 0
+         if (keep == 1) print
+       }' examples/09_embedded/simpleos_nvme_fw/fw_rv32/entry.spl \
+    | sed '/^[[:space:]]*#/d; /^[[:space:]]*$/d; /^[[:space:]]*use /d; s/-> i32:/-> i64:/g; s/: i32/: i64/g' \
+    >"$SMP_TMP_APPEND"
+  smp_check_collisions "entry.spl(filtered)" "$SMP_TMP_APPEND"
+  cat "$SMP_TMP_APPEND" >>"$SMP_DIRECT_ENTRY"
+  printf '\n' >>"$SMP_DIRECT_ENTRY"
+
+  # 3) entry_smp.spl: the 4-hart boot driver + dataplane selftest +
+  #    @export("C") rt_rv32_fourcore_main (the SMP _start asm stub's call
+  #    target). `use` lines stripped; extern declarations kept -- they are
+  #    the sole surviving decls after step 2 dropped entry.spl's duplicate
+  #    `extern fn rt_riscv_uart_put`. Same i32->i64 transform as steps 1/2:
+  #    entry_smp.spl has 17 `i32` annotations (e.g. `fn shm_ring_push_ok(...)
+  #    -> i32:` returning the now-i64 `ring_can_push(...)` from step 1) --
+  #    without this, the flattened module would mix i32 return types against
+  #    i64 core-fn bodies, either a hard type error or the exact i32/rv32
+  #    landmine this transform exists to avoid.
+  sed '/^[[:space:]]*#/d; /^[[:space:]]*$/d; /^[[:space:]]*use /d; s/-> i32:/-> i64:/g; s/: i32/: i64/g' \
+    examples/09_embedded/simpleos_nvme_fw/fw_rv32/entry_smp.spl >"$SMP_TMP_APPEND"
+  smp_check_collisions "entry_smp.spl" "$SMP_TMP_APPEND"
+  cat "$SMP_TMP_APPEND" >>"$SMP_DIRECT_ENTRY"
+
+  rm -f "$SMP_NAMES_SEEN" "$SMP_NAMES_NEW" "$SMP_NAMES_DUP" "$SMP_TMP_APPEND"
+
+  rm -f "$SMP_OUT" "$SMP_OBJ" "$SMP_START_OBJ" "$SMP_START_ASM"
+  {
+    echo "NVME_RV32_SMP_BUILD_START timeout=${TIMEOUT_SECS}s out=$SMP_OUT"
+    echo "compiler=$SIMPLE_BIN"
+    echo "sources=$SMP_ENTRY_DIR"
+    echo "entry=$SMP_DIRECT_ENTRY target=riscv32-unknown-none mode=smp_firmware_flattened"
+  } >"$SMP_OUT_LOG"
+  : >"$SMP_ERR_LOG"
+  if command -v timeout >/dev/null 2>&1; then
+    BUILD_RUNNER="timeout -k 10s ${TIMEOUT_SECS}s"
+  else
+    BUILD_RUNNER=""
+  fi
+
+  BUILD_START_EPOCH=$(date +%s)
+  set +e
+  $BUILD_RUNNER env SIMPLE_COMPILER_PHASE_PROFILE=1 SIMPLE_NATIVE_BUILD_EMIT_OBJECT=1 "$SIMPLE_BIN" native-build --backend llvm \
+    --source "$SMP_ENTRY_DIR" \
+    --entry "$SMP_DIRECT_ENTRY" --entry-closure \
+    --target riscv32-unknown-none \
+    --emit-object -o "$SMP_OBJ" >>"$SMP_OUT_LOG" 2>>"$SMP_ERR_LOG"
+  rc=$?
+  BUILD_END_EPOCH=$(date +%s)
+  BUILD_ELAPSED_SECS=$((BUILD_END_EPOCH - BUILD_START_EPOCH))
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    BUILD_REASON="native-build-failed"
+    if [ "$rc" -eq 124 ]; then
+      BUILD_REASON="native-build-timeout"
+    fi
+    if [ "$rc" -eq 143 ] && [ "$BUILD_ELAPSED_SECS" -lt "$TIMEOUT_SECS" ]; then
+      BUILD_REASON="external-termination-before-timeout"
+    fi
+    echo "NVME_RV32_SMP_BUILD_FAILED code=$rc reason=$BUILD_REASON timeout=${TIMEOUT_SECS}s elapsed=${BUILD_ELAPSED_SECS}s out=$SMP_OUT_LOG err=$SMP_ERR_LOG" >&2
+    tail -n 40 "$SMP_OUT_LOG" >&2 || true
+    tail -n 40 "$SMP_ERR_LOG" >&2 || true
+    exit "$rc"
+  fi
+  echo "NVME_RV32_SMP_BUILD_DONE elapsed=${BUILD_ELAPSED_SECS}s" >>"$SMP_OUT_LOG"
+
+  # 4-hart _start stub + externs (design §7 extern surface, lane spec L6b asm
+  # sketch, verified against this file's own default-mode putc/uart sequence
+  # and rt_riscv_uart_put's real consumption: byte arg in a0 only, ilp32 pairs
+  # an i64 as a0=lo/a1=hi so every extern below reads/writes the lo half and
+  # sign- or zero-fills the hi half as documented per-extern).
+  cat >"$SMP_START_ASM" <<'EOF_SMP_START'
+    .section .text.entry, "ax"
+    .globl _start
+_start:
+    csrr    t0, mhartid
+    la      sp, _fw_stacks + 65536
+    slli    t1, t0, 14
+    sub     sp, sp, t1
+    la      t2, _ipc_shm
+    addi    t2, t2, 4
+    li      t3, 1
+    amoadd.w zero, t3, (t2)
+    mv      a0, t0
+    li      a1, 0
+    call    rt_rv32_fourcore_main
+1:  wfi
+    j       1b
+
+    .globl rt_rv32_shm_load
+rt_rv32_shm_load:
+    slli    a0, a0, 2
+    la      t0, _ipc_shm
+    add     t0, t0, a0
+    lw      a0, 0(t0)
+    srai    a1, a0, 31
+    ret
+
+    .globl rt_rv32_shm_store
+rt_rv32_shm_store:
+    slli    a0, a0, 2
+    la      t0, _ipc_shm
+    add     t0, t0, a0
+    sw      a2, 0(t0)
+    ret
+
+    .globl rt_rv32_nand_ram_load
+rt_rv32_nand_ram_load:
+    li      t0, 64
+    bgeu    a0, t0, 1f
+    slli    a0, a0, 2
+    la      t0, _nandram_start
+    add     t0, t0, a0
+    lw      a0, 0(t0)
+    li      a1, 0
+    ret
+1:  li      a0, 0
+    li      a1, 0
+    ret
+
+    .globl rt_rv32_nand_ram_store
+rt_rv32_nand_ram_store:
+    li      t0, 64
+    bgeu    a0, t0, 1f
+    slli    a0, a0, 2
+    la      t0, _nandram_start
+    add     t0, t0, a0
+    sw      a1, 0(t0)
+1:  ret
+
+    .globl rt_rv32_fence
+rt_rv32_fence:
+    fence   rw, rw
+    ret
+
+    .globl rt_rv32_hartid
+rt_rv32_hartid:
+    csrr    a0, mhartid
+    li      a1, 0
+    ret
+
+    .globl rt_rv32_ipi_send
+rt_rv32_ipi_send:
+    slli    a0, a0, 2
+    li      t0, 0x02000000
+    add     t0, t0, a0
+    li      t1, 1
+    sw      t1, 0(t0)
+    ret
+
+    .globl rt_rv32_ipi_clear
+rt_rv32_ipi_clear:
+    csrr    t0, mhartid
+    slli    t0, t0, 2
+    li      t1, 0x02000000
+    add     t1, t1, t0
+    sw      zero, 0(t1)
+    ret
+
+    .globl rt_rv32_wfi
+rt_rv32_wfi:
+    wfi
+    ret
+
+    .globl rt_riscv_uart_put
+rt_riscv_uart_put:
+    lui     t0, 0x10000
+1:  lbu     t1, 5(t0)
+    andi    t1, t1, 0x20
+    beqz    t1, 1b
+    sb      a0, 0(t0)
+    ret
+
+    .section .bss
+    .align 4
+    .globl _ipc_shm
+_ipc_shm:
+    .space 33808
+    .globl _fw_stacks
+_fw_stacks:
+    .space 65536
+EOF_SMP_START
+  if ! riscv64-unknown-elf-gcc -march=rv32imac -mabi=ilp32 -c "$SMP_START_ASM" -o "$SMP_START_OBJ" >>"$SMP_OUT_LOG" 2>>"$SMP_ERR_LOG"; then
+    echo "NVME_RV32_SMP_BUILD_FAILED start-stub out=$SMP_OUT_LOG err=$SMP_ERR_LOG" >&2
+    tail -n 40 "$SMP_ERR_LOG" >&2 || true
+    exit 1
+  fi
+  llvm-objcopy --redefine-sym _start=__simple_unused_start "$SMP_OBJ" >>"$SMP_OUT_LOG" 2>>"$SMP_ERR_LOG" || true
+  if ! ld.lld -m elf32lriscv -T src/os/kernel/arch/riscv32/linker.ld --no-relax --gc-sections -o "$SMP_OUT" "$SMP_START_OBJ" "$SMP_OBJ" "$LIBGCC" >>"$SMP_OUT_LOG" 2>>"$SMP_ERR_LOG"; then
+    echo "NVME_RV32_SMP_BUILD_FAILED link out=$SMP_OUT_LOG err=$SMP_ERR_LOG" >&2
+    tail -n 40 "$SMP_ERR_LOG" >&2 || true
+    exit 1
+  fi
+  echo "smp build exit=0"
+  ls -la "$SMP_OUT" 2>/dev/null && file "$SMP_OUT" 2>/dev/null
+  exit 0
+fi
+
+rm -rf "$ENTRY_DIR"
+mkdir -p "$ENTRY_DIR"
+if [ "$OS_BOOT_BUILD" = "1" ]; then
+  for logic_src in examples/09_embedded/simpleos_nvme_fw/fw_rv32/logic*.spl; do
+    case "$(basename "$logic_src")" in
+      logic_check.spl) continue ;;
+    esac
+    sed '/^[[:space:]]*#/d; /^[[:space:]]*$/d' "$logic_src" >"$ENTRY_DIR/$(basename "$logic_src")"
+  done
+  sed '/^[[:space:]]*#/d; /^[[:space:]]*$/d' \
+    examples/09_embedded/simpleos_nvme_fw/fw_rv32/entry.spl >"$ENTRY_DIR/entry.spl"
+else
+  for logic_src in examples/09_embedded/simpleos_nvme_fw/fw_rv32/logic*.spl; do
+    case "$(basename "$logic_src")" in
+      logic_check.spl) continue ;;
+    esac
+    sed '/^[[:space:]]*#/d; /^[[:space:]]*$/d' "$logic_src" >"$ENTRY_DIR/$(basename "$logic_src")"
+  done
+  sed '/^[[:space:]]*#/d; /^[[:space:]]*$/d' \
+    examples/09_embedded/simpleos_nvme_fw/fw_rv32/entry.spl >"$DIRECT_ENTRY"
+  if [ "$SERVICE_MODE" = "1" ]; then
+    sed -i '/^fn main() -> i64:/,$d' "$DIRECT_ENTRY"
+    cat >>"$DIRECT_ENTRY" <<'EOF_SERVICE_MAIN'
+fn main() -> i64:
+    while true:
+        nvme_fw_rv32_service_once()
+    0
+EOF_SERVICE_MAIN
+  fi
+  mkdir -p "$BOOT_STUB_LINK"
+  cat >"$BOOT_STUB_LINK/rv32_direct_runtime_stubs.c" <<'EOF_DIRECT_STUBS'
+#include <stdint.h>
+#define UART0 ((volatile uint8_t*)0x10000000UL)
+extern volatile uint32_t _nandram_start[];
+void rt_riscv_uart_put(uint64_t b) { uint8_t out = (uint8_t)b; while (!(UART0[5] & 0x20)) {} UART0[0] = out; }
+long long rt_pool_safepoint(void) { return 0; }
+int32_t rt_native_eq(int32_t left, int32_t right) { return left == right; }
+int32_t rt_native_neq(int32_t left, int32_t right) { return left != right; }
+uint32_t rt_rv32_nand_ram_load(uint32_t word) { return word < 64 ? _nandram_start[word] : 0; }
+void rt_rv32_nand_ram_store(uint32_t word, uint32_t value) { if (word < 64) _nandram_start[word] = value; }
+EOF_DIRECT_STUBS
+  if [ "$QEMU_HOST_MODE" = "1" ]; then
+    cat >>"$BOOT_STUB_LINK/rv32_direct_runtime_stubs.c" <<'EOF_QEMU_STUBS'
+static volatile uint32_t *const NVME_MMIO = (volatile uint32_t*)0x80100000UL;
+uint32_t rt_rv32_nvme_mmio_load(uint32_t offset) { return ((offset & 3U) == 0U && offset <= 0x64U) ? NVME_MMIO[offset >> 2] : 0U; }
+void rt_rv32_nvme_mmio_store(uint32_t offset, uint32_t value) {
+    if ((offset & 3U) != 0U || offset > 0x64U) return;
+    NVME_MMIO[offset >> 2] = value;
+    if (offset == 0x50U && value == 1U) { NVME_MMIO[0] &= ~1U; return; }
+    if (offset != 0x64U) return;
+    if (NVME_MMIO[0x58U >> 2] != 0U) { NVME_MMIO[0x64U >> 2] = 0x40000000U; return; }
+    volatile uint32_t *address = (volatile uint32_t*)(uintptr_t)NVME_MMIO[0x54U >> 2];
+    if (value == 1U) { NVME_MMIO[0x60U >> 2] = *address; NVME_MMIO[0x64U >> 2] = 0U; }
+    else if (value == 2U) { *address = NVME_MMIO[0x5CU >> 2]; NVME_MMIO[0x64U >> 2] = 0U; }
+    else NVME_MMIO[0x64U >> 2] = 0x40000000U;
+}
+EOF_QEMU_STUBS
+  else
+    cat >>"$BOOT_STUB_LINK/rv32_direct_runtime_stubs.c" <<'EOF_HARDWARE_STUBS'
+static volatile uint32_t *const NVME_MMIO = (volatile uint32_t*)0x20000000UL;
+uint32_t rt_rv32_nvme_mmio_load(uint32_t offset) { return ((offset & 3U) == 0U && offset <= 0x64U) ? NVME_MMIO[offset >> 2] : 0U; }
+void rt_rv32_nvme_mmio_store(uint32_t offset, uint32_t value) { if ((offset & 3U) == 0U && offset <= 0x64U) NVME_MMIO[offset >> 2] = value; }
+EOF_HARDWARE_STUBS
+  fi
+  cat >"$BOOT_STUB_LINK/rv32_direct_entry.S" <<'EOF_DIRECT_START'
+    .section .text.entry, "ax"
+    .globl _rv32_direct_entry
+_rv32_direct_entry:
+    la      sp, _stack_top
+    call    spl_main
+    lui     t0, 0x100
+    li      t1, 0x5555
+    sw      t1, 0(t0)
+1:  wfi
+    j       1b
+EOF_DIRECT_START
+fi
+if [ "$OS_BOOT_BUILD" = "1" ]; then
+  rm -rf "$BOOT_STUB_LINK"
+  ln -s "$PWD/src/os/kernel/arch/riscv32/boot" "$BOOT_STUB_LINK"
+  cat >"$ENTRY" <<'EOF_ENTRY'
+use os.kernel.arch.riscv32.boot.{boot_main}
+use entry.{rt_rv32_boot_optional_nvme_fw_selftest}
+
+fn main() -> i64:
+    0
+EOF_ENTRY
+fi
+
+rm -f "$OUT"
+{
+  echo "NVME_RV32_BUILD_START timeout=${TIMEOUT_SECS}s out=$OUT"
+  echo "compiler=$SIMPLE_BIN"
+  if [ "$OS_BOOT_BUILD" = "1" ]; then
+    echo "sources=build/os/generated,src"
+    echo "entry=$ENTRY target=riscv32-unknown-none mode=os_boot"
+  else
+    echo "sources=build/os/generated"
+    echo "entry=$DIRECT_ENTRY target=riscv32-unknown-none mode=direct_firmware_modules"
+  fi
+} >"$OUT_LOG"
+: >"$ERR_LOG"
+if command -v timeout >/dev/null 2>&1; then
+  BUILD_RUNNER="timeout -k 10s ${TIMEOUT_SECS}s"
+else
+  BUILD_RUNNER=""
+fi
+if [ "$OS_BOOT_BUILD" = "1" ]; then
+  BUILD_START_EPOCH=$(date +%s)
+  set +e
+  $BUILD_RUNNER env SIMPLE_COMPILER_PHASE_PROFILE=1 "$SIMPLE_BIN" native-build --backend llvm \
+    --source build/os/generated --source src \
+    --entry "$ENTRY" --entry-closure \
+    --linker-script src/os/kernel/arch/riscv32/linker.ld \
+    --target riscv32-unknown-none \
+    -o "$OUT" >>"$OUT_LOG" 2>>"$ERR_LOG"
+  rc=$?
+  BUILD_END_EPOCH=$(date +%s)
+  BUILD_ELAPSED_SECS=$((BUILD_END_EPOCH - BUILD_START_EPOCH))
+  set -e
+  if [ "$rc" -eq 0 ]; then
+    echo "NVME_RV32_BUILD_DONE elapsed=${BUILD_ELAPSED_SECS}s" >>"$OUT_LOG"
+    echo "build exit=0"
+  else
+    BUILD_REASON="native-build-failed"
+    if [ "$rc" -eq 124 ]; then
+      BUILD_REASON="native-build-timeout"
+    fi
+    if [ "$rc" -eq 143 ] && [ "$BUILD_ELAPSED_SECS" -lt "$TIMEOUT_SECS" ]; then
+      BUILD_REASON="external-termination-before-timeout"
+    fi
+    echo "NVME_RV32_BUILD_FAILED code=$rc reason=$BUILD_REASON timeout=${TIMEOUT_SECS}s elapsed=${BUILD_ELAPSED_SECS}s out=$OUT_LOG err=$ERR_LOG" >&2
+    tail -n 40 "$OUT_LOG" >&2 || true
+    tail -n 40 "$ERR_LOG" >&2 || true
+    exit "$rc"
+  fi
+else
+  rm -f "$OBJ" "$START_OBJ" "$START_ASM"
+  cat >"$START_ASM" <<'EOF_START'
+    .section .text.entry, "ax"
+    .globl _start
+_start:
+    la      sp, _stack_top
+#ifdef NVME_RV32_SERVICE
+service_loop:
+    call    nvme_fw_rv32_service_once
+    j       service_loop
+#else
+    call    rt_rv32_boot_optional_nvme_fw_selftest
+    bnez    a0, fail
+    lui     t0, 0x10000
+.macro putc byte
+    li      t2, \byte
+1:  lbu     t1, 5(t0)
+    andi    t1, t1, 0x20
+    beqz    t1, 1b
+    sb      t2, 0(t0)
+.endm
+    putc 65
+    putc 76
+    putc 76
+    putc 32
+    putc 82
+    putc 86
+    putc 51
+    putc 50
+    putc 32
+    putc 78
+    putc 86
+    putc 77
+    putc 69
+    putc 32
+    putc 70
+    putc 87
+    putc 32
+    putc 67
+    putc 72
+    putc 69
+    putc 67
+    putc 75
+    putc 83
+    putc 32
+    putc 80
+    putc 65
+    putc 83
+    putc 83
+    putc 10
+    j done
+fail:
+    lui     t0, 0x10000
+    putc 70
+    putc 65
+    putc 73
+    putc 76
+    putc 10
+done:
+    lui     t0, 0x100
+    li      t1, 0x5555
+    sw      t1, 0(t0)
+1:  wfi
+    j       1b
+#endif
+
+    .globl rt_riscv_uart_put
+rt_riscv_uart_put:
+    lui     t0, 0x10000
+1:  lbu     t1, 5(t0)
+    andi    t1, t1, 0x20
+    beqz    t1, 1b
+    sb      a0, 0(t0)
+    ret
+
+    .globl rt_pool_safepoint
+rt_pool_safepoint:
+    li      a0, 0
+    li      a1, 0
+    ret
+
+    .globl rt_native_eq
+rt_native_eq:
+    xor     a0, a0, a1
+    seqz    a0, a0
+    li      a1, 0
+    ret
+
+    .globl rt_native_neq
+rt_native_neq:
+    xor     a0, a0, a1
+    snez    a0, a0
+    li      a1, 0
+    ret
+
+    .globl rt_rv32_nand_ram_load
+rt_rv32_nand_ram_load:
+    li      t0, 64
+    bgeu    a0, t0, 1f
+    slli    a0, a0, 2
+    la      t0, _nandram_start
+    add     t0, t0, a0
+    lw      a0, 0(t0)
+    li      a1, 0
+    ret
+1:  li      a0, 0
+    li      a1, 0
+    ret
+
+    .globl rt_rv32_nand_ram_store
+rt_rv32_nand_ram_store:
+    li      t0, 64
+    bgeu    a0, t0, 1f
+    slli    a0, a0, 2
+    la      t0, _nandram_start
+    add     t0, t0, a0
+    sw      a1, 0(t0)
+1:  ret
+
+    .globl rt_rv32_nvme_mmio_load
+rt_rv32_nvme_mmio_load:
+    andi    t0, a0, 3
+    bnez    t0, 1f
+    li      t0, 0x64
+    bgtu    a0, t0, 1f
+#ifdef NVME_RV32_QEMU_HOST
+    li      t0, 0x80100000
+#else
+    lui     t0, 0x20000
+#endif
+    add     t0, t0, a0
+    lw      a0, 0(t0)
+    li      a1, 0
+    ret
+1:  li      a0, 0
+    li      a1, 0
+    ret
+
+    .globl rt_rv32_nvme_mmio_store
+rt_rv32_nvme_mmio_store:
+    andi    t0, a0, 3
+    bnez    t0, 1f
+    li      t0, 0x64
+    bgtu    a0, t0, 1f
+#ifdef NVME_RV32_QEMU_HOST
+    li      t0, 0x80100000
+    add     t1, t0, a0
+    sw      a1, 0(t1)
+    li      t2, 0x50
+    bne     a0, t2, 2f
+    li      t2, 1
+    bne     a1, t2, 1f
+    lw      t3, 0(t0)
+    andi    t3, t3, -2
+    sw      t3, 0(t0)
+1:  ret
+2:  li      t2, 0x64
+    bne     a0, t2, 1f
+    lw      t3, 0x58(t0)
+    bnez    t3, 5f
+    lw      t3, 0x54(t0)
+    li      t2, 1
+    beq     a1, t2, 3f
+    li      t2, 2
+    beq     a1, t2, 4f
+    j       5f
+3:  lw      t4, 0(t3)
+    sw      t4, 0x60(t0)
+    sw      zero, 0x64(t0)
+    ret
+4:  lw      t4, 0x5c(t0)
+    sw      t4, 0(t3)
+    sw      zero, 0x64(t0)
+    ret
+5:  li      t3, 0x40000000
+    sw      t3, 0x64(t0)
+#else
+    lui     t0, 0x20000
+    add     t0, t0, a0
+    sw      a1, 0(t0)
+#endif
+1:  ret
+EOF_START
+  SERVICE_CPPFLAG=""
+  if [ "$SERVICE_MODE" = "1" ]; then SERVICE_CPPFLAG="-DNVME_RV32_SERVICE=1"; fi
+  if [ "$QEMU_HOST_MODE" = "1" ]; then SERVICE_CPPFLAG="$SERVICE_CPPFLAG -DNVME_RV32_QEMU_HOST=1"; fi
+  if ! riscv64-unknown-elf-gcc -march=rv32imac -mabi=ilp32 $SERVICE_CPPFLAG -c "$START_ASM" -o "$START_OBJ" >>"$OUT_LOG" 2>>"$ERR_LOG"; then
+    echo "NVME_RV32_BUILD_FAILED start-stub out=$OUT_LOG err=$ERR_LOG" >&2
+    tail -n 40 "$ERR_LOG" >&2 || true
+    exit 1
+  fi
+  BUILD_START_EPOCH=$(date +%s)
+  set +e
+  $BUILD_RUNNER env SIMPLE_COMPILER_PHASE_PROFILE=1 SIMPLE_NATIVE_BUILD_EMIT_OBJECT=1 "$SIMPLE_BIN" native-build --backend llvm \
+    --source build/os/generated \
+    --entry "$DIRECT_ENTRY" --entry-closure \
+    --linker-script examples/09_embedded/fpga_riscv/rtl/nvme_fw_rv32_bram.ld \
+    --target riscv32-unknown-none \
+    --emit-object -o "$OBJ" >>"$OUT_LOG" 2>>"$ERR_LOG"
+  rc=$?
+  BUILD_END_EPOCH=$(date +%s)
+  BUILD_ELAPSED_SECS=$((BUILD_END_EPOCH - BUILD_START_EPOCH))
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    BUILD_REASON="native-build-failed"
+    if [ "$rc" -eq 124 ]; then
+      BUILD_REASON="native-build-timeout"
+    fi
+    if [ "$rc" -eq 143 ] && [ "$BUILD_ELAPSED_SECS" -lt "$TIMEOUT_SECS" ]; then
+      BUILD_REASON="external-termination-before-timeout"
+    fi
+    echo "NVME_RV32_BUILD_FAILED code=$rc reason=$BUILD_REASON timeout=${TIMEOUT_SECS}s elapsed=${BUILD_ELAPSED_SECS}s out=$OUT_LOG err=$ERR_LOG" >&2
+    tail -n 40 "$OUT_LOG" >&2 || true
+    tail -n 40 "$ERR_LOG" >&2 || true
+    exit "$rc"
+  fi
+  echo "NVME_RV32_BUILD_DONE elapsed=${BUILD_ELAPSED_SECS}s" >>"$OUT_LOG"
+  if file "$OBJ" 2>/dev/null | grep -q "executable"; then
+    cp "$OBJ" "$OUT"
+    echo "build exit=0"
+    ls -la "$OUT" 2>/dev/null && file "$OUT" 2>/dev/null
+    exit 0
+  fi
+  llvm-objcopy --redefine-sym _start=__simple_unused_start "$OBJ" >>"$OUT_LOG" 2>>"$ERR_LOG" || true
+  if ! ld.lld -m elf32lriscv -T examples/09_embedded/fpga_riscv/rtl/nvme_fw_rv32_bram.ld --no-relax --gc-sections -o "$OUT" "$START_OBJ" "$OBJ" "$LIBGCC" >>"$OUT_LOG" 2>>"$ERR_LOG"; then
+    echo "NVME_RV32_BUILD_FAILED link out=$OUT_LOG err=$ERR_LOG" >&2
+    tail -n 40 "$ERR_LOG" >&2 || true
+    exit 1
+  fi
+  echo "build exit=0"
+fi
+ls -la "$OUT" 2>/dev/null && file "$OUT" 2>/dev/null

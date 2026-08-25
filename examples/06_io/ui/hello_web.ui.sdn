@@ -1,0 +1,27 @@
+app:
+    title: "Hello Web"
+    theme: glass_dark
+
+layout:
+    type: vbox
+    id: root
+    children:
+        main:
+            type: panel
+            id: main
+            title: "Hello Web"
+            flex: 1
+            children:
+                greeting:
+                    type: text
+                    id: greeting
+                    content: "Hello World from Web!"
+                info:
+                    type: text
+                    id: info
+                    content: "Served by the Simple UI web backend."
+        status:
+            type: statusbar
+            id: status
+            left: "NORMAL MODE"
+            right: "Hello Web"

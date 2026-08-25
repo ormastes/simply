@@ -1,0 +1,18 @@
+use logic_dram_durability_core.*
+
+fn rv32_dram_recovery_cases_selftest() -> i32:
+    if _rv32_durability_after_crash(10, 1010, 1020) != 1010:
+        return 1
+    if _rv32_durability_after_crash(30, 1010, 1020) != 0:
+        return 1
+    if _rv32_durability_after_recover(10, 1010, 1020, 9999, 0, 1030) != 9999:
+        return 1
+    if _rv32_durability_after_recover(20, 1010, 1020, 9999, 0, 1030) != 0:
+        return 1
+    if _rv32_durability_after_recover(30, 1010, 1020, 9999, 0, 1030) != 1030:
+        return 1
+    if _rv32_journal_overflow_checkpointed(600, 512) != 1:
+        return 1
+    if _rv32_journal_overflow_checkpointed(512, 512) != 0:
+        return 1
+    0

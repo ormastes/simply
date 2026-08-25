@@ -1,0 +1,108 @@
+# MCP Tool schemas — Phase C Enhanced Search (5 tools)
+#
+# Defines tool schemas for fuzzy_search, search_replace,
+# search_by_date, search_with_aliases, reindex_vault.
+
+use src.util.json_helpers.{js, jp, jo1, jo2, jo3, jo4, ja, jo, SB_L, SB_R, LB, RB}
+
+# --- Tool schema builder helpers ---
+
+fn make_string_prop(description: text) -> text:
+    jo2(jp("type", js("string")), jp("description", js(description)))
+
+fn make_int_prop(description: text) -> text:
+    jo2(jp("type", js("integer")), jp("description", js(description)))
+
+fn make_tool_with_annotations(name: text, description: text, props: text, required: text, read_only: bool, destructive: bool, idempotent: bool) -> text:
+    val schema = jo3(
+        jp("type", js("object")),
+        jp("properties", props),
+        jp("required", required)
+    )
+    val annotations = jo3(
+        jp("readOnlyHint", if read_only: "true" else: "false"),
+        jp("destructiveHint", if destructive: "true" else: "false"),
+        jp("idempotentHint", if idempotent: "true" else: "false")
+    )
+    var tool_obj = LB()
+    tool_obj = tool_obj + jp("name", js(name))
+    tool_obj = tool_obj + "," + jp("description", js(description))
+    tool_obj = tool_obj + "," + jp("inputSchema", schema)
+    tool_obj = tool_obj + "," + jp("annotations", annotations)
+    tool_obj = tool_obj + RB()
+    tool_obj
+
+# --- All 5 enhanced search tool schemas ---
+
+fn make_search_ext_tools() -> [text]:
+    var tools: [text] = []
+
+    # 1. fuzzy_search
+    var fs_props = LB()
+    fs_props = fs_props + jp("query", make_string_prop("Fuzzy search query string"))
+    fs_props = fs_props + "," + jp("threshold", make_string_prop("Similarity threshold 0.0-1.0 (default 0.3)"))
+    fs_props = fs_props + "," + jp("limit", make_int_prop("Max results to return (default 20)"))
+    fs_props = fs_props + RB()
+    tools.push(make_tool_with_annotations(
+        "fuzzy_search",
+        "Fuzzy search note titles and aliases using trigram similarity. Finds notes even with typos or partial matches.",
+        fs_props,
+        ja([js("query")]),
+        true, false, true
+    ))
+
+    # 2. search_replace
+    var sr_props = LB()
+    sr_props = sr_props + jp("path", make_string_prop("Relative path to a specific note (empty for vault-wide)"))
+    sr_props = sr_props + "," + jp("search", make_string_prop("Text to search for"))
+    sr_props = sr_props + "," + jp("replace", make_string_prop("Replacement text"))
+    sr_props = sr_props + "," + jp("dry_run", make_string_prop("If 'true' (default), preview without modifying files"))
+    sr_props = sr_props + RB()
+    tools.push(make_tool_with_annotations(
+        "search_replace",
+        "Search and replace text in notes. Supports single-note or vault-wide replacement with dry-run preview.",
+        sr_props,
+        ja([js("search"), js("replace")]),
+        false, false, false
+    ))
+
+    # 3. search_by_date
+    var sd_props = LB()
+    sd_props = sd_props + jp("start_date", make_string_prop("Start date in YYYY-MM-DD format"))
+    sd_props = sd_props + "," + jp("end_date", make_string_prop("End date in YYYY-MM-DD format"))
+    sd_props = sd_props + "," + jp("query", make_string_prop("Optional text query to filter results"))
+    sd_props = sd_props + "," + jp("limit", make_int_prop("Max results to return (default 20)"))
+    sd_props = sd_props + RB()
+    tools.push(make_tool_with_annotations(
+        "search_by_date",
+        "Search notes by date range. Uses frontmatter date: field or YYYY-MM-DD filename patterns.",
+        sd_props,
+        ja([js("start_date"), js("end_date")]),
+        true, false, true
+    ))
+
+    # 4. search_with_aliases
+    var sa_props = LB()
+    sa_props = sa_props + jp("query", make_string_prop("Search query to match against titles, aliases, and content"))
+    sa_props = sa_props + "," + jp("limit", make_int_prop("Max results to return (default 20)"))
+    sa_props = sa_props + RB()
+    tools.push(make_tool_with_annotations(
+        "search_with_aliases",
+        "Search notes with alias boosting. Title matches get 10x boost, alias matches get 5x boost.",
+        sa_props,
+        ja([js("query")]),
+        true, false, true
+    ))
+
+    # 5. reindex_vault
+    var ri_props = LB()
+    ri_props = ri_props + RB()
+    tools.push(make_tool_with_annotations(
+        "reindex_vault",
+        "Force a full re-scan of the vault. Returns total file and link counts.",
+        ri_props,
+        ja([]),
+        true, false, true
+    ))
+
+    tools

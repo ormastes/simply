@@ -1,0 +1,166 @@
+# logic_coro_core — pure state algebra for the wave-4 statement-like
+# coroutine/state-machine discipline (design contract: doc/05_design/hardware/
+# nvme_fw_coroutine/coroutine_statemachine_design.md §2 state vocabulary, §3
+# legality + transition, §5 debug/easy-check surface).
+#
+# Zero shm/layout knowledge on purpose: this module is pure scalar state
+# algebra only. The COROSTATE_BASE/8452 shm layout change (design §1) is a
+# LATER lane (W4c) and does not touch this file. Freestanding-safe (fw_rv32
+# boot-import-graph rule — see const_drift_check.spl header): no arrays, no
+# structs, no module-level var/val initializers, fn-per-constant style
+# matching logic_ipc_layout_core.spl / logic_fourcore_core.spl. Every fn is
+# fail-closed: an invalid/illegal transition returns -1 (or, for i32
+# validity/legality predicates, 0), never a silent/garbage success.
+#
+# ── state vocabulary (design §2) ─────────────────────────────────────────────
+# CS_BOOT      0  pre-gate (before hart0 releases the start-gate)
+# CS_IDLE      1  waiting for input (worker cores: HIL/FTL/FIL/NAND)
+# CS_PUMP_FWD  2  moving a message toward NAND
+# CS_PUMP_BACK 3  moving a completion toward HIL
+# CS_HALT_DRAIN 4 halt observed, draining in-flight traffic
+# CS_PARKED    5  terminal — core is done, never resumes
+# CS_SUBMIT    6  HIL-only: submit one selftest command
+# CS_REAP      7  HIL-only: reap the completion
+# CS_VERIFY    8  HIL-only: verify the completion's data/status
+#
+# ── legality table (design §3) — THIS COMMENT BLOCK IS THE TRANSITION SPEC
+# W4b/W4c implement against. Every legal (cur -> next) pair, and nothing else:
+#
+#   CS_BOOT      -> CS_IDLE        (worker core: post-gate default loop state)
+#   CS_BOOT      -> CS_SUBMIT      (HIL core: post-gate, starts the hil cycle)
+#   CS_IDLE      -> CS_IDLE        (self-transition — ONLY state that may
+#                                    self-transition; polling loop, no work
+#                                    seen yet)
+#   CS_IDLE      -> CS_PUMP_FWD    (a request arrived, routing it toward NAND)
+#   CS_IDLE      -> CS_PUMP_BACK   (a completion arrived, routing it toward
+#                                    HIL)
+#   CS_IDLE      -> CS_HALT_DRAIN  (halt flag observed while idle — the ONLY
+#                                    entry point into halt+drain for worker
+#                                    cores; CS_IDLE can NEVER jump straight to
+#                                    CS_PARKED, it must drain first)
+#   CS_PUMP_FWD  -> CS_IDLE        (message movement's one yield point is
+#                                    done; worker cores cycle
+#                                    CS_IDLE<->CS_PUMP_FWD, never
+#                                    CS_PUMP_FWD->CS_PUMP_BACK directly)
+#   CS_PUMP_BACK -> CS_IDLE        (completion movement done; worker cores
+#                                    cycle CS_IDLE<->CS_PUMP_BACK)
+#   CS_HALT_DRAIN -> CS_PARKED     (the ONLY exit from CS_HALT_DRAIN; drain
+#                                    complete, core parks for good)
+#   CS_SUBMIT    -> CS_REAP        (hil cycle step 1 -> 2; no self-transition)
+#   CS_REAP      -> CS_VERIFY      (hil cycle step 2 -> 3)
+#   CS_VERIFY    -> CS_SUBMIT      (hil cycle step 3 -> 1: another command)
+#   CS_VERIFY    -> CS_HALT_DRAIN  (hil cycle step 3 -> halt: selftest done;
+#                                    the ONLY entry point into halt+drain for
+#                                    the HIL core)
+#
+# 13 documented legal pairs total. CS_PARKED has ZERO outgoing legal pairs
+# (terminal). Every pair not listed above is illegal, including (non-
+# exhaustive, see coro_check.spl for the calibrated oracle list):
+#   CS_PARKED -> anything (terminal, no resurrection)
+#   CS_IDLE -> CS_PARKED (must go through CS_HALT_DRAIN)
+#   CS_HALT_DRAIN -> anything but CS_PARKED (single exit only)
+#   CS_SUBMIT -> CS_SUBMIT (no self-transition outside CS_IDLE)
+#   CS_VERIFY -> CS_REAP (the hil cycle is one-directional, never backward)
+#   CS_PUMP_FWD -> CS_PUMP_BACK / CS_PUMP_BACK -> CS_PUMP_FWD (must round-trip
+#     through CS_IDLE)
+
+fn CS_BOOT() -> i64:
+    0
+
+fn CS_IDLE() -> i64:
+    1
+
+fn CS_PUMP_FWD() -> i64:
+    2
+
+fn CS_PUMP_BACK() -> i64:
+    3
+
+fn CS_HALT_DRAIN() -> i64:
+    4
+
+fn CS_PARKED() -> i64:
+    5
+
+fn CS_SUBMIT() -> i64:
+    6
+
+fn CS_REAP() -> i64:
+    7
+
+fn CS_VERIFY() -> i64:
+    8
+
+# Fail-closed range check over the whole vocabulary (design §2: "cs_valid(s)
+# -> 0/1"). 0..8 inclusive are the only valid ids.
+fn cs_valid(s: i64) -> i32:
+    if s < CS_BOOT():
+        return 0
+    if s > CS_VERIFY():
+        return 0
+    1
+
+# Explicit if-chain legality table (design §3). Does NOT range-check its
+# inputs on its own — coro_transition_verdict is the fail-closed entry point
+# callers must use; this fn assumes both ids are already known-valid and
+# simply answers "is (cur -> next) one of the documented pairs above".
+fn coro_legal(cur: i64, next: i64) -> i32:
+    if cur == CS_BOOT():
+        if next == CS_IDLE():
+            return 1
+        if next == CS_SUBMIT():
+            return 1
+        return 0
+    if cur == CS_IDLE():
+        if next == CS_IDLE():
+            return 1
+        if next == CS_PUMP_FWD():
+            return 1
+        if next == CS_PUMP_BACK():
+            return 1
+        if next == CS_HALT_DRAIN():
+            return 1
+        return 0
+    if cur == CS_PUMP_FWD():
+        if next == CS_IDLE():
+            return 1
+        return 0
+    if cur == CS_PUMP_BACK():
+        if next == CS_IDLE():
+            return 1
+        return 0
+    if cur == CS_HALT_DRAIN():
+        if next == CS_PARKED():
+            return 1
+        return 0
+    if cur == CS_PARKED():
+        # Terminal — zero outgoing legal pairs, no resurrection.
+        return 0
+    if cur == CS_SUBMIT():
+        if next == CS_REAP():
+            return 1
+        return 0
+    if cur == CS_REAP():
+        if next == CS_VERIFY():
+            return 1
+        return 0
+    if cur == CS_VERIFY():
+        if next == CS_SUBMIT():
+            return 1
+        if next == CS_HALT_DRAIN():
+            return 1
+        return 0
+    0
+
+# Fail-closed transition entry point (design §3): validates both ids via
+# cs_valid, THEN checks coro_legal, returning `next` only when both hold.
+# Drivers must never store a corostate word except through this fn's result
+# (design §3: "compute verdict -> verdict -1 -> ipc_fatal / FAIL+exit(1)").
+fn coro_transition_verdict(cur: i64, next: i64) -> i64:
+    if cs_valid(cur) == 0:
+        return -1
+    if cs_valid(next) == 0:
+        return -1
+    if coro_legal(cur, next) == 0:
+        return -1
+    next

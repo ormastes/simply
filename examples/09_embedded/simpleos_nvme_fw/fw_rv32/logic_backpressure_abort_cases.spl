@@ -1,0 +1,12 @@
+use logic_backpressure_abort_access_cases.*
+use logic_backpressure_abort_record_cases.*
+use logic_backpressure_abort_status_cases.*
+
+fn rv32_backpressure_abort_cases_selftest() -> i32:
+    if rv32_bpa_record_cases_selftest() != 0:
+        return 1
+    if rv32_bpa_status_cases_selftest() != 0:
+        return 1
+    if rv32_bpa_access_cases_selftest() != 0:
+        return 1
+    0

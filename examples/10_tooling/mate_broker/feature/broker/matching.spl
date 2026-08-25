@@ -1,0 +1,63 @@
+# feature/broker/matching — Bid scoring: cap_overlap*0.4 + load*0.3 + priority*0.3
+
+fn broker_solicit_bids(task_id: text, required_caps: [text]) -> [Bid]:
+    var bids: [Bid] = []
+    var i = 0
+    while i < BK_AGENT_COUNT:
+        val agent_id = BK_AGENT_IDS[i]
+        val agent_status = BK_AGENT_STATUSES[i]
+        val agent_load = BK_AGENT_LOADS[i]
+        val agent_max = BK_AGENT_MAX_CONCURRENT[i]
+        val agent_priority = BK_AGENT_PRIORITIES[i]
+        val agent_caps_str = BK_AGENT_CAPS[i]
+
+        # Skip offline or at-capacity agents
+        if agent_status == "offline":
+            i = i + 1
+            continue
+        if agent_load >= agent_max:
+            i = i + 1
+            continue
+
+        # Calculate capability overlap
+        val agent_caps = agent_caps_str.split(",")
+        var overlap_count = 0
+        var total_required = 0
+        for req in required_caps:
+            val trimmed_req = req.trim()
+            if trimmed_req != "":
+                total_required = total_required + 1
+                for ac in agent_caps:
+                    if ac.trim() == trimmed_req:
+                        overlap_count = overlap_count + 1
+                        break
+
+        if overlap_count == 0:
+            i = i + 1
+            continue
+
+        # Scores (0-100 scale)
+        var cap_score = 0
+        if total_required > 0:
+            cap_score = (overlap_count * 100) / total_required
+
+        var load_score = 100
+        if agent_max > 0:
+            load_score = ((agent_max - agent_load) * 100) / agent_max
+
+        val priority_score = agent_priority * 10
+        val b = bid(agent_id, task_id, cap_score, load_score, priority_score)
+        bids.push(b)
+        i = i + 1
+    bids
+
+fn broker_select_best_bid(bids: [Bid]) -> Bid:
+    var best_idx = 0
+    var best_score = -1
+    var i = 0
+    while i < bids.len():
+        if bids[i].score > best_score:
+            best_score = bids[i].score
+            best_idx = i
+        i = i + 1
+    bids[best_idx]

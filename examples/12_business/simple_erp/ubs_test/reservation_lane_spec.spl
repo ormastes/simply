@@ -1,0 +1,110 @@
+# @cover src/lanes/reservation.spl 80%
+"""
+# Reservation Lane
+
+Bookings flow through the ONE shared gate: session -> rbac -> validation ->
+idempotency. This spec pins the accepted path plus each fail-closed reason, and
+the lane's capacity transitions (book / hold / cancel / no-show / open slots).
+"""
+
+use std.spec
+use lanes.reservation.{Reservation, validate_reservation, can_book, book, hold, cancel, no_show, open_slots, submit_reservation_write}
+use framework.guarded.{Tenant, Actor, Session}
+use std.nogc_sync_mut.enterprise_store.store.{EnterpriseStore, store_open}
+use std.io_runtime.{file_exists, file_delete, dir_create_all}
+
+# Each scenario opens its own durable store: the interpreter backend caches
+# open databases per path in-process, so every it-block gets a fresh path.
+fn fresh_store(name: text) -> EnterpriseStore:
+    dir_create_all("build/test-artifacts")
+    val db = "build/test-artifacts/erp_reservation_lane_" + name + ".db"
+    if file_exists(db):
+        file_delete(db)
+    store_open(db)
+
+describe "Reservation lane — guarded writes":
+    it "accepts a valid write through the gate":
+        val tenant = Tenant { id: "t1", name: "Demo" }
+        val user = Actor { id: 1, name: "Mina", role: "operator" }
+        val session = Session { token: "sess-1", user_id: 1, tenant_id: "t1", active: true }
+        val r = Reservation { id: 1, resource: "room A", kind: "meeting", capacity: 10, booked: 6, status: "open", deposit: 0 }
+        val store = fresh_store("s1")
+        val res = submit_reservation_write(session, tenant, user, r, "resv-1", store)
+        expect(res.ok).to_equal(true)
+        expect(res.reason).to_equal("accepted")
+        expect(res.ledger_key).to_equal("resv-1")
+
+    it "denies an inactive session":
+        val tenant = Tenant { id: "t1", name: "Demo" }
+        val user = Actor { id: 1, name: "Mina", role: "operator" }
+        val session = Session { token: "sess-1", user_id: 1, tenant_id: "t1", active: false }
+        val r = Reservation { id: 1, resource: "room A", kind: "meeting", capacity: 10, booked: 6, status: "open", deposit: 0 }
+        val store = fresh_store("s2")
+        val res = submit_reservation_write(session, tenant, user, r, "resv-1", store)
+        assert_false(res.ok)
+        expect(res.reason).to_equal("invalid-session")
+
+    it "forbids an auditor from writing":
+        val tenant = Tenant { id: "t1", name: "Demo" }
+        val user = Actor { id: 3, name: "Jae", role: "auditor" }
+        val session = Session { token: "sess-3", user_id: 3, tenant_id: "t1", active: true }
+        val r = Reservation { id: 1, resource: "room A", kind: "meeting", capacity: 10, booked: 6, status: "open", deposit: 0 }
+        val store = fresh_store("s3")
+        val res = submit_reservation_write(session, tenant, user, r, "resv-1", store)
+        assert_false(res.ok)
+        expect(res.reason).to_equal("forbidden")
+
+    it "rejects an invalid record":
+        val tenant = Tenant { id: "t1", name: "Demo" }
+        val user = Actor { id: 1, name: "Mina", role: "operator" }
+        val session = Session { token: "sess-1", user_id: 1, tenant_id: "t1", active: true }
+        val r = Reservation { id: 1, resource: "room A", kind: "meeting", capacity: 4, booked: 9, status: "open", deposit: 0 }
+        val store = fresh_store("s4")
+        val res = submit_reservation_write(session, tenant, user, r, "resv-1", store)
+        assert_false(res.ok)
+        expect(res.reason).to_equal("invalid-record")
+
+    it "rejects a duplicate idempotency key":
+        val tenant = Tenant { id: "t1", name: "Demo" }
+        val user = Actor { id: 1, name: "Mina", role: "operator" }
+        val session = Session { token: "sess-1", user_id: 1, tenant_id: "t1", active: true }
+        val r = Reservation { id: 1, resource: "room A", kind: "meeting", capacity: 10, booked: 6, status: "open", deposit: 0 }
+        val store = fresh_store("s5")
+        submit_reservation_write(session, tenant, user, r, "resv-1", store)
+        val res = submit_reservation_write(session, tenant, user, r, "resv-1", store)
+        assert_false(res.ok)
+        expect(res.reason).to_equal("duplicate-key")
+
+describe "Reservation lane — domain operations":
+    it "books within capacity but rejects over-capacity":
+        val r = Reservation { id: 1, resource: "room A", kind: "meeting", capacity: 10, booked: 6, status: "open", deposit: 0 }
+        assert_true(can_book(r, 4))
+        assert_false(can_book(r, 5))
+        val booked = book(r, 4)
+        expect(booked.booked).to_equal(10)
+
+    it "holds seats against a deposit":
+        val r = Reservation { id: 2, resource: "room 301", kind: "hotel", capacity: 1, booked: 0, status: "open", deposit: 0 }
+        val held = hold(r, 1, 10000)
+        expect(held.status).to_equal("held")
+        expect(held.deposit).to_equal(10000)
+
+    it "rejects an over-capacity hold unchanged":
+        val r = Reservation { id: 2, resource: "room 301", kind: "hotel", capacity: 1, booked: 1, status: "open", deposit: 0 }
+        val held = hold(r, 5, 10000)
+        expect(held.status).to_equal("open")
+        expect(held.booked).to_equal(1)
+        expect(held.deposit).to_equal(0)
+
+    it "cancels and marks no-show":
+        val r = Reservation { id: 3, resource: "table 4", kind: "restaurant", capacity: 4, booked: 2, status: "open", deposit: 2000 }
+        expect(cancel(r).status).to_equal("cancelled")
+        expect(no_show(r).status).to_equal("no-show")
+
+    it "counts open slots across reservations":
+        val a = Reservation { id: 1, resource: "room A", kind: "meeting", capacity: 10, booked: 6, status: "open", deposit: 0 }
+        val b = Reservation { id: 2, resource: "room 301", kind: "hotel", capacity: 1, booked: 0, status: "open", deposit: 0 }
+        var list: [Reservation] = []
+        list.push(a)
+        list.push(b)
+        expect(open_slots(list)).to_equal(5)

@@ -1,0 +1,180 @@
+# Simple 2D Engine Demo — Minimal Platformer
+#
+# A playable demo showing how to use the Simple-native 2D game engine.
+# Blue rectangle = player (dynamic, WASD-controlled)
+# Green rectangle = ground (static)
+# Red circles = obstacles (static)
+# Brown rectangles = platforms (static)
+# White background
+#
+# Run:
+#   ./examples/engine_2d_demo/run.sh
+
+use std.nogc_sync_mut.engine.core.engine.{Engine2D}
+use std.nogc_sync_mut.engine.core.game_loop.{GameLoop, GameCallbacks}
+use std.nogc_sync_mut.engine.render.command.{RenderCommandBuffer, RenderCommand}
+use std.nogc_sync_mut.engine.input.default_bindings.{bind_wasd_movement, bind_platformer_defaults}
+use std.common.engine.ids.{NodeId}
+use std.common.engine.math2d.{Vec2}
+use std.common.engine.color.{EngineColor}
+use std.common.engine.rect.{Rect2}
+
+# ---------------------------------------------------------------------------
+# Game state
+# ---------------------------------------------------------------------------
+
+var player_id: NodeId = NodeId.invalid()
+var obstacle1_id: NodeId = NodeId.invalid()
+var obstacle2_id: NodeId = NodeId.invalid()
+var obstacle3_id: NodeId = NodeId.invalid()
+var platform1_id: NodeId = NodeId.invalid()
+var platform2_id: NodeId = NodeId.invalid()
+
+# Player size (half-extents for physics, full size for rendering)
+val PLAYER_HX: f64 = 18.0
+val PLAYER_HY: f64 = 24.0
+val MOVE_FORCE: f64 = 600.0
+val JUMP_IMPULSE: f64 = -350.0
+
+# ---------------------------------------------------------------------------
+# Initialization
+# ---------------------------------------------------------------------------
+
+fn on_init(engine: Engine2D):
+    """Set up scene: input bindings, ground, player, platforms, obstacles."""
+
+    # Input — WASD + arrows for movement, space for jump
+    bind_wasd_movement(engine.input)
+    bind_platformer_defaults(engine.input)
+
+    # -- Ground (static, spans full width) --
+    var ground_id = engine.create_node("ground")
+    engine.nodes.set_position(ground_id, Vec2(x: 400.0, y: 570.0))
+    engine.physics.add_static_body(ground_id, 400.0, 570.0)
+    engine.physics.add_box_collider(ground_id, 400.0, 30.0)
+
+    # -- Floating platforms --
+    platform1_id = engine.create_node("platform1")
+    engine.nodes.set_position(platform1_id, Vec2(x: 200.0, y: 420.0))
+    engine.physics.add_static_body(platform1_id, 200.0, 420.0)
+    engine.physics.add_box_collider(platform1_id, 80.0, 10.0)
+
+    platform2_id = engine.create_node("platform2")
+    engine.nodes.set_position(platform2_id, Vec2(x: 580.0, y: 350.0))
+    engine.physics.add_static_body(platform2_id, 580.0, 350.0)
+    engine.physics.add_box_collider(platform2_id, 70.0, 10.0)
+
+    # -- Obstacles (static circles) --
+    obstacle1_id = engine.create_node("obstacle1")
+    engine.nodes.set_position(obstacle1_id, Vec2(x: 300.0, y: 545.0))
+    engine.physics.add_static_body(obstacle1_id, 300.0, 545.0)
+    engine.physics.add_circle_collider(obstacle1_id, 15.0)
+
+    obstacle2_id = engine.create_node("obstacle2")
+    engine.nodes.set_position(obstacle2_id, Vec2(x: 550.0, y: 540.0))
+    engine.physics.add_static_body(obstacle2_id, 550.0, 540.0)
+    engine.physics.add_circle_collider(obstacle2_id, 20.0)
+
+    obstacle3_id = engine.create_node("obstacle3")
+    engine.nodes.set_position(obstacle3_id, Vec2(x: 150.0, y: 550.0))
+    engine.physics.add_static_body(obstacle3_id, 150.0, 550.0)
+    engine.physics.add_circle_collider(obstacle3_id, 12.0)
+
+    # -- Player (dynamic body with gravity) --
+    player_id = engine.create_node("player")
+    engine.nodes.set_position(player_id, Vec2(x: 400.0, y: 300.0))
+    engine.physics.add_dynamic_body(player_id, 400.0, 300.0)
+    engine.physics.add_box_collider(player_id, PLAYER_HX, PLAYER_HY)
+
+# ---------------------------------------------------------------------------
+# Update — runs every frame with variable delta
+# ---------------------------------------------------------------------------
+
+fn on_update(engine: Engine2D, dt: f64):
+    """Handle player movement via input actions."""
+
+    # Horizontal movement
+    if engine.input.is_action_pressed("move_left"):
+        engine.physics.apply_force(player_id, Vec2(x: -MOVE_FORCE, y: 0.0))
+    if engine.input.is_action_pressed("move_right"):
+        engine.physics.apply_force(player_id, Vec2(x: MOVE_FORCE, y: 0.0))
+
+    # Jump — only on key-down (just_pressed prevents holding)
+    if engine.input.is_action_just_pressed("jump"):
+        engine.physics.apply_impulse(player_id, Vec2(x: 0.0, y: JUMP_IMPULSE))
+    if engine.input.is_action_just_pressed("move_up"):
+        engine.physics.apply_impulse(player_id, Vec2(x: 0.0, y: JUMP_IMPULSE))
+
+# ---------------------------------------------------------------------------
+# Render — build the command buffer each frame
+# ---------------------------------------------------------------------------
+
+fn on_render(engine: Engine2D, cmds: RenderCommandBuffer):
+    """Draw all game objects using vector shapes."""
+
+    # Clear to white
+    cmds.push(RenderCommand.Clear(color: EngineColor.white()))
+
+    # Ground — dark green bar at bottom
+    val ground_color = EngineColor.rgb(0.2, 0.6, 0.2)
+    engine.vector.fill_rect(cmds, Rect2.new(0.0, 540.0, 800.0, 60.0), ground_color, 0)
+
+    # Platform 1 — brown
+    val plat_color = EngineColor.rgb(0.55, 0.35, 0.17)
+    engine.vector.fill_rect(cmds, Rect2.new(120.0, 410.0, 160.0, 20.0), plat_color, 0)
+
+    # Platform 2 — brown
+    engine.vector.fill_rect(cmds, Rect2.new(510.0, 340.0, 140.0, 20.0), plat_color, 0)
+
+    # Obstacles — red circles at their scene positions
+    val obs_color = EngineColor.red()
+    engine.vector.fill_circle(cmds, 300.0, 545.0, 15.0, obs_color, 1)
+    engine.vector.fill_circle(cmds, 550.0, 540.0, 20.0, obs_color, 1)
+    engine.vector.fill_circle(cmds, 150.0, 550.0, 12.0, obs_color, 1)
+
+    # Player — blue rectangle at its physics position
+    val player_node = engine.get_node(player_id)
+    if val p = player_node:
+        val px = p.position.x
+        val py = p.position.y
+        val player_rect = Rect2.new(
+            px - PLAYER_HX, py - PLAYER_HY,
+            PLAYER_HX * 2.0, PLAYER_HY * 2.0
+        )
+        engine.vector.fill_rect(cmds, player_rect, EngineColor.blue(), 2)
+
+        # Simple "eyes" — two small white dots on the player
+        val eye_color = EngineColor.white()
+        engine.vector.fill_circle(cmds, px - 7.0, py - 8.0, 4.0, eye_color, 3)
+        engine.vector.fill_circle(cmds, px + 7.0, py - 8.0, 4.0, eye_color, 3)
+
+        # Pupils
+        engine.vector.fill_circle(cmds, px - 6.0, py - 7.0, 2.0, EngineColor.black(), 4)
+        engine.vector.fill_circle(cmds, px + 8.0, py - 7.0, 2.0, EngineColor.black(), 4)
+
+# ---------------------------------------------------------------------------
+# Teardown
+# ---------------------------------------------------------------------------
+
+fn on_destroy(engine: Engine2D):
+    """Clean up engine resources."""
+    engine.destroy()
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+fn main():
+    var engine = Engine2D.create("Simple 2D Platformer Demo", 800, 600)
+    var game_loop = GameLoop.create(1.0 / 60.0)
+
+    val callbacks = GameCallbacks(
+        on_init: on_init,
+        on_update: on_update,
+        on_physics_update: \e, dt: pass_dn,
+        on_late_update: \e, dt: pass_dn,
+        on_render: on_render,
+        on_destroy: on_destroy
+    )
+
+    game_loop.run(engine, callbacks)

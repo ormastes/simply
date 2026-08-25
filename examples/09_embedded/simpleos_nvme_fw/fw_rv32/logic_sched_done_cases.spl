@@ -1,0 +1,8 @@
+use logic_sched_core.*
+
+fn rv32_sched_done_cases_selftest() -> i32:
+    if _rv32_sched_completed(16) != 16:
+        return 1
+    if _rv32_sched_completed(-4) != 0:
+        return 1
+    0

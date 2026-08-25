@@ -1,0 +1,379 @@
+#!/usr/bin/env simple
+# Gilrs Gamepad Demo
+#
+# Demonstrates cross-platform gamepad/controller input using Gilrs.
+# Shows controller detection, button/axis reading, events, and rumble.
+
+use app.io.gamepad_ffi.{
+    GamepadContext, gamepad_init, gamepad_shutdown, gamepad_update,
+    gamepad_count, gamepad_is_connected, gamepad_get_name,
+    gamepad_get_power_info,
+    GamepadButton, GamepadAxis,
+    GamepadEventType, gamepad_poll_event, gamepad_event_free,
+    gamepad_button_is_pressed, gamepad_button_data,
+    gamepad_axis_data, gamepad_left_stick, gamepad_right_stick, gamepad_triggers,
+    RumbleEffect, gamepad_rumble, gamepad_rumble_simple, gamepad_stop_rumble,
+    gamepad_apply_deadzone, gamepad_stick_with_deadzone,
+    gamepad_last_error
+}
+use app.io.{print}
+
+fn main():
+    print "=== Gilrs Gamepad Demo ==="
+    print ""
+
+    # Initialize gamepad system
+    val context = gamepad_init()
+
+    if not context.is_valid:
+        print "ERROR: Failed to initialize gamepad system"
+        print "  (This is expected in demo - no Gilrs runtime loaded)"
+        return
+
+    print "✓ Gamepad system initialized"
+    print ""
+
+    demo_controller_detection(context)
+    print ""
+    demo_button_input(context)
+    print ""
+    demo_axis_input(context)
+    print ""
+    demo_stick_input(context)
+    print ""
+    demo_event_polling(context)
+    print ""
+    demo_rumble(context)
+    print ""
+    demo_deadzone(context)
+    print ""
+
+    # Cleanup
+    gamepad_shutdown(context)
+    print "✓ Gamepad system shut down"
+    print ""
+    print "=== Demo Complete ==="
+
+fn demo_controller_detection(context: GamepadContext):
+    """
+    Demonstrates controller detection and info.
+    """
+    print "--- Controller Detection ---"
+
+    # Get connected controller count
+    val count = gamepad_count(context)
+    print "Connected controllers: {count}"
+
+    if count == 0:
+        print "ℹ  No controllers connected (expected in demo)"
+        print "   In a real app, you would:"
+        print "   1. Wait for controller connection events"
+        print "   2. Poll gamepad_count() periodically"
+        print "   3. Check gamepad_is_connected(context, id)"
+        return
+
+    # Check first controller
+    val gamepad_id = 0
+    val connected = gamepad_is_connected(context, gamepad_id)
+
+    if connected:
+        val name = gamepad_get_name(context, gamepad_id)
+        print "✓ Controller {gamepad_id}: {name}"
+
+        # Get battery info
+        val power = gamepad_get_power_info(context, gamepad_id)
+        if power.percentage >= 0:
+            print "  Battery: {power.percentage}%"
+
+fn demo_button_input(context: GamepadContext):
+    """
+    Demonstrates button state reading.
+    """
+    print "--- Button Input ---"
+
+    val gamepad_id = 0
+
+    # Read button states
+    val south_pressed = gamepad_button_is_pressed(context, gamepad_id, GamepadButton.South)
+    val start_pressed = gamepad_button_is_pressed(context, gamepad_id, GamepadButton.Start)
+
+    print "Button state features:"
+    print "  ✓ gamepad_button_is_pressed(context, id, button) -> bool"
+    print "  ✓ gamepad_button_data(context, id, button) -> ButtonData"
+    print ""
+
+    # Get analog button data (for triggers as buttons)
+    val trigger_data = gamepad_button_data(context, gamepad_id, GamepadButton.LeftTrigger)
+    print "Example: Left Trigger"
+    print "  Pressed: {trigger_data.is_pressed}"
+    print "  Analog Value: {trigger_data.value:0.2f} (0.0 - 1.0)"
+    print ""
+
+    print "Available buttons:"
+    print "  Face: South (A/Cross), East (B/Circle), North (Y/Triangle), West (X/Square)"
+    print "  Triggers: LeftTrigger (LT/L2), RightTrigger (RT/R2)"
+    print "  Bumpers: LeftBumper (LB/L1), RightBumper (RB/R1)"
+    print "  D-Pad: DPadUp, DPadDown, DPadLeft, DPadRight"
+    print "  Sticks: LeftStick (L3), RightStick (R3)"
+    print "  System: Select (Back/Share), Start (Menu/Options), Mode (Xbox/PS button)"
+
+fn demo_axis_input(context: GamepadContext):
+    """
+    Demonstrates axis reading.
+    """
+    print "--- Axis Input ---"
+
+    val gamepad_id = 0
+
+    # Read individual axes
+    val left_x = gamepad_axis_data(context, gamepad_id, GamepadAxis.LeftStickX)
+    val left_y = gamepad_axis_data(context, gamepad_id, GamepadAxis.LeftStickY)
+    val left_trigger = gamepad_axis_data(context, gamepad_id, GamepadAxis.LeftTrigger)
+
+    print "✓ Left Stick X: {left_x:0.2f}"
+    print "✓ Left Stick Y: {left_y:0.2f}"
+    print "✓ Left Trigger: {left_trigger:0.2f}"
+    print ""
+
+    print "Available axes:"
+    print "  ✓ LeftStickX, LeftStickY (-1.0 to 1.0)"
+    print "  ✓ RightStickX, RightStickY (-1.0 to 1.0)"
+    print "  ✓ LeftTrigger, RightTrigger (0.0 to 1.0)"
+    print "  ✓ DPadX, DPadY (-1.0 to 1.0)"
+
+fn demo_stick_input(context: GamepadContext):
+    """
+    Demonstrates stick state helpers.
+    """
+    print "--- Stick Input (Helper Structs) ---"
+
+    val gamepad_id = 0
+
+    # Get left stick state
+    val left_stick = gamepad_left_stick(context, gamepad_id)
+    print "Left Stick:"
+    print "  X: {left_stick.x:0.2f}, Y: {left_stick.y:0.2f}"
+    print "  Magnitude: {left_stick.magnitude():0.2f}"
+    print "  Angle: {left_stick.angle():0.2f} radians"
+
+    # Get right stick state
+    val right_stick = gamepad_right_stick(context, gamepad_id)
+    print "Right Stick:"
+    print "  X: {right_stick.x:0.2f}, Y: {right_stick.y:0.2f}"
+
+    # Get trigger state
+    val triggers = gamepad_triggers(context, gamepad_id)
+    print "Triggers:"
+    print "  Left: {triggers.left:0.2f}, Right: {triggers.right:0.2f}"
+    print ""
+
+    # Normalize stick input
+    if left_stick.magnitude() > 0.0:
+        val normalized = left_stick.normalize()
+        print "Normalized Left Stick:"
+        print "  X: {normalized.x:0.2f}, Y: {normalized.y:0.2f}"
+        print "  Magnitude: {normalized.magnitude():0.2f}"
+
+fn demo_event_polling(context: GamepadContext):
+    """
+    Demonstrates event-based input reading.
+    """
+    print "--- Event Polling ---"
+
+    print "Event polling features:"
+    print "  ✓ gamepad_poll_event(context) -> GamepadEvent"
+    print "  ✓ gamepad_event_free(event)"
+    print ""
+
+    print "Event types:"
+    print "  - ButtonPressed, ButtonReleased, ButtonChanged"
+    print "  - AxisChanged"
+    print "  - Connected, Disconnected, Dropped"
+    print ""
+
+    # Poll events (none in demo)
+    var event = gamepad_poll_event(context)
+    if event.is_valid:
+        print "Got event!"
+        # Process event based on type
+        # if event.event_type == GamepadEventType.ButtonPressed:
+        #     print "Button pressed: {event.button}"
+        # elif event.event_type == GamepadEventType.AxisChanged:
+        #     print "Axis changed: {event.axis} = {event.value}"
+
+        # Clean up event
+        gamepad_event_free(event)
+    else:
+        print "ℹ  No events (expected in demo)"
+        print "   In a real game loop:"
+        print "   while true:"
+        print "       event = gamepad_poll_event(context)"
+        print "       if not event.is_valid: break"
+        print "       # Process event..."
+        print "       gamepad_event_free(event)"
+
+fn demo_rumble(context: GamepadContext):
+    """
+    Demonstrates rumble/force feedback.
+    """
+    print "--- Rumble/Force Feedback ---"
+
+    val gamepad_id = 0
+
+    print "Rumble features:"
+    print "  ✓ gamepad_rumble(context, id, effect) -> bool"
+    print "  ✓ gamepad_rumble_simple(context, id, intensity, duration_ms) -> bool"
+    print "  ✓ gamepad_stop_rumble(context, id) -> bool"
+    print ""
+
+    # Simple rumble (both motors at same intensity)
+    print "Example: Simple rumble (0.8 intensity, 500ms)"
+    val result1 = gamepad_rumble_simple(context, gamepad_id, 0.8, 500)
+    if result1:
+        print "  ✓ Rumble started"
+    else:
+        print "  ℹ  Rumble not started (no controller)"
+
+    # Custom rumble effect (different motor intensities)
+    print "Example: Custom rumble (strong=1.0, weak=0.5, 1000ms)"
+    val effect = RumbleEffect(strong_motor: 1.0, weak_motor: 0.5, duration_ms: 1000)
+    val result2 = gamepad_rumble(context, gamepad_id, effect)
+    if not result2:
+        print "  ℹ  Rumble not started (no controller)"
+
+    # Stop rumble
+    print "Example: Stop rumble"
+    val result3 = gamepad_stop_rumble(context, gamepad_id)
+
+fn demo_deadzone(context: GamepadContext):
+    """
+    Demonstrates deadzone helpers.
+    """
+    print "--- Deadzone Helpers ---"
+
+    # Apply deadzone to single axis
+    val raw_axis = 0.08
+    val deadzone = 0.1
+    val filtered_axis = gamepad_apply_deadzone(raw_axis, deadzone)
+
+    print "Single Axis Deadzone:"
+    print "  Raw value: {raw_axis:0.2f}"
+    print "  Deadzone: {deadzone:0.2f}"
+    print "  Filtered: {filtered_axis:0.2f}"
+    print ""
+
+    # Apply circular deadzone to stick
+    val gamepad_id = 0
+    val left_stick = gamepad_left_stick(context, gamepad_id)
+    val filtered_stick = gamepad_stick_with_deadzone(left_stick, 0.15)
+
+    print "Circular Stick Deadzone:"
+    print "  Raw: X={left_stick.x:0.2f}, Y={left_stick.y:0.2f}"
+    print "  Raw Magnitude: {left_stick.magnitude():0.2f}"
+    print "  Filtered: X={filtered_stick.x:0.2f}, Y={filtered_stick.y:0.2f}"
+    print "  Filtered Magnitude: {filtered_stick.magnitude():0.2f}"
+    print ""
+
+    print "Why use deadzone?"
+    print "  - Eliminates stick drift (unwanted small movements)"
+    print "  - Improves precision in center position"
+    print "  - Typical values: 0.1 to 0.2"
+
+# Example of a complete game input system (for reference)
+fn game_input_system_example():
+    """
+    This shows how you would use gamepad input in a real game.
+    Not executed in this demo.
+    """
+    # Initialize
+    val context = gamepad_init()
+
+    # Game loop
+    var running = true
+    while running:
+        # Update gamepad state
+        gamepad_update(context)
+
+        # Poll events
+        var event = gamepad_poll_event(context)
+        while event.is_valid:
+            # Handle connection events
+            # if event.event_type == GamepadEventType.Connected:
+            #     print "Controller {event.gamepad_id} connected"
+            # elif event.event_type == GamepadEventType.Disconnected:
+            #     print "Controller {event.gamepad_id} disconnected"
+
+            # Handle button events
+            # if event.event_type == GamepadEventType.ButtonPressed:
+            #     if event.button == GamepadButton.South:
+            #         # Jump action
+            #         pass
+            #     elif event.button == GamepadButton.Start:
+            #         # Pause menu
+            #         pass
+
+            gamepad_event_free(event)
+            event = gamepad_poll_event(context)
+
+        # Read analog input for player movement
+        # val gamepad_id = 0
+        # if gamepad_is_connected(context, gamepad_id):
+        #     val left_stick = gamepad_left_stick(context, gamepad_id)
+        #     val filtered_stick = gamepad_stick_with_deadzone(left_stick, 0.15)
+        #
+        #     # Move player based on stick input
+        #     # player.velocity_x = filtered_stick.x * player.speed
+        #     # player.velocity_y = filtered_stick.y * player.speed
+        #
+        #     # Rumble on player hit
+        #     # if player.was_hit:
+        #     #     gamepad_rumble_simple(context, gamepad_id, 1.0, 200)
+
+        pass
+
+    # Cleanup
+    gamepad_shutdown(context)
+
+# Example of multi-controller support
+fn multiplayer_input_example():
+    """
+    Shows how to handle multiple controllers for local multiplayer.
+    Not executed in this demo.
+    """
+    val context = gamepad_init()
+
+    # Track player assignments
+    var player_gamepads = [0, 0, 0, 0]  # Player 0-3 gamepad IDs
+    var player_count = 0
+
+    # Assign controllers to players
+    val count = gamepad_count(context)
+    for i in 0..count:
+        if gamepad_is_connected(context, i):
+            if player_count < 4:
+                player_gamepads[player_count] = i
+                player_count = player_count + 1
+
+    print "Players: {player_count}"
+
+    # Game loop
+    while true:
+        # Update all controllers
+        gamepad_update(context)
+
+        # Read input for each player
+        for player_id in 0..player_count:
+            val gamepad_id = player_gamepads[player_id]
+
+            # Read player input
+            val left_stick = gamepad_left_stick(context, gamepad_id)
+            val jump = gamepad_button_is_pressed(context, gamepad_id, GamepadButton.South)
+
+            # Update player based on input
+            # players[player_id].move(left_stick.x, left_stick.y)
+            # if jump:
+            #     players[player_id].jump()
+
+        pass
+
+    gamepad_shutdown(context)

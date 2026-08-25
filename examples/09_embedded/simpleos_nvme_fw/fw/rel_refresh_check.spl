@@ -1,0 +1,141 @@
+"""
+rel_refresh_check — absolute oracles for rel_refresh.spl (FCR/DEAR-lite
+refresh, contract: doc/05_design/hardware/nand_recovery/
+recovery_algorithms_design.md §4, design §9 lane L5). Known values at known
+points, not self-comparison — every assertion below is computed by hand
+against the design's exact trigger disjunction and its `>=` (inclusive)
+threshold semantics.
+
+THIS FILE IS A MODULE SEPARATE FROM rel_refresh.spl. Every RelRefreshState and
+RelAction below is built via rel_refresh.spl's own rel_refresh_new()
+constructor (or a scripted on_write/enqueue sequence) and read back through
+its fields HERE, exercising the module's public API only and re-proving the
+module-boundary round-trip the L1 gate established for RelAction.
+
+Oracles:
+  0. rel_refresh_new() zero-initializes both arrays to length NUM_BLOCKS.
+  1. FCR corrected-event trend fires EXACTLY at REL_REFRESH_ERR_EVENTS (3),
+     not before: corrected_events == 2 -> Accept; == 3 -> MarkForRefresh
+     (design §4 uses `>=`, inclusive — NOT the `>` pattern the sibling
+     rel_disturb/rel_wear thresholds use).
+  2. DEAR retry-success fires on a SINGLE retry: needed_retry == 1 marks
+     immediately even with corrected_events == 0 and a cold age clock — the
+     design's rule is `== 1`, not a count/streak.
+  3. Age proxy fires EXACTLY at REL_REFRESH_AGE_SEQ (100000): delta == 99999
+     -> Accept; delta == 100000 -> MarkForRefresh (inclusive, same as
+     oracle 1).
+  4. Hysteresis/dedupe: `marked[blk] == 1` short-circuits ALL three triggers
+     to Accept even when every trigger is simultaneously hot (corrected_events
+     huge, needed_retry == 1, cur_seq far past the age threshold).
+  5. Write-reset scripted sequence (the erase-adjacent reset — design §4 has
+     no `rel_refresh_on_erase`; §7 "all three per-block policies clear on
+     erase" names vref/disturb/health only, NOT refresh; a recycled block's
+     staleness is reset when it is REPROGRAMMED): enqueue (mark) -> on_write
+     (rewrite stamps last_prog_seq + clears marked) -> due immediately after
+     with corrected_events == 0 / needed_retry == 0 / cur_seq == the fresh
+     last_prog_seq (age delta 0) -> Accept, proving no sticky re-fire from
+     either the stale mark or a stale age clock.
+  6. Per-block isolation: marking one block does not affect another block's
+     verdict, and an unmarked block's hot triggers fire independently of a
+     marked sibling's state in the SAME RelRefreshState.
+
+Run: bin/simple run examples/09_embedded/simpleos_nvme_fw/fw/rel_refresh_check.spl
+Gate: prints "REL REFRESH OK" and exits 0.
+"""
+
+use nvme_types.*
+use nd_types.*
+use rel_types.*
+use rel_refresh.*
+
+fn kind_of(a: RelAction) -> i64:
+    a.kind
+
+fn arg_of(a: RelAction) -> i64:
+    a.arg
+
+fn main():
+    var fail: i64 = 0
+
+    # ── Oracle 0: rel_refresh_new() zero-initializes both arrays ──────────────
+    val fresh: RelRefreshState = rel_refresh_new()
+    fail = fail + expect_eq(fresh.last_prog_seq.len(), NUM_BLOCKS, "rel_refresh_new: last_prog_seq length == NUM_BLOCKS")
+    fail = fail + expect_eq(fresh.marked.len(), NUM_BLOCKS, "rel_refresh_new: marked length == NUM_BLOCKS")
+    fail = fail + expect_eq(fresh.last_prog_seq[0], 0, "rel_refresh_new: last_prog_seq[0] defaults 0")
+    fail = fail + expect_eq(fresh.marked[63], 0, "rel_refresh_new: marked[63] (last block) defaults 0")
+
+    # ── Oracle 1: FCR corrected-event trend fires EXACTLY at the threshold ────
+    # cur_seq=50000 with a fresh (last_prog_seq==0) block gives an age delta of
+    # 50000, safely below REL_REFRESH_AGE_SEQ (100000), so the age trigger
+    # cannot co-fire and this oracle isolates trigger (2) only.
+    val st_fcr: RelRefreshState = rel_refresh_new()
+    val blk_fcr: NdBlock = nd_block(12)
+    val below_fcr: RelAction = rel_refresh_due(st_fcr, blk_fcr, 50000, 2, 0)
+    fail = fail + expect_eq(kind_of(below_fcr), rel_act_accept(), "corrected_events==2 (< REL_REFRESH_ERR_EVENTS 3) -> Accept")
+    val at_fcr: RelAction = rel_refresh_due(st_fcr, blk_fcr, 50000, 3, 0)
+    fail = fail + expect_eq(kind_of(at_fcr), rel_act_refresh(), "corrected_events==3 (== REL_REFRESH_ERR_EVENTS) fires MarkForRefresh (>=, inclusive)")
+    fail = fail + expect_eq(arg_of(at_fcr), 12, "MarkForRefresh arg == blk (12) on the FCR trigger")
+
+    # ── Oracle 2: DEAR retry-success fires on a SINGLE retry (k>0, not a count) ─
+    val st_dear: RelRefreshState = rel_refresh_new()
+    val blk_dear: NdBlock = nd_block(7)
+    val no_retry: RelAction = rel_refresh_due(st_dear, blk_dear, 50000, 0, 0)
+    fail = fail + expect_eq(kind_of(no_retry), rel_act_accept(), "needed_retry==0, corrected_events==0, age cold -> Accept (no trigger hot)")
+    val retry_fires: RelAction = rel_refresh_due(st_dear, blk_dear, 50000, 0, 1)
+    fail = fail + expect_eq(kind_of(retry_fires), rel_act_refresh(), "needed_retry==1 (a SINGLE retry-success) fires MarkForRefresh immediately, even with corrected_events==0")
+    fail = fail + expect_eq(arg_of(retry_fires), 7, "MarkForRefresh arg == blk (7) on the DEAR trigger")
+
+    # ── Oracle 3: age proxy fires EXACTLY at the design threshold ─────────────
+    val st_age0: RelRefreshState = rel_refresh_new()
+    val blk_age: NdBlock = nd_block(30)
+    # Stamp a realistic non-zero baseline via on_write (last_prog_seq[30] =
+    # 1000, marked cleared) rather than relying on the zero-init default.
+    val st_age: RelRefreshState = rel_refresh_on_write(st_age0, blk_age, 1000)
+    val below_age: RelAction = rel_refresh_due(st_age, blk_age, 1000 + REL_REFRESH_AGE_SEQ() - 1, 0, 0)
+    fail = fail + expect_eq(kind_of(below_age), rel_act_accept(), "age delta == REL_REFRESH_AGE_SEQ-1 (99999) -> Accept")
+    val at_age: RelAction = rel_refresh_due(st_age, blk_age, 1000 + REL_REFRESH_AGE_SEQ(), 0, 0)
+    fail = fail + expect_eq(kind_of(at_age), rel_act_refresh(), "age delta == REL_REFRESH_AGE_SEQ (100000) exactly fires MarkForRefresh (>=, inclusive)")
+    fail = fail + expect_eq(arg_of(at_age), 30, "MarkForRefresh arg == blk (30) on the age trigger")
+
+    # ── Oracle 4: hysteresis/dedupe — marked short-circuits ALL triggers ──────
+    var st_mark: RelRefreshState = rel_refresh_new()
+    val blk_mark: NdBlock = nd_block(15)
+    st_mark = rel_refresh_enqueue(st_mark, blk_mark)
+    fail = fail + expect_eq(st_mark.marked[15], 1, "enqueue: marked[15] set to 1")
+    # Every trigger hot simultaneously: huge corrected_events, retry-needed,
+    # and a cur_seq far past the age threshold from a zero baseline.
+    val marked_verdict: RelAction = rel_refresh_due(st_mark, blk_mark, 999999, 99, 1)
+    fail = fail + expect_eq(kind_of(marked_verdict), rel_act_accept(), "marked==1 short-circuits ALL triggers to Accept, even with everything hot")
+
+    # ── Oracle 5: write-reset scripted sequence — no sticky re-fire ───────────
+    # Simulates the recycle lifecycle: a block gets queued for refresh, is
+    # reclaimed/erased and reprogrammed elsewhere in the pipeline, and the
+    # write path calls rel_refresh_on_write on the rewrite. The very next
+    # due-check must NOT see the stale mark or a stale age clock.
+    var st_seq: RelRefreshState = rel_refresh_new()
+    val blk_seq: NdBlock = nd_block(22)
+    st_seq = rel_refresh_enqueue(st_seq, blk_seq)
+    fail = fail + expect_eq(st_seq.marked[22], 1, "scripted seq step1: enqueue marks block 22")
+    st_seq = rel_refresh_on_write(st_seq, blk_seq, 500000)
+    fail = fail + expect_eq(st_seq.marked[22], 0, "scripted seq step2: on_write (rewrite) clears the stale mark")
+    fail = fail + expect_eq(st_seq.last_prog_seq[22], 500000, "scripted seq step2: on_write stamps last_prog_seq to the rewrite's cur_seq")
+    val after: RelAction = rel_refresh_due(st_seq, blk_seq, 500000, 0, 0)
+    fail = fail + expect_eq(kind_of(after), rel_act_accept(), "scripted seq step3: immediate due-check post-rewrite -> Accept, no sticky re-fire from the prior mark or a stale age clock")
+
+    # ── Oracle 6: per-block isolation ──────────────────────────────────────────
+    var st_iso: RelRefreshState = rel_refresh_new()
+    val blk_hot: NdBlock = nd_block(40)
+    val blk_cold: NdBlock = nd_block(41)
+    st_iso = rel_refresh_enqueue(st_iso, blk_hot)
+    fail = fail + expect_eq(st_iso.marked[40], 1, "isolation: block 40 marked")
+    fail = fail + expect_eq(st_iso.marked[41], 0, "isolation: block 41 untouched (0) by block 40's enqueue")
+    val hot_verdict: RelAction = rel_refresh_due(st_iso, blk_hot, 50000, 99, 1)
+    fail = fail + expect_eq(kind_of(hot_verdict), rel_act_accept(), "isolation: block 40 (marked) -> Accept despite every trigger being hot")
+    val cold_verdict: RelAction = rel_refresh_due(st_iso, blk_cold, 50000, 99, 1)
+    fail = fail + expect_eq(kind_of(cold_verdict), rel_act_refresh(), "isolation: block 41 (unmarked) -> MarkForRefresh, independent of block 40's mark, under the SAME RelRefreshState")
+    fail = fail + expect_eq(arg_of(cold_verdict), 41, "isolation: verdict arg identifies block 41, not block 40")
+
+    if fail == 0:
+        print "REL REFRESH OK"
+    else:
+        print "REL REFRESH FAIL ({fail})"

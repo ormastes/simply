@@ -1,0 +1,122 @@
+"""
+rel_disturb — STRAW-lite read-disturb reclaim (design doc §5, design §9 L6).
+
+Extends, does NOT duplicate, the existing FTL counter: the firmware already
+bumps `rd_disturb[blk]` on every read (ftl.spl:29,109,117,347-362) and gates
+the existing `scrub_once` at `READ_DISTURB_THRESHOLD` (50, nvme_types.spl:43).
+This module consumes that counter as a caller-supplied OBSERVATION (source of
+truth, never copied) and adds ONLY a hottest-page estimate — a parallel stress
+counter would diverge from `rd_disturb` over time.
+
+The hottest page is tracked with a Boyer-Moore majority-candidate: O(1) per
+observation, no `Dict`, no per-page array — a cheap proxy for "one wordline is
+taking most of the read stress" from the page index the FTL read path already
+knows (ppn_page(ppn) once L8 wires this in).
+
+Contract: doc/05_design/hardware/nand_recovery/recovery_algorithms_design.md
+§5 (pseudocode implemented verbatim below) + design §9 L6 ("consumes existing
+rd_disturb", depends on L1 only). Pure-policy leaf: `use nvme_types.*` +
+`use nd_types.*` + `use rel_types.*` ONLY — never fil/ftl (design §0 /
+architecture LAW: fil.spl and ftl.spl import the rel_* leaves, never the
+reverse). No module holds a Fil/Ftl handle; `rel_disturb_due` returns a pure
+`RelAction` verdict and the FTL mounting layer actuates (`scrub_once`).
+
+Language landmines honored (design §0):
+- Return-the-object: `rel_disturb_observe`/`rel_disturb_clear` return the
+  updated `RelDisturbState`; callers reassign (arrays are value types, passed
+  by copy).
+- No Dict: per-block state is `RelDisturbState`'s dense `[i64]` arrays
+  (rel_types.spl, length NUM_BLOCKS = 64), indexed by physical block.
+- Constants are fn-returning literals, never module-level scalars (matches the
+  sibling `rel_act_*` constants in rel_types.spl — freestanding-safe habit).
+
+Typed-dimensions law (guide "TYPED DIMENSIONS LAW", rel_types.spl docstring):
+`blk`/`page` are NdBlock/NdPage newtypes (nd_types.spl) at every fn's scalar
+boundary; converted to raw i64 immediately at the array-index / RelAction.arg
+flat boundary — the dense `[i64]` arrays themselves stay `[i64]` (the block is
+the ARRAY INDEX, a flat i64; the stored values are page-index/count
+estimates), matching rel_types.spl's own note on RelDisturbState.
+
+Boyer-Moore majority-vote semantics (design §5, verbatim pseudocode below):
+this is a STREAMING MAJORITY-CANDIDATE estimator, not an exact top-page
+counter. Classic Boyer-Moore property: IF a true majority page exists in the
+observed stream (strictly more than half the reads), the candidate at the end
+IS that page. If no true majority exists, the algorithm is still fully
+DETERMINISTIC (no randomness, no hashing) but the surviving candidate is
+whatever page happened to out-cancel the others along that specific sequence —
+documented in the design doc as "the majority-vote hottest page is an estimate
+that can miss multi-hot-page patterns" (§5 "Does NOT do in v1"). This is by
+design, not a bug: rel_disturb_due never treats a non-majority candidate as
+authoritative on its own — it only fires reclaim when hot_count crosses
+REL_DISTURB_HOTPAGE_MIN (a concentration signal), layered on top of the
+existing rd_disturb block-level gate which is the primary, always-correct
+source of truth.
+"""
+
+use nvme_types.*
+use nd_types.*
+use rel_types.*
+
+# Zero-initialized RelDisturbState, length NUM_BLOCKS both arrays (task
+# contract: "you own rel_disturb_new/observe/due"; rel_types.spl's docstring
+# deliberately withholds this constructor from L1 and delegates it to this
+# lane, naming rel_ladder_state_new as the §2 analog). Cannot reuse
+# ftl_fill (ftl_map.spl) -- a leaf must not import FTL -- so this mirrors the
+# same private zero-loop rel_types_check.spl uses for its oracles.
+fn rel_disturb_new() -> RelDisturbState:
+    var hot_page: [i64] = []
+    var hot_count: [i64] = []
+    var i: i64 = 0
+    while i < NUM_BLOCKS:
+        hot_page.push(0)
+        hot_count.push(0)
+        i = i + 1
+    RelDisturbState(hot_page: hot_page, hot_count: hot_count)
+
+# REL_DISTURB_HOTPAGE_MIN (design §5 constants table): fires before the
+# block-wide rd_disturb count reaches READ_DISTURB_THRESHOLD (50) when a
+# single page dominates -- concentrates reclaim on an actually-stressed block
+# earlier without churning evenly-read blocks. fn-returning literal per the
+# repo's freestanding-safe constant convention (matches rel_act_* in
+# rel_types.spl); the design doc's pseudocode spells this REL_DISTURB_HOTPAGE_MIN().
+fn REL_DISTURB_HOTPAGE_MIN() -> i64:
+    40
+
+# One read event on (blk, page): Boyer-Moore majority-vote update (design §5,
+# implemented verbatim). Return-the-object: caller reassigns.
+fn rel_disturb_observe(st: RelDisturbState, blk: NdBlock, page: NdPage) -> RelDisturbState:
+    var out: RelDisturbState = st
+    val b: i64 = blk.idx
+    val p: i64 = page.idx
+    if out.hot_count[b] == 0:
+        out.hot_page[b] = p
+        out.hot_count[b] = 1
+    elif out.hot_page[b] == p:
+        out.hot_count[b] = out.hot_count[b] + 1
+    else:
+        out.hot_count[b] = out.hot_count[b] - 1
+    return out
+
+# Reclaim verdict (design §5, implemented verbatim). Two independent gates,
+# either one fires ReclaimNow:
+#   1. block-wide `rd_disturb_blk` gate — the EXISTING scrub_once threshold,
+#      preserved unchanged (caller passes ftl.spl's live rd_disturb[blk]; this
+#      module never copies or re-derives that counter).
+#   2. hottest-page gate — a single page dominating this block's Boyer-Moore
+#      candidate count, which can fire earlier than gate 1.
+fn rel_disturb_due(st: RelDisturbState, blk: NdBlock, rd_disturb_blk: i64) -> RelAction:
+    val b: i64 = blk.idx
+    if rd_disturb_blk > READ_DISTURB_THRESHOLD:
+        return rel_action(rel_act_reclaim(), b)
+    if st.hot_count[b] > REL_DISTURB_HOTPAGE_MIN():
+        return rel_action(rel_act_reclaim(), b)
+    return rel_action(rel_act_accept(), 0)
+
+# Clear exactly one block's hottest-page estimate — called on erase/reclaim
+# (design §5). Return-the-object: caller reassigns.
+fn rel_disturb_clear(st: RelDisturbState, blk: NdBlock) -> RelDisturbState:
+    var out: RelDisturbState = st
+    val b: i64 = blk.idx
+    out.hot_page[b] = 0
+    out.hot_count[b] = 0
+    return out

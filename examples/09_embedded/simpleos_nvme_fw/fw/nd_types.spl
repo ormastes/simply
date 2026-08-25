@@ -1,0 +1,150 @@
+"""
+nd_types — typed NAND physical-address dimensions (channel/way/bank/plane/block/
+wordline/page), a peer leaf to nvme_types.spl and rel_types.spl.
+
+Contract: doc/01_research/hardware/nand_recovery/typed_nand_addressing_local.md
+(§4 "Recommendation"). Pure data + free-function constructors/converters. NO
+`impl`/`me` methods here (same contract as nvme_types.spl:4 — "cheap to
+type-check and safe to import everywhere"). Prefix `Nd` (Nand-Dimension) is
+reserved for this module's public types, distinct from `Ne` (nand_emu,
+chip-internal geometry) and `Rel` (reliability engine) — same collision-
+avoidance rule that reserves those two prefixes.
+
+Import ONLY nvme_types.* — nvme_types.spl itself imports nothing, and this
+module is meant to sit at the SAME depth as nvme_types/rel_types (research
+doc §4.2: "a third peer leaf ... not a fourth layer"), importable by fil.spl,
+ftl.spl, and every rel_* module without a cycle. It deliberately does NOT
+import fil_scheduler.spl (see ND_NUM_CHANNELS below) or openssd_config.spl —
+neither is imported by nvme_types.spl, so the peer-leaf convention does not
+license importing them here either.
+
+Value-type law: each Nd* struct is a single `idx: i64` field (field name
+`idx`, not `val` — `val` is the const-declaration keyword; not `payload` —
+that name is the crypto ctypes.spl convention for a ByteSpan). Structs are
+value types (copied on pass, per repo law); a helper that "changes" one
+returns a new value — never mutates in place (no `impl`/`me` exists here to
+do so anyway).
+
+Landing scope (research doc §4.1, §4.4 "never add unused code"): all seven
+dimension types are defined now because the rel_* implementation wave (the
+guide's "TYPED DIMENSIONS LAW") already assumes the full Nd* set is
+importable this session. Only the three LIVE dimensions (channel, block,
+page) get real flat-ppn conversion math, reusing nvme_types' canonical
+ppn_block/ppn_page/block_first_ppn helpers rather than re-deriving them a
+fifth time (research doc §2: the block/page split is already independently
+reimplemented four times — nvme_types canonical, rain.spl, ftl.spl's raw
+bypass, fil_nand_emu.spl's raw re-derivation). way/bank/plane are declared
+types with NdAddr slots and constructors but NO conversion math — see the
+comment above nd_addr_of_ppn.
+"""
+
+use nvme_types.*
+
+# ── Single-field newtypes (field `idx`, all value types) ──────────────────────
+struct NdChannel:
+    idx: i64
+
+struct NdWay:          # CE / die within a channel
+    idx: i64
+
+struct NdBank:          # LUN within a way
+    idx: i64
+
+struct NdPlane:         # plane within a bank
+    idx: i64
+
+struct NdBlock:         # erase block within a plane
+    idx: i64
+
+struct NdWordline:      # wordline within a block (SLC v1: == NdPage numerically, but a DIFFERENT type)
+    idx: i64
+
+struct NdPage:          # page within a wordline (1:1 in v1 SLC, 2-3:1 in v2 MLC/TLC)
+    idx: i64
+
+# ── Composed physical address (research doc §4.1 shape exactly) ───────────────
+struct NdAddr:
+    channel: NdChannel
+    way:     NdWay
+    bank:    NdBank
+    plane:   NdPlane
+    block:   NdBlock
+    page:    NdPage
+
+# ── Constructors (free functions; no `impl`/`me` in this leaf) ────────────────
+fn nd_channel(idx: i64) -> NdChannel:
+    NdChannel(idx: idx)
+
+fn nd_way(idx: i64) -> NdWay:
+    NdWay(idx: idx)
+
+fn nd_bank(idx: i64) -> NdBank:
+    NdBank(idx: idx)
+
+fn nd_plane(idx: i64) -> NdPlane:
+    NdPlane(idx: idx)
+
+fn nd_block(idx: i64) -> NdBlock:
+    NdBlock(idx: idx)
+
+fn nd_wordline(idx: i64) -> NdWordline:
+    NdWordline(idx: idx)
+
+fn nd_page(idx: i64) -> NdPage:
+    NdPage(idx: idx)
+
+fn nd_addr(channel: NdChannel, way: NdWay, bank: NdBank, plane: NdPlane, block: NdBlock, page: NdPage) -> NdAddr:
+    NdAddr(channel: channel, way: way, bank: bank, plane: plane, block: block, page: page)
+
+# ── Channel-of-ppn (matches rain.spl's stripe math) ────────────────────────────
+# rain.spl's parity grid lays out block = group*NUM_CHANNELS + channel (rain.spl:82),
+# i.e. channel = block % NUM_CHANNELS — exactly fil_scheduler.channel_of's formula
+# (fil_scheduler.spl:28). NUM_CHANNELS=8 is duplicated here as ND_NUM_CHANNELS rather
+# than imported from fil_scheduler.spl, because importing a FIL-tier module would pull
+# nd_types.spl out of the peer-leaf depth this module is placed at (research doc §4.2).
+# This is a deliberate, narrow duplication of a single constant, not a re-derivation of
+# the block/page math (that math is reused, not duplicated, via ppn_block below); the
+# "channel-of agrees with rain.spl's stripe assignment" oracle in nd_types_check.spl is
+# the anti-drift guard that catches this constant if it and fil_scheduler.NUM_CHANNELS
+# ever disagree.
+val ND_NUM_CHANNELS: i64 = 8
+
+fn nd_channel_of_ppn(ppn: i64) -> NdChannel:
+    nd_channel(ppn_block(ppn) % ND_NUM_CHANNELS)
+
+# ── Flat-ppn converters (reuse nvme_types' canonical helpers, never re-derive) ─
+# way/bank/plane are DECLARED types with NdAddr slots and constructors, but get NO
+# fake conversion math here. Per the research doc's live-vs-decorative table (§3):
+# `way` is declared in OpenSsdConfig.ways_per_channel but never multiplies into any
+# address computation today (`blocks: NUM_BLOCKS` stays the same flat constant
+# regardless of channel/way count); `bank` and `plane` have zero references anywhere
+# in fw/ (bank/LUN is not modeled at all; plane is a datasheet fact only, unsupported
+# in the v1 single-plane emulator). Inventing a formula for them would just be a
+# sixth reimplementation of address math that doesn't exist yet in this firmware —
+# they stay at index 0 until a real consumer (an OpenSSD 8-way board profile that
+# actually multiplies ways_per_channel into an address, or v2 plane support) needs
+# them, per the "never add unused code" / no-fake-math law.
+fn nd_addr_of_ppn(ppn: i64) -> NdAddr:
+    nd_addr(
+        nd_channel_of_ppn(ppn),
+        nd_way(0),
+        nd_bank(0),
+        nd_plane(0),
+        nd_block(ppn_block(ppn)),
+        nd_page(ppn_page(ppn))
+    )
+
+fn nd_ppn_of(addr: NdAddr) -> i64:
+    block_first_ppn(addr.block.idx) + addr.page.idx
+
+# ── Wordline (v1 SLC: numerically == page; kept as a distinct type) ────────────
+# v1 is SLC: 1 bit/cell, 1 page per wordline (nand_types.spl / chip.spl's
+# ne_sense_bit) — page and wordline are numerically identical today. MLC/TLC
+# (v2+) packs 2-3 pages per wordline (lower/middle/upper page), so this 1:1
+# breaks once v2 lands. NdWordline is kept as its own type (not a type alias
+# of NdPage) precisely so that upgrade cannot silently corrupt a policy keyed
+# on wordline (e.g. rel_disturb's v2 per-wordline mode, research doc §3) —
+# the compiler would catch a wordline/page mixup once the conversion stops
+# being the identity function.
+fn nd_wordline_of_page(page: NdPage) -> NdWordline:
+    nd_wordline(page.idx)

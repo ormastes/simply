@@ -1,0 +1,221 @@
+#!/usr/bin/env simple
+# Lyon 2D Graphics Demo
+#
+# Demonstrates 2D vector graphics tessellation using Lyon.
+# Shows path building, shape primitives, fill, and stroke operations.
+
+use app.io.graphics2d_ffi.{
+    Point2D, Vector2D, Rect, Bounds,
+    PathBuilder, graphics_path_builder_new, graphics_path_begin,
+    graphics_path_line_to, graphics_path_close, graphics_path_build,
+    graphics_path_free, graphics_path_get_bounds,
+    graphics_rectangle, graphics_circle, graphics_star,
+    FillRule, graphics_fill_tessellate, graphics_fill_free,
+    graphics_fill_vertex_count, graphics_fill_index_count,
+    graphics_fill_get_vertices, graphics_fill_get_indices,
+    graphics_stroke_tessellate, graphics_stroke_free,
+    graphics_stroke_vertex_count, graphics_stroke_index_count,
+    graphics_vertex_buffer_size, graphics_vertex_buffer_free,
+    graphics_index_buffer_size, graphics_index_buffer_free
+}
+use app.io.{print}
+
+fn main():
+    print "=== Lyon 2D Graphics Demo ==="
+    print ""
+
+    demo_path_building()
+    print ""
+    demo_shape_primitives()
+    print ""
+    demo_fill_tessellation()
+    print ""
+    demo_stroke_tessellation()
+    print ""
+
+    print "=== Demo Complete ==="
+
+fn demo_path_building():
+    """
+    Demonstrates custom path building with lines and curves.
+    """
+    print "--- Path Building ---"
+
+    # Create a simple triangle path
+    val builder = graphics_path_builder_new()
+
+    if not builder.is_valid:
+        print "ERROR: Failed to create path builder"
+        return
+
+    # Build a triangle: (0,0) -> (100,0) -> (50,86.6) -> close
+    graphics_path_begin(builder, Point2D(x: 0.0, y: 0.0))
+    graphics_path_line_to(builder, Point2D(x: 100.0, y: 0.0))
+    graphics_path_line_to(builder, Point2D(x: 50.0, y: 86.6))
+    graphics_path_close(builder)
+
+    val path = graphics_path_build(builder)
+
+    if not path.is_valid:
+        print "ERROR: Failed to build path"
+        return
+
+    print "✓ Triangle path created"
+
+    # Get bounds
+    val bounds = graphics_path_get_bounds(path)
+    print "  Bounds: ({bounds.min_x:0.1f}, {bounds.min_y:0.1f}) to ({bounds.max_x:0.1f}, {bounds.max_y:0.1f})"
+    print "  Size: {bounds.width():0.1f} x {bounds.height():0.1f}"
+
+    # Cleanup
+    graphics_path_free(path)
+
+fn demo_shape_primitives():
+    """
+    Demonstrates built-in shape primitives.
+    """
+    print "--- Shape Primitives ---"
+
+    # Rectangle
+    val rect = graphics_rectangle(Rect(x: 10.0, y: 10.0, width: 80.0, height: 60.0))
+    if rect.is_valid:
+        val bounds = graphics_path_get_bounds(rect)
+        print "✓ Rectangle: {bounds.width():0.1f} x {bounds.height():0.1f}"
+        graphics_path_free(rect)
+
+    # Circle
+    val circle = graphics_circle(Point2D(x: 50.0, y: 50.0), 25.0)
+    if circle.is_valid:
+        val bounds = graphics_path_get_bounds(circle)
+        print "✓ Circle: radius ~{(bounds.width() / 2.0):0.1f}"
+        graphics_path_free(circle)
+
+    # Star
+    val star = graphics_star(Point2D(x: 50.0, y: 50.0), 15.0, 30.0, 5)
+    if star.is_valid:
+        val bounds = graphics_path_get_bounds(star)
+        print "✓ 5-pointed star created"
+        graphics_path_free(star)
+
+fn demo_fill_tessellation():
+    """
+    Demonstrates fill tessellation (converting path to triangles).
+    """
+    print "--- Fill Tessellation ---"
+
+    # Create a rectangle to fill
+    val rect_path = graphics_rectangle(Rect(x: 0.0, y: 0.0, width: 100.0, height: 100.0))
+
+    if not rect_path.is_valid:
+        print "ERROR: Failed to create rectangle path"
+        return
+
+    # Tessellate the fill
+    val tolerance = 0.1
+    val fill_tess = graphics_fill_tessellate(rect_path, tolerance)
+
+    if not fill_tess.is_valid:
+        print "ERROR: Failed to tessellate fill"
+        graphics_path_free(rect_path)
+        return
+
+    val vertex_count = graphics_fill_vertex_count(fill_tess)
+    val index_count = graphics_fill_index_count(fill_tess)
+
+    print "✓ Fill tessellation created"
+    print "  Vertices: {vertex_count}"
+    print "  Indices: {index_count}"
+    print "  Triangles: {index_count / 3}"
+
+    # Get vertex and index buffers
+    val vertices = graphics_fill_get_vertices(fill_tess)
+    val indices = graphics_fill_get_indices(fill_tess)
+
+    if vertices.is_valid and indices.is_valid:
+        print "  Vertex buffer size: {graphics_vertex_buffer_size(vertices)}"
+        print "  Index buffer size: {graphics_index_buffer_size(indices)}"
+
+        graphics_vertex_buffer_free(vertices)
+        graphics_index_buffer_free(indices)
+
+    # Cleanup
+    graphics_fill_free(fill_tess)
+    graphics_path_free(rect_path)
+
+fn demo_stroke_tessellation():
+    """
+    Demonstrates stroke tessellation (converting path outline to triangles).
+    """
+    print "--- Stroke Tessellation ---"
+
+    # Create a circle to stroke
+    val circle_path = graphics_circle(Point2D(x: 50.0, y: 50.0), 30.0)
+
+    if not circle_path.is_valid:
+        print "ERROR: Failed to create circle path"
+        return
+
+    # Tessellate the stroke
+    val stroke_width = 5.0
+    val tolerance = 0.1
+    val stroke_tess = graphics_stroke_tessellate(circle_path, stroke_width, tolerance)
+
+    if not stroke_tess.is_valid:
+        print "ERROR: Failed to tessellate stroke"
+        graphics_path_free(circle_path)
+        return
+
+    val vertex_count = graphics_stroke_vertex_count(stroke_tess)
+    val index_count = graphics_stroke_index_count(stroke_tess)
+
+    print "✓ Stroke tessellation created (width: {stroke_width})"
+    print "  Vertices: {vertex_count}"
+    print "  Indices: {index_count}"
+    print "  Triangles: {index_count / 3}"
+
+    # Get vertex and index buffers
+    val vertices = graphics_stroke_get_vertices(stroke_tess)
+    val indices = graphics_stroke_get_indices(stroke_tess)
+
+    if vertices.is_valid and indices.is_valid:
+        print "  Vertex buffer size: {graphics_vertex_buffer_size(vertices)}"
+        print "  Index buffer size: {graphics_index_buffer_size(indices)}"
+
+        graphics_vertex_buffer_free(vertices)
+        graphics_index_buffer_free(indices)
+
+    # Cleanup
+    graphics_stroke_free(stroke_tess)
+    graphics_path_free(circle_path)
+
+# Example of a complete rendering pipeline (for reference)
+fn rendering_pipeline_example():
+    """
+    This shows how you would use Lyon tessellation in a real
+    rendering pipeline with a GPU graphics API (like Vulkan or wgpu).
+    Not executed in this demo.
+    """
+    # 1. Create path
+    val path = graphics_circle(Point2D(x: 100.0, y: 100.0), 50.0)
+
+    # 2. Tessellate to triangles
+    val fill = graphics_fill_tessellate(path, 0.1)
+    val stroke = graphics_stroke_tessellate(path, 2.0, 0.1)
+
+    # 3. Get vertex/index data
+    val fill_vertices = graphics_fill_get_vertices(fill)
+    val fill_indices = graphics_fill_get_indices(fill)
+
+    # 4. Upload to GPU (would use Vulkan/wgpu here)
+    # gpu_upload_vertex_buffer(fill_vertices)
+    # gpu_upload_index_buffer(fill_indices)
+
+    # 5. Draw with graphics API
+    # gpu_draw_indexed(fill_indices.size())
+
+    # 6. Cleanup
+    graphics_vertex_buffer_free(fill_vertices)
+    graphics_index_buffer_free(fill_indices)
+    graphics_fill_free(fill)
+    graphics_stroke_free(stroke)
+    graphics_path_free(path)

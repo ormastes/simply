@@ -1,0 +1,67 @@
+app:
+    title: "File Browser Tree Demo"
+    theme: glass_dark
+
+layout:
+    type: vbox
+    id: root
+    children:
+        file_browser:
+            type: tree
+            id: file_browser
+            children:
+                d_documents:
+                    type: treenode
+                    id: d_documents
+                    label: "Documents"
+                    expanded: true
+                    children:
+                        d_projects:
+                            type: treenode
+                            id: d_projects
+                            label: "Projects"
+                            expanded: true
+                            children:
+                                f_simple:
+                                    type: treenode
+                                    id: f_simple
+                                    label: "simple.spl"
+                                    expanded: false
+                                f_readme:
+                                    type: treenode
+                                    id: f_readme
+                                    label: "readme.md"
+                                    expanded: false
+                        d_archive:
+                            type: treenode
+                            id: d_archive
+                            label: "Archive"
+                            expanded: false
+                            children:
+                                f_old:
+                                    type: treenode
+                                    id: f_old
+                                    label: "old_data.zip"
+                                    expanded: false
+                d_pictures:
+                    type: treenode
+                    id: d_pictures
+                    label: "Pictures"
+                    expanded: true
+                    children:
+                        f_photo:
+                            type: treenode
+                            id: f_photo
+                            label: "photo.jpg"
+                            expanded: false
+                d_downloads:
+                    type: treenode
+                    id: d_downloads
+                    label: "Downloads"
+                    expanded: false
+                    children:
+                        f_installer:
+                            type: treenode
+                            id: f_installer
+                            label: "setup.exe"
+                            expanded: false

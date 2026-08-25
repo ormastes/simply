@@ -1,0 +1,21 @@
+# Autograd concept demo - runtime compatible.
+
+fn main():
+    print "=== Pure Simple Autograd Concept Demo ==="
+    val x = 3.0
+    val step = 0.001
+    val y = x * x
+    val y_plus = (x + step) * (x + step)
+    val y_minus = (x - step) * (x - step)
+    val dy_dx = (y_plus - y_minus) / (2.0 * step)
+
+    print "Function: y = x * x"
+    print "x = {x}"
+    print "y = {y}"
+    print "numeric dy/dx = {dy_dx}"
+    print "expected dy/dx ~= 6.0"
+    print ""
+    print "For the full runtime-compatible tensor demo, run:"
+    print "examples/07_ml/pure_nn/runtime_compatible/autograd_runtime.spl"
+
+main()

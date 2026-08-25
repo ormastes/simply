@@ -1,0 +1,79 @@
+# Softmax — from scratch
+# Chapter 3: "Build a Large Language Model From Scratch" (Rasbt)
+#
+# Converts logits to probabilities:
+#   softmax(x_i) = exp(x_i - max(x)) / sum(exp(x_j - max(x)))
+#
+# Numerically stable version subtracts max before exponentiating.
+
+use std.pure.tensor.{PureTensor, tensor_from_data}
+use examples.simple_deeplearning_study.lib.util.math_helpers.{dl_exp}
+
+# Row-wise softmax for 2D tensors
+# Each row independently sums to 1.0
+fn study_softmax_2d(x: PureTensor<f64>) -> PureTensor<f64>:
+    val rows = x.shape[0]
+    val cols = x.shape[1]
+    var data: [f64] = []
+
+    var r = 0
+    while r < rows:
+        # Find max for numerical stability
+        var row_max = x.get([r, 0])
+        var c = 1
+        while c < cols:
+            val v = x.get([r, c])
+            if v > row_max:
+                row_max = v
+            c = c + 1
+
+        # Compute exp(x - max) and sum
+        var exp_vals: [f64] = []
+        var exp_sum = 0.0
+        c = 0
+        while c < cols:
+            val e = dl_exp(x.get([r, c]) - row_max)
+            exp_vals.push(e)
+            exp_sum = exp_sum + e
+            c = c + 1
+
+        # Normalize
+        c = 0
+        while c < cols:
+            data.push(exp_vals[c] / exp_sum)
+            c = c + 1
+
+        r = r + 1
+
+    tensor_from_data(data, [rows, cols])
+
+# 1D softmax (single vector)
+fn study_softmax_1d(x: PureTensor<f64>) -> PureTensor<f64>:
+    val n = x.data.len()
+    # Find max
+    var mx = x.data[0]
+    var i = 1
+    while i < n:
+        if x.data[i] > mx:
+            mx = x.data[i]
+        i = i + 1
+
+    # Compute exp and sum
+    var exp_vals: [f64] = []
+    var exp_sum = 0.0
+    i = 0
+    while i < n:
+        val e = dl_exp(x.data[i] - mx)
+        exp_vals.push(e)
+        exp_sum = exp_sum + e
+        i = i + 1
+
+    # Normalize
+    var data: [f64] = []
+    i = 0
+    while i < n:
+        data.push(exp_vals[i] / exp_sum)
+        i = i + 1
+    tensor_from_data(data, x.shape)
+
+export study_softmax_2d, study_softmax_1d

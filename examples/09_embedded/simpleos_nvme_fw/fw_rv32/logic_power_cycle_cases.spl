@@ -1,0 +1,33 @@
+use logic_power_cycle_core.*
+
+fn rv32_power_cycle_cases_selftest() -> i32:
+    if _rv32_power_counter_clamped(-1) != 0:
+        return 1
+    val cap: i64 = _rv32_power_counter_cap()
+    if _rv32_power_counter_clamped(cap + 1) != cap:
+        return 1
+    if _rv32_power_cycles_after(0) != 1:
+        return 1
+    if _rv32_power_cycles_after(-4) != 1:
+        return 1
+    if _rv32_power_cycles_after(cap) != cap:
+        return 1
+    if _rv32_unsafe_after(0, 0) != 0:
+        return 1
+    if _rv32_unsafe_after(0, 1) != 1:
+        return 1
+    if _rv32_unsafe_after(-3, 1) != 1:
+        return 1
+    if _rv32_unsafe_after(cap, 1) != cap:
+        return 1
+    if _rv32_dirty_after_checkpoint() != 0:
+        return 1
+    if _rv32_dirty_after_write(0, 1) != 1:
+        return 1
+    if _rv32_dirty_after_write(0, 0) != 0:
+        return 1
+    if _rv32_dirty_after_write(2, 1) != 0:
+        return 1
+    if _rv32_dirty_after_power_cycle() != 0:
+        return 1
+    0

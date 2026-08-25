@@ -1,0 +1,171 @@
+#!/usr/bin/env simple
+# Async/Await Basics Example
+#
+# Demonstrates Future-based async programming.
+# NOTE: Full async/await syntax requires parser changes.
+# This example shows the foundation using Future types.
+
+use std.async.future.{Future, PollResult, yield_now, sleep_ms}
+use std.async.runtime.{Runtime, block_on, spawn, gather, race, timeout}
+
+# ================================================================
+# Basic Future Usage
+# ================================================================
+
+fn example_ready_future():
+    """Example: Creating an immediately ready future."""
+    print "=== Ready Future ==="
+
+    val future = Future.ready(42)
+    val runtime = Runtime.new()
+    val result = runtime.block_on(future)
+
+    print "Result: {result}"
+
+fn example_mapped_future():
+    """Example: Transforming future values with map."""
+    print "\n=== Mapped Future ==="
+
+    val future = Future.ready(21)
+    val doubled = future.map(_ * 2)
+
+    val runtime = Runtime.new()
+    val result = runtime.block_on(doubled)
+
+    print "Result: {result}"
+
+fn example_chained_futures():
+    """Example: Chaining futures with and_then."""
+    print "\n=== Chained Futures ==="
+
+    val future1 = Future.ready(5)
+    val future2 = future1.and_then(Future.ready(_1 * _1))
+
+    val runtime = Runtime.new()
+    val result = runtime.block_on(future2)
+
+    print "Result: {result}"
+
+# ================================================================
+# Concurrent Operations
+# ================================================================
+
+fn example_gather():
+    """Example: Waiting for multiple futures."""
+    print "\n=== Gather (Wait All) ==="
+
+    val futures = [
+        Future.ready("task1"),
+        Future.ready("task2"),
+        Future.ready("task3")
+    ]
+
+    val combined = gather(futures)
+    val runtime = Runtime.new()
+    val results = runtime.block_on(combined)
+
+    print "Results: {results}"
+
+fn example_race():
+    """Example: Racing futures (first to complete wins)."""
+    print "\n=== Race (First Wins) ==="
+
+    val futures = [
+        Future.ready("fast"),
+        Future.pending()  # Never completes
+    ]
+
+    val winner = race(futures)
+    val runtime = Runtime.new()
+    val result = runtime.block_on(winner)
+
+    print "Winner: {result}"
+
+fn example_timeout():
+    """Example: Timeout for slow operations."""
+    print "\n=== Timeout ==="
+
+    # Fast operation completes in time
+    val fast = Future.ready("done")
+    val fast_with_timeout = timeout(fast, 5000)  # 5 second timeout
+
+    val runtime = Runtime.new()
+    val fast_result = runtime.block_on(fast_with_timeout)
+
+    print "Fast result: {fast_result}"
+
+    # Slow operation times out
+    val slow = Future.pending()
+    val slow_with_timeout = timeout(slow, 100)  # 100ms timeout
+
+    val slow_result = runtime.block_on(slow_with_timeout)
+    print "Slow result: {slow_result}"  # Will be None
+
+# ================================================================
+# Real-World Patterns (Simulated)
+# ================================================================
+
+fn fetch_user(id: i64) -> Future<text>:
+    """Simulate async HTTP request."""
+    # In real implementation, this would make actual HTTP call
+    Future.ready("User#{id}")
+
+fn fetch_posts(user_id: i64) -> Future<[text]>:
+    """Simulate fetching user posts."""
+    Future.ready(["Post 1", "Post 2", "Post 3"])
+
+fn example_sequential_async():
+    """Example: Sequential async operations."""
+    print "\n=== Sequential Async Operations ==="
+
+    # Fetch user, then fetch their posts
+    val user_future = fetch_user(123)
+    val posts_future = user_future.and_then(\user:
+        print "Got user: {user}"
+        fetch_posts(123)
+    )
+
+    val runtime = Runtime.new()
+    val posts = runtime.block_on(posts_future)
+    print "Posts: {posts}"
+
+fn example_parallel_async():
+    """Example: Parallel async operations."""
+    print "\n=== Parallel Async Operations ==="
+
+    # Fetch multiple users in parallel
+    val user_futures = [
+        fetch_user(1),
+        fetch_user(2),
+        fetch_user(3)
+    ]
+
+    val all_users = gather(user_futures)
+    val runtime = Runtime.new()
+    val users = runtime.block_on(all_users)
+
+    print "Users: {users}"
+
+# ================================================================
+# Main
+# ================================================================
+
+fn main():
+    print "Async/Await Foundation Examples"
+    print "================================\n"
+
+    example_ready_future()
+    example_mapped_future()
+    example_chained_futures()
+    example_gather()
+    example_race()
+    example_timeout()
+    example_sequential_async()
+    example_parallel_async()
+
+    print "\n=== Complete ==="
+    print "These examples show the foundation for async/await."
+    print "Full async fn and await keywords require parser changes."
+    print "See: doc/plan/async_await_implementation_plan.md"
+
+main()

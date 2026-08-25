@@ -1,0 +1,67 @@
+use common.ui.widget.{WidgetNode}
+use common.ui.builder.{button, checkbox, column, with_width, with_height, with_background, with_disabled, with_tooltip_text, with_on_action}
+
+# Fluent method modifier example — Phase 3 UI Typed Core RFC
+#
+# NOTE: chain syntax (node.width(120).height(40)) requires Phase 9 chain-fix RFC;
+# until then, use intermediate var as shown below.
+#
+# Both forms work identically — the with_* free functions and the new methods
+# produce the same wire output.
+
+fn main():
+    # -------------------------------------------------------------------------
+    # BEFORE: original with_* free-function style
+    # -------------------------------------------------------------------------
+    var save_btn_old = button("save_old", "Save")
+    save_btn_old = with_width(save_btn_old, 120)
+    save_btn_old = with_height(save_btn_old, 40)
+    save_btn_old = with_background(save_btn_old, "primary")
+    save_btn_old = with_tooltip_text(save_btn_old, "Save your changes")
+    save_btn_old = with_on_action(save_btn_old, "on_save")
+
+    var cancel_btn_old = button("cancel_old", "Cancel")
+    cancel_btn_old = with_width(cancel_btn_old, 100)
+    cancel_btn_old = with_disabled(cancel_btn_old)
+
+    var agree_old = checkbox("agree_old", "I agree")
+    agree_old = with_tooltip_text(agree_old, "You must agree to continue")
+
+    # -------------------------------------------------------------------------
+    # AFTER: new method style — same semantics, no import of builder needed
+    # NOTE: cannot write .width(120).height(40) until Phase 9 chain-fix RFC
+    # -------------------------------------------------------------------------
+    var save_btn = button("save", "Save")
+    save_btn = save_btn.width(120)
+    save_btn = save_btn.height(40)
+    save_btn = save_btn.background("primary")
+    save_btn = save_btn.tooltip("Save your changes")
+    save_btn = save_btn.on_action("on_save")
+
+    var cancel_btn = button("cancel", "Cancel")
+    cancel_btn = cancel_btn.width(100)
+    cancel_btn = cancel_btn.disabled()
+
+    var agree = checkbox("agree", "I agree")
+    agree = agree.tooltip("You must agree to continue")
+
+    # -------------------------------------------------------------------------
+    # Building a panel with children — intermediate-var pattern
+    # -------------------------------------------------------------------------
+    var panel = column("action_panel", [])
+    panel = panel.child(save_btn)
+    panel = panel.child(cancel_btn)
+    panel = panel.child(agree)
+    panel = panel.background("surface")
+    panel = panel.radius("lg")
+
+    # Verify the props were set correctly
+    val save_w = save_btn.get_prop("width")
+    val save_h = save_btn.get_prop("height")
+    val cancel_disabled = cancel_btn.get_prop("disabled")
+    val panel_bg = panel.get_prop("app_background")
+
+    print("save width={save_w} height={save_h}")
+    print("cancel disabled={cancel_disabled}")
+    print("panel background={panel_bg}")
+    print("panel child count={panel.child_count()}")

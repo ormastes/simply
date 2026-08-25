@@ -1,0 +1,29 @@
+# RV64 filesystem-launched HTTP/database server acceptance entry.
+
+extern fn serial_println(msg: text)
+extern fn rt_qemu_exit_success()
+extern fn rt_qemu_exit_failure()
+extern fn rt_riscv_nvfs_probe() -> i64
+
+use os.services.vfs.vfs_boot_init.{vfs_boot_init_riscv64_virtio_fat32, g_mount_table}
+use os.kernel.loader.riscv64_authenticated_media_fixture.{riscv64_authenticated_media_execute_server_v1}
+use os.kernel.scheduler.scheduler_types.{Scheduler}
+
+fn reject(reason: text):
+    serial_println("[riscv64-servers] " + reason)
+    serial_println("TEST FAILED")
+    rt_qemu_exit_failure()
+
+fn spl_start():
+    serial_println("=== SimpleOS RV64 filesystem servers boot ===")
+    if rt_riscv_nvfs_probe() != 1 or not vfs_boot_init_riscv64_virtio_fat32():
+        reject("filesystem mount=fail")
+        return
+    serial_println("[riscv64-servers] executable read=ok path=/SERVERS.ELF")
+    val rc = riscv64_authenticated_media_execute_server_v1(Scheduler.new(), g_mount_table)
+    if rc != 0:
+        reject("filesystem launch=fail rc={rc}")
+        return
+    serial_println("[riscv64-servers] executable=/SERVERS.ELF exit=0")
+    serial_println("TEST PASSED")
+    rt_qemu_exit_success()

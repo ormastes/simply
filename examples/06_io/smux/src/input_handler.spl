@@ -1,0 +1,105 @@
+# Unified Input Handler
+# Manages raw mode terminal input, mouse tracking, and event dispatch.
+# Bridges terminal SFFI (Phase 0) with app-level events.
+
+# ============================================================================
+# App-Level Events
+# ============================================================================
+
+enum AppEvent:
+    Key(key: text, ctrl: bool, alt: bool, shift: bool)
+    Mouse(action: text, x: i32, y: i32, button: text)
+    Scroll(direction: text)
+    Resize(width: i32, height: i32)
+    Paste(content: text)
+    QuickText(index: i32)
+    Quit
+    None
+
+    fn is_none() -> bool:
+        match self:
+            AppEvent.None => true
+            _ => false
+
+    fn is_quit() -> bool:
+        match self:
+            AppEvent.Quit => true
+            _ => false
+
+# ============================================================================
+# Input Handler
+# ============================================================================
+
+class InputHandler:
+    raw_mode_active: bool
+    mouse_enabled: bool
+    bracketed_paste: bool
+
+    static fn create() -> InputHandler:
+        InputHandler(
+            raw_mode_active: false,
+            mouse_enabled: false,
+            bracketed_paste: false
+        )
+
+    # Enable SGR mouse tracking
+    fn enable_mouse_sequence() -> text:
+        # Enable SGR mouse mode + all mouse events
+        var seq = "\u{001b}[?1006h"  # SGR ext mouse mode
+        seq = "{seq}\u{001b}[?1003h"  # All mouse events
+        return seq
+
+    # Disable SGR mouse tracking
+    fn disable_mouse_sequence() -> text:
+        var seq = "\u{001b}[?1003l"
+        seq = "{seq}\u{001b}[?1006l"
+        return seq
+
+    # Enable bracketed paste mode
+    fn enable_paste_sequence() -> text:
+        "\u{001b}[?2004h"
+
+    # Disable bracketed paste mode
+    fn disable_paste_sequence() -> text:
+        "\u{001b}[?2004l"
+
+    # Full init sequence for raw terminal input
+    fn init_sequence() -> text:
+        var seq = self.enable_mouse_sequence()
+        seq = "{seq}{self.enable_paste_sequence()}"
+        return seq
+
+    # Full cleanup sequence
+    fn cleanup_sequence() -> text:
+        var seq = self.disable_paste_sequence()
+        seq = "{seq}{self.disable_mouse_sequence()}"
+        return seq
+
+fn term_event_to_app_event(event_key: text, event_type: text, x: i32, y: i32, ctrl: bool, alt: bool, shift: bool) -> AppEvent:
+    if event_type == "key":
+        # Check for quit shortcuts
+        if ctrl and event_key == "c":
+            return AppEvent.Quit
+        if ctrl and event_key == "q":
+            return AppEvent.Quit
+        # Check for quick text (Alt+1..Alt+9)
+        if alt:
+            if event_key >= "1" and event_key <= "9":
+                val idx = event_key.to_int() - 1
+                return AppEvent.QuickText(index: idx as i32)
+        return AppEvent.Key(key: event_key, ctrl: ctrl, alt: alt, shift: shift)
+    elif event_type == "mouse_click":
+        return AppEvent.Mouse(action: "click", x: x, y: y, button: event_key)
+    elif event_type == "mouse_move":
+        return AppEvent.Mouse(action: "move", x: x, y: y, button: "")
+    elif event_type == "mouse_release":
+        return AppEvent.Mouse(action: "release", x: x, y: y, button: "")
+    elif event_type == "scroll_up":
+        return AppEvent.Scroll(direction: "up")
+    elif event_type == "scroll_down":
+        return AppEvent.Scroll(direction: "down")
+    elif event_type == "resize":
+        return AppEvent.Resize(width: x, height: y)
+    elif event_type == "paste":
+        return AppEvent.Paste(content: event_key)
+    return AppEvent.None

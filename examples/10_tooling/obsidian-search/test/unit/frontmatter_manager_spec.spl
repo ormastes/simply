@@ -1,0 +1,141 @@
+# @cover src/core/frontmatter_manager.spl 80%
+# Unit tests for frontmatter_manager module
+
+use src.core.frontmatter_manager.{get_frontmatter_field, set_frontmatter_field, delete_frontmatter_field, get_all_frontmatter}
+
+describe "FrontmatterManager":
+    """Tests for YAML frontmatter round-trip operations"""
+
+    context "get_frontmatter_field":
+        """Extracting individual fields from frontmatter"""
+
+        it "extracts a simple text field":
+            val content = "---\ntitle: My Note\ndate: 2024-01-15\n---\nBody content"
+            val result = get_frontmatter_field(content, "title")
+            expect(result).to_equal("My Note")
+
+        it "extracts an inline array field":
+            val content = "---\ntags: [alpha, beta, gamma]\n---\nBody"
+            val result = get_frontmatter_field(content, "tags")
+            expect(result).to_equal("[alpha, beta, gamma]")
+
+        it "extracts a date field":
+            val content = "---\ntitle: Note\ndate: 2024-01-15\n---\nBody"
+            val result = get_frontmatter_field(content, "date")
+            expect(result).to_equal("2024-01-15")
+
+        it "returns empty string when field not found":
+            val content = "---\ntitle: Note\n---\nBody"
+            val result = get_frontmatter_field(content, "missing")
+            expect(result).to_equal("")
+
+        it "returns empty string when no frontmatter exists":
+            val content = "# Just a heading\nNo frontmatter here"
+            val result = get_frontmatter_field(content, "title")
+            expect(result).to_equal("")
+
+        it "handles multiline list format":
+            val content = "---\ntags:\n  - alpha\n  - beta\n---\nBody"
+            val result = get_frontmatter_field(content, "tags")
+            expect(result).to_equal("[alpha, beta]")
+
+        it "handles quoted values":
+            val content = "---\ntitle: \"Quoted Title\"\n---\nBody"
+            val result = get_frontmatter_field(content, "title")
+            expect(result).to_equal("Quoted Title")
+
+    context "set_frontmatter_field":
+        """Setting and updating frontmatter fields"""
+
+        it "updates an existing field":
+            val content = "---\ntitle: Old Title\n---\nBody"
+            val result = set_frontmatter_field(content, "title", "New Title")
+            expect(result).to_contain("title: New Title")
+            expect(result).to_contain("Body")
+
+        it "adds a new field to existing frontmatter":
+            val content = "---\ntitle: Note\n---\nBody"
+            val result = set_frontmatter_field(content, "date", "2024-06-01")
+            expect(result).to_contain("title: Note")
+            expect(result).to_contain("date: 2024-06-01")
+
+        it "creates frontmatter when none exists":
+            val content = "# Just a heading\nBody text"
+            val result = set_frontmatter_field(content, "title", "Created")
+            expect(result).to_start_with("---")
+            expect(result).to_contain("title: Created")
+            expect(result).to_contain("# Just a heading")
+
+        it "preserves other fields when updating":
+            val content = "---\ntitle: Note\ndate: 2024-01-15\ntags: [a, b]\n---\nBody"
+            val result = set_frontmatter_field(content, "date", "2024-06-01")
+            expect(result).to_contain("title: Note")
+            expect(result).to_contain("date: 2024-06-01")
+            expect(result).to_contain("tags: [a, b]")
+
+        it "preserves body content":
+            val content = "---\ntitle: Note\n---\n\n# Main\nParagraph here"
+            val result = set_frontmatter_field(content, "title", "Updated")
+            expect(result).to_contain("# Main")
+            expect(result).to_contain("Paragraph here")
+
+    context "delete_frontmatter_field":
+        """Removing fields from frontmatter"""
+
+        it "removes a field from frontmatter":
+            val content = "---\ntitle: Note\ndate: 2024-01-15\n---\nBody"
+            val result = delete_frontmatter_field(content, "date")
+            expect(result).to_contain("title: Note")
+            val has_date = result.contains("date:")
+            expect(has_date).to_equal(false)
+
+        it "leaves content unchanged when field not found":
+            val content = "---\ntitle: Note\n---\nBody"
+            val result = delete_frontmatter_field(content, "missing")
+            expect(result).to_contain("title: Note")
+            expect(result).to_contain("Body")
+
+        it "preserves other fields":
+            val content = "---\ntitle: Note\ndate: 2024-01-15\ntags: [a]\n---\nBody"
+            val result = delete_frontmatter_field(content, "date")
+            expect(result).to_contain("title: Note")
+            expect(result).to_contain("tags: [a]")
+
+        it "removes multiline list field":
+            val content = "---\ntitle: Note\ntags:\n  - alpha\n  - beta\ndate: 2024-01-15\n---\nBody"
+            val result = delete_frontmatter_field(content, "tags")
+            expect(result).to_contain("title: Note")
+            expect(result).to_contain("date: 2024-01-15")
+            val has_tags = result.contains("tags:")
+            expect(has_tags).to_equal(false)
+
+    context "get_all_frontmatter":
+        """Returning full frontmatter as JSON"""
+
+        it "returns all fields as JSON":
+            val content = "---\ntitle: Note\ndate: 2024-01-15\n---\nBody"
+            val result = get_all_frontmatter(content)
+            expect(result).to_contain("\"title\"")
+            expect(result).to_contain("\"Note\"")
+            expect(result).to_contain("\"date\"")
+            expect(result).to_contain("\"2024-01-15\"")
+
+        it "returns arrays as JSON arrays":
+            val content = "---\ntags: [alpha, beta]\n---\nBody"
+            val result = get_all_frontmatter(content)
+            expect(result).to_contain("\"tags\"")
+            expect(result).to_contain("\"alpha\"")
+            expect(result).to_contain("\"beta\"")
+
+        it "returns empty object when no frontmatter":
+            val content = "# Heading\nBody"
+            val result = get_all_frontmatter(content)
+            expect(result).to_equal("{}")
+
+        it "handles mixed field types":
+            val content = "---\ntitle: Note\ntags: [a, b]\naliases: [x]\ndate: 2024-01-15\n---\nBody"
+            val result = get_all_frontmatter(content)
+            expect(result).to_contain("\"title\"")
+            expect(result).to_contain("\"tags\"")
+            expect(result).to_contain("\"aliases\"")
+            expect(result).to_contain("\"date\"")

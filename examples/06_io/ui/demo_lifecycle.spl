@@ -1,0 +1,101 @@
+# Widget Lifecycle Demo
+#
+# Demonstrates async lifecycle hooks: on_mount logging, on_action
+# updating a text widget, and registry tracking of mount/unmount events.
+# Builds a small UI, simulates a tree update, and prints all lifecycle
+# events that were emitted.
+
+use common.ui.widget.{WidgetNode, UITree, UIState}
+use common.ui.builder.{column, panel, text_widget, button, build_tree,
+    with_on_mount, with_on_action, with_on_update}
+use common.ui.diff.{diff_trees}
+use common.ui.patch.{UIPatch, PatchKind}
+use common.ui.lifecycle.{
+    LifecycleEvent, LifecycleHandler, LifecycleRegistry,
+    new_lifecycle_registry, new_lifecycle_handler,
+    emit_lifecycle_events, emit_action_event,
+    describe_lifecycle_event
+}
+use common.ui.effect.{
+    Effect, EffectRunner, new_effect_runner, describe_effect
+}
+use common.ui.async_diff.{async_update_nodes}
+
+fn main() -> i64:
+    # --- Build initial tree ---
+    var header = text_widget("demo_lc_header", "Lifecycle Demo")
+    header = with_on_mount(header, "header_mount_handler")
+
+    var status = text_widget("demo_lc_status", "Status: idle")
+    status = with_on_update(status, "status_update_handler")
+
+    var action_btn = button("demo_lc_btn", "Run Action", "run_action")
+    action_btn = with_on_action(action_btn, "btn_action_handler")
+
+    val content = panel("demo_lc_content", "Demo Panel", [header, status, action_btn])
+    val root_old = column("demo_lc_root", [content])
+
+    # --- Set up lifecycle registry ---
+    val registry = new_lifecycle_registry()
+
+    # Register handlers for each widget
+    var header_handler = new_lifecycle_handler("demo_lc_header")
+    header_handler = header_handler.with_on_mount("header_mount_handler")
+    registry.register_handler(header_handler)
+
+    var btn_handler = new_lifecycle_handler("demo_lc_btn")
+    btn_handler = btn_handler.with_on_action("btn_action_handler")
+    registry.register_handler(btn_handler)
+
+    var status_handler = new_lifecycle_handler("demo_lc_status")
+    status_handler = status_handler.with_on_update("status_update_handler")
+    registry.register_handler(status_handler)
+
+    print "Registered {registry.handler_count()} lifecycle handlers"
+
+    # --- Set up effect runner ---
+    val runner = new_effect_runner()
+
+    # --- Simulate: button click triggers an action event ---
+    emit_action_event(registry, "demo_lc_btn", "run_action")
+    runner.dispatch_effect(Effect.Log(message: "Button clicked: run_action"))
+
+    # --- Simulate: tree update (add a new widget, change status text) ---
+    var new_status = text_widget("demo_lc_status", "Status: running")
+    new_status = with_on_update(new_status, "status_update_handler")
+
+    val new_widget = text_widget("demo_lc_result", "Result: success")
+
+    val new_content = panel("demo_lc_content", "Demo Panel", [header, new_status, action_btn, new_widget])
+    val root_new = column("demo_lc_root", [new_content])
+
+    # Diff and emit lifecycle events
+    val patches = async_update_nodes(root_old, root_new, registry)
+    print "Generated {patches.len()} patches"
+
+    # Process side effects
+    runner.dispatch_effect(Effect.Log(message: "Tree updated with {patches.len()} patches"))
+    runner.process_effects()
+
+    # --- Print all lifecycle events ---
+    print ""
+    print "=== Lifecycle Events ==="
+    var idx = 0
+    while idx < registry.event_count():
+        val event = registry.event_log[idx]
+        print "  [{idx}] {describe_lifecycle_event(event)}"
+        idx = idx + 1
+
+    # --- Print effect log ---
+    print ""
+    print "=== Effect Log ==="
+    var log_idx = 0
+    while log_idx < runner.log_count():
+        print "  [{log_idx}] {runner.log_messages[log_idx]}"
+        log_idx = log_idx + 1
+
+    # --- Summary ---
+    print ""
+    print "Summary: {registry.event_count()} lifecycle events, {runner.result_count()} effect results"
+
+    return 0

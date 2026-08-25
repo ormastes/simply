@@ -1,0 +1,28 @@
+# UBS Dimension — Money / Ledger
+#
+# Owns "every value movement". Accounts are the anchor points the ledger
+# projection (kernel/projection.spl) posts signed, unit-typed amounts against.
+
+enum AccountType:
+    Asset
+    Liability
+    Equity
+    Revenue
+    Expense
+
+struct Account:
+    val id: i64
+    val name: text
+    val kind: AccountType
+
+fn account(id: i64, name: text, kind: AccountType) -> Account:
+    return Account { id: id, name: name, kind: kind }
+
+# Normal balance sign convention: assets/expenses are debit-normal (+1),
+# liabilities/equity/revenue are credit-normal (-1).
+fn debit_normal(kind: AccountType) -> bool:
+    if kind == AccountType.Asset:
+        return true
+    if kind == AccountType.Expense:
+        return true
+    return false

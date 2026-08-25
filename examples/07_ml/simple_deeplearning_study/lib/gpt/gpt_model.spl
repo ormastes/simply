@@ -1,0 +1,105 @@
+# GPT Model — from scratch
+# Chapter 4: "Build a Large Language Model From Scratch" (Rasbt)
+#
+# Full GPT-2 architecture:
+#   1. Token embedding + Positional embedding
+#   2. Dropout
+#   3. N Transformer blocks
+#   4. Final LayerNorm
+#   5. Output linear head (logits over vocabulary)
+
+use std.pure.tensor.{PureTensor, tensor_from_data, tensor_randn}
+use std.pure.tensor_ops.{add, matmul, transpose}
+use examples.simple_deeplearning_study.lib.prim.embedding.{StudyEmbedding}
+use examples.simple_deeplearning_study.lib.prim.layer_norm.{StudyLayerNorm}
+use examples.simple_deeplearning_study.lib.prim.linear.{StudyLinear}
+use examples.simple_deeplearning_study.lib.prim.dropout.{StudyDropout}
+use examples.simple_deeplearning_study.lib.transformer.transformer_block.{StudyTransformerBlock}
+use examples.simple_deeplearning_study.lib.gpt.gpt_config.{GPTConfig}
+
+class StudyGPT:
+    config: GPTConfig
+    tok_emb: StudyEmbedding            # Token embeddings
+    pos_emb: PureTensor<f64>           # Positional embeddings [ctx_len, emb_dim]
+    drop: StudyDropout
+    blocks: [StudyTransformerBlock]    # Transformer blocks
+    ln_final: StudyLayerNorm           # Final layer norm
+    out_head: StudyLinear              # Output projection to vocab
+
+    static fn create(config: GPTConfig) -> StudyGPT:
+        # Token embedding
+        val tok_emb = StudyEmbedding.create(config.vocab_size, config.emb_dim)
+
+        # Positional embedding (learnable)
+        val pos_emb = tensor_randn([config.ctx_len, config.emb_dim])
+
+        # Dropout
+        val drop = StudyDropout.create(config.drop_rate)
+
+        # Transformer blocks
+        var blocks: [StudyTransformerBlock] = []
+        var i = 0
+        while i < config.num_layers:
+            blocks.push(StudyTransformerBlock.create(
+                config.emb_dim, config.num_heads, config.drop_rate
+            ))
+            i = i + 1
+
+        # Final layer norm
+        val ln_final = StudyLayerNorm.create(config.emb_dim)
+
+        # Output head: emb_dim -> vocab_size
+        val out_head = StudyLinear.create(config.emb_dim, config.vocab_size, false)
+
+        StudyGPT(
+            config: config,
+            tok_emb: tok_emb,
+            pos_emb: pos_emb,
+            drop: drop,
+            blocks: blocks,
+            ln_final: ln_final,
+            out_head: out_head
+        )
+
+    # Forward pass
+    # token_ids: [i64] array of token IDs, length = seq_len
+    # Returns: logits [seq_len, vocab_size]
+    fn forward(token_ids: [i64]) -> PureTensor<f64>:
+        val seq_len = token_ids.len()
+
+        # 1. Token embeddings [seq_len, emb_dim]
+        val tok = self.tok_emb.forward(token_ids)
+
+        # 2. Positional embeddings (slice to seq_len)
+        var pos_data: [f64] = []
+        var i = 0
+        while i < seq_len:
+            var j = 0
+            while j < self.config.emb_dim:
+                pos_data.push(self.pos_emb.get([i, j]))
+                j = j + 1
+            i = i + 1
+        val pos = tensor_from_data(pos_data, [seq_len, self.config.emb_dim])
+
+        # 3. Add token + positional embeddings
+        var x = add(tok, pos)
+
+        # 4. Dropout
+        x = self.drop.forward(x)
+
+        # 5. Transformer blocks
+        i = 0
+        while i < self.blocks.len():
+            x = self.blocks[i].forward(x)
+            i = i + 1
+
+        # 6. Final layer norm
+        x = self.ln_final.forward(x)
+
+        # 7. Output head: project to vocabulary
+        self.out_head.forward(x)
+
+fn study_gpt_create(config: GPTConfig) -> StudyGPT:
+    StudyGPT.create(config)
+
+export StudyGPT, study_gpt_create

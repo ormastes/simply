@@ -1,0 +1,219 @@
+# Backend Switching Example
+#
+# Demonstrates how to programmatically select backends (Cranelift vs LLVM)
+# when compiling Simple programs.
+
+use compiler.driver_types.{CompileOptions, CompileMode, CompileOptions__default}
+use compiler.backend_types.{BackendKind, backendkind_from_text, backendkind_to_text}
+
+# ============================================================================
+# Example 1: Explicit Backend Selection
+# ============================================================================
+
+fn example_explicit_backend():
+    """Show how to explicitly select a backend."""
+
+    # Create options with Cranelift backend
+    val cranelift_opts = CompileOptions(
+        mode: CompileMode.Jit,
+        input_files: ["examples/hello.spl"],
+        backend: "cranelift",  # Explicit selection
+        release: false,
+        ...CompileOptions__default()
+    )
+
+    print "Example 1: Using Cranelift backend"
+    print "  Backend: {cranelift_opts.backend}"
+    print "  Mode: Jit"
+    print "  Optimization: {cranelift_opts.release}"
+    print ""
+
+    # Create options with LLVM backend
+    val llvm_opts = CompileOptions(
+        mode: CompileMode.Jit,
+        input_files: ["examples/hello.spl"],
+        backend: "llvm",  # Explicit selection
+        release: true,
+        ...CompileOptions__default()
+    )
+
+    print "Example 2: Using LLVM backend"
+    print "  Backend: {llvm_opts.backend}"
+    print "  Mode: Jit"
+    print "  Optimization: {llvm_opts.release}"
+    print ""
+
+# ============================================================================
+# Example 2: Auto-Selection Based on Build Mode
+# ============================================================================
+
+fn example_auto_selection():
+    """Show how auto-selection works based on build mode."""
+
+    # Debug build (auto-selects Cranelift)
+    val debug_opts = CompileOptions(
+        mode: CompileMode.Jit,
+        input_files: ["program.spl"],
+        backend: "auto",  # Auto-selection
+        release: false,   # Debug mode → Cranelift
+        ...CompileOptions__default()
+    )
+
+    print "Example 3: Auto-selection for Debug"
+    print "  Backend: {debug_opts.backend} (will resolve to Cranelift)"
+    print "  Release: {debug_opts.release}"
+    print ""
+
+    # Release build (auto-selects LLVM)
+    val release_opts = CompileOptions(
+        mode: CompileMode.Jit,
+        input_files: ["program.spl"],
+        backend: "auto",  # Auto-selection
+        release: true,    # Release mode → LLVM
+        ...CompileOptions__default()
+    )
+
+    print "Example 4: Auto-selection for Release"
+    print "  Backend: {release_opts.backend} (will resolve to LLVM)"
+    print "  Release: {release_opts.release}"
+    print ""
+
+# ============================================================================
+# Example 3: Parsing Backend from String
+# ============================================================================
+
+fn example_backend_parsing():
+    """Show how to parse backend names from user input."""
+
+    val backends = ["cranelift", "llvm", "clif", "auto", "native", "invalid"]
+
+    print "Example 5: Backend Name Parsing"
+    for backend_str in backends:
+        val kind = backendkind_from_text(backend_str)
+        if kind != nil:
+            val name = backendkind_to_text(kind)
+            print "  '{backend_str}' → {name}"
+        else:
+            if backend_str == "auto":
+                print "  '{backend_str}' → auto-selection"
+            else:
+                print "  '{backend_str}' → INVALID"
+    print ""
+
+# ============================================================================
+# Example 4: Command-Line Style Usage
+# ============================================================================
+
+fn simulate_cli_args(args: [text]) -> CompileOptions:
+    """Simulate parsing CLI arguments to get backend selection."""
+
+    var backend = "auto"  # Default
+    var release = false
+
+    # Simple argument parsing
+    for arg in args:
+        if arg.starts_with("--backend="):
+            backend = arg[10:]  # Extract value after --backend=
+        if arg == "--release":
+            release = true
+
+    CompileOptions(
+        mode: CompileMode.Jit,
+        input_files: ["program.spl"],
+        backend: backend,
+        release: release,
+        ...CompileOptions__default()
+    )
+
+fn example_cli_simulation():
+    """Show how CLI would use backend selection."""
+
+    print "Example 6: CLI Argument Parsing"
+
+    val cases = [
+        ["--backend=cranelift"],
+        ["--backend=llvm"],
+        ["--backend=llvm", "--release"],
+        ["--backend=auto", "--release"],
+        []  # Defaults
+    ]
+
+    for args in cases:
+        val opts = simulate_cli_args(args)
+        print "  Args: {args.join(\" \") ?? \"(none)\"}"
+        print "    → backend={opts.backend}, release={opts.release}"
+
+    print ""
+
+# ============================================================================
+# Example 5: Performance Comparison
+# ============================================================================
+
+fn benchmark_compilation(backend_name: text, iterations: i64) -> f64:
+    """Simulate compilation time measurement."""
+
+    # Simulated compilation times (milliseconds)
+    match backend_name:
+        case "cranelift":
+            # Cranelift: fast compilation
+            50.0 + (random() * 10.0)
+        case "llvm":
+            # LLVM: slower compilation, better runtime
+            500.0 + (random() * 100.0)
+        case _:
+            100.0
+
+fn random() -> f64:
+    # Stub: return deterministic value for demo
+    0.5
+
+fn example_performance_comparison():
+    """Compare compilation performance between backends."""
+
+    print "Example 7: Compilation Performance"
+    print ""
+
+    val backends = ["cranelift", "llvm"]
+
+    for backend in backends:
+        val compile_time = benchmark_compilation(backend, 100)
+        print "  {backend}:"
+        print "    Compile time: {compile_time}ms"
+
+        # Estimate total build time for project
+        val file_count = 50  # Typical project
+        val total_time = compile_time * file_count
+        print "    50-file project: {total_time}ms ({total_time / 1000.0}s)"
+        print ""
+
+# ============================================================================
+# Main Entry Point
+# ============================================================================
+
+fn main():
+    print ""
+    print "=== Backend Switching Examples ==="
+    print ""
+
+    example_explicit_backend()
+    example_auto_selection()
+    example_backend_parsing()
+    example_cli_simulation()
+    example_performance_comparison()
+
+    print "=== Summary ==="
+    print ""
+    print "Key Takeaways:"
+    print "  1. Use backend=\"cranelift\" for fast iteration (debug builds)"
+    print "  2. Use backend=\"llvm\" for best performance (release builds)"
+    print "  3. Use backend=\"auto\" to let compiler choose based on mode"
+    print "  4. Cranelift compiles ~10x faster, LLVM optimizes ~20% better"
+    print ""
+    print "CLI Usage:"
+    print "  bin/simple compile --backend=cranelift program.spl    # Fast compile"
+    print "  bin/simple compile --backend=llvm --release program.spl  # Best runtime"
+    print "  bin/simple compile program.spl                        # Auto-select"
+    print ""
+
+# Run examples
+main()

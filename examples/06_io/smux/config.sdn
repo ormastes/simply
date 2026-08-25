@@ -1,0 +1,30 @@
+app:
+  title: "smux"
+  theme: dark
+
+platform:
+  mobile_keybar: auto
+  nerd_font: true
+
+quick_texts:
+  0:
+    label: "Continue"
+    snippet: "Please continue."
+    shortcut: "1"
+  1:
+    label: "Approve"
+    snippet: "Looks good, proceed."
+    shortcut: "2"
+  2:
+    label: "Fix tests"
+    snippet: "Fix the failing tests."
+    shortcut: "3"
+
+llm_hooks:
+  on_done_script: "hooks/check_done.spl"
+  timeout_ms: 30000
+  notification: auto
+  auto_continue: true
+
+tmux:
+  hooks_enabled: true

@@ -1,0 +1,56 @@
+app:
+    title: "Form Inputs Demo"
+    theme: glass_dark
+
+layout:
+    type: vbox
+    children:
+        text_inputs:
+            type: panel
+            title: "Text Inputs"
+            children:
+                search:
+                    type: input
+                    placeholder: "Search..."
+                email:
+                    type: input
+                    placeholder: "Enter email"
+                    required: true
+                phone:
+                    type: input
+                    placeholder: "Phone number"
+                    max_length: 15
+        validation_states:
+            type: panel
+            title: "Validation States"
+            children:
+                error_input:
+                    type: input
+                    placeholder: "Invalid field"
+                    error: true
+                    error_message: "This field has an error"
+                disabled_input:
+                    type: input
+                    placeholder: "Disabled input"
+                    disabled: true
+                readonly_field:
+                    type: textfield
+                    value: "System Generated ID: SYS-2026-001"
+                    readonly: true
+        text_areas:
+            type: panel
+            title: "Text Areas"
+            children:
+                notes:
+                    type: textarea
+                    value: "Enter your notes here..."
+                    rows: 6
+                    placeholder: "Type notes..."
+                code:
+                    type: textarea
+                    placeholder: "Paste code here..."
+                    rows: 4
+        status:
+            type: statusbar
+            left: "INSERT MODE"
+            right: "Forms Demo"

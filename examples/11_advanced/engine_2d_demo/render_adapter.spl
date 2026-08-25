@@ -1,0 +1,276 @@
+# engine_2d_demo Render Adapter
+#
+# Bridges the 2D game engine demo to the shared UI render library.
+# Produces text output (scene description, entity list, FPS stats) and
+# HTML output (canvas-like rendering of the 2D scene with CSS positioning).
+
+use app.ui.render.types.{RenderConfig, RenderResult}
+use app.ui.render.html.{html_page, html_escape, html_card, html_metric_card, html_section, css_dark_theme, css_light_theme}
+use app.ui.render.css.{card_css, grid_css, metric_css}
+use app.ui.render.fmt.{fmt_number, fmt_duration_ms, fmt_decimal, heading, separator, pad_right}
+
+# =========================================================================
+# Public API
+# =========================================================================
+
+fn render_engine_demo(config: RenderConfig) -> RenderResult:
+    """Render a 2D engine demo scene snapshot.
+
+    Text output: scene description, entity list, FPS stats.
+    HTML output: canvas-like HTML rendering with CSS absolute positioning.
+    """
+    val scene = _demo_scene()
+
+    val text_out = _render_text(config, scene)
+
+    if config.format == "html" or config.format == "both":
+        val html_out = _render_html(config, scene)
+        if config.format == "both":
+            return RenderResult.both(text_out, html_out)
+        return RenderResult.html(html_out)
+
+    return RenderResult.text(text_out)
+
+# =========================================================================
+# Scene Model
+# =========================================================================
+
+struct SceneEntity:
+    name: text
+    kind: text
+    x: f64
+    y: f64
+    width: f64
+    height: f64
+    color: text
+    radius: f64
+
+struct DemoScene:
+    title: text
+    canvas_width: i64
+    canvas_height: i64
+    entities: [SceneEntity]
+    fps: f64
+    frame_time_ms: f64
+    entity_count: i64
+    physics_bodies: i64
+
+fn _demo_scene() -> DemoScene:
+    """Build demo scene data matching the platformer layout."""
+    var entities: [SceneEntity] = []
+
+    # Ground
+    entities.push(SceneEntity(
+        name: "ground", kind: "rect",
+        x: 0.0, y: 540.0, width: 800.0, height: 60.0,
+        color: "#339933", radius: 0.0
+    ))
+
+    # Platform 1
+    entities.push(SceneEntity(
+        name: "platform1", kind: "rect",
+        x: 120.0, y: 410.0, width: 160.0, height: 20.0,
+        color: "#8C5928", radius: 0.0
+    ))
+
+    # Platform 2
+    entities.push(SceneEntity(
+        name: "platform2", kind: "rect",
+        x: 510.0, y: 340.0, width: 140.0, height: 20.0,
+        color: "#8C5928", radius: 0.0
+    ))
+
+    # Obstacles
+    entities.push(SceneEntity(
+        name: "obstacle1", kind: "circle",
+        x: 300.0, y: 545.0, width: 0.0, height: 0.0,
+        color: "#CC3333", radius: 15.0
+    ))
+    entities.push(SceneEntity(
+        name: "obstacle2", kind: "circle",
+        x: 550.0, y: 540.0, width: 0.0, height: 0.0,
+        color: "#CC3333", radius: 20.0
+    ))
+    entities.push(SceneEntity(
+        name: "obstacle3", kind: "circle",
+        x: 150.0, y: 550.0, width: 0.0, height: 0.0,
+        color: "#CC3333", radius: 12.0
+    ))
+
+    # Player
+    entities.push(SceneEntity(
+        name: "player", kind: "rect",
+        x: 382.0, y: 276.0, width: 36.0, height: 48.0,
+        color: "#3366CC", radius: 0.0
+    ))
+
+    return DemoScene(
+        title: "Simple 2D Platformer Demo",
+        canvas_width: 800,
+        canvas_height: 600,
+        entities: entities,
+        fps: 60.0,
+        frame_time_ms: 16.6,
+        entity_count: 7,
+        physics_bodies: 7
+    )
+
+# =========================================================================
+# Text Rendering
+# =========================================================================
+
+fn _render_text(config: RenderConfig, scene: DemoScene) -> text:
+    """Render the scene as plain text."""
+    val w = config.width
+    var lines: [text] = []
+
+    lines.push(heading(scene.title, "=", w))
+    lines.push("")
+
+    # Stats
+    lines.push("Scene Stats:")
+    lines.push("  Canvas:         {scene.canvas_width}x{scene.canvas_height}")
+    lines.push("  Entities:       {fmt_number(scene.entity_count)}")
+    lines.push("  Physics bodies: {fmt_number(scene.physics_bodies)}")
+    lines.push("  FPS:            {fmt_decimal(scene.fps, 1)}")
+    lines.push("  Frame time:     {fmt_duration_ms(17)}")
+    lines.push("")
+
+    # Entity list
+    lines.push(separator("-", w))
+    lines.push("Entity List:")
+    lines.push("  {pad_right(\"Name\", 16)} {pad_right(\"Kind\", 10)} {pad_right(\"Position\", 20)} Size/Radius")
+    lines.push("  {separator(\"-\", w - 2)}")
+
+    for entity in scene.entities:
+        val pos = "({fmt_decimal(entity.x, 0)}, {fmt_decimal(entity.y, 0)})"
+        val size = if entity.kind == "circle":
+            "r={fmt_decimal(entity.radius, 0)}"
+        else:
+            "{fmt_decimal(entity.width, 0)}x{fmt_decimal(entity.height, 0)}"
+        lines.push("  {pad_right(entity.name, 16)} {pad_right(entity.kind, 10)} {pad_right(pos, 20)} {size}")
+
+    lines.push("")
+    lines.push(separator("-", w))
+    lines.push("Controls: WASD/Arrows = Move, Space = Jump")
+
+    return lines.join("\n")
+
+# =========================================================================
+# HTML Rendering
+# =========================================================================
+
+fn _render_html(config: RenderConfig, scene: DemoScene) -> text:
+    """Render the scene as an HTML page with a CSS-positioned canvas."""
+    val theme_css = if config.theme == "light": css_light_theme() else: css_dark_theme()
+
+    var css = theme_css
+    css = "{css}{card_css()}"
+    css = "{css}{metric_css()}"
+    css = "{css}{_engine_css()}"
+
+    # Metric cards
+    val fps_card = html_metric_card("FPS", fmt_decimal(scene.fps, 1), "target: 60")
+    val entity_card = html_metric_card("Entities", "{scene.entity_count}", "")
+    val physics_card = html_metric_card("Physics", "{scene.physics_bodies}", "bodies")
+    val frame_card = html_metric_card("Frame Time", "{fmt_decimal(scene.frame_time_ms, 1)}ms", "")
+
+    var metrics = "<div class=\"metric-grid\">\n"
+    metrics = "{metrics}  {fps_card}\n"
+    metrics = "{metrics}  {entity_card}\n"
+    metrics = "{metrics}  {physics_card}\n"
+    metrics = "{metrics}  {frame_card}\n"
+    metrics = "{metrics}</div>\n"
+
+    # Canvas with positioned entities
+    var canvas = "<div class=\"game-canvas\" style=\"width:{scene.canvas_width}px; height:{scene.canvas_height}px\">\n"
+    for entity in scene.entities:
+        canvas = "{canvas}  {_entity_to_html(entity)}\n"
+    canvas = "{canvas}</div>\n"
+
+    # Entity table
+    var table = "<table class=\"entity-table\">\n"
+    table = "{table}<thead><tr><th>Name</th><th>Kind</th><th>Position</th><th>Size</th><th>Color</th></tr></thead>\n"
+    table = "{table}<tbody>\n"
+    for entity in scene.entities:
+        val pos = "({fmt_decimal(entity.x, 0)}, {fmt_decimal(entity.y, 0)})"
+        val size = if entity.kind == "circle":
+            "r={fmt_decimal(entity.radius, 0)}"
+        else:
+            "{fmt_decimal(entity.width, 0)}x{fmt_decimal(entity.height, 0)}"
+        val swatch = "<span class=\"color-swatch\" style=\"background:{entity.color}\"></span>"
+        table = "{table}<tr><td>{html_escape(entity.name)}</td><td>{entity.kind}</td><td>{pos}</td><td>{size}</td><td>{swatch} {entity.color}</td></tr>\n"
+    table = "{table}</tbody>\n</table>\n"
+
+    var body = "<div class=\"container\">\n"
+    body = "{body}  <h1>{html_escape(scene.title)}</h1>\n"
+    body = "{body}  {metrics}\n"
+    body = "{body}  <h2>Scene</h2>\n"
+    body = "{body}  {canvas}\n"
+    body = "{body}  <h2>Entities</h2>\n"
+    body = "{body}  {table}\n"
+    body = "{body}  <div class=\"controls-hint\">Controls: WASD/Arrows = Move, Space = Jump</div>\n"
+    body = "{body}</div>\n"
+
+    return html_page(scene.title, css, body)
+
+fn _entity_to_html(entity: SceneEntity) -> text:
+    """Convert a scene entity to an absolutely-positioned HTML element."""
+    if entity.kind == "circle":
+        val d = entity.radius * 2.0
+        val left = entity.x - entity.radius
+        val top = entity.y - entity.radius
+        return "<div class=\"entity circle\" style=\"left:{fmt_decimal(left, 0)}px; top:{fmt_decimal(top, 0)}px; width:{fmt_decimal(d, 0)}px; height:{fmt_decimal(d, 0)}px; background:{entity.color}; border-radius:50%\" title=\"{html_escape(entity.name)}\"></div>"
+
+    # Rectangle
+    return "<div class=\"entity rect\" style=\"left:{fmt_decimal(entity.x, 0)}px; top:{fmt_decimal(entity.y, 0)}px; width:{fmt_decimal(entity.width, 0)}px; height:{fmt_decimal(entity.height, 0)}px; background:{entity.color}\" title=\"{html_escape(entity.name)}\"></div>"
+
+fn _engine_css() -> text:
+    """CSS specific to the 2D engine demo rendering."""
+    var s = ""
+    s = "{s}h1 { margin-bottom: 16px; }\n"
+    s = "{s}h2 { margin: 16px 0 8px; font-size: 16px; color: var(--text-dim, #8b949e); }\n"
+    s = "{s}.game-canvas {\n"
+    s = "{s}  position: relative;\n"
+    s = "{s}  background: #ffffff;\n"
+    s = "{s}  border: 2px solid var(--border, #30363d);\n"
+    s = "{s}  border-radius: 8px;\n"
+    s = "{s}  overflow: hidden;\n"
+    s = "{s}  margin: 0 auto;\n"
+    s = "{s}}\n"
+    s = "{s}.entity {\n"
+    s = "{s}  position: absolute;\n"
+    s = "{s}}\n"
+    s = "{s}.entity-table {\n"
+    s = "{s}  width: 100%;\n"
+    s = "{s}  border-collapse: collapse;\n"
+    s = "{s}  margin-top: 8px;\n"
+    s = "{s}}\n"
+    s = "{s}.entity-table th, .entity-table td {\n"
+    s = "{s}  padding: 6px 12px;\n"
+    s = "{s}  text-align: left;\n"
+    s = "{s}  border: 1px solid var(--border, #30363d);\n"
+    s = "{s}  font-size: 13px;\n"
+    s = "{s}}\n"
+    s = "{s}.entity-table th {\n"
+    s = "{s}  background: var(--bg-card, #161b22);\n"
+    s = "{s}  font-weight: 600;\n"
+    s = "{s}}\n"
+    s = "{s}.color-swatch {\n"
+    s = "{s}  display: inline-block;\n"
+    s = "{s}  width: 12px;\n"
+    s = "{s}  height: 12px;\n"
+    s = "{s}  border-radius: 2px;\n"
+    s = "{s}  vertical-align: middle;\n"
+    s = "{s}  margin-right: 4px;\n"
+    s = "{s}}\n"
+    s = "{s}.controls-hint {\n"
+    s = "{s}  margin-top: 16px;\n"
+    s = "{s}  padding: 8px 12px;\n"
+    s = "{s}  background: var(--bg-card, #161b22);\n"
+    s = "{s}  border: 1px solid var(--border, #30363d);\n"
+    s = "{s}  border-radius: 6px;\n"
+    s = "{s}  font-size: 13px;\n"
+    s = "{s}  color: var(--text-dim, #8b949e);\n"
+    s = "{s}}\n"
+    return s

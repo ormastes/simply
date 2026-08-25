@@ -1,0 +1,150 @@
+"""
+nvme_types — shared frozen interface for the SimpleOS NVMe firmware (simulation).
+
+Pure data + constants + small free helpers. NO `impl`/`me` methods here, so this
+module is cheap to type-check and safe to import everywhere. Every HIL/FTL/FIL
+module builds against these names; do not rename without an interface re-lock.
+
+Geometry (tiny, for fast host-runnable simulation):
+  planes=4 x blocks/plane=16 x pages/block=64  => 4096 physical pages.
+  One i64 "data" byte per page stands in for a real 4 KiB page payload.
+"""
+
+# ── NVMe I/O opcodes ──────────────────────────────────────────────────────────
+val OP_FLUSH:       i64 = 0x00
+val OP_WRITE:       i64 = 0x01
+val OP_READ:        i64 = 0x02
+val OP_WRITE_ZERO:  i64 = 0x08
+val OP_DSM_TRIM:    i64 = 0x09
+
+# ── NVMe status codes (SC, generic command set) ───────────────────────────────
+val SC_SUCCESS:        i64 = 0x00
+val SC_INVALID_OPCODE: i64 = 0x01   # command opcode not supported
+val SC_INVALID_FIELD:  i64 = 0x02   # a reserved/illegal field value
+val SC_INTERNAL:       i64 = 0x06
+val SC_LBA_RANGE:      i64 = 0x80
+val SC_NS_NOT_READY:   i64 = 0x82
+val SC_MEDIA_ERR:      i64 = 0x281   # unrecovered read error (ECC exhausted)
+
+# ── Sentinels ─────────────────────────────────────────────────────────────────
+# Index-handle law (see PRODUCTION_STATUS.md "Index-handle law"): every
+# NULL/invalid-index case is a NAMED constant, never a bare -1. Vocabulary:
+#   UNMAP     — unmapped L2P entry / invalid ppn (FTL map + block-alloc domain)
+#   NO_PPN    — invalid physical page number (alias of UNMAP for ppn returns)
+#   NULL_IDX  — generic invalid index/handle (pool handles, queue/cid/sqid
+#               "none" fields, not-found search results) outside the L2P/ppn
+#               domain above. Same value as UNMAP (kept a literal, not a
+#               val-to-val alias, to match UNMAP/NO_PPN's own convention).
+val UNMAP: i64 = -1      # unmapped L2P entry / invalid ppn
+val NO_PPN: i64 = -1
+val NULL_IDX: i64 = -1   # generic invalid-index / null-handle sentinel
+
+# ── Device geometry ───────────────────────────────────────────────────────────
+val NUM_PLANES:      i64 = 4
+val BLOCKS_PER_PLANE: i64 = 16
+val PAGES_PER_BLOCK: i64 = 64
+val NUM_BLOCKS:      i64 = 64     # NUM_PLANES * BLOCKS_PER_PLANE
+val NUM_PAGES:       i64 = 4096   # NUM_BLOCKS * PAGES_PER_BLOCK
+val LBA_COUNT:       i64 = 3072   # surfaced LBAs (~75%, rest = over-provision)
+val GC_RESERVE:      i64 = 2      # free blocks the host write path never consumes —
+                                  # held as GC scratch so collection always makes progress
+val WL_THRESHOLD:    i64 = 2      # static wear-leveling fires when max-min erase spread exceeds this
+val READ_DISTURB_THRESHOLD: i64 = 50  # reads on one block before a read-disturb scrub
+val FW_SAFE_I64_LIMIT: i64 = 1000000000000000000
+val FW_OVERFLOW_TEST_SIZE: i64 = 1000000000000000000
+
+# ── NAND op outcome codes (FIL -> caller) ─────────────────────────────────────
+val NAND_OK:        i64 = 0
+val NAND_ECC_FIXED: i64 = 1   # data returned, but bit error was corrected
+val NAND_ECC_FAIL:  i64 = 2   # uncorrectable read
+val NAND_PROG_FAIL: i64 = 3   # program failure (retire block)
+val NAND_ERASE_FAIL: i64 = 4  # erase failure (retire block)
+val NAND_BAD_BLOCK: i64 = 5   # target block is retired
+
+# ── Block lifecycle states ────────────────────────────────────────────────────
+val BLK_FREE:    i64 = 0
+val BLK_OPEN:    i64 = 1   # currently being written (the active band)
+val BLK_CLOSED:  i64 = 2   # full, holds valid+stale data
+val BLK_BAD:     i64 = 3   # retired
+
+# ── Write-task cooperative phases (state machine, held in task context) ───────
+val PH_INIT:      i64 = 0
+val PH_ALLOC:     i64 = 1   # pick physical page from active band
+val PH_PROGRAM:   i64 = 2   # FIL program
+val PH_JOURNAL:   i64 = 3   # append WAL record
+val PH_UPDATE:    i64 = 4   # update L2P + valid bitmap
+val PH_COMPLETE:  i64 = 5   # post CQ completion
+val PH_DONE:      i64 = 6
+
+# ── Object-pool generation handle (index-pointer, not a raw pointer) ──────────
+struct Handle:
+    pool:       i64
+    index:      i64
+    generation: i64
+
+fn handle_invalid() -> Handle:
+    Handle(pool: NULL_IDX, index: NULL_IDX, generation: NULL_IDX)
+
+fn handle_is_valid(h: Handle) -> bool:
+    h.index >= 0
+
+# ── A decoded host NVMe command ───────────────────────────────────────────────
+struct NvmeCmd:
+    cid:     i64   # command id
+    nsid:    i64   # namespace id (single namespace model: 1)
+    opcode:  i64
+    lba:     i64
+    nblocks: i64
+    data:    i64   # simulated single-byte payload stand-in
+
+fn cmd_make(cid: i64, opcode: i64, lba: i64, nblocks: i64, data: i64) -> NvmeCmd:
+    NvmeCmd(cid: cid, nsid: 1, opcode: opcode, lba: lba, nblocks: nblocks, data: data)
+
+fn cmd_make_nsid(cid: i64, nsid: i64, opcode: i64, lba: i64, nblocks: i64, data: i64) -> NvmeCmd:
+    NvmeCmd(cid: cid, nsid: nsid, opcode: opcode, lba: lba, nblocks: nblocks, data: data)
+
+fn cid_valid(cid: i64) -> bool:
+    cid >= 0 and cid <= 65535
+
+# ── A completion-queue entry ──────────────────────────────────────────────────
+struct NvmeCpl:
+    cid:    i64
+    status: i64
+    data:   i64   # read result, or 0
+
+fn cpl_make(cid: i64, status: i64, data: i64) -> NvmeCpl:
+    NvmeCpl(cid: cid, status: status, data: data)
+
+fn cpl_status_valid(status: i64) -> bool:
+    status == SC_SUCCESS or status == SC_INVALID_OPCODE or status == SC_INVALID_FIELD or status == SC_INTERNAL or status == SC_LBA_RANGE or status == SC_NS_NOT_READY or status == SC_MEDIA_ERR
+
+# ── Physical page address helpers (ppn <-> block/page) ────────────────────────
+fn ppn_block(ppn: i64) -> i64:
+    ppn / PAGES_PER_BLOCK
+
+fn ppn_page(ppn: i64) -> i64:
+    ppn % PAGES_PER_BLOCK
+
+fn block_first_ppn(blk: i64) -> i64:
+    blk * PAGES_PER_BLOCK
+
+fn ppn_in_range(ppn: i64) -> bool:
+    ppn >= 0 and ppn < NUM_PAGES
+
+fn block_in_range(blk: i64) -> bool:
+    blk >= 0 and blk < NUM_BLOCKS
+
+# 1 if the bool is true, else 0 (for asserting bool results with expect_eq).
+fn bool_to_int(b: bool) -> i64:
+    var v: i64 = 0
+    if b:
+        v = 1
+    v
+
+# ── Tiny test helper reused across firmware self-tests ────────────────────────
+fn expect_eq(got: i64, want: i64, label: text) -> i64:
+    if got == want:
+        print "  PASS: {label} ({got})"
+        return 0
+    print "  FAIL: {label} -- expected {want} got {got}"
+    1

@@ -1,0 +1,36 @@
+# rt_text_bytes probe — verifies the RuntimeString C layout fix
+# (bug: x64_rt_extras_runtime_string_layout_mismatch).
+#
+# rt_text_to_bytes / rt_text_byte_len live in boot/rt_extras.c and decode the
+# compiler-emitted string layout via arch/common/baremetal_runtime.h. Before
+# the fix the header declared len as uint32_t, so every data[] read was
+# shifted 4 bytes early (bytes came back as zeros/garbage). This entry prints
+# expected vs actual bytes of a known string over serial and exits QEMU.
+
+extern fn serial_println(msg: text)
+extern fn rt_port_outb(port: u16, value: u8)
+extern fn rt_text_byte_len(s: text) -> i64
+extern fn rt_text_to_bytes(s: text) -> [i64]
+
+fn _start():
+    val s = "SIMPLE"
+    # rt_text_byte_len returns a tagged RuntimeValue (ENCODE_INT = n<<3);
+    # the raw extern i64 sees the tagged bits, so decode with >>3 here.
+    val n_raw = rt_text_byte_len(s)
+    val n = n_raw / 8
+    serial_println("[probe] len expected=6 actual={n} (raw tagged={n_raw})")
+    val b = rt_text_to_bytes(s)
+    val b0 = b[0]
+    val b1 = b[1]
+    val b2 = b[2]
+    val b3 = b[3]
+    val b4 = b[4]
+    val b5 = b[5]
+    serial_println("[probe] bytes expected=83 73 77 80 76 69")
+    serial_println("[probe] bytes actual  ={b0} {b1} {b2} {b3} {b4} {b5}")
+    if (n == 6 and b0 == 83 and b1 == 73 and b2 == 77 and
+        b3 == 80 and b4 == 76 and b5 == 69):
+        serial_println("PROBE PASS rt_text_to_bytes layout ok")
+    else:
+        serial_println("PROBE FAIL rt_text_to_bytes layout wrong")
+    rt_port_outb(0xf4u16, 0x03u8)

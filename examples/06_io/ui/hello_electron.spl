@@ -1,0 +1,9 @@
+# Hello Electron — Electron Backend Hello World
+#
+# Launches the Electron desktop backend on port 3000
+# with the shared hello_web.ui.sdn layout.
+
+use app.ui.electron.app.{run_electron}
+
+fn main() -> i64:
+    return run_electron("examples/06_io/ui/hello_web.ui.sdn", 3000)

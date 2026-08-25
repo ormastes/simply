@@ -1,0 +1,12 @@
+use logic_power_thermal_core.*
+
+fn rv32_pt_state_cases_selftest() -> i32:
+    if _rv32_pt_power_state_valid(0) != 0:
+        return 1
+    if _rv32_pt_power_state_valid(4) != 0:
+        return 1
+    if _rv32_pt_power_state_valid(-1) == 0:
+        return 1
+    if _rv32_pt_power_state_valid(5) == 0:
+        return 1
+    0

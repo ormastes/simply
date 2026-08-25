@@ -1,0 +1,16 @@
+use logic_hil_core.*
+
+fn rv32_hil_valid_cases_selftest() -> i32:
+    if rv32_hil_validate(0, 1, 0, 1, 0) != 0:
+        return 1
+    if rv32_hil_validate(65535, 0, 0, 0, 0) != 0:
+        return 1
+    if rv32_hil_validate(65535, 1, 7, 1, 99) != 0:
+        return 1
+    if rv32_hil_validate(65535, 2, 7, 1, 0) != 0:
+        return 1
+    if rv32_hil_validate(65535, 8, 7, 1, 0) != 0:
+        return 1
+    if rv32_hil_validate(65535, 9, 7, 1, 0) != 0:
+        return 1
+    0

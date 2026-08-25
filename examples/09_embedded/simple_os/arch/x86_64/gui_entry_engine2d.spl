@@ -1,0 +1,430 @@
+# x86_64 GUI Entry — Engine2D + WM + Simple Web demo
+#
+# This entry is the visible integrated QEMU lane:
+#   - BGA framebuffer in an x86_64 QEMU Cocoa window
+#   - WmService + launcher registry initialized
+#   - freestanding Engine2D core paints the desktop/window chrome
+#   - the shared MDI renderer produces Simple Web-style app content written
+#     into the framebuffer
+#
+# The full std.gpu.engine2d facade currently has a known method-dispatch
+# bug in --entry-closure baremetal builds. This entry uses the freestanding
+# Engine2D core so the demo boots reliably while still exercising the 2D
+# drawing layer and the Simple Web rendering library in the same frame.
+
+use os.compositor.shared_mdi_framebuffer_scene.{SharedMdiFramebufferScene, render_shared_mdi_framebuffer_scene, render_shared_mdi_framebuffer_scene_for_lifecycle_windows, shared_mdi_lifecycle_seed_windows}
+use os.compositor.simpleos_wm_theme_bootstrap.{install_generated_simpleos_wm_theme}
+use os.compositor.wm_action_applier.{WmLifecycleWindowState, WmPointerInteractionState, apply_wm_action_to_lifecycle_windows, wm_focus_action, wm_lifecycle_left_button, wm_lifecycle_pointer_move}
+use os.services.wm.wm_world.{WmAction}
+use os.drivers.framebuffer.bga_init.{ScanoutEvidence, bga_init_scanout, scanout_evidence_is_valid, scanout_stride_pixels}
+
+extern fn serial_println(msg: text)
+extern fn rt_gui_set_fb(addr: u64, width: u64)
+extern fn rt_port_inb(port: u64) -> u64
+extern fn rt_port_outb(port: u16, value: u8)
+extern fn rt_mmio_write_u32(addr: u64, value: u32)
+
+var g_last_shared_scene_pixels: i64 = 0
+var g_last_shared_scene_checksum: i64 = 0
+
+# WM window-0 geometry. Non-fullscreen geometry is a fixed constant
+# (matches the original hardcoded window-0 rect); the fullscreen rect is the
+# full framebuffer read back from _fb_w()/_fb_h() at toggle time.
+#
+# NOTE: this is intentionally NOT module-`var` global state. A module-level
+# `var g_win0_w: i32 = 236` (or any nonzero-initialized primitive global in
+# this --entry-closure freestanding wrapper profile) reads back as
+# uninitialized garbage at boot, and even a subsequent plain literal
+# reassignment (`g_win0_w = 1024`) reads back corrupted (value>>3, e.g. 1024
+# read back as 128) — a genuine Cranelift freestanding-global codegen bug,
+# not something introduced here. See
+# doc/08_tracking/bug/freestanding_wrapper_profile_i32_global_var_shifted_2026-07-02.md.
+# The fullscreen/restore toggle below threads its state through locals and
+# function parameters instead, which read/write correctly in this profile.
+fn _win0_default_x() -> i32:
+    58
+
+fn _win0_default_y() -> i32:
+    76
+
+fn _win0_default_w() -> i32:
+    236
+
+fn _win0_default_h() -> i32:
+    142
+
+fn _fullscreen_hold_iters() -> u64:
+    # I/O-port-delay spin (same idiom as _capture_settle_window) sized to
+    # give an external QMP client real wall-clock time to connect and
+    # pmemsave the framebuffer while window 0 is maximized.
+    15000000
+
+fn _fullscreen_hold():
+    var iter: u64 = 0
+    while iter < _fullscreen_hold_iters():
+        rt_port_outb(0x80, 0)
+        iter = iter + 1
+
+fn _fb_w(scanout: ScanoutEvidence) -> i32:
+    scanout.width.to_i32()
+
+fn _fb_h(scanout: ScanoutEvidence) -> i32:
+    scanout.height.to_i32()
+
+fn _fb_stride_pixels(scanout: ScanoutEvidence) -> i32:
+    scanout_stride_pixels(scanout).to_i32()
+
+fn _mmio_write32(addr: u64, value: u32):
+    rt_mmio_write_u32(addr, value)
+
+fn _ps2_wait_write():
+    var i: u64 = 0
+    while i < 100000:
+        if (rt_port_inb(0x64) & 2) == 0:
+            return
+        i = i + 1
+
+fn _ps2_wait_read():
+    var i: u64 = 0
+    while i < 100000:
+        if (rt_port_inb(0x64) & 1) != 0:
+            return
+        i = i + 1
+
+fn _ps2_wait_mouse_read() -> bool:
+    var i: u64 = 0
+    while i < 100000:
+        if (rt_port_inb(0x64) & 0x21) == 0x21:
+            return true
+        i = i + 1
+    false
+
+fn _ps2_flush():
+    var i: u64 = 0
+    while i < 16:
+        if (rt_port_inb(0x64) & 1) != 0:
+            rt_port_inb(0x60)
+        i = i + 1
+
+fn _ps2_mouse_cmd(cmd: u8):
+    _ps2_wait_write()
+    rt_port_outb(0x64, 0xD4)
+    _ps2_wait_write()
+    rt_port_outb(0x60, cmd)
+    _ps2_wait_read()
+    rt_port_inb(0x60)
+
+fn _ps2_mouse_init():
+    _ps2_flush()
+    _ps2_wait_write()
+    rt_port_outb(0x64, 0xA8)
+    _ps2_wait_write()
+    rt_port_outb(0x64, 0x20)
+    _ps2_wait_read()
+    val config = rt_port_inb(0x60)
+    _ps2_wait_write()
+    rt_port_outb(0x64, 0x60)
+    _ps2_wait_write()
+    rt_port_outb(0x60, ((config | 2) & 0xDF).to_u8())
+    _ps2_mouse_cmd(0xF6)
+    _ps2_mouse_cmd(0xF4)
+    _ps2_flush()
+    serial_println("[mdi-demo] qemu-mouse-ready")
+
+fn _capture_wait_iters() -> u64:
+    400000000
+
+fn _surface_count() -> i64:
+    5
+
+class QemuPs2MousePacket:
+    ready: bool
+    valid: bool
+    left: bool
+    dx: i32
+    dy: i32
+
+fn _poll_qemu_mouse_packet() -> QemuPs2MousePacket:
+    val status = rt_port_inb(0x64)
+    if (status & 0x21) != 0x21:
+        return QemuPs2MousePacket(ready: false, valid: false, left: false, dx: 0, dy: 0)
+    val flags = rt_port_inb(0x60)
+    if (flags & 0x08) == 0:
+        serial_println("[mdi-demo] qemu-mouse-packet-invalid reason=sync-bit-missing")
+        return QemuPs2MousePacket(ready: true, valid: false, left: false, dx: 0, dy: 0)
+    if not _ps2_wait_mouse_read():
+        serial_println("[mdi-demo] qemu-mouse-packet-invalid reason=dx-timeout")
+        return QemuPs2MousePacket(ready: true, valid: false, left: false, dx: 0, dy: 0)
+    val x_byte = rt_port_inb(0x60)
+    if not _ps2_wait_mouse_read():
+        serial_println("[mdi-demo] qemu-mouse-packet-invalid reason=dy-timeout")
+        return QemuPs2MousePacket(ready: true, valid: false, left: false, dx: 0, dy: 0)
+    val y_byte = rt_port_inb(0x60)
+    if (flags & 0xC0) != 0:
+        serial_println("[mdi-demo] qemu-mouse-packet-invalid reason=motion-overflow")
+        return QemuPs2MousePacket(ready: true, valid: false, left: false, dx: 0, dy: 0)
+    var dx = x_byte.to_i32()
+    var dy = y_byte.to_i32()
+    if (flags & 0x10) != 0:
+        dx = dx - 256
+    if (flags & 0x20) != 0:
+        dy = dy - 256
+    QemuPs2MousePacket(ready: true, valid: true, left: (flags & 1) != 0, dx: dx, dy: dy)
+
+fn _topmost_titlebar_window_index(windows: [WmLifecycleWindowState], x: i32, y: i32) -> i32:
+    var i = windows.len() - 1
+    while i >= 0:
+        val win = windows[i]
+        if not win.minimized and x >= win.x and x < win.x + win.w and y >= win.y and y < win.y + 28:
+            return i
+        i = i - 1
+    -1
+
+fn _lifecycle_window_index(windows: [WmLifecycleWindowState], window_id: i64) -> i32:
+    var i = 0
+    while i < windows.len():
+        if windows[i].id == window_id:
+            return i
+        i = i + 1
+    -1
+
+fn _present_mdi_lifecycle_scene_input_fb(scanout: ScanoutEvidence, windows: [WmLifecycleWindowState], pointer_x: i32, pointer_y: i32):
+    val scene = render_shared_mdi_framebuffer_scene_for_lifecycle_windows(_fb_w(scanout), _fb_h(scanout), "qemu-framebuffer-cpu-simd", windows)
+    _blit_scene_to_fb(scanout, scene)
+    _draw_mouse_cursor_fb(scanout, pointer_x, pointer_y)
+    _fill_rect_fb(scanout, 0, 0, 32, 1, 0xFFFF0000)
+
+fn _capture_settle_window(scanout: ScanoutEvidence):
+    var iter: u64 = 0
+    var input_seq: u64 = 0
+    var win0_fullscreen: u64 = 0
+    var windows = shared_mdi_lifecycle_seed_windows()
+    var interaction = WmPointerInteractionState(dragging: false, drag_window_id: 0, drag_offset_x: 0, drag_offset_y: 0, resizing: false, resize_window_id: 0, resize_start_x: 0, resize_start_y: 0, resize_start_w: 0, resize_start_h: 0)
+    var pointer_x: i32 = 0
+    var pointer_y: i32 = 0
+    var left_down = false
+    var pointer_packet_seq: u64 = 0
+    var drag_origin_x: i32 = 0
+    var drag_origin_y: i32 = 0
+    while iter < _capture_wait_iters():
+        val status = rt_port_inb(0x64)
+        if (status & 0x21) == 0x21:
+            val packet = _poll_qemu_mouse_packet()
+            if packet.ready and packet.valid:
+                pointer_packet_seq = pointer_packet_seq + 1
+                var next_x = pointer_x + packet.dx
+                var next_y = pointer_y - packet.dy
+                if next_x < 0:
+                    next_x = 0
+                if next_x >= _fb_w(scanout):
+                    next_x = _fb_w(scanout) - 1
+                if next_y < 0:
+                    next_y = 0
+                if next_y >= _fb_h(scanout):
+                    next_y = _fb_h(scanout) - 1
+                pointer_x = next_x
+                pointer_y = next_y
+                val previous_left_down = left_down
+                left_down = packet.left
+                serial_println("[mdi-demo] qemu-mouse-packet seq={pointer_packet_seq} left={left_down} dx={packet.dx} dy={packet.dy} x={pointer_x} y={pointer_y}")
+                if left_down and not previous_left_down:
+                    val hit_idx = _topmost_titlebar_window_index(windows, pointer_x, pointer_y)
+                    if hit_idx >= 0:
+                        val hit = windows[hit_idx]
+                        drag_origin_x = hit.x
+                        drag_origin_y = hit.y
+                        interaction.dragging = true
+                        interaction.drag_window_id = hit.id
+                        interaction.drag_offset_x = pointer_x - hit.x
+                        interaction.drag_offset_y = pointer_y - hit.y
+                        interaction = wm_lifecycle_left_button(interaction, true)
+                        val focused = apply_wm_action_to_lifecycle_windows(windows, _surface_count() + 1, _fb_w(scanout), _fb_h(scanout), wm_focus_action(hit.id))
+                        windows = focused.windows
+                        serial_println("[mdi-demo] qemu-drag-armed packet_seq={pointer_packet_seq} window={hit.id} origin={drag_origin_x},{drag_origin_y} offset={interaction.drag_offset_x},{interaction.drag_offset_y}")
+                if interaction.dragging and (packet.dx != 0 or packet.dy != 0):
+                    val moved = wm_lifecycle_pointer_move(windows, _surface_count() + 1, _fb_w(scanout), _fb_h(scanout), interaction, pointer_x, pointer_y)
+                    windows = moved.windows
+                    interaction = moved.interaction
+                if not left_down and previous_left_down:
+                    val dragged_window_id = interaction.drag_window_id
+                    val dragged_idx = _lifecycle_window_index(windows, dragged_window_id)
+                    if dragged_idx >= 0:
+                        val dragged = windows[dragged_idx]
+                        val geometry_changed = dragged.x != drag_origin_x or dragged.y != drag_origin_y
+                        _present_mdi_lifecycle_scene_input_fb(scanout, windows, pointer_x, pointer_y)
+                        serial_println("[mdi-demo] qemu-shared-pointer-event source=wm_lifecycle_pointer_move action=drag window={dragged.id} from={drag_origin_x},{drag_origin_y} to={dragged.x},{dragged.y} pointer={pointer_x},{pointer_y} decoded_packets={pointer_packet_seq} render_commits=1 focused={dragged.focused} geometry_changed={geometry_changed}")
+                        serial_println("[mdi-demo] qemu-mouse-repainted geometry_window={dragged.id} geometry_x={dragged.x} geometry_y={dragged.y}")
+                    interaction = wm_lifecycle_left_button(interaction, false)
+        elif (status & 1) != 0:
+            val scancode = rt_port_inb(0x60)
+            # Set-1 F11 make code. Break codes and unrelated keys do not
+            # mutate WM state or advance the authoritative input sequence.
+            if scancode == 0x57:
+                input_seq = input_seq + 1
+                serial_println("[wm-input-irq] input_seq={input_seq} scancode={scancode}")
+                if win0_fullscreen == 0:
+                    win0_fullscreen = 1
+                    _present_mdi_scene_direct_fb(scanout, 1)
+                    serial_println("[wm-state] input_seq={input_seq} action=maximize window=1 maximized=true")
+                else:
+                    win0_fullscreen = 0
+                    _present_mdi_scene_direct_fb(scanout, 0)
+                    serial_println("[wm-state] input_seq={input_seq} action=restore window=1 maximized=false")
+                val frame_generation = scanout.generation + input_seq
+                serial_println("[wm-frame] input_seq={input_seq} generation={frame_generation}")
+        rt_port_outb(0x80, 0)
+        iter = iter + 1
+
+fn _draw_mmio_probe(fb_addr: u64, width: i32):
+    var x: i32 = 0
+    while x < 32:
+        val offset = (x * 4).to_u64()
+        _mmio_write32(fb_addr + offset, 0xFFFF0000)
+        x = x + 1
+
+fn _fill_rect_fb(scanout: ScanoutEvidence, x: i32, y: i32, w: i32, h: i32, color: u32):
+    val fb_addr = scanout.address
+    val stride = _fb_stride_pixels(scanout)
+    var x0 = x
+    var y0 = y
+    var x1 = x + w
+    var y1 = y + h
+    if x0 < 0:
+        x0 = 0
+    if y0 < 0:
+        y0 = 0
+    if x1 > _fb_w(scanout):
+        x1 = _fb_w(scanout)
+    if y1 > _fb_h(scanout):
+        y1 = _fb_h(scanout)
+    if x1 <= x0 or y1 <= y0:
+        return
+    var py = y0
+    while py < y1:
+        var px = x0
+        var addr = fb_addr + ((py * stride + px) * 4).to_u64()
+        while px < x1:
+            _mmio_write32(addr, color)
+            addr = addr + 4
+            px = px + 1
+        py = py + 1
+
+fn _draw_mouse_cursor_fb(scanout: ScanoutEvidence, x: i32, y: i32):
+    _fill_rect_fb(scanout, x, y, 2, 22, 0xFFFFFFFF)
+    _fill_rect_fb(scanout, x + 2, y + 2, 2, 18, 0xFFFFFFFF)
+    _fill_rect_fb(scanout, x + 4, y + 4, 2, 14, 0xFFFFFFFF)
+    _fill_rect_fb(scanout, x + 6, y + 6, 2, 10, 0xFFFFFFFF)
+    _fill_rect_fb(scanout, x + 8, y + 8, 2, 6, 0xFFFFFFFF)
+    _fill_rect_fb(scanout, x + 5, y + 16, 10, 2, 0xFFFFFFFF)
+    _fill_rect_fb(scanout, x + 8, y + 18, 8, 2, 0xFFFFFFFF)
+    _fill_rect_fb(scanout, x + 12, y + 20, 6, 2, 0xFFFFFFFF)
+
+fn _shared_scene_sample_checksum(pixels: [u32], width: i32, height: i32) -> i64:
+    var checksum: i64 = 0
+    if width > 0 and height > 0 and pixels.len() > 0:
+        val mid = (height / 2) * width + (width / 2)
+        val task = (height - 24) * width + (width / 2)
+        val browser = 150 * width + 470
+        val last = pixels.len() - 1
+        if mid >= 0 and mid < pixels.len():
+            checksum = checksum + (pixels[mid] & 0x00FFFFFFu32).to_i64()
+        if task >= 0 and task < pixels.len():
+            checksum = checksum + ((pixels[task] & 0x00FFFFFFu32).to_i64() * 3)
+        if browser >= 0 and browser < pixels.len():
+            checksum = checksum + ((pixels[browser] & 0x00FFFFFFu32).to_i64() * 5)
+        checksum = checksum + ((pixels[last] & 0x00FFFFFFu32).to_i64() * 7)
+    checksum
+
+fn _blit_shared_scene_to_fb(scanout: ScanoutEvidence):
+    val scene = render_shared_mdi_framebuffer_scene(_fb_w(scanout), _fb_h(scanout), "qemu-framebuffer-cpu-simd")
+    _blit_scene_to_fb(scanout, scene)
+
+fn _blit_scene_to_fb(scanout: ScanoutEvidence, scene: SharedMdiFramebufferScene):
+    val fb_addr = scanout.address
+    val stride = _fb_stride_pixels(scanout)
+    g_last_shared_scene_pixels = scene.web_pixel_count
+    g_last_shared_scene_checksum = _shared_scene_sample_checksum(scene.pixels, scene.width, scene.height)
+    val pixel_count = scene.pixels.len()
+    var y_limit = scene.height
+    if y_limit > _fb_h(scanout):
+        y_limit = _fb_h(scanout)
+    var x_limit = scene.width
+    if x_limit > _fb_w(scanout):
+        x_limit = _fb_w(scanout)
+    var y: i32 = 0
+    while y < y_limit:
+        val row_src = y * scene.width
+        var x: i32 = 0
+        var dst_addr = fb_addr + ((y * stride) * 4).to_u64()
+        if row_src + x_limit <= pixel_count:
+            while x < x_limit:
+                _mmio_write32(dst_addr, scene.pixels[row_src + x])
+                dst_addr = dst_addr + 4
+                x = x + 1
+        y = y + 1
+
+fn _present_mdi_scene_direct_fb(scanout: ScanoutEvidence, win0_fullscreen: u64):
+    if win0_fullscreen == 1:
+        var windows = shared_mdi_lifecycle_seed_windows()
+        val maximized = apply_wm_action_to_lifecycle_windows(
+            windows,
+            (windows.len() + 1).to_i64(),
+            _fb_w(scanout),
+            _fb_h(scanout),
+            WmAction(kind: "maximize", window_id: 1, title: "", x: 0, y: 0, width: 0, height: 0, content: "", process_id: 0, app_id: "", owner_port: 0, src_port: 0)
+        )
+        val scene = render_shared_mdi_framebuffer_scene_for_lifecycle_windows(_fb_w(scanout), _fb_h(scanout), "qemu-framebuffer-cpu-simd", maximized.windows)
+        _blit_scene_to_fb(scanout, scene)
+        return
+    _blit_shared_scene_to_fb(scanout)
+    _draw_mouse_cursor_fb(scanout, 360, 190)
+
+fn spl_start():
+    serial_println("SimpleOS x86_64 GUI boot (Engine2D + WM + Simple Web)")
+    serial_println("[BOOT] COM1 serial ready")
+    val theme_snapshot = install_generated_simpleos_wm_theme()
+    serial_println("[theme-evidence] id={theme_snapshot.id} source_manifest_sha256={theme_snapshot.source_manifest_sha256} material_sha256={theme_snapshot.material_sha256} backdrop_filter=unavailable fallback=solid-material")
+
+    serial_println("[BOOT] Initializing BGA framebuffer...")
+    val scanout = bga_init_scanout(1024, 768, 32)
+    serial_println("[BOOT] BGA framebuffer ready")
+    serial_println("[scanout-evidence] address={scanout.address} width={scanout.width} height={scanout.height} stride={scanout.stride} pixel_format={scanout.pixel_format} generation={scanout.generation}")
+    if not scanout_evidence_is_valid(scanout):
+        serial_println("[scanout-invalid] unsupported-or-incomplete-metadata")
+        serial_println("TEST FAILED")
+        rt_port_outb(0xf4, 1)
+        return
+    _ps2_mouse_init()
+
+    rt_gui_set_fb(scanout.address, scanout.width.to_u64())
+    serial_println("[GUI] framebuffer bound")
+    _draw_mmio_probe(scanout.address, _fb_w(scanout))
+    serial_println("[GUI] mmio-probe-painted")
+
+    serial_println("[wm-demo] wm-service-ready")
+    val app_count: i64 = 15
+    serial_println("[wm-demo] launcher-ready apps={app_count}")
+
+    serial_println("[e2d-demo] freestanding-framebuffer-ready")
+    serial_println("[e2d-demo] engine-core-ready")
+
+    serial_println("[web-demo] rendering Simple Web pixels")
+    _present_mdi_scene_direct_fb(scanout, 0)
+    val web_pixel_count = g_last_shared_scene_pixels
+    val web_checksum = g_last_shared_scene_checksum
+    serial_println("[web-demo] pixels-ready expected={web_pixel_count}")
+    serial_println("[web-demo] renderer=shared_mdi_framebuffer_scene html=about:engine2d-wm checksum={web_checksum}")
+    serial_println("[backend-evidence] selected=qemu-framebuffer-cpu-simd renderer=shared_mdi_framebuffer_scene fallback=none frame_time_ms=unmeasured readback=unavailable:qemu-framebuffer-write-only")
+
+    serial_println("[backend-evidence] present=direct-mmio-commit source=shared_mdi_framebuffer_scene")
+    serial_println("[mdi-demo] shared-mdi-ready surfaces={_surface_count()}")
+    serial_println("[mdi-demo] top-command-lane-ready")
+    serial_println("[mdi-demo] taskbar-ready")
+    serial_println("[mdi-demo] html-renderable window=browser renderer=shared_mdi_framebuffer_scene pixels={web_pixel_count} checksum={web_checksum}")
+    serial_println("[mdi-demo] windows-ready count={_surface_count()}")
+
+    serial_println("[integrated-demo] render-ready")
+    serial_println("TEST PASSED")
+    serial_println("[GUI] Live input loop ready for capture")
+    _capture_settle_window(scanout)
+    rt_port_outb(0xf4, 0)

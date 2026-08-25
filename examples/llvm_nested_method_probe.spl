@@ -1,0 +1,31 @@
+class Env:
+    xs: [i64]
+
+    static fn new() -> Env:
+        Env(xs: [])
+
+    me add(v: i64):
+        self.xs.push(v)
+
+    me len() -> i64:
+        self.xs.len()
+
+class Holder:
+    env: Env
+    count: i64
+
+    static fn new() -> Holder:
+        Holder(env: Env.new(), count: 0)
+
+    me add_one():
+        self.env.add(1)
+        self.count = self.count + 1
+
+fn spl_main() -> i64:
+    var holder = Holder.new()
+    holder.add_one()
+    if holder.env.len() != 1:
+        return 11
+    if holder.count != 1:
+        return 12
+    0

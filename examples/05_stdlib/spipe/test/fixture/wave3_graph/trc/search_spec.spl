@@ -1,0 +1,4 @@
+# spipe:artifact uid=A-00000000000000000000000006 key=spec.trc.search
+describe "Mirror":
+    it "has a generated manual":
+        expect(true).to_be(true)

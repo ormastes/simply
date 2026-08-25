@@ -1,0 +1,80 @@
+pub fn _rv32_dram_effective_cap(cap: i64, data_len: i64, used_len: i64) -> i64:
+    var c: i64 = cap
+    if c < 0:
+        return 0
+    if c > 16:
+        c = 16
+    if c > data_len:
+        c = data_len
+    if c > used_len:
+        c = used_len
+    c
+
+pub fn _rv32_dram_alloc_ok(nblocks: i64, used: i64, cap: i64) -> i32:
+    val eff: i64 = _rv32_dram_effective_cap(cap, 16, 16)
+    if nblocks <= 0:
+        return 1
+    if nblocks > eff:
+        return 0
+    if used < 0:
+        return 0
+    if used + nblocks > eff:
+        return 0
+    1
+
+pub fn _rv32_dram_stage_status(span_ok: i32, base: i64, len: i64, index: i64, cap: i64, slot_used: i32) -> i64:
+    val eff: i64 = _rv32_dram_effective_cap(cap, 16, 16)
+    if span_ok == 0:
+        return 130
+    if index < 0:
+        return 130
+    if index >= len:
+        return 130
+    if base < 0:
+        return 130
+    if len < 0:
+        return 130
+    if base + len > eff:
+        return 130
+    if slot_used == 0:
+        return 130
+    0
+
+pub fn _rv32_dram_mask_byte(value: i64) -> i64:
+    value & 255
+
+pub fn _rv32_dram_used(count: i64, cap: i64) -> i64:
+    val eff: i64 = _rv32_dram_effective_cap(cap, 16, 16)
+    if count < 0:
+        return 0
+    if count > eff:
+        return eff
+    count
+
+pub fn _rv32_dram_overflows(count: i64) -> i64:
+    if count < 0:
+        return 0
+    count
+
+pub fn _rv32_durability_after_crash(lba: i64, checkpointed10: i64, checkpointed20: i64) -> i64:
+    if lba == 10:
+        return checkpointed10
+    if lba == 20:
+        return checkpointed20
+    0
+
+pub fn _rv32_durability_after_recover(lba: i64, checkpointed10: i64, checkpointed20: i64, wal10: i64, wal20: i64, wal30: i64) -> i64:
+    if lba == 10:
+        return wal10
+    if lba == 20:
+        return wal20
+    if lba == 30:
+        return wal30
+    _rv32_durability_after_crash(lba, checkpointed10, checkpointed20)
+
+pub fn _rv32_journal_overflow_checkpointed(writes: i64, cap: i64) -> i32:
+    if cap <= 0:
+        return 0
+    if writes <= cap:
+        return 0
+    1

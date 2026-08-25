@@ -1,0 +1,207 @@
+# MCP Tool schemas — all 33 tools
+#
+# Defines tool schemas for MCP tools/list response.
+# Original: Foundation (4), Graph+Ranking (4), Specialized (3) = 11
+# Phase A: Write (4), Phase B: Metadata (6), Phase C: Search Ext (5),
+# Phase D: Analytics (3), Phase E: Periodic (3) = 22 new = 33 total
+
+use src.util.json_helpers.{js, jp, jo1, jo2, jo3, jo4, ja, jo, make_json_result, SB_L, SB_R, LB, RB}
+use src.mcp.tools_write.{make_write_tools}
+use src.mcp.tools_metadata.{make_metadata_tools}
+use src.mcp.tools_search_ext.{make_search_ext_tools}
+use src.mcp.tools_analytics.{make_analytics_tools}
+use src.mcp.tools_periodic.{make_periodic_tools}
+
+# --- Tool schema builder ---
+
+fn make_string_prop(description: text) -> text:
+    jo2(jp("type", js("string")), jp("description", js(description)))
+
+fn make_int_prop(description: text) -> text:
+    jo2(jp("type", js("integer")), jp("description", js(description)))
+
+fn make_tool(name: text, description: text, props: text, required: text) -> text:
+    val schema = jo3(
+        jp("type", js("object")),
+        jp("properties", props),
+        jp("required", required)
+    )
+    val annotations = jo3(
+        jp("readOnlyHint", "true"),
+        jp("destructiveHint", "false"),
+        jp("idempotentHint", "true")
+    )
+    var tool_obj = LB()
+    tool_obj = tool_obj + jp("name", js(name))
+    tool_obj = tool_obj + "," + jp("description", js(description))
+    tool_obj = tool_obj + "," + jp("inputSchema", schema)
+    tool_obj = tool_obj + "," + jp("annotations", annotations)
+    tool_obj = tool_obj + RB()
+    tool_obj
+
+# --- All 11 tool schemas ---
+
+fn make_tools_list(id: text) -> text:
+    var tool_parts: [text] = []
+
+    # Phase 1: Foundation (4 tools)
+
+    # 1. search_vault
+    var sv_props = LB()
+    sv_props = sv_props + jp("query", make_string_prop("Search query with optional operators (tag:, path:, title:, heading:, linkto:, linkedfrom:, type:, modified:recent)"))
+    sv_props = sv_props + "," + jp("limit", make_int_prop("Max results to return (default 20)"))
+    sv_props = sv_props + "," + jp("mode", make_string_prop("Search mode: 'full' (default), 'title', 'heading'"))
+    sv_props = sv_props + RB()
+    tool_parts.push(make_tool(
+        "search_vault",
+        "Search the Obsidian vault using hybrid BM25/graph ranking. Supports operators like tag:meeting, path:daily/, title:standup.",
+        sv_props,
+        ja([js("query")])
+    ))
+
+    # 2. read_note
+    var rn_props = LB()
+    rn_props = rn_props + jp("path", make_string_prop("Relative path to the note in the vault"))
+    rn_props = rn_props + RB()
+    tool_parts.push(make_tool(
+        "read_note",
+        "Read full note content and metadata from the vault.",
+        rn_props,
+        ja([js("path")])
+    ))
+
+    # 3. search_by_tag
+    var st_props = LB()
+    st_props = st_props + jp("tag", make_string_prop("Tag to search for (without # prefix)"))
+    st_props = st_props + RB()
+    tool_parts.push(make_tool(
+        "search_by_tag",
+        "Find all notes with a specific tag.",
+        st_props,
+        ja([js("tag")])
+    ))
+
+    # 4. find_backlinks
+    var fb_props = LB()
+    fb_props = fb_props + jp("note_path", make_string_prop("Path of the note to find backlinks for"))
+    fb_props = fb_props + RB()
+    tool_parts.push(make_tool(
+        "find_backlinks",
+        "Find all notes that link TO the specified note.",
+        fb_props,
+        ja([js("note_path")])
+    ))
+
+    # Phase 2: Graph + Ranking (4 tools)
+
+    # 5. find_forward_links
+    var ff_props = LB()
+    ff_props = ff_props + jp("note_path", make_string_prop("Path of the note to find forward links for"))
+    ff_props = ff_props + RB()
+    tool_parts.push(make_tool(
+        "find_forward_links",
+        "Find all notes that the specified note links TO.",
+        ff_props,
+        ja([js("note_path")])
+    ))
+
+    # 6. find_related
+    var fr_props = LB()
+    fr_props = fr_props + jp("note_path", make_string_prop("Path of the note to find related notes for"))
+    fr_props = fr_props + RB()
+    tool_parts.push(make_tool(
+        "find_related",
+        "Find related notes via backlinks, forward links, and shared tags.",
+        fr_props,
+        ja([js("note_path")])
+    ))
+
+    # 7. find_authoritative_docs
+    var fa_props = LB()
+    fa_props = fa_props + jp("query", make_string_prop("Search query to find authoritative documents"))
+    fa_props = fa_props + "," + jp("limit", make_int_prop("Max results (default 10)"))
+    fa_props = fa_props + RB()
+    tool_parts.push(make_tool(
+        "find_authoritative_docs",
+        "Find the most authoritative (highly-linked) notes matching a query.",
+        fa_props,
+        ja([js("query")])
+    ))
+
+    # 8. graph_walk
+    var gw_props = LB()
+    gw_props = gw_props + jp("seed", make_string_prop("Starting note path for graph traversal"))
+    gw_props = gw_props + "," + jp("hops", make_int_prop("Maximum traversal depth (default 2)"))
+    gw_props = gw_props + RB()
+    tool_parts.push(make_tool(
+        "graph_walk",
+        "BFS traversal of the note graph starting from a seed note.",
+        gw_props,
+        ja([js("seed")])
+    ))
+
+    # Phase 3: Specialized (3 tools)
+
+    # 9. search_tasks
+    var stk_props = LB()
+    stk_props = stk_props + jp("query", make_string_prop("Task text to search for"))
+    stk_props = stk_props + "," + jp("status", make_string_prop("Filter by status: 'open', 'done', or '' for all"))
+    stk_props = stk_props + RB()
+    tool_parts.push(make_tool(
+        "search_tasks",
+        "Search for tasks (checkboxes) across the vault.",
+        stk_props,
+        ja([js("query")])
+    ))
+
+    # 10. search_decisions
+    var sd_props = LB()
+    sd_props = sd_props + jp("query", make_string_prop("Query to search decision-related content"))
+    sd_props = sd_props + RB()
+    tool_parts.push(make_tool(
+        "search_decisions",
+        "Search for decision-related content (ADRs, decision headings).",
+        sd_props,
+        ja([js("query")])
+    ))
+
+    # 11. explain_search
+    var es_props = LB()
+    es_props = es_props + jp("query", make_string_prop("Search query to explain scoring for"))
+    es_props = es_props + "," + jp("limit", make_int_prop("Max results to explain (default 5)"))
+    es_props = es_props + RB()
+    tool_parts.push(make_tool(
+        "explain_search",
+        "Run a search and return detailed score breakdowns per result.",
+        es_props,
+        ja([js("query")])
+    ))
+
+    # Phase A: Write tools (4)
+    val write_tools = make_write_tools()
+    for write_tool in write_tools:
+        tool_parts.push(write_tool)
+
+    # Phase B: Metadata tools (6)
+    val metadata_tools = make_metadata_tools()
+    for metadata_tool in metadata_tools:
+        tool_parts.push(metadata_tool)
+
+    # Phase C: Enhanced search tools (5)
+    val search_ext_tools = make_search_ext_tools()
+    for search_ext_tool in search_ext_tools:
+        tool_parts.push(search_ext_tool)
+
+    # Phase D: Analytics tools (3)
+    val analytics_tools = make_analytics_tools()
+    for analytics_tool in analytics_tools:
+        tool_parts.push(analytics_tool)
+
+    # Phase E: Periodic notes tools (3)
+    val periodic_tools = make_periodic_tools()
+    for periodic_tool in periodic_tools:
+        tool_parts.push(periodic_tool)
+
+    val tools = SB_L() + tool_parts.join(",") + SB_R()
+    val result = jo1(jp("tools", tools))
+    make_json_result(id, result)

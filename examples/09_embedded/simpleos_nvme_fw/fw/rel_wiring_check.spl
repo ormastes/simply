@@ -1,0 +1,223 @@
+"""
+rel_wiring_check — absolute integration oracles for the L8 reliability WIRING pass
+(contract: doc/05_design/hardware/nand_recovery/recovery_algorithms_design.md §7/§9
+L8 + §10 "Wiring / budget" row; architecture reliability_engine_architecture.md §4).
+
+This proves the LANDED rel_* policy leaves, once wired into fil.spl (the FIL recovery-
+ladder mount) and ftl.spl (the FTL service tick + policy feeds + event-driven spare),
+produce live firmware behaviour — end to end, no manual ladder driving, absolute
+values at known points (never self-comparison).
+
+Five oracles:
+
+  (a) RECOVERY + REFRESH + RECLAIM (Vt-physics emu backend). A retention-drifted page
+      that a plain sense FAILS is recovered through the PRODUCTION ftl.read path — the
+      FIL mount drives the ladder, no manual stepping. Health records retry_depth > 0
+      and the block is DEAR-marked for refresh; a later rel_tick actually reclaims it,
+      and the data still reads back correct afterwards.
+
+  (b) BUDGET INVARIANT. rel_tick_select is one-step-per-tick by fixed priority
+      (GC > refresh > scrub > WL) — proven both as a pure selector and on a live Ftl
+      with TWO reclaim gates hot at once: exactly ONE reclaim-class action fires
+      (observable via the rel_reclaims counter).
+
+  (c) READ-DISTURB SCRUB. Hammer reads on one CLOSED block past READ_DISTURB_THRESHOLD;
+      a tick reclaims it (scrub), the block's read-disturb counter resets to 0, and the
+      data is intact.
+
+  (d) WEAR LEVELING. An erase spread beyond WL_THRESHOLD with the cold block dwelled
+      makes a tick fire wear_level_once (one reclaim); with the dwell too small the
+      SREA-lite verdict DEFERS (gate hot, no reclaim).
+
+  (e) EVENT-DRIVEN SPARE. A block retired on an erase failure draws one over-provision
+      spare (56..63) from the retire path — observable via the spare counter, the last
+      spare index, and the retired block being out of rotation (BLK_BAD).
+
+Emu addresses stay in the S1 window (blocks 0-7, pages 0-3) so nothing fold-aliases;
+CLOSED reclaim candidates are set up white-box (band lifecycle poke), the same
+technique nvme_controller_gc_check.spl uses — because the S1-folded emu never fills a
+block to BLK_CLOSED through ordinary writes (fil_nand_emu_e2e_check §B documents that).
+
+Run: bin/simple run examples/09_embedded/simpleos_nvme_fw/fw/rel_wiring_check.spl
+Gate: prints "REL WIRING OK" and exits 0.
+"""
+
+use nvme_types.*
+use fil.*
+use ftl.*
+use firmware.*          # GC_LOW_WATERMARK (the production low watermark rel_tick is fed)
+
+fn main():
+    var fail: i64 = 0
+
+    # ═══ (a) recovery through the production ftl.read path + refresh + reclaim ══
+    # Vt-physics emu backend. Program four in-window pages of block 0 with 0x00, then
+    # white-box CLOSE block 0 so it is a reclaim candidate (the S1-folded emu never
+    # reaches BLK_CLOSED via ordinary writes — see header).
+    var ra: Ftl = ftl_new_emu()
+    fail = fail + expect_eq(ra.write(0, 0x00), SC_SUCCESS, "a: program block0 page0 = 0x00")
+    fail = fail + expect_eq(ra.write(1, 0x00), SC_SUCCESS, "a: program block0 page1 = 0x00")
+    fail = fail + expect_eq(ra.write(2, 0x00), SC_SUCCESS, "a: program block0 page2 = 0x00")
+    fail = fail + expect_eq(ra.write(3, 0x00), SC_SUCCESS, "a: program block0 page3 = 0x00")
+    val a_blk: i64 = ppn_block(ra.lba_ppn(0))
+    fail = fail + expect_eq(a_blk, 0, "a: writes landed in block 0")
+    ra.band.blk_state[0] = BLK_CLOSED           # white-box: make block 0 a CLOSED reclaim candidate
+    ra.band.active_blk = UNMAP
+    ra.band.active_wp = 0
+    ra.band.free_count = ra.band.actual_free_blocks()
+
+    # Drive genuine retention drift (the seams-proven regime): a plain read now FAILS.
+    ra.emu_set_block_wear(0, 3000)
+    ra.emu_advance_time_s(31536000.0)           # age one year
+    val a_raw: FilRead = ra.fil.read(ra.lba_ppn(0))
+    print "  PROBE a raw offset-0: data={a_raw.data} code={a_raw.code} corrected={a_raw.corrected}"
+    fail = fail + expect_eq(a_raw.code, NAND_ECC_FAIL, "a: raw offset-0 sense FAILS before recovery (drift is real)")
+
+    # The PRODUCTION read path recovers it — the FIL mount drives the ladder, no manual
+    # stepping in this check.
+    val a_rec: i64 = ra.read(0)
+    print "  PROBE a recovered={a_rec} retry_depth={ra.health_retry_depth(0)} marked={ra.refresh_marked(0)} cal={ra.calibrated_offset(0)} cause={ra.refresh_cause(0)}"
+    fail = fail + expect_eq(a_rec, 0x00, "a: ftl.read recovers the exact programmed 0x00 (mount-driven ladder)")
+    fail = fail + expect_eq(bool_to_int(ra.health_retry_depth(0) > 0), 1, "a: health recorded retry_depth > 0")
+    fail = fail + expect_eq(ra.refresh_marked(0), 1, "a: drifted block DEAR-marked for refresh")
+    fail = fail + expect_eq(ra.refresh_cause(0), 2, "a: refresh cause tagged DEAR (rel_cause_err == 2)")
+    fail = fail + expect_eq(bool_to_int(ra.calibrated_offset(0) < 0), 1, "a: ROR persisted a negative calibrated offset")
+
+    # A later tick reclaims the refresh-marked block (free is high -> GC does not preempt;
+    # refresh is the highest due gate). Budget: exactly one reclaim-class action.
+    val a_rc0: i64 = ra.rel_reclaims()
+    val a_step: i64 = ra.rel_tick(GC_LOW_WATERMARK)
+    val a_rc1: i64 = ra.rel_reclaims()
+    print "  PROBE a tick step={a_step} reclaims_delta={a_rc1 - a_rc0} marked_after={ra.refresh_marked(0)} cal_after={ra.calibrated_offset(0)}"
+    fail = fail + expect_eq(a_step, rel_step_refresh(), "a: the tick selected the refresh reclaim step")
+    fail = fail + expect_eq(a_rc1 - a_rc0, 1, "a: exactly one reclaim-class action fired")
+    # Data still correct after the refresh rewrite (relocated to a fresh, un-drifted block).
+    fail = fail + expect_eq(ra.read(0), 0x00, "a: data still reads back 0x00 after the refresh reclaim")
+    # Erase-reset discipline cleared the recycled block's reliability state.
+    fail = fail + expect_eq(ra.refresh_marked(0), 0, "a: refresh mark cleared on the reclaimed block")
+    fail = fail + expect_eq(ra.calibrated_offset(0), 0, "a: ROR calibration decayed on erase")
+
+    # ═══ (b) budget invariant — one reclaim-class step per tick, fixed priority ═
+    # (b1) pure selector: with EVERY gate hot the priority order is exact and singular.
+    fail = fail + expect_eq(rel_tick_select(3, 4, 5, 99, 50, 9, 2), rel_step_gc(),      "b1: free < wm -> GC wins over all")
+    fail = fail + expect_eq(rel_tick_select(9, 4, 5, 99, 50, 9, 2), rel_step_refresh(), "b1: free ok -> refresh before scrub/wl")
+    fail = fail + expect_eq(rel_tick_select(9, 4, 0, 99, 50, 9, 2), rel_step_scrub(),   "b1: no refresh -> scrub before wl")
+    fail = fail + expect_eq(rel_tick_select(9, 4, 0, 10, 50, 9, 2), rel_step_wl(),      "b1: only spread hot -> wl")
+    fail = fail + expect_eq(rel_tick_select(9, 4, 0, 10, 50, 1, 2), rel_step_none(),    "b1: all gates cold -> none")
+
+    # (b2) live Ftl with scrub AND wl gates hot simultaneously -> exactly one action.
+    var bg: Ftl = ftl_new()
+    var i: i64 = 0
+    while i < PAGES_PER_BLOCK:
+        bg.write(i, 0x40 + (i % 200))
+        i = i + 1
+    bg.write(PAGES_PER_BLOCK, 0x99)             # lba 64 opens block 1 -> block 0 CLOSED (64 valid)
+    i = 0
+    while i < 55:                                # hammer block 0 past the disturb threshold
+        bg.read(0)
+        i = i + 1
+    i = 0
+    while i < 8:                                 # raise erase spread + dwell elsewhere
+        bg.fil.erase(40)
+        i = i + 1
+    print "  PROBE b2 worst_disturb={bg.worst_read_disturb()} wl_spread={bg.wl_spread()} free={bg.free_blocks()}"
+    fail = fail + expect_eq(bool_to_int(bg.worst_read_disturb() > READ_DISTURB_THRESHOLD), 1, "b2 setup: scrub gate hot")
+    fail = fail + expect_eq(bool_to_int(bg.wl_spread() > WL_THRESHOLD), 1, "b2 setup: wl gate hot")
+    val b_rc0: i64 = bg.rel_reclaims()
+    val b_step: i64 = bg.rel_tick(GC_LOW_WATERMARK)
+    val b_rc1: i64 = bg.rel_reclaims()
+    print "  PROBE b2 step={b_step} reclaims_delta={b_rc1 - b_rc0}"
+    fail = fail + expect_eq(b_step, rel_step_scrub(), "b2: with scrub AND wl hot, the one step is scrub (priority)")
+    fail = fail + expect_eq(b_rc1 - b_rc0, 1, "b2: exactly one reclaim-class action per tick")
+
+    # ═══ (c) read-disturb scrub fires via tick; counter resets; data intact ═════
+    var rc: Ftl = ftl_new()
+    fail = fail + expect_eq(rc.write(0, 0xAB), SC_SUCCESS, "c: seed lba0 with a known byte")
+    i = 1
+    while i < PAGES_PER_BLOCK:
+        rc.write(i, 0x10 + (i % 200))
+        i = i + 1
+    rc.write(PAGES_PER_BLOCK, 0x99)             # close block 0 (holds lba0..63 live)
+    i = 0
+    while i < 55:                                # hammer lba0 (block 0) past threshold
+        fail = fail + expect_eq(rc.read(0), 0xAB, "c: hammered read returns the known byte")
+        i = i + 1
+    print "  PROBE c disturb_before={rc.read_disturb_count(0)}"
+    fail = fail + expect_eq(bool_to_int(rc.read_disturb_count(0) > READ_DISTURB_THRESHOLD), 1, "c: block 0 read-disturb exceeds threshold")
+    val c_rc0: i64 = rc.rel_reclaims()
+    val c_step: i64 = rc.rel_tick(GC_LOW_WATERMARK)
+    val c_rc1: i64 = rc.rel_reclaims()
+    print "  PROBE c step={c_step} reclaims_delta={c_rc1 - c_rc0} disturb_after={rc.read_disturb_count(0)}"
+    fail = fail + expect_eq(c_step, rel_step_scrub(), "c: tick selects the read-disturb scrub step")
+    fail = fail + expect_eq(c_rc1 - c_rc0, 1, "c: scrub reclaimed exactly one block")
+    fail = fail + expect_eq(rc.read_disturb_count(0), 0, "c: reclaimed block's read-disturb counter reset to 0")
+    fail = fail + expect_eq(rc.read(0), 0xAB, "c: data intact after the disturb scrub")
+
+    # ═══ (d) wear leveling fires via tick (dwell satisfied) + SREA deferral ═════
+    var wl: Ftl = ftl_new()
+    i = 0
+    while i < PAGES_PER_BLOCK:
+        wl.write(i, 0x50 + (i % 200))
+        i = i + 1
+    wl.write(PAGES_PER_BLOCK, 0x99)             # close block 0 (cold: erase 0, live)
+    i = 0
+    while i < 8:                                 # total_erases 8, max_erase 8 -> spread 8, dwell 8
+        wl.fil.erase(40)
+        i = i + 1
+    print "  PROBE d wl_spread={wl.wl_spread()} worst_disturb={wl.worst_read_disturb()}"
+    fail = fail + expect_eq(bool_to_int(wl.wl_spread() > WL_THRESHOLD), 1, "d setup: erase spread exceeds WL_THRESHOLD")
+    val d_rc0: i64 = wl.rel_reclaims()
+    val d_step: i64 = wl.rel_tick(GC_LOW_WATERMARK)
+    val d_rc1: i64 = wl.rel_reclaims()
+    print "  PROBE d step={d_step} reclaims_delta={d_rc1 - d_rc0}"
+    fail = fail + expect_eq(d_step, rel_step_wl(), "d: tick selects the wear-level step")
+    fail = fail + expect_eq(d_rc1 - d_rc0, 1, "d: wear_level_once actually fired (one reclaim, dwell satisfied)")
+
+    # SREA deferral: same spread but the cold block has not dwelled (< REL_WL_DWELL_MIN).
+    var wd: Ftl = ftl_new()
+    i = 0
+    while i < PAGES_PER_BLOCK:
+        wd.write(i, 0x60 + (i % 200))
+        i = i + 1
+    wd.write(PAGES_PER_BLOCK, 0x99)
+    i = 0
+    while i < 3:                                 # total_erases 3 -> spread 3 (>2) but dwell 3 (<8)
+        wd.fil.erase(40)
+        i = i + 1
+    print "  PROBE d-defer wl_spread={wd.wl_spread()}"
+    fail = fail + expect_eq(bool_to_int(wd.wl_spread() > WL_THRESHOLD), 1, "d-defer setup: spread still hot")
+    val dd_rc0: i64 = wd.rel_reclaims()
+    val dd_step: i64 = wd.rel_tick(GC_LOW_WATERMARK)
+    val dd_rc1: i64 = wd.rel_reclaims()
+    print "  PROBE d-defer step={dd_step} reclaims_delta={dd_rc1 - dd_rc0}"
+    fail = fail + expect_eq(dd_step, rel_step_wl(), "d-defer: tick still selects wl by spread")
+    fail = fail + expect_eq(dd_rc1 - dd_rc0, 0, "d-defer: SREA dwell deferral -> no reclaim (dwell < 8)")
+
+    # ═══ (e) event-driven spare substitution from the retire path ══════════════
+    var re: Ftl = ftl_new()
+    i = 0
+    while i < PAGES_PER_BLOCK:
+        re.write(i, 0x70 + (i % 200))
+        i = i + 1
+    re.write(PAGES_PER_BLOCK, 0x99)             # close block 0
+    i = 0
+    while i < PAGES_PER_BLOCK:                   # overwrite lba0..63 -> block 0 fully stale
+        re.write(i, 0x80 + (i % 200))
+        i = i + 1
+    fail = fail + expect_eq(re.block_valid_count(0), 0, "e: block 0 fully stale (0 live pages) before retire")
+    val e_spares0: i64 = re.rel_spares_allocated()
+    re.fil.inject_erase_fail(0)                  # the block's erase will fail -> retire
+    val e_reclaim: i64 = re.reclaim_block(0)     # 0 live pages -> straight to erase -> fails -> retire
+    val e_spares1: i64 = re.rel_spares_allocated()
+    print "  PROBE e reclaim={e_reclaim} spares_delta={e_spares1 - e_spares0} last_spare={re.rel_last_spare_block()} blk0_state={re.band.block_state(0)}"
+    fail = fail + expect_eq(e_reclaim, UNMAP, "e: erase-fail reclaim aborts (returns UNMAP)")
+    fail = fail + expect_eq(e_spares1 - e_spares0, 1, "e: retire drew exactly one over-provision spare")
+    fail = fail + expect_eq(bool_to_int(re.rel_last_spare_block() >= 56), 1, "e: the substituted spare is from the OP region (>= 56)")
+    fail = fail + expect_eq(bool_to_int(re.rel_last_spare_block() < NUM_BLOCKS), 1, "e: the substituted spare is a valid block (< NUM_BLOCKS)")
+    fail = fail + expect_eq(re.band.block_state(0), BLK_BAD, "e: the retired block is out of rotation (BLK_BAD)")
+    fail = fail + expect_eq(bool_to_int(re.fil.block_bad(0)), 1, "e: the retired block is marked bad in the bad-block table")
+
+    if fail == 0:
+        print "REL WIRING OK"
+    else:
+        print "REL WIRING FAIL ({fail})"

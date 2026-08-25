@@ -1,0 +1,442 @@
+#!/usr/bin/env simple
+# HTTP Client/Server Demo
+#
+# Demonstrates HTTP client for REST APIs, HTTP server,
+# and WebSocket connections for real-time communication.
+
+use app.io.http_ffi.{
+    HttpMethod, HttpStatus,
+    http_get, http_post, http_put, http_delete,
+    http_request, http_download, http_upload,
+    http_client_new, http_client_set_timeout, http_client_set_header, http_client_destroy,
+    http_server_new, http_server_route, http_server_static, http_server_destroy,
+    ws_connect, ws_send, ws_receive, ws_close,
+    url_encode, url_decode,
+    http_get_json, http_post_json,
+    http_is_success
+}
+use app.io.{print}
+
+fn main():
+    print "=== HTTP Client/Server Demo ==="
+    print ""
+
+    demo_http_client()
+    print ""
+    demo_rest_api()
+    print ""
+    demo_file_operations()
+    print ""
+    demo_http_client_config()
+    print ""
+    demo_http_server()
+    print ""
+    demo_websocket()
+    print ""
+    demo_url_encoding()
+    print ""
+    demo_use_cases()
+    print ""
+
+    print "=== Demo Complete ==="
+
+fn demo_http_client():
+    """
+    Demonstrates basic HTTP client operations.
+    """
+    print "--- HTTP Client (Basic) ---"
+
+    # Simple GET request
+    val response = http_get("https://httpbin.org/get")
+
+    if response.is_ok:
+        print "✓ GET request successful"
+        print "  Status: {response.status_code}"
+        print "  Body length: {response.body.len()} bytes"
+    else:
+        print "ℹ  No HTTP runtime available"
+        print "   In a real app, you would:"
+        print "   1. Make request: http_get(url)"
+        print "   2. Check status: response.is_ok"
+        print "   3. Process body: response.body"
+        return
+
+    # POST request with JSON
+    val json_data = '{"name": "Alice", "age": 30}'
+    val post_response = http_post("https://httpbin.org/post", json_data)
+
+    if post_response.is_ok:
+        print "✓ POST request successful"
+
+    # Other HTTP methods
+    print ""
+    print "Supported methods:"
+    print "  ✓ GET - Retrieve data"
+    print "  ✓ POST - Create resource"
+    print "  ✓ PUT - Update resource"
+    print "  ✓ DELETE - Remove resource"
+    print "  ✓ PATCH - Partial update"
+    print "  ✓ HEAD - Get headers only"
+
+fn demo_rest_api():
+    """
+    Demonstrates RESTful API interactions.
+    """
+    print "--- REST API Example ---"
+
+    val base_url = "https://jsonplaceholder.typicode.com"
+
+    # List resources
+    print "1. GET /users (list users)"
+    val users = http_get("{base_url}/users")
+    if users.is_ok:
+        print "   ✓ Retrieved users"
+
+    # Get single resource
+    print "2. GET /users/1 (get user)"
+    val user = http_get("{base_url}/users/1")
+    if user.is_ok:
+        print "   ✓ Retrieved user 1"
+
+    # Create resource
+    print "3. POST /users (create user)"
+    val new_user = '{"name": "Alice", "email": "alice@example.com"}'
+    val created = http_post("{base_url}/users", new_user)
+    if created.is_ok:
+        print "   ✓ Created user"
+
+    # Update resource
+    print "4. PUT /users/1 (update user)"
+    val updated_user = '{"name": "Alice Updated", "email": "alice@example.com"}'
+    val updated = http_put("{base_url}/users/1", updated_user)
+    if updated.is_ok:
+        print "   ✓ Updated user"
+
+    # Delete resource
+    print "5. DELETE /users/1 (delete user)"
+    val deleted = http_delete("{base_url}/users/1")
+    if deleted.is_ok:
+        print "   ✓ Deleted user"
+
+    print ""
+    print "REST pattern: CRUD operations via HTTP verbs"
+
+fn demo_file_operations():
+    """
+    Demonstrates file download and upload.
+    """
+    print "--- File Operations ---"
+
+    # Download file
+    print "Download:"
+    val download_url = "https://httpbin.org/image/png"
+    val download_response = http_download(download_url, "/tmp/image.png")
+
+    if download_response.is_ok:
+        print "  ✓ Downloaded {download_response.body} bytes"
+    else:
+        print "  ℹ  No runtime - would download file to /tmp/image.png"
+
+    # Upload file
+    print "Upload:"
+    val upload_response = http_upload("https://httpbin.org/post", "/tmp/image.png", "file")
+
+    if upload_response.is_ok:
+        print "  ✓ Uploaded file"
+    else:
+        print "  ℹ  No runtime - would upload file as multipart/form-data"
+
+fn demo_http_client_config():
+    """
+    Demonstrates configured HTTP client.
+    """
+    print "--- HTTP Client (Configured) ---"
+
+    # Create client with custom settings
+    val client = http_client_new()
+
+    if not client.is_valid:
+        print "ℹ  No HTTP runtime available"
+        print ""
+        print "Configuration options:"
+        print "  - Timeout: http_client_set_timeout(client, 5000)"
+        print "  - Headers: http_client_set_header(client, 'User-Agent', 'MyApp/1.0')"
+        print "  - Auth: http_client_set_header(client, 'Authorization', 'Bearer token')"
+        http_client_destroy(client)
+        return
+
+    # Set timeout
+    http_client_set_timeout(client, 5000)  # 5 seconds
+    print "✓ Timeout set to 5 seconds"
+
+    # Set default headers
+    http_client_set_header(client, "User-Agent", "Simple-Demo/1.0")
+    http_client_set_header(client, "Accept", "application/json")
+    print "✓ Default headers set"
+
+    # Make request with client
+    val headers = ["Authorization: Bearer secret_token"]
+    val response = http_client_request(client, HttpMethod.GET, "https://api.example.com/data", headers, "")
+
+    if response.is_ok:
+        print "✓ Request with auth successful"
+
+    # Cleanup
+    http_client_destroy(client)
+
+fn demo_http_server():
+    """
+    Demonstrates HTTP server creation.
+    """
+    print "--- HTTP Server ---"
+
+    val server = http_server_new(8080)
+
+    if not server.is_valid:
+        print "ℹ  No HTTP server runtime available"
+        print ""
+        print "Server usage:"
+        print "  1. Create: server = http_server_new(8080)"
+        print "  2. Route: http_server_route(server, 'GET', '/', 'handle_index')"
+        print "  3. Static: http_server_static(server, '/assets', './public')"
+        print "  4. Start: http_server_start(server)  # Blocking"
+        print ""
+        print "Example routes:"
+        print "  GET  /            -> handle_index()"
+        print "  GET  /api/users   -> handle_users()"
+        print "  POST /api/users   -> create_user()"
+        print "  GET  /assets/*    -> Serve from ./public/"
+        http_server_destroy(server)
+        return
+
+    # Register routes
+    http_server_route(server, "GET", "/", "handle_index")
+    http_server_route(server, "GET", "/api/users", "handle_users")
+    http_server_route(server, "POST", "/api/users", "create_user")
+
+    # Serve static files
+    http_server_static(server, "/assets", "./public")
+
+    print "✓ Server configured on port 8080"
+    print "  Routes:"
+    print "    GET  /"
+    print "    GET  /api/users"
+    print "    POST /api/users"
+    print "  Static: /assets -> ./public"
+
+    # Start server (would block)
+    # http_server_start(server)
+
+    http_server_destroy(server)
+
+fn demo_websocket():
+    """
+    Demonstrates WebSocket connections.
+    """
+    print "--- WebSocket ---"
+
+    val ws = ws_connect("wss://echo.websocket.org")
+
+    if not ws.is_valid:
+        print "ℹ  No WebSocket runtime available"
+        print ""
+        print "WebSocket usage:"
+        print "  1. Connect: ws = ws_connect('wss://server.com/ws')"
+        print "  2. Send: ws_send(ws, 'Hello')"
+        print "  3. Receive: msg = ws_receive(ws)"
+        print "  4. Close: ws_close(ws)"
+        print ""
+        print "Use cases:"
+        print "  - Real-time chat"
+        print "  - Live updates"
+        print "  - Game multiplayer"
+        print "  - Stock tickers"
+        ws_close(ws)
+        return
+
+    # Send message
+    ws_send(ws, "Hello, WebSocket!")
+    print "✓ Sent message"
+
+    # Receive echo
+    val response = ws_receive(ws)
+    print "✓ Received: {response}"
+
+    # Close connection
+    ws_close(ws)
+    print "✓ Connection closed"
+
+fn demo_url_encoding():
+    """
+    Demonstrates URL encoding/decoding.
+    """
+    print "--- URL Encoding ---"
+
+    val original = "hello world & special chars!"
+    val encoded = url_encode(original)
+    val decoded = url_decode(encoded)
+
+    if encoded == "":
+        print "ℹ  No runtime - would encode URL strings"
+        print ""
+        print "Examples:"
+        print "  'hello world' -> 'hello%20world'"
+        print "  'a&b=c' -> 'a%26b%3Dc'"
+    else:
+        print "Original: {original}"
+        print "Encoded:  {encoded}"
+        print "Decoded:  {decoded}"
+
+fn demo_use_cases():
+    """
+    Demonstrates real-world use cases.
+    """
+    print "--- Real-World Use Cases ---"
+
+    print "1. REST API Client"
+    print "   api_client = http_client_new()"
+    print "   http_client_set_header(api_client, 'API-Key', key)"
+    print "   response = http_client_request(api_client, GET, '/users', [], '')"
+    print ""
+
+    print "2. Microservice"
+    print "   server = http_server_new(3000)"
+    print "   http_server_route(server, 'POST', '/webhook', 'handle_webhook')"
+    print "   http_server_start(server)"
+    print ""
+
+    print "3. File Sync"
+    print "   files = dir_list('uploads/')"
+    print "   for file in files:"
+    print "       http_upload('https://storage.com/upload', file, 'data')"
+    print ""
+
+    print "4. API Gateway"
+    print "   request = get_client_request()"
+    print "   response = http_request(GET, backend_url, headers, '')"
+    print "   send_client_response(response.body)"
+    print ""
+
+    print "5. Real-Time Chat"
+    print "   ws = ws_connect('wss://chat.example.com')"
+    print "   while running:"
+    print "       msg = ws_receive(ws)"
+    print "       process_message(msg)"
+    print ""
+
+    print "6. Weather API"
+    print "   response = http_get('https://api.weather.com/forecast?city=NYC')"
+    print "   data = parse_json(response.body)"
+
+# Example: Complete REST API client
+fn rest_api_client_example():
+    """
+    Complete REST API client (not executed in demo).
+    """
+    val client = http_client_new()
+
+    # Configure
+    http_client_set_timeout(client, 10000)
+    http_client_set_header(client, "API-Key", "secret_key_123")
+    http_client_set_header(client, "Accept", "application/json")
+
+    # GET list
+    # val users = http_client_request(client, HttpMethod.GET, "https://api.example.com/users", [], "")
+    # if users.is_ok:
+    #     print users.body
+
+    # POST create
+    # val new_user = '{"name": "Alice", "email": "alice@example.com"}'
+    # val created = http_client_request(client, HttpMethod.POST, "https://api.example.com/users", [], new_user)
+    # if created.is_ok:
+    #     print "Created user ID: {created.body}"
+
+    # PUT update
+    # val updated_user = '{"name": "Alice Smith"}'
+    # val updated = http_client_request(client, HttpMethod.PUT, "https://api.example.com/users/1", [], updated_user)
+
+    # DELETE remove
+    # val deleted = http_client_request(client, HttpMethod.DELETE, "https://api.example.com/users/1", [], "")
+
+    http_client_destroy(client)
+
+# Example: HTTP server with handlers
+fn http_server_example():
+    """
+    Complete HTTP server (not executed in demo).
+    """
+    val server = http_server_new(8080)
+
+    # Register routes
+    http_server_route(server, "GET", "/", "handle_index")
+    http_server_route(server, "GET", "/api/users", "get_users")
+    http_server_route(server, "POST", "/api/users", "create_user")
+    http_server_route(server, "GET", "/api/users/:id", "get_user")
+    http_server_route(server, "PUT", "/api/users/:id", "update_user")
+    http_server_route(server, "DELETE", "/api/users/:id", "delete_user")
+
+    # Static files
+    http_server_static(server, "/static", "./public")
+    http_server_static(server, "/uploads", "./uploads")
+
+    print "Server listening on http://localhost:8080"
+
+    # Start server (blocking)
+    http_server_start(server)
+
+    http_server_destroy(server)
+
+# Handler functions would be:
+# fn handle_index(request, response):
+#     response.set_status(200)
+#     response.set_body("<h1>Hello World</h1>")
+#
+# fn get_users(request, response):
+#     users = database_get_all_users()
+#     json = users_to_json(users)
+#     response.set_header("Content-Type", "application/json")
+#     response.set_body(json)
+#
+# fn create_user(request, response):
+#     body = request.get_body()
+#     user = json_parse(body)
+#     id = database_create_user(user)
+#     response.set_status(201)
+#     response.set_body('{"id": {id}}')
+
+# Example: WebSocket chat client
+fn websocket_chat_example():
+    """
+    WebSocket chat client (not executed in demo).
+    """
+    val ws = ws_connect("wss://chat.example.com/ws")
+
+    if not ws.is_valid:
+        print "Failed to connect"
+        return
+
+    print "Connected to chat"
+
+    # Send join message
+    ws_send(ws, '{"type": "join", "username": "Alice"}')
+
+    # Receive messages
+    var running = true
+    while running:
+        val msg = ws_receive(ws)
+
+        if msg == "":
+            # Connection closed
+            running = false
+        else:
+            # Process message
+            # val data = json_parse(msg)
+            # if data.type == "message":
+            #     print "{data.username}: {data.text}"
+            # elif data.type == "user_joined":
+            #     print "{data.username} joined"
+            # elif data.type == "user_left":
+            #     print "{data.username} left"
+            pass
+
+    ws_close(ws)

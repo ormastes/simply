@@ -1,0 +1,63 @@
+"""
+nand_migration_capture_main — capture a real NAND FTL block migration through the FW.
+
+Writes a logical block, fills + closes its physical block as a mostly-stale GC victim
+that still holds the live copy of the logical block, runs one GC cycle, and proves the
+logical block was physically relocated to a different block while its data survived and
+the victim block was erased + reclaimed.
+"""
+
+use nvme_types.*
+use ftl.*
+
+fn main():
+    var ftl: Ftl = ftl_new()
+
+    # Land LBA 100 on a fresh physical page (block 0, page 0).
+    ftl.write(100, 0xAB)                                   # 0xAB == 171
+    val blk_before: i64 = ftl.physical_block(100)
+    val ppn_before: i64 = ftl.physical_ppn(100)         # bind before passing (call-boundary corruption)
+    val nand_before: i64 = ftl.nand_word(ppn_before)
+    print "MIGRATE-BEFORE lba=100 block={blk_before} nand={nand_before}"
+
+    # Fill the rest of block 0 with filler LBAs, keeping LBA 100 live at page 0.
+    var i: i64 = 1
+    while i < PAGES_PER_BLOCK:
+        ftl.write(200 + i, 200 + i)
+        i = i + 1
+
+    # Open a new active block -> block 0 becomes CLOSED.
+    ftl.write(900, 0x55)
+
+    # Overwrite every filler LBA (not LBA 100) so block 0 is mostly stale but still
+    # holds the single live copy of LBA 100 -> GC must migrate LBA 100.
+    i = 1
+    while i < PAGES_PER_BLOCK:
+        ftl.write(200 + i, 111)
+        i = i + 1
+
+    val victim: i64 = ftl.gc_once()
+    val blk_after: i64 = ftl.physical_block(100)
+    val ppn_after: i64 = ftl.physical_ppn(100)          # bind before passing (call-boundary corruption)
+    val nand_after: i64 = ftl.nand_word(ppn_after)
+    val erased: i64 = ftl.erase_count(victim)
+    val readback: i64 = ftl.read(100)
+    print "MIGRATE-AFTER lba=100 block={blk_after} nand={nand_after} victim={victim} erase_count={erased}"
+
+    var fails: i64 = 0
+    if victim == UNMAP:
+        fails = fails + 1
+    if blk_after == blk_before:
+        fails = fails + 1
+    if nand_after != nand_before:
+        fails = fails + 1
+    if erased != 1:
+        fails = fails + 1
+    if readback != nand_after:
+        fails = fails + 1
+
+    if fails == 0:
+        print "NAND FTL BLOCK MIGRATION CAPTURED (lba moved blocks; data preserved; victim erased)"
+        print "NAND MIGRATION CAPTURE PASS"
+    else:
+        print "NAND MIGRATION CAPTURE FAIL ({fails})"

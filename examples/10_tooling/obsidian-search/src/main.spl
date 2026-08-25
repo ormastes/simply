@@ -1,0 +1,13 @@
+# Obsidian Search MCP Server — Entry Point
+#
+# Starts the MCP server for Obsidian vault search.
+# Set OBSIDIAN_VAULT_PATH environment variable to your vault directory.
+#
+# Usage:
+#   OBSIDIAN_VAULT_PATH=/path/to/vault simple run src/main.spl
+
+use src.mcp.server.{start_server}
+
+fn main() -> i64:
+    start_server()
+    0

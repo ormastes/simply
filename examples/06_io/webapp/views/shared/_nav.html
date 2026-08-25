@@ -1,0 +1,18 @@
+<nav class="navbar">
+    <div class="container nav-container">
+        <a href="/" class="nav-brand">TodoApp</a>
+        <div class="nav-links">
+            {{#if logged_in}}
+                <span class="nav-user">Hello, {{username}}</span>
+                <a href="/todos" class="nav-link">My Todos</a>
+                <form method="POST" action="/logout" class="nav-form">
+                    <input type="hidden" name="csrf_token" value="{{csrf_token}}">
+                    <button type="submit" class="btn btn-link nav-link">Log Out</button>
+                </form>
+            {{else}}
+                <a href="/login" class="nav-link">Log In</a>
+                <a href="/register" class="nav-link btn btn-primary btn-sm">Sign Up</a>
+            {{/if}}
+        </div>
+    </div>
+</nav>

@@ -1,0 +1,99 @@
+# 61. Tokenization and Embeddings - Tests
+#
+# CPU-reference checks for the embedding gather and the sinusoidal
+# positional encoding. No assertion depends on kernel output: a `<<<>>>`
+# launch is a no-op on the Rust seed, so a GPU-output assert would only
+# ever be true by accident.
+
+use std.gpu.*
+
+fn make_embedding_table(vocab_size: i64, embed_dim: i64) -> [f32]:
+    var table: [f32] = []
+    for i in 0..(vocab_size * embed_dim):
+        val v = ((i % 100) as f64) * 0.01 - 0.5
+        table.push(v as f32)
+    table
+
+fn embedding_lookup_cpu(token_ids: [i64], table: [f32], embed_dim: i64) -> [f32]:
+    var out: [f32] = []
+    for t in 0..token_ids.len():
+        val base = token_ids[t] * embed_dim
+        for d in 0..embed_dim:
+            out.push(table[base + d])
+    out
+
+fn positional_encoding(max_len: i64, embed_dim: i64) -> [f32]:
+    var pe: [f32] = []
+    for pos in 0..max_len:
+        for d in 0..embed_dim:
+            val pair = (d / 2) as f64
+            val denom = (10000.0).pow(2.0 * pair / (embed_dim as f64))
+            val angle = (pos as f64) / denom
+            if d % 2 == 0:
+                pe.push(angle.sin() as f32)
+            else:
+                pe.push(angle.cos() as f32)
+    pe
+
+fn close(a: f32, b: f32) -> bool:
+    val d = a - b
+    val ad = if d < 0.0: 0.0 - d else: d
+    ad < 0.0001
+
+describe "Tokenization and embeddings":
+
+    describe "embedding table":
+
+        it "has vocab_size * embed_dim entries":
+            val table = make_embedding_table(1000, 64)
+            expect(table.len()).to_equal(64000)
+
+        it "rows differ for different tokens":
+            val table = make_embedding_table(100, 8)
+            val r0 = embedding_lookup_cpu([0], table, 8)
+            val r1 = embedding_lookup_cpu([1], table, 8)
+            var differs = false
+            for i in 0..8:
+                if r0[i] != r1[i]:
+                    differs = true
+            expect(differs).to_equal(true)
+
+    describe "embedding lookup":
+
+        it "gathers a single row":
+            val table = make_embedding_table(100, 8)
+            val out = embedding_lookup_cpu([3], table, 8)
+            expect(out.len()).to_equal(8)
+            expect(close(out[0], table[24])).to_equal(true)
+
+        it "gathers a batch of rows in order":
+            val table = make_embedding_table(100, 8)
+            val out = embedding_lookup_cpu([1, 5, 10, 20], table, 8)
+            expect(out.len()).to_equal(32)
+            expect(close(out[8], table[40])).to_equal(true)
+            expect(close(out[31], table[167])).to_equal(true)
+
+    describe "positional encoding":
+
+        it "has max_len * embed_dim entries":
+            expect(positional_encoding(4, 8).len()).to_equal(32)
+
+        it "position 0 is [0, 1, 0, 1, ...]":
+            val pe = positional_encoding(4, 8)
+            expect(close(pe[0], 0.0)).to_equal(true)
+            expect(close(pe[1], 1.0)).to_equal(true)
+            expect(close(pe[6], 0.0)).to_equal(true)
+            expect(close(pe[7], 1.0)).to_equal(true)
+
+        it "position 1 dim 0 is sin(1)":
+            val pe = positional_encoding(4, 8)
+            expect(close(pe[8], (1.0).sin() as f32)).to_equal(true)
+
+    describe "launch geometry":
+
+        it "covers every token with 256-thread blocks":
+            val seq_len = 1000
+            val block = 256
+            val grid = (seq_len + block - 1) / block
+            expect(grid).to_equal(4)
+            expect(grid * block >= seq_len).to_equal(true)

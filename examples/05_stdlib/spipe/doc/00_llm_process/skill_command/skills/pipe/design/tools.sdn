@@ -1,0 +1,8 @@
+# llm-process-gen: managed source=pipe_design_tools source_sha256=597e07db61bbeaac71c0da6fbf123a1cc0baddd381bf528258cf3c2c573a9b75 content_sha256=69c7e11fb86f5a7c979d90596d1ab5d2f160e8b1e5897f99fa74997f279b524f
+skill_tools |skill, stage|
+    design, design
+
+tools |id, type, name, purpose|
+    simple_mcp, mcp, "Simple MCP", "Inspect modules, dependencies, and existing tests"
+    simple_lsp_mcp, mcp, "Simple LSP MCP", "Inspect type signatures, references, and call sites"
+    spipe, cli, "bin/simple test", "Validate designed SPipe scenarios when applicable"

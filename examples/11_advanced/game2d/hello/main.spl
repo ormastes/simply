@@ -1,0 +1,25 @@
+# Hello game2d — moving sprite, std.game2d only (AC-1 demo, <=25 lines).
+# Structural App: any class with load/update/fixed_update/draw matches g.App.
+# Scalar dx/dy because `if cond: lhs.member = expr` is a parser gap (see
+# doc/08_tracking/bug/parser_member_target_in_single_line_if.md).
+use std.game2d as g
+
+class Game:
+    pos: g.Vec2
+    fn load(self): pass_do_nothing
+    me update(self, dt: f32):
+        var dx: f32 = 0.0
+        var dy: f32 = 0.0
+        if g.input.key_down(g.Key.left):  dx -= 1.0
+        if g.input.key_down(g.Key.right): dx += 1.0
+        if g.input.key_down(g.Key.up):    dy -= 1.0
+        if g.input.key_down(g.Key.down):  dy += 1.0
+        self.pos = g.Vec2(x: self.pos.x + dx * 120.0 * dt,
+                          y: self.pos.y + dy * 120.0 * dt)
+    fn fixed_update(self, step: f32):
+        val _ = step
+    fn draw(self, ctx: g.Canvas):
+        val _ = ctx
+
+fn main():
+    g.run(Game(pos: g.Vec2(x: 100.0, y: 100.0)), "Hello", 800, 600)

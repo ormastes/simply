@@ -1,0 +1,58 @@
+use std.gpu.*
+
+describe "GPU BLAS operations":
+    it "should compute matrix multiply (GEMM)":
+        # 2x3 * 3x2 = 2x2
+        val a = [1.0, 2.0, 3.0,
+                 4.0, 5.0, 6.0]
+        val b = [7.0,  8.0,
+                 9.0,  10.0,
+                 11.0, 12.0]
+        val c = gpu_gemm(a, b, 2, 2, 3)?
+        # Row 0: 1*7+2*9+3*11=58, 1*8+2*10+3*12=64
+        # Row 1: 4*7+5*9+6*11=139, 4*8+5*10+6*12=154
+        expect(c[0]).to_equal(58.0)
+        expect(c[1]).to_equal(64.0)
+        expect(c[2]).to_equal(139.0)
+        expect(c[3]).to_equal(154.0)
+
+    it "should compute identity matrix multiply":
+        val a = [1.0, 0.0,
+                 0.0, 1.0]
+        val b = [5.0, 6.0,
+                 7.0, 8.0]
+        val c = gpu_gemm(a, b, 2, 2, 2)?
+        expect(c[0]).to_equal(5.0)
+        expect(c[1]).to_equal(6.0)
+        expect(c[2]).to_equal(7.0)
+        expect(c[3]).to_equal(8.0)
+
+    it "should compute dot product":
+        val x = [1.0, 2.0, 3.0, 4.0]
+        val y = [5.0, 6.0, 7.0, 8.0]
+        val result = gpu_dot(x, y)?
+        # 1*5 + 2*6 + 3*7 + 4*8 = 5+12+21+32 = 70
+        expect(result).to_equal(70.0)
+
+    it "should compute dot product of orthogonal vectors":
+        val x = [1.0, 0.0, 0.0]
+        val y = [0.0, 1.0, 0.0]
+        val result = gpu_dot(x, y)?
+        expect(result).to_equal(0.0)
+
+    it "should compute AXPY (y = alpha*x + y)":
+        val x = [1.0, 2.0, 3.0]
+        val y = [10.0, 20.0, 30.0]
+        val result = gpu_axpy(2.0, x, y)?
+        # 2*1+10=12, 2*2+20=24, 2*3+30=36
+        expect(result[0]).to_equal(12.0)
+        expect(result[1]).to_equal(24.0)
+        expect(result[2]).to_equal(36.0)
+
+    it "should handle AXPY with zero alpha":
+        val x = [1.0, 2.0, 3.0]
+        val y = [10.0, 20.0, 30.0]
+        val result = gpu_axpy(0.0, x, y)?
+        expect(result[0]).to_equal(10.0)
+        expect(result[1]).to_equal(20.0)
+        expect(result[2]).to_equal(30.0)

@@ -1,0 +1,114 @@
+"""
+nvme_admin_types — admin command set constants + plain data for the NVMe
+controller front end. Types only (no `impl`/`me`), so it stays cheap to
+type-check and safe to import everywhere, exactly like nvme_types.
+
+Admin commands ride a dedicated admin queue (qid 0). They carry command dwords
+(CDW10..) the way real NVMe does; the bit layouts are decoded by helpers in
+nvme_admin.spl.
+"""
+
+use nvme_types.*
+
+# ── Admin opcodes (NVMe base spec, Figure: Admin Command Set) ──────────────────
+val ADMIN_DELETE_SQ:   i64 = 0x00
+val ADMIN_CREATE_SQ:   i64 = 0x01
+val ADMIN_GET_LOG:     i64 = 0x02
+val ADMIN_DELETE_CQ:   i64 = 0x04
+val ADMIN_CREATE_CQ:   i64 = 0x05
+val ADMIN_IDENTIFY:    i64 = 0x06
+val ADMIN_ABORT:       i64 = 0x08
+val ADMIN_SET_FEATURES: i64 = 0x09
+val ADMIN_GET_FEATURES: i64 = 0x0A
+val ADMIN_ASYNC_EVENT: i64 = 0x0C
+val ADMIN_FW_COMMIT:   i64 = 0x10
+val ADMIN_FW_DOWNLOAD: i64 = 0x11
+val ADMIN_FORMAT_NVM:  i64 = 0x80
+
+# ── Async Event Request event types (completion dword0, low byte) ──────────────
+val AER_SMART_HEALTH:  i64 = 0x01   # SMART / health status (e.g. spare below threshold)
+
+# ── Identify CNS (Controller or Namespace Structure) ──────────────────────────
+val CNS_NAMESPACE:  i64 = 0x00
+val CNS_CONTROLLER: i64 = 0x01
+
+# ── Feature identifiers ───────────────────────────────────────────────────────
+val FEAT_ARBITRATION:   i64 = 0x01
+val FEAT_POWER_MGMT:    i64 = 0x02
+val FEAT_TEMP_THRESH:   i64 = 0x04
+val FEAT_ERROR_RECOVERY: i64 = 0x05
+val FEAT_VOLATILE_WC:   i64 = 0x06   # volatile write cache enable
+val FEAT_NUM_QUEUES:    i64 = 0x07
+val FEAT_MAX:           i64 = 16     # feature store array size (covers ids 0..15)
+
+# ── Log page identifiers ──────────────────────────────────────────────────────
+val LOG_ERROR:   i64 = 0x01
+val LOG_SMART:   i64 = 0x02
+val LOG_FW_SLOT: i64 = 0x03
+
+# ── Admin completion status codes (status field, cmd-specific) ────────────────
+# SC_INVALID_OPCODE / SC_INVALID_FIELD are generic and defined in nvme_types.
+val SC_CQ_INVALID:     i64 = 0x100   # Create IO SQ references a non-existent CQ
+val SC_INVALID_QID:    i64 = 0x101   # qid out of range / already in use / not present
+val SC_INVALID_QSIZE:  i64 = 0x102   # requested queue size exceeds device max
+val SC_QUEUE_BUSY:     i64 = 0x103   # Delete SQ/CQ while bound work or completions remain
+
+# ── Endurance / health model (sim-scaled) ─────────────────────────────────────
+val RATED_PE_CYCLES: i64 = 100  # rated program/erase cycles per block (sim-scaled small
+                                # so wear is observable; real TLC NAND is ~3000)
+val SPARE_BLOCKS:    i64 = 8     # over-provisioning spare pool (blocks 56..63)
+
+# ── Queue topology limits ─────────────────────────────────────────────────────
+val ADMIN_QID:      i64 = 0     # qid 0 is reserved for the admin queue
+val MAX_IO_QUEUES:  i64 = 8     # IO queues use qid 1..MAX_IO_QUEUES
+val MAX_QUEUE_SIZE: i64 = 64    # per-queue ring depth (matches hil_queue depth)
+val MDTS_BLOCKS:    i64 = 8     # maximum data transfer size advertised by Identify Controller
+
+# ── A decoded admin command (carries command dwords like real NVMe) ───────────
+struct AdminCmd:
+    cid:    i64
+    opcode: i64
+    nsid:   i64
+    cdw10:  i64
+    cdw11:  i64
+    cdw12:  i64
+
+fn admin_cmd_make(cid: i64, opcode: i64, nsid: i64, cdw10: i64, cdw11: i64, cdw12: i64) -> AdminCmd:
+    AdminCmd(cid: cid, opcode: opcode, nsid: nsid, cdw10: cdw10, cdw11: cdw11, cdw12: cdw12)
+
+# ── Identify Controller / Namespace result (handler fills, host reads) ────────
+# Real NVMe DMAs a 4 KiB structure to a host buffer; here the controller stashes
+# this struct and the host reads the fields it cares about.
+struct IdentifyData:
+    kind:        i64   # CNS_CONTROLLER or CNS_NAMESPACE
+    vid:         i64   # PCI vendor id (controller)
+    num_ns:      i64   # number of namespaces (controller)
+    max_queues:  i64   # max IO queue pairs the controller supports (controller)
+    mdts:        i64   # max data transfer size, in blocks (controller)
+    target_id:   i64   # selected firmware target profile (controller)
+    channels:    i64   # NAND channels exposed by the selected target (controller)
+    ways_per_channel: i64 # NAND ways per channel for the selected target (controller)
+    nvme_blocks_per_slice: i64 # OpenSSD slice / NVMe-block ratio (controller)
+    cpu_cores:   i64   # controller CPU cores in the selected target (controller)
+    nsid:        i64   # namespace id (namespace)
+    ns_size:     i64   # namespace size in logical blocks (namespace)
+    ns_cap:      i64   # namespace capacity in logical blocks (namespace)
+    lba_bytes:   i64   # logical block size in bytes (namespace)
+
+fn identify_empty() -> IdentifyData:
+    IdentifyData(kind: NULL_IDX, vid: 0, num_ns: 0, max_queues: 0, mdts: 0, target_id: 0, channels: 0, ways_per_channel: 0, nvme_blocks_per_slice: 0, cpu_cores: 0, nsid: 0, ns_size: 0, ns_cap: 0, lba_bytes: 0)
+
+# ── SMART / health log page (subset of the real 512-byte structure) ───────────
+struct SmartLog:
+    crit_warning:   i64
+    temperature:    i64   # kelvin
+    avail_spare:    i64   # percent
+    percent_used:   i64   # endurance used, percent
+    data_units_read: i64
+    data_units_written: i64
+    power_cycles:   i64
+    unsafe_shutdowns: i64
+    media_errors:   i64
+
+fn smart_empty() -> SmartLog:
+    SmartLog(crit_warning: 0, temperature: 300, avail_spare: 100, percent_used: 0, data_units_read: 0, data_units_written: 0, power_cycles: 0, unsafe_shutdowns: 0, media_errors: 0)

@@ -1,0 +1,42 @@
+pub fn _rv32_map_lba_valid(lba: i64) -> i32:
+    if lba < 0:
+        return 0
+    if lba >= 3072:  # LBA_COUNT (fw/nvme_types.spl) — matches logic_hil_core / logic_io_command_core
+        return 0
+    1
+
+pub fn _rv32_map_ppn_valid(ppn: i64) -> i32:
+    if ppn == -1:
+        return 1
+    if ppn < 0:
+        return 0
+    if ppn >= 4096:
+        return 0
+    1
+
+pub fn _rv32_map_sanitize_ppn(ppn: i64) -> i64:
+    if _rv32_map_ppn_valid(ppn) == 1:
+        return ppn
+    -1
+
+pub fn _rv32_map_counter(count: i64) -> i64:
+    if count < 0:
+        return 0
+    count
+
+pub fn _rv32_map_dirty_after_update(lba: i64, ppn: i64) -> i32:
+    if _rv32_map_lba_valid(lba) == 0:
+        return 0
+    if _rv32_map_ppn_valid(ppn) == 0:
+        return 0
+    1
+
+pub fn _rv32_map_l2p_after_flush(lba: i64, ppn: i64, dirty: i32) -> i64:
+    if dirty == 0:
+        return -1
+    if _rv32_map_lba_valid(lba) == 0:
+        return -1
+    _rv32_map_sanitize_ppn(ppn)
+
+pub fn _rv32_map_l2p_after_crash(backing_ppn: i64) -> i64:
+    _rv32_map_sanitize_ppn(backing_ppn)

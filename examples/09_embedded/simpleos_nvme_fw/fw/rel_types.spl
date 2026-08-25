@@ -1,0 +1,157 @@
+"""
+rel_types — shared reliability-engine leaf: the RelAction verdict, the narrow
+observation structs, the per-policy state structs, and the two mount bundles.
+
+Contract: doc/05_design/hardware/nand_recovery/recovery_algorithms_design.md §1
+(implements architecture doc reliability_engine_architecture.md §3). This module is
+a PURE-POLICY LEAF: it does `use nvme_types.*` + `use nd_types.*` ONLY — never
+fil/ftl — so both fil.spl and ftl.spl (and every rel_* policy module) may import it
+without a cycle (design §0 / architecture §0 LAW). No module holds a Fil/Ftl handle;
+policies are pure functions over these structs returning a RelAction verdict, and
+the mounting layer actuates.
+
+Module-boundary law (design §1, §9 L1; confirmed against the guide's routing rule):
+this L1 leaf owns exactly the STRUCT DECLARATIONS + the RelAction kind constants +
+the two constructors the design doc explicitly places in §1 (`rel_action`,
+`rel_read_obs`). It deliberately provides NO per-policy state-struct constructors:
+the design doc places `rel_ladder_state_new`/phase constants in §2 (rel_ladder.spl,
+L4) and defines the vref/refresh/disturb/wear/health mutators in §3-§7 (their own
+policy lanes L2-L7). Those lanes own their `*_new`/decision/mutator fns; a zero-init
+state struct is built with the plain struct-literal constructor
+(`RelVrefCache(offset: ..., valid: ..., gen: ...)`, language.md "Constructors:
+Point(x: 3, y: 4)"). Keeping constructors in their lanes means zero duplicate-symbol
+collision when L2-L7 land.
+
+Language landmines honored (design §0):
+- Rel prefix on every public type (interpreter global-registry collision guard,
+  mirrors nand_emu's Ne prefix and nd_types' Nd prefix).
+- RelAction is a tagged struct {kind:i64, arg:i64}, NOT an enum-with-payload: a
+  payload enum can tag-decay across the rel_ladder -> mount module boundary; the
+  tagged struct round-trips identically (architecture §3 detail-design gate, design
+  §9 L1). kind and arg stay raw i64 — arg is the flat boundary value (a block index
+  OR a signed Vref offset depending on kind) that feeds the FTL/FIL flat-i64 world.
+- Per-block state is a dense [i64] array of length NUM_BLOCKS (= 64), indexed by
+  physical block — no Dict (design §0 "No Dict.get-as-Option").
+- Return-the-object: policy lanes' mutators RETURN the updated struct (value types);
+  this leaf holds no mutators.
+
+Typed-dimensions law (guide "TYPED DIMENSIONS LAW"): a SCALAR field that is a NAND
+physical block/page coordinate uses the nd_types.spl value-type newtype rather than
+a raw i64. Here that is exactly `RelBlockObs.blk` and `RelLadderState.blk` -> NdBlock
+(field name kept from the design doc). RelAction.arg stays flat i64 (it is the
+round-trip boundary value, polymorphic in meaning). The dense per-block [i64] arrays
+stay [i64]: the block is the ARRAY INDEX (a flat i64), the stored VALUES are
+offsets/counts/seqs/flags/page-estimates, and the §5/§6 policy pseudocode assigns
+raw i64 into them (e.g. rel_disturb_observe's `out.hot_page[blk] = page`) — wrapping
+those arrays in a newtype would break that pseudocode for zero coordinate-safety
+gain. Consequence for L4 (rel_ladder.spl): because RelLadderState.blk is an NdBlock,
+L4 must convert at the flat boundary when it emits a verdict, i.e.
+`rel_action(rel_act_calibrate(), s.blk.idx)` — exactly the TYPED-DIMS "convert at the
+flat-ppn boundary with existing fw code" rule.
+"""
+
+use nvme_types.*
+use nd_types.*
+
+# ── 1.1  The verdict — RelAction tagged struct ────────────────────────────────
+# Exactly the seven RelAction variants named in architecture §3
+# (Accept / RetryAtOffset / CalibrateBlock / MarkForRefresh / ReclaimNow /
+# Quarantine / Uncorrectable), encoded as the fallback tagged struct the
+# architecture mandates.
+struct RelAction:
+    kind: i64      # one of the rel_act_* codes below
+    arg:  i64      # block index or signed Vref offset, per kind
+
+# kind codes — fn-returning constants (freestanding-safe; no module-level init)
+fn rel_act_accept() -> i64:
+    0              # Accept: data good / no action
+
+fn rel_act_retry() -> i64:
+    1              # RetryAtOffset: arg = signed Vref offset; FIL re-sense
+
+fn rel_act_calibrate() -> i64:
+    2              # CalibrateBlock: arg = blk; FIL persist winning offset (ROR)
+
+fn rel_act_refresh() -> i64:
+    3              # MarkForRefresh: arg = blk; FTL enqueue age/error rewrite (FCR/DEAR)
+
+fn rel_act_reclaim() -> i64:
+    4              # ReclaimNow: arg = blk; FTL reclaim_block (disturb/wear)
+
+fn rel_act_quarantine() -> i64:
+    5              # Quarantine: arg = blk; FTL retire + alloc_spare
+
+fn rel_act_uncorrectable() -> i64:
+    6              # Uncorrectable: arg = blk; ladder exhausted -> host NAND_ECC_FAIL
+
+fn rel_action(kind: i64, arg: i64) -> RelAction:
+    RelAction(kind: kind, arg: arg)
+
+# ── 1.2  Observation structs (narrow, pure inputs) ────────────────────────────
+struct RelReadObs:          # one sense result, fed to rel_ladder_step
+    code:      i64          # ECC_OK (0) | NAND_ECC_FAIL (nvme_types constant)
+    corrected: i64          # coarse 0 / 1 / 2 (2 = uncorrectable) — the ECC-signal constraint
+    offset:    i64          # signed Vref offset this sense used (vref = 128 + offset)
+    depth:     i64          # rung index of this observation
+
+struct RelBlockObs:         # per-block snapshot, caller-assembled, fed to FTL policies
+    blk:              NdBlock   # typed physical block coordinate (was i64 in design §1.2)
+    erase_count:      i64       # from Fil.erase_count
+    rd_disturb:       i64       # EXISTING ftl.spl rd_disturb counter (source of truth)
+    corrected_events: i64       # from RelHealth (count of reads with corrected>=1)
+    last_prog_seq:    i64       # RelRefreshState
+    cur_seq:          i64       # ftl next_seq (logical clock, §4 age proxy)
+
+fn rel_read_obs(code: i64, corrected: i64, offset: i64, depth: i64) -> RelReadObs:
+    RelReadObs(code: code, corrected: corrected, offset: offset, depth: depth)
+
+# ── 1.3  Per-policy state structs (dense [i64], length NUM_BLOCKS = 64) ────────
+# Constructors + mutators live in the policy lanes (rel_ladder/rel_vref/rel_refresh/
+# rel_disturb/rel_wear/rel_health); this leaf declares the shapes only.
+struct RelLadderState:      # one live instance per in-flight read (scalars)
+    blk:            NdBlock  # typed physical block under recovery (was i64 in design §2)
+    depth:          i64      # rungs consumed (0 = clean; observability retry-depth)
+    table_idx:      i64      # next rel_vref table entry to try
+    best_offset:    i64      # winning offset (for CalibrateBlock)
+    best_corrected: i64      # coarse corrected count at the winner
+    phase:          i64      # rel_phase_seed(0) -> table(1) -> done(2)/fail(3) [constants in L4]
+
+struct RelVrefCache:        # per-block calibrated Vref offset (ROR-lite, §3)
+    offset: [i64]           # calibrated Vref offset per block (0 = none)
+    valid:  [i64]           # 1 = calibrated, 0 = not/expired
+    gen:    [i64]           # erase generation at calibration (audit / optional gen-guard)
+
+struct RelRefreshState:     # FCR/DEAR-lite refresh bookkeeping (§4)
+    last_prog_seq: [i64]    # next_seq snapshot at the block's last (re)write
+    marked:        [i64]    # 1 = already queued for refresh (dedupe)
+
+struct RelDisturbState:     # STRAW-lite read-disturb hottest-page estimate (§5)
+    hot_page:  [i64]        # Boyer-Moore majority candidate page per block
+    hot_count: [i64]        # its running majority count
+
+struct RelWearState:        # SREA-lite dwell-aware static wear leveling (§6)
+    last_global_erase: [i64]  # total_erases snapshot when this block was last erased
+
+struct RelHealth:           # observability sink, durable at RelFtlMount.health (§7)
+    reads:            [i64]  # total reads per block
+    corrected_sum:    [i64]  # sum of coarse corrected counts (for scaled RBER ppm)
+    corrected_events: [i64]  # count of reads with corrected>=1 (FCR trigger source)
+    retry_depth_max:  [i64]  # deepest recovery-ladder rung observed
+    refresh_cause:    [i64]  # rel_cause_* tag of the last refresh (constants in L2)
+
+# ── 1.4  Mount bundles (pure state, composed by the layer — no handle) ────────
+# Health-sink discipline (design §1.4 / architecture §5): RelFtlMount.health is the
+# DURABLE sink; RelFilMount.health is a TRANSIENT in-loop copy for the read in
+# flight — the FIL copy never accumulates across reads. On read completion the
+# (corrected, retry_depth) ride up to ftl.read, which folds them into the durable
+# RelFtlMount.health via rel_health_note_read (L2).
+struct RelFilMount:         # device-near mount (recovery ladder + vref calibration)
+    vref:   RelVrefCache
+    health: RelHealth
+    ladder: RelLadderState
+
+struct RelFtlMount:         # map-owning mount (refresh + disturb + wear + durable health)
+    refresh: RelRefreshState
+    disturb: RelDisturbState
+    wear:    RelWearState
+    health:  RelHealth

@@ -1,0 +1,44 @@
+{
+  "schema": "spipe-wave4-provider-conformance-schema-v2",
+  "line_prefix": "SPIPE_WAVE4_CONFORMANCE=",
+  "additionalProperties": false,
+  "required": ["schema", "fixture_id", "implementation", "logical_root", "stats", "queries", "delta", "cells"],
+  "properties": {
+    "schema": { "const": "spipe-wave4-provider-conformance-v1" },
+    "fixture_id": { "const": "spipe-wave4-search-golden-v1" },
+    "implementation": { "enum": ["simple", "dbfs"] },
+    "logical_root": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "stats": { "type": "object" },
+    "queries": { "type": "array" },
+    "delta": {
+      "type": "object", "additionalProperties": false,
+      "required": ["added", "candidate_logical_root", "clean_logical_root", "deleted", "incremental_equals_clean", "no_op_logical_root", "replaced"],
+      "properties": {
+        "added": { "const": 1 },
+        "candidate_logical_root": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "clean_logical_root": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "deleted": { "const": 1 },
+        "incremental_equals_clean": { "const": true },
+        "no_op_logical_root": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "replaced": { "const": 1 }
+      }
+    },
+    "cells": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["matrix_id", "oracle"],
+        "properties": {
+          "matrix_id": { "type": "string", "pattern": "^W4-SRCH-[0-9]{2}$" },
+          "oracle": { "type": "string", "pattern": "^wave4_search_[0-9]{2}$" }
+        }
+      }
+    }
+  },
+  "oracle": "golden_results.json",
+  "delta_oracle": {
+    "base_logical_root": "sha256:8cd7ac31569e67b132a477ed1e5e66cc610a9119f0bf899b8fee26d5d27e90dd",
+    "candidate_logical_root": "sha256:c5600ad56bbfb4753ebd981d6f2b9c8afa7baf8dd2a3206e567eceaa604b3eb5",
+    "cross_provider_candidate_equal": true
+  }
+}

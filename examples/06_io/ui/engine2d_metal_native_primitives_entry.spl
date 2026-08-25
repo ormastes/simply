@@ -1,0 +1,61 @@
+use std.gpu.engine2d.backend_metal.{MetalBackend}
+use std.gpu.engine2d.backend_probe.{backend_status_text}
+
+val W: i32 = 64
+val H: i32 = 48
+val BG: u32 = 0xFF101820u32
+val RECT: u32 = 0xFFE53935u32
+val CIRCLE: u32 = 0xFF43A047u32
+val LINE: u32 = 0xFF33A1FDu32
+val GRAD_TOP: u32 = 0xFFFFB300u32
+val GRAD_BOT: u32 = 0xFF6A1B9Au32
+val ROUND: u32 = 0xFF00ACC1u32
+val TEXT: u32 = 0xFFFFFFFFu32
+
+fn px(pixels: [u32], x: i32, y: i32) -> u32:
+    pixels[y * W + x]
+
+fn main() -> i64:
+    print "=== Engine2D Metal native primitive smoke ==="
+    var backend = MetalBackend.create()
+    if not backend.init(W, H):
+        print "status: {backend_status_text(backend.last_probe.status)} - {backend.last_probe.reason}"
+        return 1
+    backend.clear(BG)
+    backend.draw_rect_filled(3, 3, 10, 8, RECT)
+    backend.draw_circle_filled(48, 8, 5, CIRCLE)
+    backend.draw_line(2, 18, 60, 18, LINE, 3)
+    backend.draw_gradient_rect(4, 24, 18, 12, GRAD_TOP, GRAD_BOT)
+    backend.draw_rounded_rect(32, 24, 20, 12, 4, ROUND)
+    backend.draw_text(3, 38, "2D", TEXT, 6)
+    backend.present()
+    val pixels = backend.read_pixels()
+    var passed = 0
+    if px(pixels, 8, 6) == RECT:
+        passed = passed + 1
+    if px(pixels, 48, 8) == CIRCLE:
+        passed = passed + 1
+    if px(pixels, 30, 18) == LINE:
+        passed = passed + 1
+    val gt = px(pixels, 8, 25)
+    val gb = px(pixels, 8, 34)
+    if gt != BG and gb != BG and gt != gb:
+        passed = passed + 1
+    if px(pixels, 42, 28) == ROUND and px(pixels, 32, 24) == BG:
+        passed = passed + 1
+    var text_pixels = 0
+    var ty = 38
+    while ty < 45:
+        var tx = 3
+        while tx < 17:
+            if px(pixels, tx, ty) == TEXT:
+                text_pixels = text_pixels + 1
+            tx = tx + 1
+        ty = ty + 1
+    if text_pixels > 0:
+        passed = passed + 1
+    backend.shutdown()
+    print "native GPU readback checks: {passed}/6"
+    if passed == 6:
+        return 0
+    1

@@ -1,0 +1,89 @@
+# Self-Attention — from scratch
+# Chapter 3: "Build a Large Language Model From Scratch" (Rasbt)
+#
+# Implements scaled dot-product attention:
+#   Attention(Q, K, V) = softmax(QK^T / sqrt(d_k)) V
+#
+# With optional causal masking for autoregressive models.
+
+use std.pure.tensor.{PureTensor, tensor_from_data}
+use std.pure.tensor_ops.{matmul, transpose}
+use examples.simple_deeplearning_study.lib.util.math_helpers.{dl_sqrt, dl_exp}
+use examples.simple_deeplearning_study.lib.prim.softmax.{study_softmax_2d}
+use examples.simple_deeplearning_study.lib.prim.linear.{StudyLinear}
+use examples.simple_deeplearning_study.lib.attention.causal_mask.{create_causal_mask}
+
+class AttentionResult:
+    output: PureTensor<f64>       # [seq_len, d_k]
+    weights: PureTensor<f64>      # [seq_len, seq_len] attention weights
+
+# Scaled dot-product attention
+# Q: [seq_q, d_k], K: [seq_k, d_k], V: [seq_k, d_v]
+# mask: optional [seq_q, seq_k] mask (0.0 = attend, -999999.0 = block)
+fn scaled_dot_product(
+    q: PureTensor<f64>,
+    k: PureTensor<f64>,
+    v: PureTensor<f64>,
+    mask: PureTensor<f64>?
+) -> AttentionResult:
+    val d_k = q.shape[1] as f64
+    val scale = dl_sqrt(d_k)
+
+    # scores = Q @ K^T / sqrt(d_k)
+    val kt = transpose(k)
+    var scores = matmul(q, kt)    # [seq_q, seq_k]
+
+    # Scale
+    val rows = scores.shape[0]
+    val cols = scores.shape[1]
+    var scaled_data: [f64] = []
+    var r = 0
+    while r < rows:
+        var c = 0
+        while c < cols:
+            var v_score = scores.get([r, c]) / scale
+            # Apply mask if present
+            if val m = mask:
+                v_score = v_score + m.get([r, c])
+            scaled_data.push(v_score)
+            c = c + 1
+        r = r + 1
+    val scaled = tensor_from_data(scaled_data, [rows, cols])
+
+    # Softmax over last dimension (each row)
+    val weights = study_softmax_2d(scaled)
+
+    # output = weights @ V
+    val output = matmul(weights, v)
+
+    AttentionResult(output: output, weights: weights)
+
+# Causal self-attention (for autoregressive models like GPT)
+class StudyCausalSelfAttention:
+    w_query: StudyLinear
+    w_key: StudyLinear
+    w_value: StudyLinear
+    d_k: i64
+
+    static fn create(d_in: i64, d_k: i64) -> StudyCausalSelfAttention:
+        StudyCausalSelfAttention(
+            w_query: StudyLinear.create(d_in, d_k, false),
+            w_key: StudyLinear.create(d_in, d_k, false),
+            w_value: StudyLinear.create(d_in, d_k, false),
+            d_k: d_k
+        )
+
+    # Forward: x [seq_len, d_in] -> output [seq_len, d_k]
+    fn forward(x: PureTensor<f64>) -> AttentionResult:
+        val seq_len = x.shape[0]
+        val q = self.w_query.forward(x)
+        val k = self.w_key.forward(x)
+        val v = self.w_value.forward(x)
+        val mask = create_causal_mask(seq_len)
+        scaled_dot_product(q, k, v, mask)
+
+fn study_causal_attention_create(d_in: i64, d_k: i64) -> StudyCausalSelfAttention:
+    StudyCausalSelfAttention.create(d_in, d_k)
+
+export AttentionResult, scaled_dot_product
+export StudyCausalSelfAttention, study_causal_attention_create

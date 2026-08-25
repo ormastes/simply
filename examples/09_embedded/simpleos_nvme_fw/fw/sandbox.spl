@@ -1,0 +1,89 @@
+"""
+sandbox — the trust boundary for dynamically-installed policy hooks (research req 7).
+
+Research §14 (nvme_ssd_firmware_architecture.md) requires that dynamic code in SSD
+firmware be allowed ONLY for bounded, sandboxed policy hooks (GC scoring, QoS, hot/cold
+classifier, telemetry filter) and NEVER for recovery / metadata-commit code. This module
+holds the hook-kind taxonomy, the install-time gate that rejects the forbidden domains,
+and the output-validation clamps the sandbox applies to a hook's decision.
+
+Sandbox model (eBPF-like, adapted to a host-runnable Simple simulation):
+  * install gate     — only allowed kinds can be installed; the forbidden metadata /
+                       recovery / commit domains are rejected at install (hook_kind_allowed).
+  * no raw pointers  — a hook is a pure fn(read-only snapshot) -> HookVote; it holds no
+                       handle to the FTL / NAND / journal, so it CANNOT mutate them.
+  * output validation — the sandbox clamps/validates a hook's returned decision into the
+                       safe set before the firmware acts on it (see hooks.spl).
+  * bounded execution — a fuel budget is modeled (a vote reporting fuel_used over budget is
+                       discarded -> default). NOTE: fuel is a cooperative/modeled bound; an
+                       in-process Simple lambda cannot be hard-preempted. A real device uses
+                       a bytecode VM with hard fuel preemption + signed modules + a static
+                       verifier — the silicon path (see PRODUCTION_STATUS.md § boundary).
+                       In-sim, the install gate is the trust boundary and validation +
+                       structural no-mutation are the load-bearing safety guarantees.
+"""
+
+use nvme_types.*
+
+# ── Allowed policy-hook kinds (the only installable surfaces) ─────────────────
+val HOOK_GC_SCORE:  i64 = 0   # score a GC candidate block (lower score = collect sooner)
+val HOOK_QOS:       i64 = 1   # priority class for a host command
+val HOOK_HOT_COLD:  i64 = 2   # classify an LBA hot(1) / cold(0)
+val HOOK_TELEMETRY: i64 = 3   # keep(1) / drop(0) a telemetry event
+
+# ── Forbidden domains — installing dynamic code here is REJECTED ───────────────
+# (research §14: "Do not allow loaded code to mutate metadata journal, checkpoint,
+#  recovery, or NAND commit order.")
+val HOOK_WAL:         i64 = 100
+val HOOK_CHECKPOINT:  i64 = 101
+val HOOK_RECOVERY:    i64 = 102
+val HOOK_SUPERBLOCK:  i64 = 103
+val HOOK_BAD_BLOCK:   i64 = 104
+val HOOK_NAND_COMMIT: i64 = 105
+
+val QOS_MAX_PRIORITY: i64 = 3   # priority classes 0..3
+
+# True only for the allowed policy-hook kinds; false for every forbidden domain.
+fn hook_kind_allowed(kind: i64) -> bool:
+    kind == HOOK_GC_SCORE or kind == HOOK_QOS or kind == HOOK_HOT_COLD or kind == HOOK_TELEMETRY
+
+# ── Output-validation clamps (applied to a hook's returned decision) ──────────
+fn clamp_priority(p: i64) -> i64:
+    var v: i64 = p
+    if v < 0:
+        v = 0
+    if v > QOS_MAX_PRIORITY:
+        v = QOS_MAX_PRIORITY
+    v
+
+fn clamp_bool(b: i64) -> i64:
+    if b <= 0:
+        return 0
+    var v: i64 = 0
+    if b != 0:
+        v = 1
+    v
+
+# ── Self-test ─────────────────────────────────────────────────────────────────
+fn sandbox_selftest() -> i64:
+    var fail: i64 = 0
+    # Allowed kinds pass the gate.
+    fail = fail + expect_eq(bool_to_int(hook_kind_allowed(HOOK_GC_SCORE)), 1, "sandbox: GC_SCORE allowed")
+    fail = fail + expect_eq(bool_to_int(hook_kind_allowed(HOOK_QOS)), 1, "sandbox: QOS allowed")
+    fail = fail + expect_eq(bool_to_int(hook_kind_allowed(HOOK_HOT_COLD)), 1, "sandbox: HOT_COLD allowed")
+    fail = fail + expect_eq(bool_to_int(hook_kind_allowed(HOOK_TELEMETRY)), 1, "sandbox: TELEMETRY allowed")
+    # Forbidden metadata/recovery/commit domains are rejected.
+    fail = fail + expect_eq(bool_to_int(hook_kind_allowed(HOOK_WAL)), 0, "sandbox: WAL forbidden")
+    fail = fail + expect_eq(bool_to_int(hook_kind_allowed(HOOK_CHECKPOINT)), 0, "sandbox: checkpoint forbidden")
+    fail = fail + expect_eq(bool_to_int(hook_kind_allowed(HOOK_RECOVERY)), 0, "sandbox: recovery forbidden")
+    fail = fail + expect_eq(bool_to_int(hook_kind_allowed(HOOK_SUPERBLOCK)), 0, "sandbox: superblock forbidden")
+    fail = fail + expect_eq(bool_to_int(hook_kind_allowed(HOOK_BAD_BLOCK)), 0, "sandbox: bad-block forbidden")
+    fail = fail + expect_eq(bool_to_int(hook_kind_allowed(HOOK_NAND_COMMIT)), 0, "sandbox: NAND-commit forbidden")
+    # Clamps keep decisions in range.
+    fail = fail + expect_eq(clamp_priority(-5), 0, "sandbox: priority clamps to 0")
+    fail = fail + expect_eq(clamp_priority(99), QOS_MAX_PRIORITY, "sandbox: priority clamps to max")
+    fail = fail + expect_eq(clamp_priority(2), 2, "sandbox: in-range priority unchanged")
+    fail = fail + expect_eq(clamp_bool(7), 1, "sandbox: bool clamps nonzero to 1")
+    fail = fail + expect_eq(clamp_bool(0), 0, "sandbox: bool keeps 0")
+    fail = fail + expect_eq(clamp_bool(-1), 0, "sandbox: negative bool fails closed")
+    fail

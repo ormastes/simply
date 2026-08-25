@@ -1,0 +1,19 @@
+schema: spipe.view
+version: 1
+record: view
+identity: key
+read_only: true
+fields:
+  key: semantic_key
+  kind: enum(lifecycle,feature,component,layer,matrix,trace,project,status,diagnostics)
+  title: non_empty_text
+  root_path: project_relative_path
+  visibility: enum(public,project,private,restricted)
+  filters: sorted_map(text,text_or_sorted_text_array)
+  page_size: uint_1_to_1000
+
+projection_identity:
+  form: spkp1-<lowercase_sha256>
+  tuple: projection_v1(workspace_uid,snapshot_id,view_kind,normalized_logical_path,normalized_parameters_hash,effective_auth_scope_hash,page_start_key)
+  page_start_key_absent: ""
+  ownership: projection_only

@@ -1,0 +1,37 @@
+"""
+# Protocol
+
+Tests for protocol functionality.
+"""
+# Unit tests for mcpgdb protocol metadata.
+#
+# The frontend is cold-start optimized; heavy tool work is deferred to
+# `debug_state_runner.spl`, `debug_runner.spl`, and `clangd_runner.spl`, but the
+# public tool list stays stable.
+
+use examples.mcpgdb.protocol.{make_init_response, make_tools_list}
+
+describe "mcpgdb protocol":
+    """
+    ## Mcpgdb Protocol Tests
+
+    Validates mcpgdb protocol functionality.
+    """
+
+    context "initialize":
+        it "returns server info and protocol version":
+            val response = make_init_response("1")
+            expect(response).to_contain("\"protocolVersion\":\"2025-06-18\"")
+            expect(response).to_contain("\"name\":\"mcpgdb\"")
+            expect(response).to_contain("persistent GDB/LLDB sessions")
+
+    context "tools list":
+        it "includes merged debugger and clangd tools":
+            val response = make_tools_list("1")
+            expect(response).to_contain("\"debug_session_create\"")
+            expect(response).to_contain("\"clangd_open\"")
+            expect(response).to_contain("\"debug_disconnect\"")
+            expect(response).to_contain("\"debug_restart\"")
+            expect(response).to_contain("\"debug_command_run\"")
+            expect(response).to_contain("\"clangd_definition\"")
+            expect(response).to_contain("\"clangd_diagnostics\"")

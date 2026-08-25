@@ -1,0 +1,160 @@
+"""
+ftl_emu — a compact custom-typed Flash Translation Layer over the ONFI NandArray.
+
+Minimal by design (# ponytail: no GC, no journal — "2 is enough"): a single
+forward map l2p[LBA] -> ppn and a monotonic write cursor that allocates the next
+free physical page sequentially. Writes program NAND and advance the cursor; when
+the cursor runs off the end of the media there is no reclaim, so writes fail with
+SC_INTERNAL (exhaustion) rather than silently corrupting.
+
+DISCIPLINE (see nvme_ct header + emu gotchas): l2p / cursor are raw i64 (no
+newtype arithmetic); newtypes (Lba/Ppn) are wrapped only at the interface. The Ftl
+OWNS its NandArray and mutates it via `me.nand.<method>` (nested field mutation
+persists — gotcha 4). Reads return freshly built result records (gotcha 3).
+"""
+
+use nvme_ct.*
+use nand_onfi.*
+
+struct Ftl:
+    nand:   NandArray
+    l2p:    [i64]   # LBA_COUNT entries, UNMAP until first write
+    cursor: i64     # next free ppn (sequential allocator)
+
+fn ftl_new() -> Ftl:
+    var l: [i64] = []
+    var i: i64 = 0
+    while i < LBA_COUNT:
+        l = l.push(UNMAP)
+        i = i + 1
+    Ftl(nand: nand_array_new(), l2p: l, cursor: 0)
+
+# Build a zero-payload read result carrying a code (used for unmapped / range).
+fn ftl_zero_result(lba: Lba, code: i64) -> NandReadResult:
+    var w: [i64] = []
+    var i: i64 = 0
+    while i < WORDS_PER_PAGE:
+        w = w.push(0)
+        i = i + 1
+    NandReadResult(words: w, lba: lba, seq: 0, code: code)
+
+impl Ftl:
+    # Allocate the next free ppn, program it, update the forward map. seq == ppn
+    # (monotonic). Out-of-range -> SC_LBA_RANGE; exhausted media -> SC_INTERNAL.
+    me write(lba: Lba, words: [i64]) -> i64:
+        if lba.value < 0 or lba.value >= LBA_COUNT:
+            return SC_LBA_RANGE
+        if me.cursor >= NUM_PAGES:
+            return SC_INTERNAL   # ponytail: no GC -> exhaustion is a hard error
+        val ppn = Ppn(value: me.cursor)
+        val st = me.nand.program(ppn, lba, me.cursor, words)
+        if st != NAND_OK:
+            return SC_INTERNAL
+        me.l2p[lba.value] = me.cursor
+        me.cursor = me.cursor + 1
+        SC_SUCCESS
+
+    # Resolve LBA -> ppn and read the page. UNMAP -> zero result coded UNMAP.
+    me read(lba: Lba) -> NandReadResult:
+        if lba.value < 0 or lba.value >= LBA_COUNT:
+            return ftl_zero_result(lba, SC_LBA_RANGE)
+        val ppn = me.l2p.get(lba.value)
+        if ppn == UNMAP:
+            return ftl_zero_result(lba, UNMAP)
+        me.nand.read_page(Ppn(value: ppn))
+
+    # NVMe completion status for a read of this LBA. Unmapped reads are legal
+    # deallocated reads (return zeros) -> SC_SUCCESS; only range is an error.
+    me read_status(lba: Lba) -> i64:
+        if lba.value < 0 or lba.value >= LBA_COUNT:
+            return SC_LBA_RANGE
+        SC_SUCCESS
+
+    # Deallocate an LBA (drop its mapping). The physical page is not reclaimed
+    # (no GC), matching the minimal cursor allocator.
+    me trim(lba: Lba) -> i64:
+        if lba.value < 0 or lba.value >= LBA_COUNT:
+            return SC_LBA_RANGE
+        me.l2p[lba.value] = UNMAP
+        SC_SUCCESS
+
+    # Physical pages still available to the sequential allocator.
+    me free_ppns() -> i64:
+        NUM_PAGES - me.cursor
+
+    me erase_count(block_index: i64) -> i64:
+        me.nand.erase_count(block_index)
+
+    # ── read-only introspection (no array store -> no x8 risk) ────────────────
+    # The physical ppn an LBA currently maps to (UNMAP if never written).
+    me physical_ppn(lba: Lba) -> i64:
+        me.l2p[lba.value]
+
+    # Raw NAND page payload at a physical ppn (erased pages read as zeros).
+    me nand_words(ppn: i64) -> [i64]:
+        me.nand.read_page(Ppn(value: ppn)).words
+
+    # The ppn the next write will allocate (sequential cursor).
+    me next_free_ppn() -> i64:
+        me.cursor
+
+# ── Self-test ─────────────────────────────────────────────────────────────────
+fn ftl_selftest() -> i64:
+    var fails: i64 = 0
+
+    var ftl: Ftl = ftl_new()
+    fails = fails + expect_eq(ftl.free_ppns(), NUM_PAGES, "fresh ftl has NUM_PAGES free")
+
+    # unmapped read before any write -> zero words, UNMAP code
+    val u = ftl.read(Lba(value: 7))
+    fails = fails + expect_eq(u.code, UNMAP, "unmapped read coded UNMAP")
+    fails = fails + expect_eq(u.words.get(0), 0, "unmapped read word0 == 0")
+    fails = fails + expect_eq(u.words.get(3), 0, "unmapped read word3 == 0")
+
+    # write lba 0 (lands ppn0, channel 0). Values chosen so x8 corruption shows.
+    var d0: [i64] = []
+    d0 = d0.push(11)
+    d0 = d0.push(22)
+    d0 = d0.push(33)
+    d0 = d0.push(44)
+    fails = fails + expect_eq(ftl.write(Lba(value: 0), d0), SC_SUCCESS, "write lba0 ok")
+    fails = fails + expect_eq(ftl.free_ppns(), NUM_PAGES - 1, "free_ppns drops by 1")
+
+    val r0 = ftl.read(Lba(value: 0))
+    fails = fails + expect_eq(r0.code, NAND_OK, "read lba0 ECC clean")
+    fails = fails + expect_eq(r0.words.get(0), 11, "lba0 word0 round-trip")
+    fails = fails + expect_eq(r0.words.get(1), 22, "lba0 word1 round-trip")
+    fails = fails + expect_eq(r0.words.get(2), 33, "lba0 word2 round-trip")
+    fails = fails + expect_eq(r0.words.get(3), 44, "lba0 word3 round-trip")
+    fails = fails + expect_eq(r0.lba.value, 0, "lba0 oob lba round-trip")
+    fails = fails + expect_eq(ftl.read_status(Lba(value: 0)), SC_SUCCESS, "read_status lba0 ok")
+
+    # second write to a different LBA -> different ppn, mapping independent
+    var d1: [i64] = []
+    d1 = d1.push(55)
+    d1 = d1.push(66)
+    d1 = d1.push(77)
+    d1 = d1.push(88)
+    fails = fails + expect_eq(ftl.write(Lba(value: 5), d1), SC_SUCCESS, "write lba5 ok")
+    val r5 = ftl.read(Lba(value: 5))
+    fails = fails + expect_eq(r5.words.get(0), 55, "lba5 word0 round-trip")
+    fails = fails + expect_eq(r5.words.get(3), 88, "lba5 word3 round-trip")
+    # lba0 still intact after lba5 write
+    val r0b = ftl.read(Lba(value: 0))
+    fails = fails + expect_eq(r0b.words.get(0), 11, "lba0 intact after lba5 write")
+
+    # trim unmaps
+    fails = fails + expect_eq(ftl.trim(Lba(value: 5)), SC_SUCCESS, "trim lba5 ok")
+    val r5t = ftl.read(Lba(value: 5))
+    fails = fails + expect_eq(r5t.code, UNMAP, "trimmed lba5 reads UNMAP")
+
+    # out-of-range guards
+    fails = fails + expect_eq(ftl.write(Lba(value: LBA_COUNT), d0), SC_LBA_RANGE, "write OOB -> LBA_RANGE")
+    fails = fails + expect_eq(ftl.read_status(Lba(value: -1)), SC_LBA_RANGE, "read_status OOB -> LBA_RANGE")
+    fails = fails + expect_eq(ftl.read(Lba(value: LBA_COUNT)).code, SC_LBA_RANGE, "read OOB coded LBA_RANGE")
+
+    if fails == 0:
+        print "FTL_EMU_SELFTEST PASS"
+    else:
+        print "FTL_EMU_SELFTEST FAIL ({fails})"
+    fails

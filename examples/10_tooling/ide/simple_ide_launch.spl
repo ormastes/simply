@@ -1,0 +1,12 @@
+# Minimal reusable IDE launch example.
+#
+# Demonstrates how an embedded/sample IDE consumes std.editor.core.launch
+# without depending on host-only GUI APIs.
+
+use std.editor.core.launch.*
+
+fn main() -> i64:
+    val launch = editor_launch_parse(["--tui", "README.md", "doc/07_guide/editor_tui.md"])
+    print "mode={launch.mode}"
+    print "files={launch.files.len()}"
+    0

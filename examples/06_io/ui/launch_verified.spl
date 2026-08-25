@@ -1,0 +1,53 @@
+# Verified Minimal UI Launch
+#
+# Uses only the shared UI operations that are already runtime-verified
+# in native execution so the sample can be launched reliably.
+
+use common.ui.widget.{WidgetNode, UITree, WidgetKind}
+
+fn repeat_text(value: text, count: i32) -> text:
+    var out = ""
+    var idx = 0
+    while idx < count:
+        out = "{out}{value}"
+        idx = idx + 1
+    return out
+
+fn frame_line(width: i32) -> text:
+    return "+{repeat_text(\"-\", width - 2)}+"
+
+fn frame_text(width: i32, content: text) -> text:
+    var text_val = content
+    if text_val.len() > width - 4:
+        text_val = text_val.substring(0, width - 4)
+    val padding = width - 2 - text_val.len()
+    return "|{text_val}{repeat_text(\" \", padding)}|"
+
+fn main() -> i64:
+    var root = WidgetNode.new("root", WidgetKind.Panel.to_wire())
+    root = root.set_layout("vbox")
+    root = root.set_prop("title", "Simple GUI Demo")
+
+    var greeting = WidgetNode.new("greeting", WidgetKind.Text.to_wire())
+    greeting = greeting.set_prop("content", "Hello from Simple UI")
+
+    var status = WidgetNode.new("status", WidgetKind.Text.to_wire())
+    status = status.set_prop("content", "launch_verified is running")
+
+    root = root.add_child(greeting)
+    root = root.add_child(status)
+
+    val first_child = root.child_at(0)
+    val second_child = root.child_at(1)
+    val tree = UITree.new(root).with_title("Hello Simple GUI")
+
+    print "launch:title:{tree.title_text()}"
+    print frame_line(34)
+    print frame_text(34, " Simple GUI Demo")
+    print frame_line(34)
+    if first_child != nil:
+        print frame_text(34, " {first_child.get_prop(\"content\")}")
+    if second_child != nil:
+        print frame_text(34, " {second_child.get_prop(\"content\")}")
+    print frame_line(34)
+    return 0

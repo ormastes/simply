@@ -1,0 +1,17 @@
+schema: spipe.section
+version: 1
+record: section
+identity: uid
+marker: "<!-- spipe:section uid=<uid> key=<key> -->"
+fields:
+  uid: opaque_uid(S)
+  artifact_uid: opaque_uid(A)|opaque_uid(P)
+  key: semantic_key
+  heading: non_empty_text
+  ordinal: uint
+  source_span: byte_span|null
+  content_hash: sha256
+  aliases: sorted_unique(text)
+  managed: bool
+  marker_present: bool
+  identity_status: enum(canonical,provisional)

@@ -1,0 +1,55 @@
+# Render an arbitrary HTML+CSS page through the PURE-SIMPLE web lane (layout +
+# paint -> Engine2D CPU backend) and dump a binary P6 PPM for visual inspection.
+#
+# Unlike web_render_dump_ppm.spl (80x60 sanity thumbnail, O(n^2) ASCII P3), this
+# renders at a realistic page resolution and writes binary PPM via encode_ppm_p6
+# (O(1) push, correct [u8] marshalling).
+#
+# Usage:
+#   bin/simple run examples/06_io/ui/web_render_page_ppm.spl <page.html> [out.ppm] [W] [H]
+# Env: PAGE_W / PAGE_H override the resolution.
+
+use std.gc_async_mut.gpu.browser_engine.simple_web_renderer.{simple_web_render_html_to_pixels_with_engine2d_backend}
+use common.image.ppm_decode.{encode_ppm_p6}
+use std.sffi.cli.{cli_get_args}
+use std.nogc_sync_mut.sffi.io.{file_write_bytes}
+
+use std.io_runtime.{read_file, file_exists, env_get}
+
+fn arg_with_suffix(suffix: text, fallback: text) -> text:
+    val args = cli_get_args()
+    var i = 0
+    while i < args.len():
+        if args[i].ends_with(suffix):
+            return args[i]
+        i = i + 1
+    fallback
+
+fn int_env(key: text, fallback: i32) -> i32:
+    val v = env_get(key) ?? ""
+    if v == "":
+        return fallback
+    v.to_i32()
+
+fn main() -> i64:
+    val hp = arg_with_suffix(".html", "test/09_baselines/web_html_input/vanillastyle_demo.html")
+    if not file_exists(hp):
+        print "HTML file not found: {hp}"
+        return 1
+    val W = int_env("PAGE_W", 900)
+    val H = int_env("PAGE_H", 760)
+    val op = arg_with_suffix(".ppm", "/tmp/simple-web-capture/vanillastyle_page.ppm")
+
+    val html = read_file(hp)
+    print "rendering {hp} at {W}x{H} via pure-Simple web lane (cpu_simd)..."
+    val pixels = simple_web_render_html_to_pixels_with_engine2d_backend(html, W, H, "cpu_simd")
+    if pixels.len() < W * H:
+        print "render produced too few pixels: {pixels.len()} < {W*H}"
+        return 1
+
+    val bytes = encode_ppm_p6(W.to_u32(), H.to_u32(), pixels)
+    if not file_write_bytes(op, bytes):
+        print "failed to write {op}"
+        return 1
+    print "wrote {op} ({pixels.len()} px, {bytes.len()} bytes)"
+    0

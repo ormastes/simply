@@ -1,0 +1,397 @@
+"""
+hil_queue — NVMe submission/completion queue rings (host <-> controller).
+Implements a pair of circular ring buffers at depth 64.
+"""
+
+use nvme_types.*
+
+struct NvmeQueues:
+    sq_cid:    [i64]
+    sq_nsid:   [i64]
+    sq_op:     [i64]
+    sq_lba:    [i64]
+    sq_nblk:   [i64]
+    sq_data:   [i64]
+    sq_head:   i64
+    sq_tail:   i64
+    sq_len:    i64
+    cq_cid:    [i64]
+    cq_status: [i64]
+    cq_data:   [i64]
+    cq_head:   i64
+    cq_tail:   i64
+    cq_len:    i64
+    depth:     i64
+
+fn nvme_queues_new() -> NvmeQueues:
+    val cap: i64 = 64
+    var sq_cid:    [i64] = []
+    var sq_nsid:   [i64] = []
+    var sq_op:     [i64] = []
+    var sq_lba:    [i64] = []
+    var sq_nblk:   [i64] = []
+    var sq_data:   [i64] = []
+    var cq_cid:    [i64] = []
+    var cq_status: [i64] = []
+    var cq_data:   [i64] = []
+    var i: i64 = 0
+    while i < cap:
+        sq_cid.push(0)
+        sq_nsid.push(1)
+        sq_op.push(0)
+        sq_lba.push(0)
+        sq_nblk.push(0)
+        sq_data.push(0)
+        cq_cid.push(0)
+        cq_status.push(0)
+        cq_data.push(0)
+        i = i + 1
+    NvmeQueues(sq_cid: sq_cid, sq_nsid: sq_nsid, sq_op: sq_op, sq_lba: sq_lba, sq_nblk: sq_nblk, sq_data: sq_data, sq_head: 0, sq_tail: 0, sq_len: 0, cq_cid: cq_cid, cq_status: cq_status, cq_data: cq_data, cq_head: 0, cq_tail: 0, cq_len: 0, depth: cap)
+
+impl NvmeQueues:
+    me sq_effective_depth() -> i64:
+        var d: i64 = me.depth
+        if d < 0:
+            return 0
+        if me.sq_cid.len() < d:
+            d = me.sq_cid.len()
+        if me.sq_nsid.len() < d:
+            d = me.sq_nsid.len()
+        if me.sq_op.len() < d:
+            d = me.sq_op.len()
+        if me.sq_lba.len() < d:
+            d = me.sq_lba.len()
+        if me.sq_nblk.len() < d:
+            d = me.sq_nblk.len()
+        if me.sq_data.len() < d:
+            d = me.sq_data.len()
+        d
+
+    me cq_effective_depth() -> i64:
+        var d: i64 = me.depth
+        if d < 0:
+            return 0
+        if me.cq_cid.len() < d:
+            d = me.cq_cid.len()
+        if me.cq_status.len() < d:
+            d = me.cq_status.len()
+        if me.cq_data.len() < d:
+            d = me.cq_data.len()
+        d
+
+    me sq_submit(c: NvmeCmd) -> bool:
+        if not cid_valid(c.cid):
+            return false
+        val depth: i64 = me.sq_effective_depth()
+        if depth <= 0:
+            return false
+        if me.sq_len < 0 or me.sq_len >= depth:
+            return false
+        val t: i64 = me.sq_tail
+        if t < 0 or t >= depth:
+            return false
+        me.sq_cid[t]  = c.cid
+        me.sq_nsid[t] = c.nsid
+        me.sq_op[t]   = c.opcode
+        me.sq_lba[t]  = c.lba
+        me.sq_nblk[t] = c.nblocks
+        me.sq_data[t] = c.data
+        val next_t: i64 = me.sq_tail + 1
+        me.sq_tail = next_t % depth
+        me.sq_len = me.sq_len + 1
+        true
+
+    me sq_fetch() -> NvmeCmd:
+        if me.sq_len <= 0:
+            return cmd_make(0, OP_FLUSH, 0, 0, 0)
+        val depth: i64 = me.sq_effective_depth()
+        if depth <= 0:
+            return cmd_make(0, OP_FLUSH, 0, 0, 0)
+        val h: i64 = me.sq_head
+        if h < 0 or h >= depth:
+            return cmd_make(0, OP_FLUSH, 0, 0, 0)
+        val cid:   i64 = me.sq_cid[h]
+        if not cid_valid(cid):
+            return cmd_make(0, OP_FLUSH, 0, 0, 0)
+        val nsid:  i64 = me.sq_nsid[h]
+        val op:    i64 = me.sq_op[h]
+        val lba:   i64 = me.sq_lba[h]
+        val nblk:  i64 = me.sq_nblk[h]
+        val data:  i64 = me.sq_data[h]
+        val next_h: i64 = me.sq_head + 1
+        me.sq_head = next_h % depth
+        me.sq_len = me.sq_len - 1
+        cmd_make_nsid(cid, nsid, op, lba, nblk, data)
+
+    me sq_pending() -> i64:
+        val depth: i64 = me.sq_effective_depth()
+        if me.sq_len < 0:
+            return 0
+        if me.sq_len > depth:
+            return depth
+        me.sq_len
+
+    me sq_can_fetch() -> bool:
+        val depth: i64 = me.sq_effective_depth()
+        if depth <= 0:
+            return false
+        if me.sq_len <= 0 or me.sq_len > depth:
+            return false
+        if me.sq_head < 0 or me.sq_head >= depth:
+            return false
+        if not cid_valid(me.sq_cid[me.sq_head]):
+            return false
+        true
+
+    me cq_post(p: NvmeCpl) -> bool:
+        if not cid_valid(p.cid):
+            return false
+        if not cpl_status_valid(p.status):
+            return false
+        val depth: i64 = me.cq_effective_depth()
+        if depth <= 0:
+            return false
+        if me.cq_len < 0 or me.cq_len >= depth:
+            return false
+        val t: i64 = me.cq_tail
+        if t < 0 or t >= depth:
+            return false
+        me.cq_cid[t]    = p.cid
+        me.cq_status[t] = p.status
+        me.cq_data[t]   = p.data
+        val next_t: i64 = me.cq_tail + 1
+        me.cq_tail = next_t % depth
+        me.cq_len = me.cq_len + 1
+        true
+
+    me cq_reap() -> NvmeCpl:
+        if me.cq_len <= 0:
+            return cpl_make(0, SC_INVALID_FIELD, 0)
+        val depth: i64 = me.cq_effective_depth()
+        if depth <= 0:
+            return cpl_make(0, SC_INVALID_FIELD, 0)
+        val h: i64 = me.cq_head
+        if h < 0 or h >= depth:
+            return cpl_make(0, SC_INVALID_FIELD, 0)
+        val cid:    i64 = me.cq_cid[h]
+        if not cid_valid(cid):
+            return cpl_make(0, SC_INVALID_FIELD, 0)
+        val status: i64 = me.cq_status[h]
+        if not cpl_status_valid(status):
+            return cpl_make(0, SC_INVALID_FIELD, 0)
+        val data:   i64 = me.cq_data[h]
+        val next_h: i64 = me.cq_head + 1
+        me.cq_head = next_h % depth
+        me.cq_len = me.cq_len - 1
+        cpl_make(cid, status, data)
+
+    me cq_pending() -> i64:
+        val depth: i64 = me.cq_effective_depth()
+        if me.cq_len < 0:
+            return 0
+        if me.cq_len > depth:
+            return depth
+        me.cq_len
+
+    me cq_is_full() -> bool:
+        val depth: i64 = me.cq_effective_depth()
+        if depth <= 0:
+            return true
+        if me.cq_len < 0 or me.cq_len > depth:
+            return true
+        if me.cq_head < 0 or me.cq_head >= depth:
+            return true
+        if me.cq_tail < 0 or me.cq_tail >= depth:
+            return true
+        if me.cq_len > 0:
+            if not cid_valid(me.cq_cid[me.cq_head]):
+                return true
+            if not cpl_status_valid(me.cq_status[me.cq_head]):
+                return true
+        me.cq_len >= depth
+
+# ── Helper: convert bool to i64 for expect_eq ────────────────────────────────
+fn bool_to_i64(b: bool) -> i64:
+    if b:
+        return 1
+    0
+
+# ── Self-test ─────────────────────────────────────────────────────────────────
+fn hil_queue_selftest() -> i64:
+    var failures: i64 = 0
+    var q = nvme_queues_new()
+
+    # Test 1: submit two commands, sq_pending == 2
+    val cmd1 = cmd_make(1, OP_READ, 10, 1, 0xAA)
+    val cmd2 = cmd_make(2, OP_WRITE, 20, 2, 0xBB)
+    var ok1: bool = q.sq_submit(cmd1)
+    var ok2: bool = q.sq_submit(cmd2)
+    failures = failures + expect_eq(bool_to_i64(ok1), 1, "submit cmd1 ok")
+    failures = failures + expect_eq(bool_to_i64(ok2), 1, "submit cmd2 ok")
+    failures = failures + expect_eq(q.sq_pending(), 2, "sq_pending==2 after 2 submits")
+
+    # Test 2: fetch FIFO order — cid 1 before cid 2
+    val f1 = q.sq_fetch()
+    val f2 = q.sq_fetch()
+    failures = failures + expect_eq(f1.cid,    1,        "fetch1 cid==1")
+    failures = failures + expect_eq(f1.nsid,   1,        "fetch1 nsid==1")
+    failures = failures + expect_eq(f1.opcode, OP_READ,  "fetch1 opcode==OP_READ")
+    failures = failures + expect_eq(f1.lba,    10,       "fetch1 lba==10")
+    failures = failures + expect_eq(f2.cid,    2,        "fetch2 cid==2")
+    failures = failures + expect_eq(f2.opcode, OP_WRITE, "fetch2 opcode==OP_WRITE")
+    failures = failures + expect_eq(q.sq_pending(), 0,   "sq_pending==0 after fetches")
+    val empty_sq = q.sq_fetch()
+    failures = failures + expect_eq(empty_sq.nblocks, 0, "empty SQ fetch returns inert flush")
+    failures = failures + expect_eq(q.sq_pending(), 0, "empty SQ fetch leaves pending count unchanged")
+    q.sq_len = 1
+    q.sq_head = q.depth
+    val bad_sq_head = q.sq_fetch()
+    failures = failures + expect_eq(bad_sq_head.nblocks, 0, "invalid HIL SQ head fetch fails closed")
+    failures = failures + expect_eq(q.sq_pending(), 1, "invalid HIL SQ head leaves pending count unchanged")
+    failures = failures + expect_eq(bool_to_i64(q.sq_can_fetch()), 0, "invalid HIL SQ head blocks dispatch")
+    q.sq_len = 0
+    q.sq_head = 0
+    q.sq_tail = q.depth
+    failures = failures + expect_eq(bool_to_i64(q.sq_submit(cmd_make(3, OP_READ, 30, 1, 0))), 0, "invalid HIL SQ tail submit fails closed")
+    failures = failures + expect_eq(q.sq_pending(), 0, "invalid HIL SQ tail leaves pending count unchanged")
+    q.sq_tail = 0
+    q.sq_len = -3
+    failures = failures + expect_eq(q.sq_pending(), 0, "negative HIL SQ length pending clamps to zero")
+    failures = failures + expect_eq(bool_to_i64(q.sq_submit(cmd_make(4, OP_READ, 30, 1, 0))), 0, "negative HIL SQ length submit fails closed")
+    val neg_sq = q.sq_fetch()
+    failures = failures + expect_eq(neg_sq.nblocks, 0, "negative HIL SQ length fetch returns inert command")
+    q.sq_len = q.depth + 3
+    failures = failures + expect_eq(q.sq_pending(), q.depth, "oversized HIL SQ length pending clamps to depth")
+    failures = failures + expect_eq(bool_to_i64(q.sq_can_fetch()), 0, "oversized HIL SQ length blocks dispatch")
+    failures = failures + expect_eq(bool_to_i64(q.sq_submit(cmd_make(5, OP_READ, 30, 1, 0))), 0, "oversized HIL SQ length submit fails closed")
+    q.sq_len = 0
+    q.sq_head = 0
+    q.sq_tail = 0
+    q.sq_submit(cmd_make(6, OP_READ, 31, 1, 0))
+    val bad_cid_slot: i64 = q.sq_head
+    val saved_sq_cid: i64 = q.sq_cid[bad_cid_slot]
+    q.sq_cid[bad_cid_slot] = 70000
+    failures = failures + expect_eq(bool_to_i64(q.sq_can_fetch()), 0, "invalid HIL SQ head cid blocks dispatch")
+    failures = failures + expect_eq(q.sq_pending(), 1, "invalid HIL SQ head cid preserves pending command")
+    val bad_cid_fetch = q.sq_fetch()
+    failures = failures + expect_eq(bad_cid_fetch.nblocks, 0, "invalid HIL SQ head cid fetch fails closed")
+    failures = failures + expect_eq(q.sq_pending(), 1, "invalid HIL SQ head cid fetch preserves pending command")
+    q.sq_cid[bad_cid_slot] = saved_sq_cid
+    failures = failures + expect_eq(bool_to_i64(q.sq_can_fetch()), 1, "repaired HIL SQ head cid re-enables dispatch")
+    val cid_repaired = q.sq_fetch()
+    failures = failures + expect_eq(cid_repaired.cid, 6, "repaired HIL SQ head cid command remains fetchable")
+    q.sq_submit(cmd_make_nsid(7, 0, OP_READ, 32, 1, 0))
+    val nsid_fetch = q.sq_fetch()
+    failures = failures + expect_eq(nsid_fetch.nsid, 0, "HIL SQ preserves explicit invalid namespace for validator")
+
+    # Test 3: completion post/reap round-trip (status + data preserved)
+    val cpl = cpl_make(42, SC_SUCCESS, 0x99)
+    var post_ok: bool = q.cq_post(cpl)
+    failures = failures + expect_eq(bool_to_i64(post_ok), 1, "cq_post ok")
+    failures = failures + expect_eq(q.cq_pending(), 1,        "cq_pending==1")
+    val r1 = q.cq_reap()
+    failures = failures + expect_eq(r1.cid,    42,         "reaped cid==42")
+    failures = failures + expect_eq(r1.status, SC_SUCCESS, "reaped status==SC_SUCCESS")
+    failures = failures + expect_eq(r1.data,   0x99,       "reaped data==0x99")
+    failures = failures + expect_eq(q.cq_pending(), 0,     "cq_pending==0 after reap")
+    val empty_cq = q.cq_reap()
+    failures = failures + expect_eq(empty_cq.status, SC_INVALID_FIELD, "empty CQ reap fails closed")
+    failures = failures + expect_eq(q.cq_pending(), 0, "empty CQ reap leaves pending count unchanged")
+    q.cq_len = 1
+    q.cq_head = q.depth
+    val bad_cq_head = q.cq_reap()
+    failures = failures + expect_eq(bad_cq_head.status, SC_INVALID_FIELD, "invalid HIL CQ head reap fails closed")
+    failures = failures + expect_eq(q.cq_pending(), 1, "invalid HIL CQ head leaves pending count unchanged")
+    failures = failures + expect_eq(bool_to_i64(q.cq_is_full()), 1, "invalid HIL CQ head blocks dispatch")
+    q.cq_len = 0
+    q.cq_head = 0
+    q.cq_tail = q.depth
+    failures = failures + expect_eq(bool_to_i64(q.cq_is_full()), 1, "invalid HIL CQ tail blocks dispatch")
+    failures = failures + expect_eq(bool_to_i64(q.cq_post(cpl_make(43, SC_SUCCESS, 0))), 0, "invalid HIL CQ tail post fails closed")
+    failures = failures + expect_eq(q.cq_pending(), 0, "invalid HIL CQ tail leaves pending count unchanged")
+    q.cq_tail = 0
+    q.cq_len = -4
+    failures = failures + expect_eq(q.cq_pending(), 0, "negative HIL CQ length pending clamps to zero")
+    failures = failures + expect_eq(bool_to_i64(q.cq_is_full()), 1, "negative HIL CQ length blocks dispatch")
+    failures = failures + expect_eq(bool_to_i64(q.cq_post(cpl_make(44, SC_SUCCESS, 0))), 0, "negative HIL CQ length post fails closed")
+    val neg_cq = q.cq_reap()
+    failures = failures + expect_eq(neg_cq.status, SC_INVALID_FIELD, "negative HIL CQ length reap fails closed")
+    q.cq_len = q.depth + 4
+    failures = failures + expect_eq(q.cq_pending(), q.depth, "oversized HIL CQ length pending clamps to depth")
+    failures = failures + expect_eq(bool_to_i64(q.cq_post(cpl_make(45, SC_SUCCESS, 0))), 0, "oversized HIL CQ length post fails closed")
+    q.cq_len = 0
+    q.cq_head = 0
+    q.cq_tail = 0
+    q.cq_post(cpl_make(46, SC_SUCCESS, 0x66))
+    val bad_cq_cid_slot: i64 = q.cq_head
+    val saved_cq_cid: i64 = q.cq_cid[bad_cq_cid_slot]
+    q.cq_cid[bad_cq_cid_slot] = 70000
+    val bad_cq_cid = q.cq_reap()
+    failures = failures + expect_eq(bad_cq_cid.status, SC_INVALID_FIELD, "invalid HIL CQ head cid reap fails closed")
+    failures = failures + expect_eq(q.cq_pending(), 1, "invalid HIL CQ head cid preserves pending completion")
+    q.cq_cid[bad_cq_cid_slot] = saved_cq_cid
+    val repaired_cq_cid = q.cq_reap()
+    failures = failures + expect_eq(repaired_cq_cid.cid, 46, "repaired HIL CQ head cid completion remains reapable")
+    q.cq_post(cpl_make(47, SC_SUCCESS, 0x67))
+    val bad_cq_status_slot: i64 = q.cq_head
+    val saved_cq_status: i64 = q.cq_status[bad_cq_status_slot]
+    q.cq_status[bad_cq_status_slot] = 70000
+    val bad_cq_status = q.cq_reap()
+    failures = failures + expect_eq(bad_cq_status.status, SC_INVALID_FIELD, "invalid HIL CQ head status reap fails closed")
+    failures = failures + expect_eq(q.cq_pending(), 1, "invalid HIL CQ head status preserves pending completion")
+    failures = failures + expect_eq(bool_to_i64(q.cq_is_full()), 1, "invalid HIL CQ head status blocks dispatch")
+    q.cq_status[bad_cq_status_slot] = saved_cq_status
+    val repaired_cq_status = q.cq_reap()
+    failures = failures + expect_eq(repaired_cq_status.status, SC_SUCCESS, "repaired HIL CQ head status completion remains reapable")
+    failures = failures + expect_eq(bool_to_i64(q.cq_post(cpl_make(70000, SC_SUCCESS, 0))), 0, "reject oversized completion id")
+    failures = failures + expect_eq(bool_to_i64(q.cq_post(cpl_make(-1, SC_SUCCESS, 0))), 0, "reject negative completion id")
+    failures = failures + expect_eq(bool_to_i64(q.cq_post(cpl_make(48, 70000, 0))), 0, "reject invalid completion status")
+
+    var qtr = nvme_queues_new()
+    qtr.sq_cid = []
+    failures = failures + expect_eq(bool_to_i64(qtr.sq_submit(cmd_make(49, OP_READ, 0, 1, 0))), 0, "truncated HIL SQ ring submit fails closed")
+    qtr.sq_len = 1
+    failures = failures + expect_eq(bool_to_i64(qtr.sq_can_fetch()), 0, "truncated HIL SQ ring blocks dispatch")
+    failures = failures + expect_eq(qtr.sq_fetch().nblocks, 0, "truncated HIL SQ ring fetch returns inert command")
+    failures = failures + expect_eq(qtr.sq_pending(), 0, "truncated HIL SQ ring pending clamps to physical depth")
+    qtr.cq_cid = []
+    failures = failures + expect_eq(bool_to_i64(qtr.cq_post(cpl_make(50, SC_SUCCESS, 0))), 0, "truncated HIL CQ ring post fails closed")
+    qtr.cq_len = 1
+    failures = failures + expect_eq(bool_to_i64(qtr.cq_is_full()), 1, "truncated HIL CQ ring blocks dispatch")
+    failures = failures + expect_eq(qtr.cq_reap().status, SC_INVALID_FIELD, "truncated HIL CQ ring reap fails closed")
+    failures = failures + expect_eq(qtr.cq_pending(), 0, "truncated HIL CQ ring pending clamps to physical depth")
+    var qdepth = nvme_queues_new()
+    qdepth.depth = qdepth.depth + 99
+    qdepth.sq_len = qdepth.depth
+    qdepth.cq_len = qdepth.depth
+    failures = failures + expect_eq(qdepth.sq_pending(), 64, "oversized HIL SQ depth clamps pending to physical ring")
+    failures = failures + expect_eq(qdepth.cq_pending(), 64, "oversized HIL CQ depth clamps pending to physical ring")
+
+    # Test 4: fill SQ to depth; next submit must return false
+    # At this point sq_head==2, sq_tail==2 (2 submit+fetch cycles above)
+    # Filling 64 entries wraps sq_tail around: 2..63..0..1..2
+    var fill_ok: bool = false
+    var i: i64 = 0
+    while i < q.depth:
+        val fill_cmd = cmd_make(100 + i, OP_FLUSH, 0, 0, 0)
+        fill_ok = q.sq_submit(fill_cmd)
+        i = i + 1
+    failures = failures + expect_eq(q.sq_pending(), q.depth, "sq full: pending==depth")
+    val extra = cmd_make(999, OP_FLUSH, 0, 0, 0)
+    var full_ok: bool = q.sq_submit(extra)
+    failures = failures + expect_eq(bool_to_i64(full_ok), 0, "submit on full ring returns false")
+
+    # Test 5: drain the full ring and verify FIFO across the wrap boundary
+    var fifo_ok: i64 = 1
+    i = 0
+    while i < q.depth:
+        val fc = q.sq_fetch()
+        if fc.cid != 100 + i:
+            fifo_ok = 0
+        i = i + 1
+    failures = failures + expect_eq(fifo_ok, 1,           "wrap-around FIFO order correct")
+    failures = failures + expect_eq(q.sq_pending(), 0,    "sq empty after wrap drain")
+    failures = failures + expect_eq(bool_to_i64(q.sq_submit(cmd_make(70000, OP_READ, 0, 1, 0))), 0, "reject oversized command id")
+    failures = failures + expect_eq(bool_to_i64(q.sq_submit(cmd_make(-1, OP_READ, 0, 1, 0))), 0, "reject negative command id")
+
+    failures

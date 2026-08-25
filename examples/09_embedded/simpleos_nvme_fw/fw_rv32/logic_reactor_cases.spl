@@ -1,0 +1,12 @@
+use logic_reactor_bg_cases.*
+use logic_reactor_fg_cases.*
+use logic_reactor_lock_cases.*
+
+fn rv32_reactor_cases_selftest() -> i32:
+    if rv32_reactor_lock_cases_selftest() != 0:
+        return 1
+    if rv32_reactor_fg_cases_selftest() != 0:
+        return 1
+    if rv32_reactor_bg_cases_selftest() != 0:
+        return 1
+    0

@@ -1,0 +1,19 @@
+use logic_map_core.*
+
+fn rv32_map_lba_cases_selftest() -> i32:
+    if _rv32_map_lba_valid(0) != 1:
+        return 1
+    if _rv32_map_lba_valid(3071) != 1:
+        return 1
+    if _rv32_map_lba_valid(-1) != 0:
+        return 1
+    if _rv32_map_lba_valid(3072) != 0:
+        return 1
+    # regression: 1024..3071 was wrongly rejected by a stale 1024 bound (should be
+    # LBA_COUNT=3072, see fw/nvme_types.spl) — assert the previously-truncated
+    # range now validates as valid.
+    if _rv32_map_lba_valid(1024) != 1:
+        return 1
+    if _rv32_map_lba_valid(2048) != 1:
+        return 1
+    0

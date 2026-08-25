@@ -1,0 +1,66 @@
+use std.gpu.*
+
+describe "Parallel iterators (Thrust equivalent)":
+    it "should map square over array":
+        val data = [1.0, 2.0, 3.0, 4.0]
+        val result = gpu_map(data, _ ** 2)?
+        expect(result[0]).to_equal(1.0)
+        expect(result[1]).to_equal(4.0)
+        expect(result[2]).to_equal(9.0)
+        expect(result[3]).to_equal(16.0)
+
+    it "should map with lambda":
+        val data = [1.0, 2.0, 3.0]
+        val result = gpu_map(data, _ * 10.0)?
+        expect(result[0]).to_equal(10.0)
+        expect(result[1]).to_equal(20.0)
+        expect(result[2]).to_equal(30.0)
+
+    it "should reduce with sum":
+        val data = [1.0, 2.0, 3.0, 4.0, 5.0]
+        val result = gpu_reduce(data, 0.0, _ + _)?
+        expect(result).to_equal(15.0)
+
+    it "should reduce with product":
+        val data = [1.0, 2.0, 3.0, 4.0]
+        val result = gpu_reduce(data, 1.0, _ * _)?
+        expect(result).to_equal(24.0)
+
+    it "should compute inclusive prefix sum":
+        val data = [1.0, 2.0, 3.0, 4.0]
+        val result = gpu_scan(data, 0.0, _ + _)?
+        expect(result[0]).to_equal(1.0)
+        expect(result[1]).to_equal(3.0)
+        expect(result[2]).to_equal(6.0)
+        expect(result[3]).to_equal(10.0)
+
+    it "should filter elements":
+        val data = [-2.0, 3.0, -1.0, 5.0, -4.0, 7.0]
+        val result = gpu_filter(data, _ > 0.0)?
+        expect(result.len()).to_equal(3)
+        expect(result[0]).to_equal(3.0)
+        expect(result[1]).to_equal(5.0)
+        expect(result[2]).to_equal(7.0)
+
+    it "should sort ascending":
+        val data = [3.0, 1.0, 4.0, 1.0, 5.0]
+        val result = gpu_sort(data)?
+        expect(result[0]).to_equal(1.0)
+        expect(result[1]).to_equal(1.0)
+        expect(result[2]).to_equal(3.0)
+        expect(result[3]).to_equal(4.0)
+        expect(result[4]).to_equal(5.0)
+
+    it "should compose stages by unwrapping each Result":
+        val data = [1.0, 2.0, 3.0, 4.0, 5.0]
+        # Square, filter > 10, sum -- each stage returns a Result, so unwrap with ?
+        val squared = gpu_map(data, _ ** 2)?
+        val large = gpu_filter(squared, _ > 10.0)?
+        val result = gpu_reduce(large, 0.0, _ + _)?
+        # 16 + 25 = 41
+        expect(result).to_equal(41.0)
+
+    it "should handle empty array":
+        val data: [f32] = []
+        val result = gpu_reduce(data, 0.0, _ + _)?
+        expect(result).to_equal(0.0)

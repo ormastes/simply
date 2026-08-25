@@ -1,0 +1,274 @@
+"""
+ftl_journal — write-ahead log + checkpoint + A/B superblock (in-memory durability sim).
+
+Provides a pre-sized WAL ring (cap 512), checkpoint tracking, and A/B superblock
+generation counter. All durability is simulated in memory; no actual storage I/O.
+"""
+
+use nvme_types.*
+
+val JOURNAL_CAP: i64 = 512
+
+fn journal_counter_next(v: i64) -> i64:
+    if v < 0:
+        return 1
+    if v >= 1000000000000000000:
+        return 1000000000000000000
+    v + 1
+
+# ── Journal struct ────────────────────────────────────────────────────────────
+
+struct Journal:
+    wal_lba:  [i64]   # LBA for each WAL record
+    wal_old:   [i64]   # old PPN (before remap)
+    wal_new:   [i64]   # new PPN (after remap)
+    wal_seq:   [i64]   # sequence number for each record
+    wal_count: i64     # number of valid records written so far
+    cap:       i64     # ring capacity (512)
+    ckpt_seq:  i64     # highest seq flushed to checkpoint
+    ckpt_valid: i64    # 1 once a checkpoint has been written
+    sb_gen:    i64     # A/B superblock generation counter
+    sb_ckpt_ptr: i64   # checkpoint pointer in the active superblock
+
+# ── Constructor ───────────────────────────────────────────────────────────────
+
+fn ftl_journal_new() -> Journal:
+    var wal_lba: [i64] = []
+    var wal_old: [i64] = []
+    var wal_new: [i64] = []
+    var wal_seq: [i64] = []
+    val cap: i64 = JOURNAL_CAP
+    var i: i64 = 0
+    while i < cap:
+        wal_lba.push(UNMAP)
+        wal_old.push(UNMAP)
+        wal_new.push(UNMAP)
+        wal_seq.push(0)
+        i = i + 1
+    Journal(wal_lba: wal_lba, wal_old: wal_old, wal_new: wal_new, wal_seq: wal_seq,
+            wal_count: 0, cap: cap,
+            ckpt_seq: 0, ckpt_valid: 0,
+            sb_gen: 0, sb_ckpt_ptr: UNMAP)
+
+# ── Methods ───────────────────────────────────────────────────────────────────
+
+impl Journal:
+    me physical_cap() -> i64:
+        var c: i64 = JOURNAL_CAP
+        if me.wal_lba.len() < c:
+            c = me.wal_lba.len()
+        if me.wal_old.len() < c:
+            c = me.wal_old.len()
+        if me.wal_new.len() < c:
+            c = me.wal_new.len()
+        if me.wal_seq.len() < c:
+            c = me.wal_seq.len()
+        c
+
+    me wal_slot_ready(ridx: i64) -> bool:
+        ridx >= 0 and ridx < me.physical_cap()
+
+    me effective_count() -> i64:
+        var n: i64 = me.wal_count
+        if n < 0:
+            return 0
+        var c: i64 = me.cap
+        if c < 0:
+            return 0
+        if c > JOURNAL_CAP:
+            c = JOURNAL_CAP
+        val physical: i64 = me.physical_cap()
+        if c > physical:
+            c = physical
+        if n > c:
+            n = c
+        if n > JOURNAL_CAP:
+            n = JOURNAL_CAP
+        n
+
+    # Append a MAP_COMMIT record; returns the new wal_count.
+    # NOTE(interp bug): a leading dummy _p0 (always 0) absorbs a conditional interpreter
+    # defect where the FIRST param of THIS multi-param me method binds to value*8. Real
+    # args start at position 2. Single-param me methods are unaffected; the clean fix for
+    # new code is a single struct param (see fw/CONVENTIONS.md).
+    me append(_p0: i64, map_lba: i64, old_ppn: i64, new_ppn: i64, map_seq: i64) -> i64:
+        val count: i64 = me.effective_count()
+        me.wal_count = count
+        if count >= me.cap:
+            return count
+        if count >= JOURNAL_CAP:
+            return count
+        if not me.wal_slot_ready(count):
+            return count
+        val slot: i64 = count
+        me.wal_lba[slot] = map_lba
+        me.wal_old[slot] = old_ppn
+        me.wal_new[slot] = new_ppn
+        me.wal_seq[slot] = map_seq
+        me.wal_count = slot + 1
+        me.wal_count
+
+    # Checkpoint: mark seq durable, flip the A/B superblock.
+    me checkpoint(seq: i64):
+        me.ckpt_seq = seq
+        me.ckpt_valid = 1
+        me.sb_gen = journal_counter_next(me.sb_gen)
+        me.sb_ckpt_ptr = seq
+
+    # Number of valid WAL records.
+    me wal_len() -> i64:
+        me.effective_count()
+
+    # True when the WAL ring is full: a further append would be dropped. The caller
+    # must checkpoint (flush durable + truncate) before appending so no record is
+    # ever silently lost (and a write acked to the host whose record went missing).
+    me is_full() -> bool:
+        val count: i64 = me.effective_count()
+        if not me.wal_slot_ready(count):
+            return true
+        count >= me.cap or count >= JOURNAL_CAP
+
+    # Accessors for WAL replay.
+    me record_lba(ridx: i64) -> i64:
+        if ridx < 0 or ridx >= me.effective_count():
+            return UNMAP
+        if not me.wal_slot_ready(ridx):
+            return UNMAP
+        me.wal_lba[ridx]
+
+    me record_new(ridx: i64) -> i64:
+        if ridx < 0 or ridx >= me.effective_count():
+            return UNMAP
+        if not me.wal_slot_ready(ridx):
+            return UNMAP
+        me.wal_new[ridx]
+
+    me record_seq(ridx: i64) -> i64:
+        if ridx < 0 or ridx >= me.effective_count():
+            return 0
+        if not me.wal_slot_ready(ridx):
+            return 0
+        me.wal_seq[ridx]
+
+    # Drop all WAL records whose seq <= ckpt_seq (durable in checkpoint).
+    # Compacts the arrays in-place and pads the tail with sentinels.
+    me truncate_checkpointed():
+        var new_addr: [i64] = []
+        var new_old: [i64] = []
+        var new_new: [i64] = []
+        var new_seq: [i64] = []
+        var kept: i64 = 0
+        var i: i64 = 0
+        val count: i64 = me.effective_count()
+        while i < count:
+            if me.wal_slot_ready(i) and me.wal_seq[i] > me.ckpt_seq:
+                new_addr.push(me.wal_lba[i])
+                new_old.push(me.wal_old[i])
+                new_new.push(me.wal_new[i])
+                new_seq.push(me.wal_seq[i])
+                kept = kept + 1
+            i = i + 1
+        # Pad to cap with sentinels so the arrays stay pre-sized.
+        var j: i64 = kept
+        while j < me.cap and j < JOURNAL_CAP:
+            new_addr.push(UNMAP)
+            new_old.push(UNMAP)
+            new_new.push(UNMAP)
+            new_seq.push(0)
+            j = j + 1
+        me.wal_lba = new_addr
+        me.wal_old = new_old
+        me.wal_new = new_new
+        me.wal_seq = new_seq
+        me.wal_count = kept
+
+# ── Self-test ─────────────────────────────────────────────────────────────────
+
+fn ftl_journal_selftest() -> i64:
+    var fail: i64 = 0
+    var j: Journal = ftl_journal_new()
+
+    # Append 3 records with distinct seqs (leading 0 = dummy _p0, see append note).
+    j.append(0, 100, 10, 20, 1)
+    j.append(0, 101, 11, 21, 2)
+    j.append(0, 102, 12, 22, 3)
+
+    fail = fail + expect_eq(j.wal_len(), 3, "wal_len after 3 appends")
+
+    # Read back individual fields.
+    fail = fail + expect_eq(j.record_seq(0), 1,   "record_seq(0)")
+    fail = fail + expect_eq(j.record_seq(1), 2,   "record_seq(1)")
+    fail = fail + expect_eq(j.record_seq(2), 3,   "record_seq(2)")
+    fail = fail + expect_eq(j.record_lba(0), 100, "record_lba(0)")
+    fail = fail + expect_eq(j.record_new(0), 20,  "record_new(0)")
+    fail = fail + expect_eq(j.record_lba(2), 102, "record_lba(2)")
+    fail = fail + expect_eq(j.record_new(2), 22,  "record_new(2)")
+    fail = fail + expect_eq(j.record_lba(-1), UNMAP, "negative WAL read fails closed")
+    fail = fail + expect_eq(j.record_new(j.wal_len()), UNMAP, "past-end WAL ppn read fails closed")
+    fail = fail + expect_eq(j.record_seq(j.wal_len()), 0, "past-end WAL seq read fails closed")
+    j.wal_count = -4
+    fail = fail + expect_eq(j.wal_len(), 0, "corrupt negative WAL count clamps to zero")
+    fail = fail + expect_eq(j.append(0, 199, 29, 39, 4), 1, "append recovers corrupt negative WAL count")
+    fail = fail + expect_eq(j.record_lba(0), 199, "recovered WAL append stores lba")
+    j.wal_lba[0] = 100
+    j.wal_old[0] = 10
+    j.wal_new[0] = 20
+    j.wal_seq[0] = 1
+    j.wal_count = 3
+    j.wal_count = JOURNAL_CAP + 1
+    fail = fail + expect_eq(j.wal_len(), JOURNAL_CAP, "corrupt oversized WAL count clamps to cap")
+    fail = fail + expect_eq(j.record_lba(JOURNAL_CAP), UNMAP, "corrupt oversized WAL count lba read fails closed")
+    fail = fail + expect_eq(j.record_seq(JOURNAL_CAP), 0, "corrupt oversized WAL count seq read fails closed")
+    j.cap = -1
+    fail = fail + expect_eq(j.wal_len(), 0, "corrupt negative WAL cap clamps len to zero")
+    j.cap = JOURNAL_CAP
+    j.wal_count = JOURNAL_CAP
+    j.cap = JOURNAL_CAP + 1
+    fail = fail + expect_eq(j.append(0, 200, 30, 40, 4), JOURNAL_CAP, "corrupt oversized WAL cap append fails closed")
+    fail = fail + expect_eq(j.wal_len(), JOURNAL_CAP, "corrupt oversized WAL cap leaves count unchanged")
+    j.wal_count = 3
+    j.cap = JOURNAL_CAP
+
+    var jt: Journal = ftl_journal_new()
+    jt.append(0, 300, 40, 50, 7)
+    jt.append(0, 301, 41, 51, 8)
+    jt.wal_lba = []
+    jt.wal_old = []
+    jt.wal_new = []
+    jt.wal_seq = []
+    fail = fail + expect_eq(jt.wal_len(), 0, "truncated WAL arrays clamp len to physical slots")
+    fail = fail + expect_eq(if jt.is_full(): 1 else: 0, 1, "truncated WAL arrays force journal repair")
+    fail = fail + expect_eq(jt.record_lba(0), UNMAP, "truncated WAL lba read fails closed")
+    fail = fail + expect_eq(jt.record_new(0), UNMAP, "truncated WAL ppn read fails closed")
+    fail = fail + expect_eq(jt.record_seq(0), 0, "truncated WAL seq read fails closed")
+    fail = fail + expect_eq(jt.append(0, 302, 42, 52, 9), 0, "truncated WAL append fails closed")
+    jt.truncate_checkpointed()
+    fail = fail + expect_eq(if jt.is_full(): 1 else: 0, 0, "truncate rebuilds truncated WAL storage")
+    fail = fail + expect_eq(jt.append(0, 303, 43, 53, 10), 1, "append resumes after WAL storage rebuild")
+    fail = fail + expect_eq(jt.record_seq(0), 10, "rebuilt WAL stores new record")
+
+    # Checkpoint at seq=2 — records 1 and 2 become durable.
+    j.checkpoint(2)
+    fail = fail + expect_eq(j.ckpt_valid, 1,  "ckpt_valid after checkpoint")
+    fail = fail + expect_eq(j.sb_gen,     1,  "sb_gen after first checkpoint")
+    fail = fail + expect_eq(j.ckpt_seq,   2,  "ckpt_seq after checkpoint(2)")
+    fail = fail + expect_eq(j.sb_ckpt_ptr, 2, "sb_ckpt_ptr after checkpoint(2)")
+
+    # Truncate: seq<=2 dropped; only seq=3 survives.
+    j.truncate_checkpointed()
+    fail = fail + expect_eq(j.wal_len(), 1,   "wal_len after truncate")
+    fail = fail + expect_eq(j.record_seq(0), 3, "surviving record seq")
+    fail = fail + expect_eq(j.record_lba(0), 102, "surviving record lba")
+    fail = fail + expect_eq(j.record_new(0), 22,  "surviving record new")
+
+    # Second checkpoint bumps sb_gen to 2.
+    j.checkpoint(3)
+    fail = fail + expect_eq(j.sb_gen, 2, "sb_gen after second checkpoint")
+    j.sb_gen = -4
+    j.checkpoint(4)
+    fail = fail + expect_eq(j.sb_gen, 1, "corrupted negative sb_gen resumes from one")
+    j.sb_gen = 1000000000000000000
+    j.checkpoint(5)
+    fail = fail + expect_eq(j.sb_gen, 1000000000000000000, "saturated sb_gen does not wrap negative")
+
+    fail

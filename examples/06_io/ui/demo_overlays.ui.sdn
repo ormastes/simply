@@ -1,0 +1,101 @@
+app:
+    title: "Overlays Demo"
+    theme: glass_dark
+
+layout:
+    type: vbox
+    children:
+        scroll_panel:
+            type: panel
+            title: "Scroll Container"
+            flex: 1
+            children:
+                log_scroll:
+                    type: scroll
+                    id: log_scroll
+                    max_height: 8
+                    children:
+                        item_01:
+                            type: text
+                            content: "Log entry 1"
+                        item_02:
+                            type: text
+                            content: "Log entry 2"
+                        item_03:
+                            type: text
+                            content: "Log entry 3"
+                        item_04:
+                            type: text
+                            content: "Log entry 4"
+                        item_05:
+                            type: text
+                            content: "Log entry 5"
+                        item_06:
+                            type: text
+                            content: "Log entry 6"
+                        item_07:
+                            type: text
+                            content: "Log entry 7"
+                        item_08:
+                            type: text
+                            content: "Log entry 8"
+                        item_09:
+                            type: text
+                            content: "Log entry 9"
+                        item_10:
+                            type: text
+                            content: "Log entry 10"
+                        item_11:
+                            type: text
+                            content: "Log entry 11"
+                        item_12:
+                            type: text
+                            content: "Log entry 12"
+                        item_13:
+                            type: text
+                            content: "Log entry 13"
+                        item_14:
+                            type: text
+                            content: "Log entry 14"
+                        item_15:
+                            type: text
+                            content: "Log entry 15"
+        textarea_panel:
+            type: panel
+            title: "Scrollable Text Area"
+            children:
+                code_scroll:
+                    type: scroll
+                    id: code_scroll
+                    max_height: 6
+                    children:
+                        code_area:
+                            type: textarea
+                            value: "fn main():\n    print Hello\n    val x = 42\n    return x"
+                            rows: 10
+        confirm_dialog:
+            type: dialog
+            id: confirm_dialog
+            title: "Confirm Action"
+            children:
+                dialog_text:
+                    type: text
+                    content: "Are you sure you want to proceed with this action?"
+                dialog_info:
+                    type: text
+                    content: "This cannot be undone."
+                dialog_buttons:
+                    type: hbox
+                    children:
+                        confirm_btn:
+                            type: button
+                            label: "Confirm"
+                            action: "confirm"
+                        cancel_btn:
+                            type: button
+                            label: "Cancel"
+                            action: "cancel"
+        status:
+            type: statusbar
+            left: "NORMAL MODE"
+            right: "Overlays Demo"

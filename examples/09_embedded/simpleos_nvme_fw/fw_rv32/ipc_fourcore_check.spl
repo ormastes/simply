@@ -1,0 +1,942 @@
+"""
+ipc_fourcore_check — host-only end-to-end harness for the wave-3 4-core NVMe
+FW IPC pipeline (design contract: doc/05_design/hardware/nvme_fw_multicore/
+fourcore_ipc_index_handle_design.md §6 four-core partition, §8 dataplane
+selftest).
+
+Simulates all 4 cores (HIL/FTL/FIL/NAND) as round-robin step functions over a
+single host-side `[i64]` array standing in for the rv32 `_ipc_shm` region —
+the SAME state machines (logic_fourcore_core.spl, logic_ipc_ring_core.spl,
+logic_buf_pool_core.spl, logic_nand_region_core.spl) the rv32 SMP boot path
+(L6) will run; only the shm accessor differs (bounds-checked array indexing
+here vs. the asm-stub load/store externs on rv32). Arrays are legal here:
+this file is host-only, never imported by entry.spl / logic.spl (same
+exemption const_drift_check.spl / buf_pool_check.spl rely on).
+
+Deliberately NOT part of the boot-linked import graph.
+
+Run: timeout 300 bin/simple run examples/09_embedded/simpleos_nvme_fw/fw_rv32/ipc_fourcore_check.spl
+Gate: prints "IPC FOURCORE CHECK PASS" and exits rc=0; any oracle failure or
+step-budget exhaustion prints "IPC FOURCORE CHECK FAIL" and exits rc=1 (same
+mechanism as ipc_ring_check.spl).
+
+Completions are correlated by TAG only (like an NVMe CID), not by re-parsing
+the opcode field on the way back up — HIL's own local bookkeeping (which
+lba/expected-data a tag maps to, tracked directly in the selftest script)
+plays the role real firmware gets from its own outstanding-command table.
+The opcode field IS translated at each DOWNWARD hop (OP_WRITE->OP_PROG->
+NOP_PROG etc., per design §4) since that is what routes the message; on the
+way back up each hop only rewrites the STATUS field and relays
+opcode/tag/w1/w2/w3 unchanged — HIL never needs to re-derive the original
+HIL-facing opcode from a NOP_*/OP_PROG value.
+
+Deviation from the wave-3 lane spec text (reported per the agent guide's
+"deviate + report" rule): the spec sketches `drv_ring_push(...) -> (shm, ok)`
+/ `drv_ring_pop(...)` as tuple-returning drivers. The agent guide's language
+landmines flag anonymous-tuple returns as decaying to garbage in this
+interpreter, so this file avoids tuples entirely: `drv_ring_push` returns
+only the mutated shm (callers must check shm_ring_push_ok first — the
+backpressure law is enforced at the call site via the pure ring-verdict
+fns, which is where the design doc says the "compute verdict, only act if
+ok" decision belongs anyway), and pop is split into a pure
+`drv_ring_peek_word` (read, no mutation) plus `drv_ring_pop` (advance-only
+mutation).
+
+── W4b: statement-like corostate dispatch overlay (design contract: doc/
+05_design/hardware/nvme_fw_coroutine/coroutine_statemachine_design.md, lane
+table §6 row W4b) ───────────────────────────────────────────────────────────
+hil_step/ftl_step/fil_step/nand_step below are rewritten as corostate
+dispatchers over logic_coro_core.spl's shared state vocabulary, WITHOUT
+changing a single message/ring/pool statement (every dataplane statement
+that used to live directly in those 4 fns now lives, byte-for-byte, in a
+`*_body`/`*_reap` helper called from exactly one dispatch branch). The rv32
+shm layout (logic_ipc_layout_core.spl, COROSTATE_BASE=8448) LANDED in W4c:
+the 4 corostate words themselves now come from the real corostate_base()/
+corostate_idx() fns (host_corostate_idx below just delegates to
+corostate_idx()). The debug trace ring (16 slots + cursor + count) has no
+rv32 counterpart in the design (it is a host-harness-only debug surface, W4c
+deferred the rv32 UART-per-transition trace flag instead — see
+NVME_RV32_CORO_TRACE in entry_smp.spl), so it stays harness-local, living
+PURELY in host memory ABOVE the landed ipc_shm_words()=8452 ceiling (see
+HOST_TRACE_* below), never through shm_get/shm_put (which stay bound to
+ipc_shm_words() on purpose, so any accidental drift would fail loudly rather
+than silently write past the real layout).
+
+Deviations from the design doc's illustrative pattern, documented per the
+same "deviate + report" rule as above:
+- hil_submit_write/read/flush stay OUTSIDE the corostate machine (untouched,
+  still callable back-to-back with no scheduler steps between them, per the
+  file's existing stage-3 backpressure contract). CS_SUBMIT is therefore a
+  pass-through phase for hil_step (nothing to do — the actual submit already
+  happened via a direct call) that always advances to CS_REAP; CS_VERIFY is
+  likewise a pass-through that only re-checks the halt flag (the actual
+  tag/status/data verification is the selftest's own inline checks, which
+  run between hil_step's REAP and the next scheduler tick).
+- Because CS_SUBMIT/CS_VERIFY advance unconditionally every tick regardless
+  of whether a completion has actually arrived, HIL's REAP phase is not
+  guaranteed to be the ACTIVE phase on the exact tick a completion first
+  lands in R_FTL2HIL (SUBMIT/VERIFY may be "in the way"). The selftest's
+  single explicit `hil_step(shm)` call after each drain relies on HIL being
+  in CS_REAP right then, so `drain_until_ftl2hil_ready` below gained a
+  second wait condition (HIL corostate == CS_REAP) alongside the original
+  ring-ready check — a harness-only scheduling fix, zero dataplane change.
+- Workers (FTL/FIL/NAND) collapse CS_PUMP_FWD/CS_PUMP_BACK into a same-tick
+  self-loop back to CS_IDLE: the *_step_idle wrapper calls the existing body
+  unconditionally (unchanged behavior) and then either self-transitions
+  CS_IDLE->CS_IDLE or, once the halt flag is observed, CS_IDLE->
+  CS_HALT_DRAIN — never labeling a movement as FWD/BACK, since deriving that
+  label precisely would require duplicating the body's internal nested
+  backpressure branches outside it (a correctness risk for a label the host
+  harness's oracles never need — design §5's HIL-cycle oracle is the only
+  one this lane requires). The dispatchers still carry explicit
+  CS_PUMP_FWD/CS_PUMP_BACK branches (pass-through back to CS_IDLE) for full
+  vocabulary coverage; they are unreached by this harness, same hardening-
+  honesty convention as nand_step's NOP_ERASE branch below.
+"""
+
+use logic_ipc_layout_core.*
+use logic_ipc_msg_core.*
+use logic_ipc_ring_core.*
+use logic_buf_pool_core.*
+use logic_nand_region_core.*
+use logic_fourcore_core.*
+use logic_coro_core.*
+use std.io_runtime.{exit}
+
+# ── W4c: corostate words now come from the LANDED real layout fns
+# (corostate_base()/corostate_idx() in logic_ipc_layout_core.spl). Only the
+# debug trace ring stays harness-local, living past ipc_shm_words()=8452
+# using its own hc_get/hc_put accessors (NOT shm_get/shm_put, which stay
+# bound to the landed layout on purpose) and its own bounds check against
+# HOST_SHM_WORDS(). ─────────────────────────────────────────────────────────
+
+fn HIL_CORE() -> i64:
+    0
+
+fn FTL_CORE() -> i64:
+    1
+
+fn FIL_CORE() -> i64:
+    2
+
+fn NAND_CORE() -> i64:
+    3
+
+# Delegates to the real, landed corostate_idx() (logic_ipc_layout_core.spl),
+# which already bounds-checks core 0..3 (else IPC_NULL_IDX) — kept as a
+# thin wrapper so every call site below is unchanged.
+fn host_corostate_idx(core: i64) -> i64:
+    corostate_idx(core)
+
+# 16-entry transition trace ring, right after the 4 (now-real) corostate
+# words: each slot holds one packed (core, cur, next) triple as
+# core*100 + cur*10 + next (core 0..3, state ids 0..8 — both fit single
+# decimal digits, so the packing is lossless and trivially decodable:
+# core = packed/100, cur = (packed/10)%10, next = packed%10).
+fn HOST_TRACE_BASE() -> i64:
+    ipc_shm_words()
+
+fn HOST_TRACE_DEPTH() -> i64:
+    16
+
+fn HOST_TRACE_CURSOR_IDX() -> i64:
+    HOST_TRACE_BASE() + HOST_TRACE_DEPTH()
+
+fn HOST_TRACE_COUNT_IDX() -> i64:
+    HOST_TRACE_CURSOR_IDX() + 1
+
+fn HOST_SHM_WORDS() -> i64:
+    HOST_TRACE_COUNT_IDX() + 1
+
+fn hc_idx_valid(idx: i64) -> i32:
+    if idx < 0:
+        return 0
+    if idx >= HOST_SHM_WORDS():
+        return 0
+    1
+
+fn hc_get(shm: [i64], idx: i64) -> i64:
+    if hc_idx_valid(idx) == 0:
+        return -1
+    shm[idx]
+
+fn hc_put(shm: [i64], idx: i64, v: i64) -> [i64]:
+    if hc_idx_valid(idx) == 0:
+        return shm
+    var s = shm
+    s[idx] = v
+    s
+
+# Oldest-to-newest walk over the trace ring's currently-valid entries
+# (logical_i = 0 is oldest, HOST_TRACE_COUNT_IDX()-1 is newest); handles
+# the pre-wrap (count < depth, oldest is slot 0) and post-wrap (count ==
+# depth, oldest is the slot the cursor is about to overwrite next) cases.
+fn trace_entry_at(shm: [i64], logical_i: i64) -> i64:
+    val count: i64 = hc_get(shm, HOST_TRACE_COUNT_IDX())
+    val cursor: i64 = hc_get(shm, HOST_TRACE_CURSOR_IDX())
+    var oldest_slot: i64 = 0
+    if count >= HOST_TRACE_DEPTH():
+        oldest_slot = cursor
+    val slot: i64 = (oldest_slot + logical_i) % HOST_TRACE_DEPTH()
+    hc_get(shm, HOST_TRACE_BASE() + slot)
+
+fn coro_trace_push(shm: [i64], core: i64, cur: i64, next: i64) -> [i64]:
+    val packed: i64 = core * 100 + cur * 10 + next
+    val cursor: i64 = hc_get(shm, HOST_TRACE_CURSOR_IDX())
+    var s = shm
+    s = hc_put(s, HOST_TRACE_BASE() + cursor, packed)
+    s = hc_put(s, HOST_TRACE_CURSOR_IDX(), (cursor + 1) % HOST_TRACE_DEPTH())
+    val cnt: i64 = hc_get(s, HOST_TRACE_COUNT_IDX())
+    var new_cnt: i64 = cnt
+    if cnt < HOST_TRACE_DEPTH():
+        new_cnt = cnt + 1
+    hc_put(s, HOST_TRACE_COUNT_IDX(), new_cnt)
+
+# The ONE shared transition helper every dispatcher below must go through
+# (design §3/§4: drivers never store a corostate word except through this
+# path). Fail-closed: an illegal verdict FAILs the whole harness the same
+# way rv32's ipc_fatal would (design §3), never a silent/garbage state
+# write. On success: commits the new corostate word AND appends one trace-
+# ring entry, so "one dispatch call -> at most one transition" also means
+# "at most one trace entry" (design §5 debug surface).
+fn coro_do_transition(shm: [i64], core: i64, cur: i64, next: i64) -> [i64]:
+    val verdict: i64 = coro_transition_verdict(cur, next)
+    if verdict == -1:
+        print "  FAIL: illegal corostate transition (fail-closed halt, design SS3)"
+        exit(1)
+        return shm
+    var s = shm
+    s = hc_put(s, host_corostate_idx(core), verdict)
+    coro_trace_push(s, core, cur, verdict)
+
+# Shared CS_HALT_DRAIN phase (design §3: the ONLY exit is CS_HALT_DRAIN ->
+# CS_PARKED, once drain is complete). "Drain complete" is the same global
+# all_rings_empty() the selftest itself already uses for its own halt+drain
+# oracle (design §6 core_should_halt has the same "aggregate of its rings"
+# looseness) — reused here rather than re-deriving a per-core notion.
+fn coro_halt_drain_phase(shm: [i64], core: i64, cs: i64) -> [i64]:
+    if all_rings_empty(shm) == 0:
+        return shm
+    coro_do_transition(shm, core, cs, CS_PARKED())
+
+fn all_corostates_parked(shm: [i64]) -> i32:
+    if hc_get(shm, host_corostate_idx(HIL_CORE())) != CS_PARKED():
+        return 0
+    if hc_get(shm, host_corostate_idx(FTL_CORE())) != CS_PARKED():
+        return 0
+    if hc_get(shm, host_corostate_idx(FIL_CORE())) != CS_PARKED():
+        return 0
+    if hc_get(shm, host_corostate_idx(NAND_CORE())) != CS_PARKED():
+        return 0
+    1
+
+# Oracle (a) helper (design §5): scan the trace ring's valid entries
+# oldest->newest, filter to HIL-only, and match the canonical 3-transition
+# sequence for one write's full journey: CS_BOOT->CS_SUBMIT (packed 6),
+# CS_SUBMIT->CS_REAP (packed 67), CS_REAP->CS_VERIFY (packed 78), in that
+# exact order (other cores' interleaved entries are skipped, not required
+# to be absent).
+fn hil_seq_check(shm: [i64]) -> i32:
+    val count: i64 = hc_get(shm, HOST_TRACE_COUNT_IDX())
+    var matched: i64 = 0
+    var i: i64 = 0
+    while i < count:
+        val packed: i64 = trace_entry_at(shm, i)
+        val core: i64 = packed / 100
+        if core == HIL_CORE():
+            if matched == 0 and packed == 6:
+                matched = 1
+            if matched == 1 and packed == 67:
+                matched = 2
+            if matched == 2 and packed == 78:
+                matched = 3
+        i = i + 1
+    if matched == 3:
+        return 1
+    0
+
+# ── shm accessors (bounds-checked, same convention the rv32 asm-stub
+# wrappers will use) ──────────────────────────────────────────────────────────
+
+fn shm_new() -> [i64]:
+    # HOST_SHM_WORDS() (not ipc_shm_words()) so the real corostate words
+    # (now part of the landed layout) plus the harness-local trace-ring
+    # words past the ipc_shm_words()=8452 ceiling all exist too. All-zero
+    # init already gives every corostate word CS_BOOT()==0 and an empty
+    # trace ring (cursor=0, count=0) for free — no extra init needed.
+    var s: [i64] = [0 for i in 0..HOST_SHM_WORDS()]
+    var i: i64 = 0
+    while i < buf_pool_capacity():
+        s = shm_put(s, buf_pool_next_idx(i), buf_pool_init_next_val(i))
+        i = i + 1
+    s = shm_put(s, buf_pool_free_head_idx(), 0)
+    s = shm_put(s, buf_pool_alloc_count_idx(), 0)
+    s
+
+fn shm_get(shm: [i64], idx: i64) -> i64:
+    if shm_idx_valid(idx) == 0:
+        return -1
+    shm[idx]
+
+fn shm_put(shm: [i64], idx: i64, v: i64) -> [i64]:
+    if shm_idx_valid(idx) == 0:
+        return shm
+    var s = shm
+    s[idx] = v
+    s
+
+# ── ring driver (§4 publish/consume order) ────────────────────────────────────
+# SPSC ownership: TAIL is written only by the producer (drv_ring_push), HEAD
+# only by the consumer (drv_ring_pop). Callers MUST check shm_ring_push_ok /
+# shm_ring_pop_ok before calling the matching mutator — the backpressure law
+# (design §4: "compute pop-verdict on input ring AND push-verdict on output
+# ring; only when BOTH ok, perform...") is enforced at the CALL SITE using
+# the pure ring-verdict fns; drv_ring_push/drv_ring_pop trust the caller and
+# just perform the prescribed shm writes.
+
+fn shm_ring_push_ok(shm: [i64], r: i64) -> i32:
+    val head: i64 = shm_get(shm, ring_head_idx(r))
+    val tail: i64 = shm_get(shm, ring_tail_idx(r))
+    ring_can_push(head, tail)
+
+fn shm_ring_pop_ok(shm: [i64], r: i64) -> i32:
+    val head: i64 = shm_get(shm, ring_head_idx(r))
+    val tail: i64 = shm_get(shm, ring_tail_idx(r))
+    if ring_empty(head, tail) == 1:
+        return 0
+    1
+
+# Publish order (design §4): write payload words, then (fence — no-op on
+# host), then advance TAIL.
+fn drv_ring_push(shm: [i64], r: i64, w0: i64, w1: i64, w2: i64, w3: i64) -> [i64]:
+    val tail: i64 = shm_get(shm, ring_tail_idx(r))
+    var s = shm
+    s = shm_put(s, ring_slot_idx(r, tail, 0), w0)
+    s = shm_put(s, ring_slot_idx(r, tail, 1), w1)
+    s = shm_put(s, ring_slot_idx(r, tail, 2), w2)
+    s = shm_put(s, ring_slot_idx(r, tail, 3), w3)
+    s = shm_put(s, ring_tail_idx(r), tail + 1)
+    s
+
+# Read one word of the message at the HEAD slot, without mutating anything —
+# the consume-order read half of "read TAIL -> fence -> read payload -> write
+# HEAD" (§4).
+fn drv_ring_peek_word(shm: [i64], r: i64, word: i64) -> i64:
+    val head: i64 = shm_get(shm, ring_head_idx(r))
+    shm_get(shm, ring_slot_idx(r, head, word))
+
+# Consume order tail: advance HEAD by one (the payload words must already
+# have been read via drv_ring_peek_word before calling this).
+fn drv_ring_pop(shm: [i64], r: i64) -> [i64]:
+    val head: i64 = shm_get(shm, ring_head_idx(r))
+    shm_put(shm, ring_head_idx(r), head + 1)
+
+# ── buf pool driver (§5) ──────────────────────────────────────────────────────
+
+fn buf_pool_alloc_slot(shm: [i64]) -> i64:
+    val free_head: i64 = shm_get(shm, buf_pool_free_head_idx())
+    val alloc_count: i64 = shm_get(shm, buf_pool_alloc_count_idx())
+    buf_alloc_verdict(free_head, alloc_count)
+
+fn drv_buf_alloc_commit(shm: [i64], slot: i64) -> [i64]:
+    val new_head: i64 = shm_get(shm, buf_pool_next_idx(slot))
+    var s = shm
+    s = shm_put(s, buf_pool_next_idx(slot), BUF_IN_USE())
+    s = shm_put(s, buf_pool_free_head_idx(), new_head)
+    val cnt: i64 = shm_get(s, buf_pool_alloc_count_idx())
+    s = shm_put(s, buf_pool_alloc_count_idx(), cnt + 1)
+    s
+
+fn buf_pool_free_ok(shm: [i64], slot: i64) -> i32:
+    val next_val: i64 = shm_get(shm, buf_pool_next_idx(slot))
+    val free_head: i64 = shm_get(shm, buf_pool_free_head_idx())
+    val alloc_count: i64 = shm_get(shm, buf_pool_alloc_count_idx())
+    buf_free_verdict_ok(buf_free_verdict(slot, next_val, free_head, alloc_count))
+
+fn drv_buf_free_commit(shm: [i64], slot: i64) -> [i64]:
+    if buf_pool_free_ok(shm, slot) == 0:
+        return shm
+    val free_head: i64 = shm_get(shm, buf_pool_free_head_idx())
+    var s = shm
+    s = shm_put(s, buf_pool_next_idx(slot), free_head)
+    s = shm_put(s, buf_pool_free_head_idx(), slot)
+    val cnt: i64 = shm_get(s, buf_pool_alloc_count_idx())
+    s = shm_put(s, buf_pool_alloc_count_idx(), cnt - 1)
+    s
+
+# ── aggregate + scheduler helpers ──────────────────────────────────────────────
+
+fn all_rings_empty(shm: [i64]) -> i32:
+    var r: i64 = 0
+    while r < ring_count():
+        if shm_ring_pop_ok(shm, r) == 1:
+            return 0
+        r = r + 1
+    1
+
+fn pump_once(shm: [i64]) -> [i64]:
+    var s = shm
+    s = hil_step(s)
+    s = ftl_step(s)
+    s = fil_step(s)
+    s = nand_step(s)
+    s
+
+# Bounded drain helpers: try up to the 100000-step scheduler budget (design
+# §8 / lane spec: "Budget exhaustion = FAIL"), then return whatever shm state
+# was reached. Callers detect success/failure by re-checking the SAME
+# predicate the drain was waiting on — this sidesteps returning a second
+# "did it converge" value (see the tuple-avoidance note in the file header).
+fn drain_until_ftl2hil_ready(shm: [i64]) -> [i64]:
+    # Waits for BOTH the ring (original condition) AND HIL's corostate
+    # actually being CS_REAP (W4b addition — see file header "Deviations"):
+    # CS_SUBMIT/CS_VERIFY advance every tick unconditionally, so a
+    # completion can land in R_FTL2HIL on a tick where HIL isn't the phase
+    # that would reap it. Without this second condition the selftest's one
+    # explicit `hil_step(shm)` call right after this drain could land on a
+    # SUBMIT/VERIFY pass-through instead of the reap, leaving the
+    # completion unpopped. Same budget, same "whatever state was reached"
+    # contract as before (see the comment above this fn group).
+    var s = shm
+    var i: i64 = 0
+    while ((shm_ring_pop_ok(s, r_ftl2hil()) == 0) or (hc_get(s, host_corostate_idx(HIL_CORE())) != CS_REAP())) and i < 100000:
+        s = pump_once(s)
+        i = i + 1
+    s
+
+fn drain_until_all_empty(shm: [i64]) -> [i64]:
+    var s = shm
+    var i: i64 = 0
+    while all_rings_empty(s) == 0 and i < 100000:
+        s = pump_once(s)
+        i = i + 1
+    s
+
+# W4b addition: drives the corostate overlay the rest of the way to its
+# terminal state (design §5 end-state oracle). drain_until_all_empty alone
+# does not reach this — see the stage-5 comment at its call site.
+fn drain_until_all_parked(shm: [i64]) -> [i64]:
+    var s = shm
+    var i: i64 = 0
+    while all_corostates_parked(s) == 0 and i < 100000:
+        s = pump_once(s)
+        i = i + 1
+    s
+
+# ── HIL submit path (host test driver only — NOT part of the round-robin
+# scheduler; the ring-backpressure oracle needs submits callable back-to-back
+# WITHOUT the scheduler running in between, per the lane spec) ──────────────
+
+fn hil_can_submit(shm: [i64]) -> i32:
+    shm_ring_push_ok(shm, r_hil2ftl())
+
+fn hil_submit_write(shm: [i64], lba: i64, tag: i64, data: i64) -> [i64]:
+    if hil_can_submit(shm) == 0:
+        return shm
+    val slot: i64 = buf_pool_alloc_slot(shm)
+    if slot == ipc_null_idx():
+        return shm
+    var s = shm
+    s = drv_buf_alloc_commit(s, slot)
+    s = shm_put(s, buf_pool_data_idx(slot), data)
+    val w0: i64 = msg_w0_pack(OP_WRITE(), tag, ST_OK())
+    drv_ring_push(s, r_hil2ftl(), w0, lba, slot, 0)
+
+fn hil_submit_read(shm: [i64], lba: i64, tag: i64) -> [i64]:
+    if hil_can_submit(shm) == 0:
+        return shm
+    val slot: i64 = buf_pool_alloc_slot(shm)
+    if slot == ipc_null_idx():
+        return shm
+    var s = shm
+    s = drv_buf_alloc_commit(s, slot)
+    val w0: i64 = msg_w0_pack(OP_READ(), tag, ST_OK())
+    drv_ring_push(s, r_hil2ftl(), w0, lba, slot, 0)
+
+fn hil_submit_flush(shm: [i64], tag: i64) -> [i64]:
+    if hil_can_submit(shm) == 0:
+        return shm
+    val w0: i64 = msg_w0_pack(OP_FLUSH(), tag, ST_OK())
+    drv_ring_push(shm, r_hil2ftl(), w0, 0, ipc_null_idx(), 0)
+
+# ── core step functions (§8: "one message movement per call") — W4b:
+# rewritten as corostate dispatchers (design §4). Every dataplane statement
+# below is EXACTLY what used to live directly in hil_step/ftl_step/
+# fil_step/nand_step; only the wrapping changed (file header "Deviations"
+# explains the per-core phase mapping). ─────────────────────────────────────
+
+# HIL CS_REAP phase body: consume ONE completion off R_FTL2HIL (if any) and
+# free its buffer (if it held one — flush/bounds-fail completions may carry
+# IPC_NULL_IDX or a valid never-used slot; both are handled uniformly).
+# Unchanged from the pre-W4b hil_step body except the tail: instead of
+# returning drv_ring_pop's result directly, it feeds that shm into the one
+# CS_REAP->CS_VERIFY transition (design §4 "ending in exactly one
+# transition").
+fn hil_step_reap(shm: [i64], cs: i64) -> [i64]:
+    if shm_ring_pop_ok(shm, r_ftl2hil()) == 0:
+        return shm
+    val buf_idx: i64 = drv_ring_peek_word(shm, r_ftl2hil(), 2)
+    var s = shm
+    if buf_idx != ipc_null_idx():
+        if buf_pool_free_ok(s, buf_idx) == 1:
+            s = drv_buf_free_commit(s, buf_idx)
+    s = drv_ring_pop(s, r_ftl2hil())
+    coro_do_transition(s, HIL_CORE(), cs, CS_VERIFY())
+
+# HIL dispatcher (design §4/§6): CS_BOOT->CS_SUBMIT stands in for the rv32
+# hart-release gate this harness doesn't have (file header). CS_SUBMIT and
+# CS_VERIFY are pass-through phases (see file header "Deviations" for why);
+# CS_REAP is the only phase with a data-dependent guard, gated on the exact
+# same shm_ring_pop_ok check the original hil_step used.
+fn hil_step(shm: [i64]) -> [i64]:
+    val cs: i64 = hc_get(shm, host_corostate_idx(HIL_CORE()))
+    if cs == CS_BOOT():
+        return coro_do_transition(shm, HIL_CORE(), cs, CS_SUBMIT())
+    if cs == CS_SUBMIT():
+        return coro_do_transition(shm, HIL_CORE(), cs, CS_REAP())
+    if cs == CS_REAP():
+        return hil_step_reap(shm, cs)
+    if cs == CS_VERIFY():
+        val halt_word: i64 = shm_get(shm, IPC_HALT_IDX())
+        if halt_word == 1:
+            return coro_do_transition(shm, HIL_CORE(), cs, CS_HALT_DRAIN())
+        return coro_do_transition(shm, HIL_CORE(), cs, CS_SUBMIT())
+    if cs == CS_HALT_DRAIN():
+        return coro_halt_drain_phase(shm, HIL_CORE(), cs)
+    if cs == CS_PARKED():
+        return shm
+    print "  FAIL: HIL corostate word out of range"
+    exit(1)
+    shm
+
+# FTL CS_IDLE phase body (unchanged from the pre-W4b ftl_step body): up-pump
+# (FIL completion -> HIL) takes priority over down-pump (HIL request -> FTL
+# routing); still at most one message movement total.
+fn ftl_step_body(shm: [i64]) -> [i64]:
+    if shm_ring_pop_ok(shm, r_fil2ftl()) == 1:
+        if shm_ring_push_ok(shm, r_ftl2hil()) == 1:
+            val w0: i64 = drv_ring_peek_word(shm, r_fil2ftl(), 0)
+            val w1: i64 = drv_ring_peek_word(shm, r_fil2ftl(), 1)
+            val w2: i64 = drv_ring_peek_word(shm, r_fil2ftl(), 2)
+            val w3: i64 = drv_ring_peek_word(shm, r_fil2ftl(), 3)
+            var s = shm
+            s = drv_ring_push(s, r_ftl2hil(), w0, w1, w2, w3)
+            return drv_ring_pop(s, r_fil2ftl())
+        return shm
+    if shm_ring_pop_ok(shm, r_hil2ftl()) == 0:
+        return shm
+    val w0: i64 = drv_ring_peek_word(shm, r_hil2ftl(), 0)
+    val w1: i64 = drv_ring_peek_word(shm, r_hil2ftl(), 1)
+    val w2: i64 = drv_ring_peek_word(shm, r_hil2ftl(), 2)
+    val opcode: i64 = msg_w0_opcode(w0)
+    val tag: i64 = msg_w0_tag(w0)
+    val routed: i64 = ftl_route_opcode(opcode)
+    if routed == -1:
+        # OP_FLUSH completes at FTL directly (design §4/§8); any other
+        # opcode landing here is a defensive fail-closed case (never
+        # produced by hil_submit_*, kept for hardening honesty).
+        if shm_ring_push_ok(shm, r_ftl2hil()) == 0:
+            return shm
+        var out_status: i64 = ST_OK()
+        if opcode != OP_FLUSH():
+            out_status = ST_ERR()
+        val out_w0: i64 = msg_w0_pack(opcode, tag, out_status)
+        var s = shm
+        s = drv_ring_push(s, r_ftl2hil(), out_w0, w1, w2, 0)
+        return drv_ring_pop(s, r_hil2ftl())
+    val ppn: i64 = ftl_map_ppn(w1)
+    if ppn == -1:
+        # LBA out of range: synthesize ST_BOUNDS directly, bypass FIL/NAND.
+        if shm_ring_push_ok(shm, r_ftl2hil()) == 0:
+            return shm
+        val out_w0: i64 = msg_w0_pack(opcode, tag, ST_BOUNDS())
+        var s = shm
+        s = drv_ring_push(s, r_ftl2hil(), out_w0, w1, w2, 0)
+        return drv_ring_pop(s, r_hil2ftl())
+    if shm_ring_push_ok(shm, r_ftl2fil()) == 0:
+        return shm
+    val out_w0b: i64 = msg_w0_pack(routed, tag, ST_OK())
+    var s = shm
+    s = drv_ring_push(s, r_ftl2fil(), out_w0b, ppn, w2, 0)
+    drv_ring_pop(s, r_hil2ftl())
+
+# FTL CS_IDLE dispatch wrapper: runs the unchanged body, then picks the one
+# outgoing transition (self-loop, unless halt is observed — file header
+# "Deviations" explains why CS_PUMP_FWD/CS_PUMP_BACK are not labeled here).
+fn ftl_step_idle(shm: [i64], cs: i64) -> [i64]:
+    val s: [i64] = ftl_step_body(shm)
+    val halt_word: i64 = shm_get(s, IPC_HALT_IDX())
+    if halt_word == 1:
+        return coro_do_transition(s, FTL_CORE(), cs, CS_HALT_DRAIN())
+    coro_do_transition(s, FTL_CORE(), cs, CS_IDLE())
+
+fn ftl_step(shm: [i64]) -> [i64]:
+    val cs: i64 = hc_get(shm, host_corostate_idx(FTL_CORE()))
+    if cs == CS_BOOT():
+        return coro_do_transition(shm, FTL_CORE(), cs, CS_IDLE())
+    if cs == CS_IDLE():
+        return ftl_step_idle(shm, cs)
+    if cs == CS_PUMP_FWD():
+        # Unreached by this harness's simplified overlay (file header
+        # "Deviations"); kept for full vocabulary coverage, same hardening-
+        # honesty convention as nand_step_body's NOP_ERASE branch below.
+        return coro_do_transition(shm, FTL_CORE(), cs, CS_IDLE())
+    if cs == CS_PUMP_BACK():
+        return coro_do_transition(shm, FTL_CORE(), cs, CS_IDLE())
+    if cs == CS_HALT_DRAIN():
+        return coro_halt_drain_phase(shm, FTL_CORE(), cs)
+    if cs == CS_PARKED():
+        return shm
+    print "  FAIL: FTL corostate word out of range"
+    exit(1)
+    shm
+
+# FIL CS_IDLE phase body (unchanged from the pre-W4b fil_step body): up-pump
+# (NAND completion -> FTL) takes priority over down-pump (FTL request ->
+# NAND routing).
+fn fil_step_body(shm: [i64]) -> [i64]:
+    if shm_ring_pop_ok(shm, r_nand2fil()) == 1:
+        if shm_ring_push_ok(shm, r_fil2ftl()) == 1:
+            val w0: i64 = drv_ring_peek_word(shm, r_nand2fil(), 0)
+            val w1: i64 = drv_ring_peek_word(shm, r_nand2fil(), 1)
+            val w2: i64 = drv_ring_peek_word(shm, r_nand2fil(), 2)
+            val w3: i64 = drv_ring_peek_word(shm, r_nand2fil(), 3)
+            val opcode: i64 = msg_w0_opcode(w0)
+            val tag: i64 = msg_w0_tag(w0)
+            val st: i64 = msg_w0_status(w0)
+            val out_status: i64 = fil_status_of_nand(st)
+            val out_w0: i64 = msg_w0_pack(opcode, tag, out_status)
+            var s = shm
+            s = drv_ring_push(s, r_fil2ftl(), out_w0, w1, w2, w3)
+            return drv_ring_pop(s, r_nand2fil())
+        return shm
+    if shm_ring_pop_ok(shm, r_ftl2fil()) == 0:
+        return shm
+    val w0: i64 = drv_ring_peek_word(shm, r_ftl2fil(), 0)
+    val w1: i64 = drv_ring_peek_word(shm, r_ftl2fil(), 1)
+    val w2: i64 = drv_ring_peek_word(shm, r_ftl2fil(), 2)
+    val w3: i64 = drv_ring_peek_word(shm, r_ftl2fil(), 3)
+    val opcode: i64 = msg_w0_opcode(w0)
+    val tag: i64 = msg_w0_tag(w0)
+    val nand_op: i64 = fil_route_opcode(opcode)
+    if nand_op == -1:
+        # Fail-closed: an unroutable opcode reaching FIL — bump the shared
+        # error counter and drop rather than forward garbage to NAND or
+        # wedge the ring forever (design §2 rule 4: never wrap, never
+        # clamp-and-continue). Unreachable via hil_submit_*/ftl_step in this
+        # harness; kept for hardening honesty.
+        val errc: i64 = shm_get(shm, ipc_err_count_idx())
+        var s = shm
+        s = shm_put(s, ipc_err_count_idx(), errc + 1)
+        return drv_ring_pop(s, r_ftl2fil())
+    if shm_ring_push_ok(shm, r_fil2nand()) == 0:
+        return shm
+    val out_w0: i64 = msg_w0_pack(nand_op, tag, ST_OK())
+    var s = shm
+    s = drv_ring_push(s, r_fil2nand(), out_w0, w1, w2, w3)
+    drv_ring_pop(s, r_ftl2fil())
+
+# FIL CS_IDLE dispatch wrapper — same shape as ftl_step_idle.
+fn fil_step_idle(shm: [i64], cs: i64) -> [i64]:
+    val s: [i64] = fil_step_body(shm)
+    val halt_word: i64 = shm_get(s, IPC_HALT_IDX())
+    if halt_word == 1:
+        return coro_do_transition(s, FIL_CORE(), cs, CS_HALT_DRAIN())
+    coro_do_transition(s, FIL_CORE(), cs, CS_IDLE())
+
+fn fil_step(shm: [i64]) -> [i64]:
+    val cs: i64 = hc_get(shm, host_corostate_idx(FIL_CORE()))
+    if cs == CS_BOOT():
+        return coro_do_transition(shm, FIL_CORE(), cs, CS_IDLE())
+    if cs == CS_IDLE():
+        return fil_step_idle(shm, cs)
+    if cs == CS_PUMP_FWD():
+        return coro_do_transition(shm, FIL_CORE(), cs, CS_IDLE())
+    if cs == CS_PUMP_BACK():
+        return coro_do_transition(shm, FIL_CORE(), cs, CS_IDLE())
+    if cs == CS_HALT_DRAIN():
+        return coro_halt_drain_phase(shm, FIL_CORE(), cs)
+    if cs == CS_PARKED():
+        return shm
+    print "  FAIL: FIL corostate word out of range"
+    exit(1)
+    shm
+
+# NAND CS_IDLE phase body (unchanged from the pre-W4b nand_step body):
+# consume ONE request off R_FIL2NAND, apply it to the NAND-state/data
+# region + buf-pool data staging words, push ONE completion to R_NAND2FIL.
+fn nand_step_body(shm: [i64]) -> [i64]:
+    if shm_ring_pop_ok(shm, r_fil2nand()) == 0:
+        return shm
+    if shm_ring_push_ok(shm, r_nand2fil()) == 0:
+        return shm
+    val w0: i64 = drv_ring_peek_word(shm, r_fil2nand(), 0)
+    val ppn: i64 = drv_ring_peek_word(shm, r_fil2nand(), 1)
+    val buf_idx: i64 = drv_ring_peek_word(shm, r_fil2nand(), 2)
+    val block: i64 = drv_ring_peek_word(shm, r_fil2nand(), 3)
+    val opcode: i64 = msg_w0_opcode(w0)
+    val tag: i64 = msg_w0_tag(w0)
+
+    var s = shm
+    var out_status: i64 = ST_ERR()
+
+    if opcode == NOP_PROG():
+        if nand_ppn_valid(ppn) == 0:
+            out_status = ST_BOUNDS()
+        else:
+            val cur_state: i64 = shm_get(s, nand_state_idx(ppn))
+            if nand_program_verdict(cur_state) == NAND_PROGRAM_OK():
+                val data_word: i64 = shm_get(s, buf_pool_data_idx(buf_idx))
+                s = shm_put(s, nand_state_idx(ppn), 1)
+                s = shm_put(s, nand_data_idx(ppn), data_word)
+                out_status = ST_OK()
+            else:
+                out_status = ST_MEDIA()
+
+    if opcode == NOP_READ():
+        if nand_ppn_valid(ppn) == 0:
+            out_status = ST_BOUNDS()
+        else:
+            val cur_state: i64 = shm_get(s, nand_state_idx(ppn))
+            var data_val: i64 = NAND_ERASED_DATA()
+            if nand_read_verdict(cur_state) == NAND_READ_OK():
+                data_val = shm_get(s, nand_data_idx(ppn))
+            s = shm_put(s, buf_pool_data_idx(buf_idx), data_val)
+            out_status = ST_OK()
+
+    if opcode == NOP_ERASE():
+        # Not reachable via this harness (no FTL/FIL path emits OP_ERASE —
+        # HIL only issues WRITE/READ/FLUSH); implemented for opcode-table
+        # completeness/hardening honesty, not exercised by the 5 selftest
+        # oracles below.
+        if nand_block_valid(block) == 0:
+            out_status = ST_BOUNDS()
+        else:
+            val first: i64 = nand_block_first_ppn(block)
+            val last: i64 = nand_block_last_ppn(block)
+            var p: i64 = first
+            while p <= last:
+                s = shm_put(s, nand_state_idx(p), NAND_STATE_ERASED())
+                p = p + 1
+            out_status = ST_OK()
+
+    val out_w0: i64 = msg_w0_pack(opcode, tag, out_status)
+    s = drv_ring_push(s, r_nand2fil(), out_w0, ppn, buf_idx, block)
+    drv_ring_pop(s, r_fil2nand())
+
+# NAND CS_IDLE dispatch wrapper — same shape as ftl_step_idle/fil_step_idle.
+fn nand_step_idle(shm: [i64], cs: i64) -> [i64]:
+    val s: [i64] = nand_step_body(shm)
+    val halt_word: i64 = shm_get(s, IPC_HALT_IDX())
+    if halt_word == 1:
+        return coro_do_transition(s, NAND_CORE(), cs, CS_HALT_DRAIN())
+    coro_do_transition(s, NAND_CORE(), cs, CS_IDLE())
+
+fn nand_step(shm: [i64]) -> [i64]:
+    val cs: i64 = hc_get(shm, host_corostate_idx(NAND_CORE()))
+    if cs == CS_BOOT():
+        return coro_do_transition(shm, NAND_CORE(), cs, CS_IDLE())
+    if cs == CS_IDLE():
+        return nand_step_idle(shm, cs)
+    if cs == CS_PUMP_FWD():
+        return coro_do_transition(shm, NAND_CORE(), cs, CS_IDLE())
+    if cs == CS_PUMP_BACK():
+        return coro_do_transition(shm, NAND_CORE(), cs, CS_IDLE())
+    if cs == CS_HALT_DRAIN():
+        return coro_halt_drain_phase(shm, NAND_CORE(), cs)
+    if cs == CS_PARKED():
+        return shm
+    print "  FAIL: NAND corostate word out of range"
+    exit(1)
+    shm
+
+# ── 5-stage dataplane selftest (design §8, lane spec L5b) ─────────────────────
+
+fn ipc_fourcore_selftest() -> i32:
+    var shm: [i64] = shm_new()
+    var tag: i64 = 0
+    val lbas: [i64] = [5, 100, 3071]
+
+    # Stage 1a: write 3 LBAs with the fixed data oracle hil_expect_data(lba).
+    var idx: i64 = 0
+    while idx < 3:
+        val lba: i64 = lbas[idx]
+        if hil_can_submit(shm) == 0:
+            print "  FAIL: stage1 write submit unexpectedly rejected"
+            return 1
+        shm = hil_submit_write(shm, lba, tag, hil_expect_data(lba))
+        shm = drain_until_ftl2hil_ready(shm)
+        if shm_ring_pop_ok(shm, r_ftl2hil()) == 0:
+            print "  FAIL: step budget exhausted awaiting write completion"
+            return 1
+        val w0: i64 = drv_ring_peek_word(shm, r_ftl2hil(), 0)
+        if msg_w0_tag(w0) != tag:
+            print "  FAIL: write completion tag mismatch (FIFO order broken)"
+            return 1
+        if msg_w0_status(w0) != ST_OK():
+            print "  FAIL: write completion status != ST_OK"
+            return 1
+        shm = hil_step(shm)
+        if idx == 0:
+            # Oracle (a) (design §5, W4b): the FIRST write's full HIL
+            # journey must show the canonical corostate sequence
+            # CS_BOOT->CS_SUBMIT->CS_REAP->CS_VERIFY, still present in the
+            # last-16 transition trace ring at this exact checkpoint (this
+            # journey logs 15 total entries across all 4 cores — verified
+            # by execution — one under the 16-slot cap, so nothing has been
+            # evicted yet).
+            if hil_seq_check(shm) == 0:
+                print "  FAIL: HIL canonical transition sequence BOOT->SUBMIT->REAP->VERIFY not found in trace ring"
+                return 1
+        tag = tag + 1
+        idx = idx + 1
+
+    # Stage 1b: flush, assert ST_OK.
+    if hil_can_submit(shm) == 0:
+        print "  FAIL: stage1 flush submit unexpectedly rejected"
+        return 1
+    shm = hil_submit_flush(shm, tag)
+    shm = drain_until_ftl2hil_ready(shm)
+    if shm_ring_pop_ok(shm, r_ftl2hil()) == 0:
+        print "  FAIL: step budget exhausted awaiting flush completion"
+        return 1
+    if msg_w0_status(drv_ring_peek_word(shm, r_ftl2hil(), 0)) != ST_OK():
+        print "  FAIL: flush completion status != ST_OK"
+        return 1
+    shm = hil_step(shm)
+    tag = tag + 1
+
+    # Stage 1c: read back all 3 LBAs, assert exact data values.
+    idx = 0
+    while idx < 3:
+        val lba: i64 = lbas[idx]
+        if hil_can_submit(shm) == 0:
+            print "  FAIL: stage1 read submit unexpectedly rejected"
+            return 1
+        shm = hil_submit_read(shm, lba, tag)
+        shm = drain_until_ftl2hil_ready(shm)
+        if shm_ring_pop_ok(shm, r_ftl2hil()) == 0:
+            print "  FAIL: step budget exhausted awaiting read completion"
+            return 1
+        val w0: i64 = drv_ring_peek_word(shm, r_ftl2hil(), 0)
+        val buf_idx: i64 = drv_ring_peek_word(shm, r_ftl2hil(), 2)
+        if msg_w0_tag(w0) != tag:
+            print "  FAIL: read completion tag mismatch (FIFO order broken)"
+            return 1
+        if msg_w0_status(w0) != ST_OK():
+            print "  FAIL: read completion status != ST_OK"
+            return 1
+        if shm_get(shm, buf_pool_data_idx(buf_idx)) != hil_expect_data(lba):
+            print "  FAIL: read data mismatch against hil_expect_data(lba)"
+            return 1
+        shm = hil_step(shm)
+        tag = tag + 1
+        idx = idx + 1
+
+    # Stage 2: read an out-of-range LBA -> completion status ST_BOUNDS.
+    if hil_can_submit(shm) == 0:
+        print "  FAIL: stage2 OOB read submit unexpectedly rejected"
+        return 1
+    shm = hil_submit_read(shm, 9999, tag)
+    shm = drain_until_ftl2hil_ready(shm)
+    if shm_ring_pop_ok(shm, r_ftl2hil()) == 0:
+        print "  FAIL: step budget exhausted awaiting OOB-read completion"
+        return 1
+    if msg_w0_status(drv_ring_peek_word(shm, r_ftl2hil(), 0)) != ST_BOUNDS():
+        print "  FAIL: OOB read (lba=9999) completion status != ST_BOUNDS"
+        return 1
+    shm = hil_step(shm)
+    tag = tag + 1
+
+    # Stage 3: 9 writes back-to-back with NO scheduler steps in between —
+    # ring depth is 8, so the 9th submit must be rejected (backoff verdict).
+    var accepted: i64 = 0
+    var i3: i64 = 0
+    while i3 < 9:
+        val ok: i32 = hil_can_submit(shm)
+        if i3 < 8:
+            if ok == 0:
+                print "  FAIL: an early back-to-back submit was unexpectedly rejected"
+                return 1
+            shm = hil_submit_write(shm, 200 + i3, tag, hil_expect_data(200 + i3))
+            tag = tag + 1
+            accepted = accepted + 1
+        else:
+            if ok != 0:
+                print "  FAIL: 9th back-to-back submit unexpectedly accepted (expected ring-full backoff)"
+                return 1
+        i3 = i3 + 1
+    if accepted != 8:
+        print "  FAIL: stage3 accepted-submit count != 8"
+        return 1
+
+    # Stage 4: drain all in-flight traffic, then assert no buf-pool leak and
+    # a complete 16-slot free-list.
+    shm = drain_until_all_empty(shm)
+    if all_rings_empty(shm) == 0:
+        print "  FAIL: step budget exhausted draining stage3 traffic"
+        return 1
+    if shm_get(shm, buf_pool_alloc_count_idx()) != 0:
+        print "  FAIL: buf pool ALLOC_COUNT != 0 after full reap (leak)"
+        return 1
+    var visited: [i64] = [0 for i in 0..buf_pool_capacity()]
+    var cursor: i64 = shm_get(shm, buf_pool_free_head_idx())
+    var walk_steps: i64 = 0
+    while cursor != ipc_null_idx():
+        if walk_steps > buf_pool_capacity():
+            print "  FAIL: buf pool free-list walk did not terminate"
+            return 1
+        if buf_slot_valid(cursor) == 0:
+            print "  FAIL: buf pool free-list walk hit an out-of-range slot"
+            return 1
+        if visited[cursor] != 0:
+            print "  FAIL: buf pool free-list walk revisited a slot (cycle)"
+            return 1
+        visited[cursor] = 1
+        cursor = shm_get(shm, buf_pool_next_idx(cursor))
+        walk_steps = walk_steps + 1
+    var total: i64 = 0
+    var vi: i64 = 0
+    while vi < buf_pool_capacity():
+        total = total + visited[vi]
+        vi = vi + 1
+    if total != buf_pool_capacity():
+        print "  FAIL: buf pool free-list walk did not reach all 16 slots"
+        return 1
+
+    # Stage 5: halt + drain, assert done.
+    shm = shm_put(shm, IPC_HALT_IDX(), 1)
+    shm = drain_until_all_empty(shm)
+    val halt_word: i64 = shm_get(shm, IPC_HALT_IDX())
+    val empties: i32 = all_rings_empty(shm)
+    if core_should_halt(halt_word, empties) != 1:
+        print "  FAIL: halt+drain did not reach the done condition"
+        return 1
+
+    # Oracle (b) (design §5, W4b): drive the corostate overlay the rest of
+    # the way to its terminal state and assert all four corostate words end
+    # at CS_PARKED. drain_until_all_empty alone does not guarantee this:
+    # stage 4 already fully drained the rings, so drain_until_all_empty's
+    # while-condition is false on entry here and it runs zero extra
+    # pump_once ticks — this harness has no real hart-release gate, so its
+    # CS_BOOT exit stands in for one (file header), and likewise needs its
+    # own explicit drain here for every core to observe the halt flag and
+    # walk CS_IDLE/CS_VERIFY -> CS_HALT_DRAIN -> CS_PARKED.
+    shm = drain_until_all_parked(shm)
+    if all_corostates_parked(shm) == 0:
+        print "  FAIL: end-state oracle: not all 4 corostate words reached CS_PARKED after halt+drain"
+        return 1
+
+    if shm_get(shm, ipc_err_count_idx()) != 0:
+        print "  FAIL: IPC_ERR_COUNT nonzero after a clean run"
+        return 1
+
+    0
+
+fn main():
+    val fail = ipc_fourcore_selftest()
+    if fail == 0:
+        print "IPC FOURCORE CHECK PASS"
+    else:
+        print "IPC FOURCORE CHECK FAIL"
+        exit(1)

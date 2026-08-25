@@ -1,0 +1,12 @@
+# Contract verification example
+# Demonstrates: in:/out: preconditions and postconditions
+#
+# The @verify attribute triggers Lean code generation.
+# The in: clause becomes a precondition theorem.
+# The out: clause becomes a postcondition theorem.
+
+@verify
+fn safe_divide(a: i64, b: i64) -> i64:
+    in: b != 0
+    out(ret): ret * b <= a
+    a / b

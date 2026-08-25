@@ -1,0 +1,219 @@
+"""
+ipc_ring_check — host-only absolute-oracle checks for logic_ipc_layout_core.spl
+and logic_ipc_ring_core.spl (wave-3 4-core IPC design contract:
+doc/05_design/hardware/nvme_fw_multicore/fourcore_ipc_index_handle_design.md
+§3 region map, §4 rings, §5 buf pool).
+
+Deliberately NOT part of the boot-linked import graph (same convention as
+const_drift_check.spl): logic.spl / entry.spl never `use ipc_ring_check`.
+
+Run: bin/simple run examples/09_embedded/simpleos_nvme_fw/fw_rv32/ipc_ring_check.spl
+Gate: prints "IPC RING CHECK PASS" and exits rc=0; any oracle failure prints
+"IPC RING CHECK FAIL" and exits rc=1 (rc IS meaningful for this plain host
+program — see doc/05_design/.../fourcore_ipc_index_handle_design.md §10).
+"""
+
+use logic_ipc_layout_core.*
+use logic_ipc_ring_core.*
+use std.io_runtime.{exit}
+
+fn _check_fresh_empty() -> i32:
+    if ring_empty(0, 0) != 1:
+        return 1
+    if ring_full(0, 0) != 0:
+        return 1
+    if ring_free_slots(0, 0) != ring_depth():
+        return 1
+    if ring_can_push(0, 0) != 1:
+        return 1
+    0
+
+fn _check_push_to_full() -> i32:
+    # 8 pushes starting at tail=0 leave the ring full at (head=0, tail=8).
+    if ring_full(0, 8) != 1:
+        return 1
+    if ring_can_push(0, 8) != 0:
+        return 1
+    if ring_free_slots(0, 8) != 0:
+        return 1
+    0
+
+fn _check_ninth_rejected() -> i32:
+    val v: i64 = ring_push_verdict(0, 8)
+    if ring_verdict_ok(v) != 0:
+        return 1
+    0
+
+fn _check_pop_fifo_order() -> i32:
+    # Ring holds 8 items pushed at producer counters 0..7 (head still 0,
+    # tail=8). Popping must yield slots in FIFO order: 0,1,2,...,7, then
+    # empty once head catches tail.
+    if ring_verdict_slot(ring_pop_verdict(0, 8)) != 0:
+        return 1
+    if ring_verdict_slot(ring_pop_verdict(1, 8)) != 1:
+        return 1
+    if ring_verdict_slot(ring_pop_verdict(2, 8)) != 2:
+        return 1
+    if ring_verdict_slot(ring_pop_verdict(7, 8)) != 7:
+        return 1
+    if ring_verdict_ok(ring_pop_verdict(8, 8)) != 0:
+        return 1
+    0
+
+fn _check_wraparound() -> i32:
+    # head=tail=6: empty at nonzero counters (not just at the origin).
+    if ring_empty(6, 6) != 1:
+        return 1
+    if ring_slot_of(6) != 6:
+        return 1
+    if ring_slot_of(7) != 7:
+        return 1
+    if ring_slot_of(8) != 0:
+        return 1
+    if ring_slot_of(13) != 5:
+        return 1
+    # 8 pushes from tail=6 -> tail=14: full again, slots wrapped once.
+    if ring_full(6, 14) != 1:
+        return 1
+    if ring_can_push(6, 14) != 0:
+        return 1
+    0
+
+fn _check_large_counters() -> i32:
+    # Free-running counters at large values still compute correctly.
+    if ring_empty(1000000, 1000000) != 1:
+        return 1
+    if ring_slot_of(1000000) != 0:
+        return 1
+    if ring_full(1000000, 1000008) != 1:
+        return 1
+    if ring_free_slots(1000000, 1000003) != 5:
+        return 1
+    0
+
+fn _check_invalid_ring_id() -> i32:
+    if ring_base(-1) != -1:
+        return 1
+    if ring_base(6) != -1:
+        return 1
+    if ring_head_idx(-1) != -1:
+        return 1
+    if ring_tail_idx(6) != -1:
+        return 1
+    if ring_drop_idx(100) != -1:
+        return 1
+    if ring_slot_idx(-1, 0, 0) != -1:
+        return 1
+    if ring_slot_idx(0, 0, -1) != -1:
+        return 1
+    if ring_slot_idx(0, 0, 4) != -1:
+        return 1
+    if ring_slot_idx(0, -1, 0) != -1:
+        return 1
+    0
+
+fn _check_ring_region_layout() -> i32:
+    if ring_base(0) != 4:
+        return 1
+    if ring_base(5) != 184:
+        return 1
+    if ring_head_idx(0) != 4:
+        return 1
+    if ring_tail_idx(0) != 5:
+        return 1
+    if ring_drop_idx(0) != 6:
+        return 1
+    if ring_slot_idx(0, 0, 0) != 8:
+        return 1
+    if ring_slot_idx(0, 1, 0) != 12:
+        return 1
+    if ring_slot_idx(0, 8, 0) != 8:
+        return 1
+    0
+
+fn _check_buf_pool_layout() -> i32:
+    if buf_pool_free_head_idx() != 220:
+        return 1
+    if buf_pool_alloc_count_idx() != 221:
+        return 1
+    if buf_pool_next_idx(0) != 222:
+        return 1
+    if buf_pool_next_idx(15) != 237:
+        return 1
+    if buf_pool_data_idx(0) != 238:
+        return 1
+    if buf_pool_data_idx(15) != 253:
+        return 1
+    if buf_pool_next_idx(16) != -1:
+        return 1
+    if buf_pool_next_idx(-1) != -1:
+        return 1
+    0
+
+fn _check_nand_regions() -> i32:
+    if nand_state_base() != 256:
+        return 1
+    if nand_data_base() != 4352:
+        return 1
+    # wave-4 coroutine_statemachine_design.md §1: COROSTATE region appended
+    # at the end bumps IPC_SHM_WORDS 8448 -> 8452 (see ipc_drift_check.spl).
+    if ipc_shm_words() != 8452:
+        return 1
+    0
+
+fn _check_shm_idx_valid() -> i32:
+    if shm_idx_valid(-1) != 0:
+        return 1
+    # first out-of-bounds index is now 8452 (was 8448 pre-wave-4)
+    if shm_idx_valid(8452) != 0:
+        return 1
+    if shm_idx_valid(0) != 1:
+        return 1
+    # last valid index is now 8451 (was 8447 pre-wave-4)
+    if shm_idx_valid(8451) != 1:
+        return 1
+    0
+
+fn ipc_ring_check_selftest() -> i32:
+    if _check_fresh_empty() != 0:
+        print "  FAIL: fresh ring empty/full/free_slots/can_push"
+        return 1
+    if _check_push_to_full() != 0:
+        print "  FAIL: push 8 -> full"
+        return 1
+    if _check_ninth_rejected() != 0:
+        print "  FAIL: 9th push rejected"
+        return 1
+    if _check_pop_fifo_order() != 0:
+        print "  FAIL: pop FIFO order"
+        return 1
+    if _check_wraparound() != 0:
+        print "  FAIL: wrap-around across counter values"
+        return 1
+    if _check_large_counters() != 0:
+        print "  FAIL: free-running counters at large values"
+        return 1
+    if _check_invalid_ring_id() != 0:
+        print "  FAIL: invalid ring id -> -1"
+        return 1
+    if _check_ring_region_layout() != 0:
+        print "  FAIL: ring region word layout"
+        return 1
+    if _check_buf_pool_layout() != 0:
+        print "  FAIL: buf pool layout"
+        return 1
+    if _check_nand_regions() != 0:
+        print "  FAIL: NAND region base words"
+        return 1
+    if _check_shm_idx_valid() != 0:
+        print "  FAIL: shm_idx_valid bounds"
+        return 1
+    0
+
+fn main():
+    val fail = ipc_ring_check_selftest()
+    if fail == 0:
+        print "IPC RING CHECK PASS"
+    else:
+        print "IPC RING CHECK FAIL"
+        exit(1)

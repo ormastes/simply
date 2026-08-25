@@ -1,0 +1,221 @@
+"""
+coro_check — host-only absolute-oracle checks for logic_coro_core.spl (wave-4
+statement-like coroutine/state-machine discipline design contract:
+doc/05_design/hardware/nvme_fw_coroutine/coroutine_statemachine_design.md
+§2 state vocabulary, §3 legality + transition, §5 debug/easy-check surface).
+
+Deliberately NOT part of the boot-linked import graph (same convention as
+const_drift_check.spl / ipc_ring_check.spl): logic.spl / entry.spl never
+`use coro_check`.
+
+Run: timeout 300 bin/simple run examples/09_embedded/simpleos_nvme_fw/fw_rv32/coro_check.spl
+Gate: prints "CORO CHECK PASS" and exits rc=0; any oracle failure prints
+"CORO CHECK FAIL" and exits rc=1 (rc IS meaningful for this plain host
+program — same mechanism as ipc_ring_check.spl / ipc_fourcore_check.spl).
+"""
+
+use logic_coro_core.*
+use std.io_runtime.{exit}
+
+# ── cs_valid boundaries (0..8 valid, everything else invalid) ────────────────
+
+fn _check_cs_valid_boundaries() -> i32:
+    if cs_valid(0) != 1:
+        return 1
+    if cs_valid(8) != 1:
+        return 1
+    if cs_valid(4) != 1:
+        return 1
+    if cs_valid(-1) != 0:
+        return 1
+    if cs_valid(9) != 0:
+        return 1
+    if cs_valid(100) != 0:
+        return 1
+    0
+
+# ── every documented legal pair (design §3 / logic_coro_core.spl header
+# comment) returns `next` from coro_transition_verdict ──────────────────────
+
+fn _check_boot_exits() -> i32:
+    if coro_transition_verdict(CS_BOOT(), CS_IDLE()) != CS_IDLE():
+        return 1
+    if coro_transition_verdict(CS_BOOT(), CS_SUBMIT()) != CS_SUBMIT():
+        return 1
+    0
+
+fn _check_idle_fanout() -> i32:
+    if coro_transition_verdict(CS_IDLE(), CS_IDLE()) != CS_IDLE():
+        return 1
+    if coro_transition_verdict(CS_IDLE(), CS_PUMP_FWD()) != CS_PUMP_FWD():
+        return 1
+    if coro_transition_verdict(CS_IDLE(), CS_PUMP_BACK()) != CS_PUMP_BACK():
+        return 1
+    if coro_transition_verdict(CS_IDLE(), CS_HALT_DRAIN()) != CS_HALT_DRAIN():
+        return 1
+    0
+
+fn _check_worker_pump_return() -> i32:
+    if coro_transition_verdict(CS_PUMP_FWD(), CS_IDLE()) != CS_IDLE():
+        return 1
+    if coro_transition_verdict(CS_PUMP_BACK(), CS_IDLE()) != CS_IDLE():
+        return 1
+    0
+
+fn _check_halt_drain_exit() -> i32:
+    if coro_transition_verdict(CS_HALT_DRAIN(), CS_PARKED()) != CS_PARKED():
+        return 1
+    0
+
+fn _check_hil_cycle() -> i32:
+    if coro_transition_verdict(CS_SUBMIT(), CS_REAP()) != CS_REAP():
+        return 1
+    if coro_transition_verdict(CS_REAP(), CS_VERIFY()) != CS_VERIFY():
+        return 1
+    if coro_transition_verdict(CS_VERIFY(), CS_SUBMIT()) != CS_SUBMIT():
+        return 1
+    if coro_transition_verdict(CS_VERIFY(), CS_HALT_DRAIN()) != CS_HALT_DRAIN():
+        return 1
+    0
+
+# ── representative illegal pairs (per the wave-4 lane spec's minimum list) ──
+
+fn _check_parked_is_terminal() -> i32:
+    if coro_transition_verdict(CS_PARKED(), CS_IDLE()) != -1:
+        return 1
+    if coro_transition_verdict(CS_PARKED(), CS_BOOT()) != -1:
+        return 1
+    if coro_transition_verdict(CS_PARKED(), CS_PARKED()) != -1:
+        return 1
+    if coro_transition_verdict(CS_PARKED(), CS_SUBMIT()) != -1:
+        return 1
+    0
+
+fn _check_idle_must_go_through_halt() -> i32:
+    if coro_transition_verdict(CS_IDLE(), CS_PARKED()) != -1:
+        return 1
+    0
+
+fn _check_halt_drain_single_exit() -> i32:
+    if coro_transition_verdict(CS_HALT_DRAIN(), CS_IDLE()) != -1:
+        return 1
+    if coro_transition_verdict(CS_HALT_DRAIN(), CS_BOOT()) != -1:
+        return 1
+    if coro_transition_verdict(CS_HALT_DRAIN(), CS_HALT_DRAIN()) != -1:
+        return 1
+    0
+
+fn _check_no_self_transition_outside_idle() -> i32:
+    if coro_transition_verdict(CS_SUBMIT(), CS_SUBMIT()) != -1:
+        return 1
+    if coro_transition_verdict(CS_REAP(), CS_REAP()) != -1:
+        return 1
+    if coro_transition_verdict(CS_VERIFY(), CS_VERIFY()) != -1:
+        return 1
+    if coro_transition_verdict(CS_PUMP_FWD(), CS_PUMP_FWD()) != -1:
+        return 1
+    if coro_transition_verdict(CS_PUMP_BACK(), CS_PUMP_BACK()) != -1:
+        return 1
+    if coro_transition_verdict(CS_BOOT(), CS_BOOT()) != -1:
+        return 1
+    0
+
+fn _check_hil_cycle_never_backward() -> i32:
+    if coro_transition_verdict(CS_VERIFY(), CS_REAP()) != -1:
+        return 1
+    if coro_transition_verdict(CS_REAP(), CS_SUBMIT()) != -1:
+        return 1
+    if coro_transition_verdict(CS_SUBMIT(), CS_VERIFY()) != -1:
+        return 1
+    0
+
+fn _check_pump_states_must_round_trip_idle() -> i32:
+    if coro_transition_verdict(CS_PUMP_FWD(), CS_PUMP_BACK()) != -1:
+        return 1
+    if coro_transition_verdict(CS_PUMP_BACK(), CS_PUMP_FWD()) != -1:
+        return 1
+    0
+
+fn _check_boot_cannot_skip_to_worker_or_hil_body() -> i32:
+    if coro_transition_verdict(CS_BOOT(), CS_PUMP_FWD()) != -1:
+        return 1
+    if coro_transition_verdict(CS_BOOT(), CS_HALT_DRAIN()) != -1:
+        return 1
+    if coro_transition_verdict(CS_BOOT(), CS_PARKED()) != -1:
+        return 1
+    if coro_transition_verdict(CS_BOOT(), CS_REAP()) != -1:
+        return 1
+    if coro_transition_verdict(CS_BOOT(), CS_VERIFY()) != -1:
+        return 1
+    0
+
+# ── invalid ids rejected in both positions (fail-closed range check runs
+# BEFORE the legality table) ─────────────────────────────────────────────────
+
+fn _check_invalid_ids_rejected_both_positions() -> i32:
+    if coro_transition_verdict(-1, CS_IDLE()) != -1:
+        return 1
+    if coro_transition_verdict(CS_IDLE(), -1) != -1:
+        return 1
+    if coro_transition_verdict(9, CS_IDLE()) != -1:
+        return 1
+    if coro_transition_verdict(CS_IDLE(), 9) != -1:
+        return 1
+    if coro_transition_verdict(100, 100) != -1:
+        return 1
+    if coro_transition_verdict(-1, -1) != -1:
+        return 1
+    0
+
+fn coro_check_selftest() -> i32:
+    if _check_cs_valid_boundaries() != 0:
+        print "  FAIL: cs_valid boundaries (0..8 valid, -1/9/100 invalid)"
+        return 1
+    if _check_boot_exits() != 0:
+        print "  FAIL: CS_BOOT -> CS_IDLE|CS_SUBMIT"
+        return 1
+    if _check_idle_fanout() != 0:
+        print "  FAIL: CS_IDLE -> CS_IDLE|CS_PUMP_FWD|CS_PUMP_BACK|CS_HALT_DRAIN"
+        return 1
+    if _check_worker_pump_return() != 0:
+        print "  FAIL: CS_PUMP_FWD|CS_PUMP_BACK -> CS_IDLE"
+        return 1
+    if _check_halt_drain_exit() != 0:
+        print "  FAIL: CS_HALT_DRAIN -> CS_PARKED"
+        return 1
+    if _check_hil_cycle() != 0:
+        print "  FAIL: hil cycle CS_SUBMIT->CS_REAP->CS_VERIFY->(CS_SUBMIT|CS_HALT_DRAIN)"
+        return 1
+    if _check_parked_is_terminal() != 0:
+        print "  FAIL: CS_PARKED must be terminal (zero outgoing legal pairs)"
+        return 1
+    if _check_idle_must_go_through_halt() != 0:
+        print "  FAIL: CS_IDLE -> CS_PARKED must be illegal (must go through halt)"
+        return 1
+    if _check_halt_drain_single_exit() != 0:
+        print "  FAIL: CS_HALT_DRAIN must have exactly one legal exit (CS_PARKED)"
+        return 1
+    if _check_no_self_transition_outside_idle() != 0:
+        print "  FAIL: self-transition must be illegal outside CS_IDLE"
+        return 1
+    if _check_hil_cycle_never_backward() != 0:
+        print "  FAIL: hil cycle must never run backward"
+        return 1
+    if _check_pump_states_must_round_trip_idle() != 0:
+        print "  FAIL: CS_PUMP_FWD<->CS_PUMP_BACK must be illegal (round-trip via CS_IDLE)"
+        return 1
+    if _check_boot_cannot_skip_to_worker_or_hil_body() != 0:
+        print "  FAIL: CS_BOOT must only reach CS_IDLE|CS_SUBMIT"
+        return 1
+    if _check_invalid_ids_rejected_both_positions() != 0:
+        print "  FAIL: invalid state ids must be rejected in either position"
+        return 1
+    0
+
+fn main():
+    val fail = coro_check_selftest()
+    if fail == 0:
+        print "CORO CHECK PASS"
+    else:
+        print "CORO CHECK FAIL"
+        exit(1)

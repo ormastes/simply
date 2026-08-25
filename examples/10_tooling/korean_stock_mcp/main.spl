@@ -1,0 +1,290 @@
+#![allow(unnamed_duplicate_typed_args)]
+# Korean Stock MCP Server
+#
+# MCP server for Korean stock market data (KRX, DART, news).
+# Uses direct HTTP calls — no Python dependencies.
+#
+# Architecture:
+#   - Zero stdlib imports: all JSON helpers and tool logic inlined
+#   - Direct extern fn calls: rt_http_get, rt_http_post, rt_http_request
+#   - Stdio JSON-RPC loop (Content-Length + JSON Lines auto-detect)
+#
+# Split into modules:
+#   - json_helpers.spl   — JSON building, escaping, extraction
+#   - protocol.spl       — Protocol I/O, initialize, tools list
+#   - tools.spl          — Tool dispatch and implementations
+#   - sources/            — KRX, DART, news data sources
+#   - utils/              — Cache, formatting, config
+
+extern fn rt_file_read_text(path: text) -> text
+extern fn rt_process_run(cmd: text, args: [text]) -> (text, text, i64)
+extern fn rt_env_get(name: text) -> text
+extern fn rt_file_write_text(path: text, content: text) -> bool
+extern fn rt_file_exists(path: text) -> bool
+extern fn rt_http_get(url: text) -> (i64, text, text)
+extern fn rt_http_post(url: text, body: text, content_type: text) -> (i64, text, text)
+extern fn rt_http_request(method: text, url: text, headers: [text], body: text) -> (i64, text, text)
+extern fn rt_http_url_encode(input: text) -> text
+extern fn rt_cli_get_args() -> [text]
+extern fn stdin_read_char() -> text
+
+# Load modules
+use json_helpers
+use tools
+use sources.krx_source
+use sources.dart_source
+use sources.news_source
+use utils.cache
+use utils.formatting
+use utils.config
+
+val SERVER_NAME = "korean-stock-mcp"
+val SERVER_VERSION = "1.0.0"
+val NL = "\n"
+
+# Caches
+var TOOLS_CACHE = ""
+var INIT_CACHE = ""
+
+# --- Server loop ---
+
+fn korean_read_line() -> text:
+    var result = ""
+    while true:
+        val ch = stdin_read_char()
+        if ch == "":
+            if result == "":
+                return ""
+            return result
+        result = result + ch
+        if ch == "\n":
+            return result
+
+fn korean_read_chars(count: i64) -> text:
+    var result = ""
+    var i = 0
+    while i < count:
+        val ch = stdin_read_char()
+        if ch == "":
+            break
+        result = result + ch
+        i = i + 1
+    result
+
+fn korean_strip_line_end(line: text) -> text:
+    if line.ends_with("\r\n"):
+        return line.substring(0, line.len() - 2)
+    if line.ends_with("\n"):
+        return line.substring(0, line.len() - 1)
+    if line.ends_with("\r"):
+        return line.substring(0, line.len() - 1)
+    line
+
+fn korean_parse_decimal(raw: text) -> i64:
+    var result = 0
+    var i = 0
+    while i < raw.len():
+        val ch = raw.substring(i, i + 1)
+        if ch == "0":
+            result = result * 10
+        elif ch == "1":
+            result = result * 10 + 1
+        elif ch == "2":
+            result = result * 10 + 2
+        elif ch == "3":
+            result = result * 10 + 3
+        elif ch == "4":
+            result = result * 10 + 4
+        elif ch == "5":
+            result = result * 10 + 5
+        elif ch == "6":
+            result = result * 10 + 6
+        elif ch == "7":
+            result = result * 10 + 7
+        elif ch == "8":
+            result = result * 10 + 8
+        elif ch == "9":
+            result = result * 10 + 9
+        else:
+            return result
+        i = i + 1
+    result
+
+fn korean_read_message() -> text:
+    var content_length = 0
+    while true:
+        var line = korean_read_line()
+        if line == "":
+            if content_length > 0:
+                break
+            return ""
+        if line == "\r\n" or line == "\n" or line == "\r":
+            if content_length > 0:
+                break
+            continue
+        line = korean_strip_line_end(line)
+        if line.starts_with("{"):
+            return line
+        if line.starts_with("Content-Length:"):
+            var len_str = line.replace("Content-Length:", "")
+            len_str = len_str.trim()
+            content_length = korean_parse_decimal(len_str)
+    if content_length <= 0:
+        return ""
+    "__korean_stock_mcp_content_length__" + korean_read_chars(content_length)
+
+fn korean_write_message(body: text, use_content_length: bool):
+    if not use_content_length:
+        print body
+    else:
+        print "Content-Length: " + str(body.len())
+        print ""
+        print body
+
+fn korean_extract_string_field(json: text, key: text) -> text:
+    val pattern1 = "\"" + key + "\":\""
+    val parts1 = json.split(pattern1)
+    if parts1.len() >= 2:
+        return parts1[1].split("\"")[0]
+    val pattern2 = "\"" + key + "\": \""
+    val parts2 = json.split(pattern2)
+    if parts2.len() >= 2:
+        return parts2[1].split("\"")[0]
+    ""
+
+fn korean_extract_id(json: text) -> text:
+    val quoted = korean_extract_string_field(json, "id")
+    if quoted != "":
+        return "\"" + quoted + "\""
+    val parts = json.split("\"id\":")
+    if parts.len() >= 2:
+        val raw = parts[1].split(",")[0].split("}")[0].split("\n")[0].split("\r")[0].trim()
+        if raw != "":
+            return raw
+    "null"
+
+fn korean_lb() -> text:
+    "{"
+
+fn korean_rb() -> text:
+    "}"
+
+fn korean_json_result(id: text, result: text) -> text:
+    korean_lb() + "\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":" + result + korean_rb()
+
+fn korean_json_error(id: text, code: i64, message: text) -> text:
+    var safe_message = message.replace("\\", "\\\\")
+    safe_message = safe_message.replace("\"", "\\\"")
+    val err = korean_lb() + "\"code\":" + str(code) + ",\"message\":\"" + safe_message + "\"" + korean_rb()
+    return korean_lb() + "\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"error\":" + err + korean_rb()
+
+fn korean_init_result() -> text:
+    val tools_cap = korean_lb() + "\"listChanged\":true" + korean_rb()
+    val caps = korean_lb() + "\"tools\":" + tools_cap + korean_rb()
+    val info = korean_lb() + "\"name\":\"korean-stock-mcp\",\"version\":\"1.0.0\"" + korean_rb()
+    korean_lb() + "\"protocolVersion\":\"2025-06-18\",\"capabilities\":" + caps + ",\"serverInfo\":" + info + korean_rb()
+
+fn korean_tool_schema(name: text, description: text) -> text:
+    val schema = korean_lb() + "\"type\":\"object\",\"properties\":" + korean_lb() + korean_rb() + ",\"required\":[]" + korean_rb()
+    korean_lb() + "\"name\":\"" + name + "\",\"description\":\"" + description + "\",\"inputSchema\":" + schema + korean_rb()
+
+fn korean_tools_result() -> text:
+    val tools =
+        korean_tool_schema("stock_price", "Get current stock price for a Korean stock") + "," +
+        korean_tool_schema("stock_ohlcv", "Get OHLCV history for a Korean stock") + "," +
+        korean_tool_schema("stock_search", "Search for Korean stocks") + "," +
+        korean_tool_schema("stock_list", "List Korean stocks by market") + "," +
+        korean_tool_schema("market_index", "Get Korean market index value") + "," +
+        korean_tool_schema("market_cap", "Get market capitalization ranking") + "," +
+        korean_tool_schema("sector_performance", "Get Korean sector performance") + "," +
+        korean_tool_schema("stock_compare", "Compare Korean stocks") + "," +
+        korean_tool_schema("company_info", "Get company information from DART") + "," +
+        korean_tool_schema("financial_statements", "Get financial statements from DART") + "," +
+        korean_tool_schema("market_news", "Get Korean market news") + "," +
+        korean_tool_schema("stock_news", "Get news for a Korean stock")
+    korean_lb() + "\"tools\":[" + tools + "]" + korean_rb()
+
+fn start_server():
+    var running = true
+    while running:
+        var line = korean_read_message()
+        if line == "":
+            running = false
+        else:
+            var use_content_length = false
+            if line.starts_with("__korean_stock_mcp_content_length__"):
+                use_content_length = true
+                line = line.replace("__korean_stock_mcp_content_length__", "")
+            var method = korean_extract_string_field(line, "method")
+            var id = korean_extract_id(line)
+            var response = ""
+            if method == "initialize":
+                response = korean_json_result(id, korean_init_result())
+            elif method == "initialized" or method == "notifications/initialized":
+                response = ""
+            elif method == "shutdown":
+                response = korean_json_result(id, "null")
+            elif method == "tools/list":
+                response = korean_json_result(id, korean_tools_result())
+            elif method == "tools/call":
+                var tool_name = korean_extract_string_field(line, "name")
+                response = dispatch_tool(id, tool_name, line)
+            elif method == "ping":
+                response = korean_json_result(id, "{}")
+            elif method == "notifications/cancelled" or method == "notifications/roots/list_changed":
+                response = ""
+            else:
+                if method == "":
+                    response = korean_lb() + "\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"Parse error: missing JSON-RPC method\"}" + korean_rb()
+                elif id != "" and id != "null":
+                    val err = korean_lb() + "\"code\":-32601,\"message\":\"Method not found: " + method + "\"" + korean_rb()
+                    response = korean_lb() + "\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"error\":" + err + korean_rb()
+            if response != "":
+                korean_write_message(response, use_content_length)
+
+fn korean_stock_print_usage():
+    print "korean-stock-mcp 1.0.0"
+    print ""
+    print "Usage: korean_stock_mcp [options]"
+    print ""
+    print "Runs the Korean Stock MCP JSON-RPC server over stdin/stdout."
+    print ""
+    print "Options:"
+    print "  -h, --help       Show this help"
+    print "  -v, --version    Show version"
+    print "  --json           Print readiness metadata as JSON"
+
+fn korean_stock_args() -> [text]:
+    val all_args = rt_cli_get_args()
+    var args: [text] = []
+    var start_idx = 1
+    var i = 0
+    while i < all_args.len():
+        if all_args[i].ends_with("main.spl"):
+            start_idx = i + 1
+        i = i + 1
+    i = start_idx
+    while i < all_args.len():
+        args.push(all_args[i])
+        i = i + 1
+    args
+
+fn main() -> i64:
+    val args = korean_stock_args()
+    if args.len() > 0:
+        if args[0] == "--help" or args[0] == "-h":
+            korean_stock_print_usage()
+            return 0
+        if args[0] == "--version" or args[0] == "-v":
+            print "korean-stock-mcp 1.0.0"
+            return 0
+        if args[0] == "--json":
+            print "{\"command\":\"korean-stock-mcp\",\"status\":\"ready\",\"tool\":\"Korean Stock MCP Server\",\"version\":\"1.0.0\"}"
+            return 0
+        if args[0].starts_with("-"):
+            print "error: unknown option: {args[0]}"
+            print "checked: supported options --help, --version, --json"
+            print "hint: run korean_stock_mcp --help for usage"
+            return 1
+    start_server()
+    0

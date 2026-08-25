@@ -1,0 +1,55 @@
+# Linear Layer — from scratch
+# Chapter 4: "Build a Large Language Model From Scratch" (Rasbt)
+#
+# Implements: y = xW^T + b
+# This is the fundamental building block of neural networks.
+
+use std.pure.tensor.{PureTensor, tensor_from_data, tensor_zeros, tensor_randn}
+use std.pure.tensor_ops.{matmul, transpose, add}
+
+class StudyLinear:
+    weight: PureTensor<f64>   # [out_features, in_features]
+    bias: PureTensor<f64>     # [out_features] or empty
+    in_features: i64
+    out_features: i64
+    use_bias: bool
+
+    # Xavier-uniform initialization: range = sqrt(6 / (in + out))
+    static fn create(in_features: i64, out_features: i64, use_bias: bool) -> StudyLinear:
+        # Initialize with small random values
+        val w = tensor_randn([out_features, in_features])
+        var b = tensor_zeros([out_features])
+        StudyLinear(
+            weight: w,
+            bias: b,
+            in_features: in_features,
+            out_features: out_features,
+            use_bias: use_bias
+        )
+
+    # Forward pass: y = x @ W^T + b
+    # x shape: [batch, in_features] or [seq_len, in_features]
+    # output shape: [batch, out_features]
+    fn forward(x: PureTensor<f64>) -> PureTensor<f64>:
+        val wt = transpose(self.weight)    # [in_features, out_features]
+        var out = matmul(x, wt)            # [batch, out_features]
+        if self.use_bias:
+            # Add bias to each row
+            val rows = out.shape[0]
+            val cols = out.shape[1]
+            var data: [f64] = []
+            var r = 0
+            while r < rows:
+                var c = 0
+                while c < cols:
+                    val v = out.get([r, c]) + self.bias.get([c])
+                    data.push(v)
+                    c = c + 1
+                r = r + 1
+            out = tensor_from_data(data, [rows, cols])
+        out
+
+fn study_linear_create(in_f: i64, out_f: i64) -> StudyLinear:
+    StudyLinear.create(in_f, out_f, true)
+
+export StudyLinear, study_linear_create

@@ -1,0 +1,79 @@
+# Hello Async TUI — Channel-Based Async TUI Hello World
+#
+# Demonstrates the async TUI event loop architecture:
+#   - Builds a minimal widget tree
+#   - Creates a Channel for event passing
+#   - Shows how events flow through the channel
+#   - Renders a single frame headless (no blocking input)
+#
+# Run: bin/simple run examples/ui/hello_async_tui.spl
+
+use std.nogc_async_mut.concurrent.channel.{Channel, channel_new}
+use common.ui.builder.{column, panel, text_widget, button, statusbar, build_tree_with_title}
+use common.ui.widget.{UIState, UIEvent}
+use common.ui.layout.{compute_layout}
+use common.ui.state.{init_state, update_state, is_quit_event}
+use app.ui.tui.screen.{Screen}
+use app.ui.render.widgets.{render_tui_tree}
+
+fn build_hello_tree() -> UIState:
+    """Build a minimal hello-world widget tree."""
+    val greeting = text_widget("greeting", "Hello Async TUI!")
+    val info = text_widget("info", "Channel-based event architecture")
+    val btn = button("ok_btn", "OK", "quit")
+    val header = panel("main", "Async TUI Demo", [greeting, info, btn])
+    val status = statusbar("status", "ASYNC MODE", "Hello Async TUI")
+    val root = column("root", [header, status])
+    val tree = build_tree_with_title(root, "Hello Async TUI", "dark")
+    return init_state(tree)
+
+fn main() -> i64:
+    val state = build_hello_tree()
+
+    # Demonstrate channel event flow
+    val ch = channel_new()
+
+    # Simulate events being pushed into the channel
+    ch.send(UIEvent.FocusNext)
+    ch.send(UIEvent.FocusPrev)
+    ch.send(UIEvent.KeyPress(key: "j"))
+
+    # Drain events from channel and apply to state
+    var current_state = state
+    var event_count = 0
+    var event = ch.try_recv()
+    while event != nil:
+        val ui_event: UIEvent = event
+        current_state = update_state(current_state, ui_event)
+        event_count = event_count + 1
+        event = ch.try_recv()
+
+    print "Processed {event_count} events from channel."
+
+    # Render a single frame headless
+    val width = 80
+    val height = 24
+
+    val rects = compute_layout(current_state.tree.root_node(), 0, 0, width, height - 1)
+    var screen = Screen.new(width, height - 1)
+    screen = render_tui_tree(screen, current_state.tree.root_node(), rects, current_state)
+    val output = screen.render()
+
+    print output
+
+    if output.contains("Hello Async TUI!"):
+        print "OK: Async TUI hello world rendered successfully."
+    else:
+        print "ERROR: Expected greeting not found in output."
+        return 1
+
+    # Verify channel closure
+    ch.close()
+    if ch.is_closed():
+        print "OK: Channel closed cleanly."
+    else:
+        print "ERROR: Channel should be closed."
+        return 1
+
+    print "OK: All async TUI checks passed."
+    return 0

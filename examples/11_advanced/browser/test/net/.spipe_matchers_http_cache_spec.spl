@@ -1,0 +1,210 @@
+#![allow(REQC001)]
+#![allow(REQC004)]
+#![allow(unnamed_duplicate_typed_args)]
+"""
+# Http Cache
+
+Tests for http cache functionality.
+"""
+#![allow(unnamed_duplicate_typed_args)]
+# HTTP Cache Tests
+#
+# Category: Browser Platform Networking
+# Status: Active
+#
+# Validates the HTTP cache layer: lookup, store, invalidate, eviction,
+# Cache-Control parsing, freshness checks, and cacheability decisions.
+# Tests operate on HttpCache and pure parsing functions directly.
+#
+# Run with: bin/simple test examples/browser/test/net/http_cache_spec.spl
+
+use std.spec
+use sbp.feature.net.cache.{HttpCache, parse_cache_control, is_fresh, should_cache}
+use sbp.entity.net.cache_types.{CacheEntry, CachePolicy, CacheControl, ETag}
+use sbp.shared.logging.Logger
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+fn make_logger() -> Logger:
+    Logger.create("test-cache", "warn")
+
+fn make_cache(max_mb: i64) -> HttpCache:
+    HttpCache.new(make_logger(), max_mb)
+
+fn make_headers(cc_value: text):
+    var headers: [text] = []
+    headers
+
+fn empty_headers():
+    var h: [text] = []
+    h
+
+fn make_fresh_entry(url: text, max_age: i64, stored_at: i64) -> CacheEntry:
+    var controls = [CacheControl]()
+    controls.push(CacheControl.MaxAge(seconds: max_age))
+    val etag = ETag.strong("")
+    val policy = CachePolicy.create(controls, etag, 0)
+    CacheEntry(
+        url: url,
+        body: "<html>ok</html>",
+        headers: empty_headers(),
+        policy: policy,
+        stored_at: stored_at
+    )
+
+# ============================================================================
+# HttpCache: lookup / store / invalidate
+# ============================================================================
+
+describe "HttpCache":
+    """
+    ## Httpcache Tests
+
+    Validates HttpCache functionality.
+    """
+
+    context "lookup":
+        it "returns nil for uncached URL":
+            var cache = make_cache(10)
+            val result = cache.lookup("https://example.com/missing")
+            val is_nil = not result.?
+            expect is_nil == true
+
+    context "store":
+        it "adds entry to cache":
+            var cache = make_cache(10)
+            val headers = make_headers("max-age=3600")
+            val res = cache.store("https://example.com/page", "<html>hello</html>", headers)
+            # After storing, lookup should find it
+            val found = cache.lookup("https://example.com/page")
+            expect found.? == true
+
+        it "lookup returns stored entry":
+            var cache = make_cache(10)
+            val headers = make_headers("max-age=3600")
+            cache.store("https://example.com/data", "payload-body", headers)
+            val result = cache.lookup("https://example.com/data")
+            if val entry = result:
+                expect entry.url == "https://example.com/data"
+                expect entry.body == "payload-body"
+            else:
+                expect "lookup should return entry" == ""
+
+    context "invalidation":
+        it "invalidate removes cached entry":
+            var cache = make_cache(10)
+            val headers = make_headers("max-age=3600")
+            cache.store("https://example.com/a", "body-a", headers)
+            cache.store("https://example.com/b", "body-b", headers)
+            cache.invalidate("https://example.com/a")
+            val removed = cache.lookup("https://example.com/a")
+            val is_nil = not removed.?
+            expect is_nil == true
+            # Other entry still present
+            val remaining = cache.lookup("https://example.com/b")
+            expect remaining.? == true
+
+# ============================================================================
+# parse_cache_control
+# ============================================================================
+
+describe "parse_cache_control":
+    it "extracts max-age":
+        val directives = parse_cache_control("max-age=3600")
+        expect directives.len() == 1
+        val first = directives.get(0)
+        val is_max_age = match first:
+            CacheControl.MaxAge(m): m.seconds == 3600
+            _: false
+        expect is_max_age == true
+
+    it "handles no-cache":
+        val directives = parse_cache_control("no-cache")
+        expect directives.len() == 1
+        val first = directives.get(0)
+        val is_no_cache = match first:
+            CacheControl.NoCache: true
+            _: false
+        expect is_no_cache == true
+
+    it "handles no-store":
+        val directives = parse_cache_control("no-store")
+        expect directives.len() == 1
+        val first = directives.get(0)
+        val is_no_store = match first:
+            CacheControl.NoStore: true
+            _: false
+        expect is_no_store == true
+
+    it "handles multiple directives":
+        val directives = parse_cache_control("public, max-age=600, must-revalidate")
+        expect directives.len() == 3
+        val d0 = directives.get(0)
+        val is_public = match d0:
+            CacheControl.Public: true
+            _: false
+        expect is_public == true
+        val d1 = directives.get(1)
+        val is_max_age = match d1:
+            CacheControl.MaxAge(m): m.seconds == 600
+            _: false
+        expect is_max_age == true
+        val d2 = directives.get(2)
+        val is_must_reval = match d2:
+            CacheControl.MustRevalidate: true
+            _: false
+        expect is_must_reval == true
+
+# ============================================================================
+# is_fresh
+# ============================================================================
+
+describe "is_fresh":
+    it "returns true for fresh entry":
+        val entry = make_fresh_entry("https://example.com/f", 3600, 1000)
+        # now = 1500, age = 500, max-age = 3600 => fresh
+        val fresh = is_fresh(entry, 1500)
+        expect fresh == true
+
+    it "returns false for expired entry":
+        val entry = make_fresh_entry("https://example.com/e", 60, 1000)
+        # now = 1100, age = 100, max-age = 60 => stale
+        val fresh = is_fresh(entry, 1100)
+        expect fresh == false
+
+# ============================================================================
+# should_cache
+# ============================================================================
+
+describe "should_cache":
+    it "returns true for 200":
+        val result = should_cache(200, empty_headers())
+        expect result == true
+
+    it "returns false for 304":
+        val result = should_cache(304, empty_headers())
+        expect result == false
+
+# ============================================================================
+# Eviction
+# ============================================================================
+
+describe "HttpCache eviction":
+    it "evict removes oldest entries when over limit":
+        # Create a very small cache (1 byte budget, effectively)
+        # so any entry triggers eviction logic
+        var cache = make_cache(1)
+        val headers = make_headers("max-age=3600")
+        # Store several entries that together exceed 1 MB
+        var i = 0
+        while i < 5:
+            val url = "https://example.com/evict/{i}"
+            cache.store(url, "x", headers)
+            i = i + 1
+        # The cache should have evicted older entries to stay within budget.
+        # Depending on entry sizes, not all 5 may remain.
+        # At minimum, the last stored entry should be accessible.
+        val last = cache.lookup("https://example.com/evict/4")
+        expect last.? == true

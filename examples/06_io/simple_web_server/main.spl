@@ -1,0 +1,56 @@
+# Simple Web Server — Full Standalone Example
+#
+# A full-featured HTTP server built on the lightweight
+# std.nogc_sync_mut.http_server lib. Demonstrates middleware,
+# static file serving, routing, and configuration.
+#
+# Reuses: std.nogc_sync_mut.http_server (lightweight lib)
+# Lib source: src/lib/nogc_sync_mut/http_server/
+# Design: doc/05_design/simple_web_server_example.md
+#
+# Usage:
+#   bin/simple run examples/simple_web_server/main.spl
+#   bin/simple run examples/simple_web_server/main.spl -- --port=3000
+#   bin/simple run examples/simple_web_server/main.spl -- --static=./my_assets
+#   bin/simple run examples/simple_web_server/main.spl -- --port=443 --tls-cert=cert.pem --tls-key=key.pem
+
+use std.nogc_sync_mut.http_server.server.{SimpleHttpServer, SecureServerPolicy, plaintext_development_capability}
+use std.nogc_sync_mut.http_server.router.{Router}
+use config.{ServerConfig, parse_args}
+use routes.{register_routes}
+
+fn main():
+    val config = parse_args()
+
+    var router = register_routes(Router.new(), config)
+
+    print "============================================"
+    print "  Simple Web Server"
+    print "  Powered by std.nogc_sync_mut.http_server"
+    print "============================================"
+    print ""
+    print "  Host:        {config.host}"
+    print "  Port:        {config.port}"
+    print "  Static root: {config.static_root}"
+    print "  Logging:     {if config.log_requests: "on" else: "off"}"
+    if config.tls_enabled:
+        print "  TLS:         enabled"
+        print "  Cert:        {config.tls_cert}"
+        print "  Key:         {config.tls_key}"
+    print ""
+
+    var server = SimpleHttpServer.new(config.host, config.port, router)
+    if config.tls_enabled:
+        print "Error: production TLS is unavailable: GAP-TLS-3 requires an owned encrypted TcpStream overlay"
+        return
+    if not config.plaintext_development:
+        print "Error: choose --plaintext-development explicitly; production startup requires TLS"
+        return
+    match plaintext_development_capability("operator supplied --plaintext-development"):
+        Err(e):
+            print "Error: {e}"
+        Ok(capability):
+            server.with_policy(SecureServerPolicy.plaintext_dev(capability))
+            match server.start_plaintext(capability):
+                Err(e): print "Error: {e}"
+                Ok(_): pass

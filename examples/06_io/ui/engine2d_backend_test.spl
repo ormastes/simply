@@ -1,0 +1,99 @@
+# engine2d_backend_test.spl — 2D engine drawing test across backends.
+#
+# Draws the core primitives — square, circle, line, text, shade (vertical
+# gradient) and a rounded-edge square — then reads the framebuffer back and
+# pixel-checks each shape. Probes the CPU, Metal and Vulkan backends, reports
+# which are implemented/available on this host, and renders+checks every
+# backend that initializes. The CPU backend is always available.
+#
+# Run the CPU backend (default — the always-available lane, fast):
+#   bin/simple run examples/ui/engine2d_backend_test.spl
+#
+# Probe + render the key verification backends (cpu_simd, metal, vulkan). On the interpreter
+# this can exceed the 10s example watchdog when a GPU backend probes slowly;
+# prefer the compiled path for the full sweep:
+#   bin/simple run examples/ui/engine2d_backend_test.spl --backend=all
+#
+# Switch to a single backend:
+#   bin/simple run examples/ui/engine2d_backend_test.spl --backend=cpu_simd
+#   bin/simple run examples/ui/engine2d_backend_test.spl metal
+#   bin/simple run examples/ui/engine2d_backend_test.spl vulkan
+#
+# Exit code is 0 when at least one selected backend passes all checks (CPU
+# always should), 1 otherwise.
+
+use std.sffi.cli.{cli_get_args}
+use std.io_runtime.{process_run, env_get}
+
+# Small canvas: the software/CPU renderer is per-pixel and very slow under the
+# interpreter, and examples run under a 10s wall-clock watchdog. 48x40 keeps the
+# run (probe + render + readback + checks) within budget while still fitting six
+# distinct shapes. Use a larger size only on the compiled path.
+fn _simple_binary() -> text:
+    val env_binary = env_get("SIMPLE_BINARY") ?? ""
+    if env_binary != "":
+        return env_binary
+    val env_bin = env_get("SIMPLE_BIN") ?? ""
+    if env_bin != "":
+        return env_bin
+    "src/compiler_rust/target/release/simple"
+
+fn _backend_entry(name: text) -> text:
+    if name == "metal":
+        return "examples/ui/engine2d_backend_metal_entry.spl"
+    if name == "vulkan":
+        return "examples/ui/engine2d_backend_vulkan_entry.spl"
+    "examples/ui/engine2d_backend_cpu_simd_entry.spl"
+
+# Probe, render and check one backend. Returns true if it ran and passed 6/6.
+fn _run_backend(name: text) -> bool:
+    val result = process_run(_simple_binary(), ["run", _backend_entry(name)])
+    if result.0.len() > 0:
+        print result.0
+    if result.1.len() > 0:
+        print result.1
+    result.2 == 0
+
+fn _join(items: [text], sep: text) -> text:
+    var out = ""
+    var i = 0
+    while i < items.len():
+        if i > 0:
+            out = out + sep
+        out = out + items[i]
+        i = i + 1
+    out
+
+fn _selected_backends(args: [text]) -> [text]:
+    # Default to CPU SIMD: the always-available SIMD-instrumented lane, fast
+    # enough for the watchdog. Pass --backend=metal for strict Metal probing or
+    # --backend=all for the discoverability sweep.
+    # Pass --backend=all (or a single name) to override.
+    var sel = "cpu_simd"
+    for a in args:
+        if a.index_of("--backend=") == 0:
+            sel = a.substring(10, a.len())
+        elif a == "cpu" or a == "cpu_simd" or a == "simd_cpu" or a == "metal" or a == "vulkan" or a == "software" or a == "all":
+            sel = a
+    if sel == "all":
+        return ["cpu_simd", "metal", "vulkan"]
+    [sel]
+
+fn main() -> i64:
+    print "=== Engine2D drawing test: square / circle / line / text / shade / rounded ==="
+    val args = cli_get_args()
+    val backends = _selected_backends(args)
+    print "Testing: " + _join(backends, ", ")
+    print ""
+    var passed_count: i32 = 0
+    var ran_count: i32 = 0
+    for name in backends:
+        if _run_backend(name):
+            passed_count = passed_count + 1
+        ran_count = ran_count + 1
+        print ""
+    print "=== summary: {passed_count}/{ran_count} backend(s) passed all checks ==="
+    if passed_count > 0:
+        return 0
+    print "No backend rendered all primitives correctly."
+    return 1

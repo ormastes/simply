@@ -1,0 +1,30 @@
+# Minimal MCP server — the complete thing, in ~30 lines.
+# Run:  bin/simple run examples/10_tooling/minimal_mcp/minimal_mcp.spl
+# Talk: pipe JSON-RPC lines (initialize, tools/list, tools/call) on stdin.
+# Note: `{...}` interpolates inside string literals, so JSON is built with
+# the brace helpers below instead of literal `{}` pairs.
+
+use std.mcp_sdk.server.app.{mcp_server_init, mcp_server_tool, mcp_serve}
+use std.mcp_sdk.transport.transport.{StdioTransport}
+
+fn lb() -> text:
+    "{"
+
+fn rb() -> text:
+    "}"
+
+fn str_prop(name: text) -> text:
+    "\"{name}\":" + lb() + "\"type\":\"string\"" + rb()
+
+fn echo_schema() -> text:
+    lb() + "\"type\":\"object\",\"properties\":" + lb() + str_prop("message") +
+        rb() + ",\"required\":[\"message\"]" + rb()
+
+fn echo_handler(args: text) -> text:
+    "echo: {args}"
+
+fn main():
+    mcp_server_init("minimal-mcp", "0.1.0")
+    mcp_server_tool("echo", "Echo the arguments back.", echo_schema, echo_handler)
+    val transport = StdioTransport.json_lines()
+    mcp_serve(transport)

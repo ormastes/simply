@@ -1,0 +1,26 @@
+use logic_nand_read_level.*
+
+fn _check(got: i64, want: i64, label: text) -> i64:
+    if got == want:
+        return 0
+    print "FAIL {label}: got={got} want={want}"
+    1
+
+fn main() -> i64:
+    val data: i64 = 0x13579BDE
+    val ecc = rv32_nand_ecc_compute(data)
+    var fail: i64 = 0
+    fail = fail + _check(rv32_nand_ecc_decode_status(data, ecc, 0, 1), 1, "clean status")
+    fail = fail + _check(rv32_nand_ecc_decode_data(data, ecc), data, "clean data")
+    fail = fail + _check(rv32_nand_ecc_decode_status(data ^ 1, ecc, 1, 1), 1, "low status")
+    fail = fail + _check(rv32_nand_ecc_decode_data(data ^ 1, ecc), data, "low data")
+    fail = fail + _check(rv32_nand_ecc_decode_status(data ^ (1 << 16), ecc, 1, 1), 1, "mid status")
+    fail = fail + _check(rv32_nand_ecc_decode_data(data ^ (1 << 16), ecc), data, "mid data")
+    fail = fail + _check(rv32_nand_ecc_decode_status(data ^ (1 << 31), ecc, 1, 1), 1, "high status")
+    fail = fail + _check(rv32_nand_ecc_decode_data(data ^ (1 << 31), ecc), data, "high data")
+    fail = fail + _check(rv32_nand_ecc_decode_status(data ^ 3, ecc, 2, 2), 0, "double status")
+    fail = fail + _check(rv32_nand_ecc_decode_status(data ^ 1, ecc, 1, 0), 0, "budget status")
+    fail = fail + _check(rv32_nand_read_level_selftest(), 0, "full policy")
+    if fail == 0:
+        print "RV32 NAND READ LEVEL OK"
+    fail

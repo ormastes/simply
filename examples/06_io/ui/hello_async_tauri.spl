@@ -1,0 +1,9 @@
+# Hello Async Tauri — Channel-Based Tauri Backend
+#
+# Launches the async (non-blocking, channel-based) Tauri backend
+# on port 3000 with the hello_tauri.ui.sdn layout.
+
+use app.ui.tauri.async_app.{run_async_tauri}
+
+fn main() -> i64:
+    return run_async_tauri("examples/ui/hello_tauri.ui.sdn", 3000)

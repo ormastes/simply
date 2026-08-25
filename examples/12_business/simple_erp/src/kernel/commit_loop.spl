@@ -1,0 +1,45 @@
+# UBS Kernel — Two-tree commit loop
+#
+# The transactional spine. Effects are staged in a working tree, invariants are
+# validated, then the batch is atomically promoted into the committed tree — or
+# the whole batch is rolled back. This gives saga-like multi-entity commits with
+# a clean rollback story: one event, composed across many dimensions, committed
+# once (see doc §2.10).
+
+use kernel.event_log.{Event, EventLog, append, event_count, new_event_log}
+
+# A staged effect waiting to be promoted. Mirrors Event minus the assigned seq.
+struct StagedEffect:
+    val kind: text
+    val entity: i64
+    val payload: text
+
+# A transaction: the committed base plus a working tree of staged effects.
+struct Tx:
+    val base: EventLog
+    val staged: [StagedEffect]
+
+fn begin(base: EventLog) -> Tx:
+    var s: [StagedEffect] = []
+    return Tx { base: base, staged: s }
+
+# Stage one effect into the working tree (not yet visible to projections).
+fn stage(tx: Tx, kind: text, entity: i64, payload: text) -> Tx:
+    var s = tx.staged
+    s.push(StagedEffect { kind: kind, entity: entity, payload: payload })
+    return Tx { base: tx.base, staged: s }
+
+fn staged_count(tx: Tx) -> i64:
+    return tx.staged.length()
+
+# Atomically promote every staged effect into the base log, in stage order.
+# Returns the new committed log. Callers validate invariants BEFORE calling this.
+fn commit(tx: Tx) -> EventLog:
+    var log = tx.base
+    for eff in tx.staged:
+        log = append(log, eff.kind, eff.entity, eff.payload)
+    return log
+
+# Discard the working tree; the committed tree is unchanged.
+fn rollback(tx: Tx) -> EventLog:
+    return tx.base

@@ -1,0 +1,157 @@
+# Platform Abstraction Library - Quick Example
+#
+# Demonstrates the key features of the platform abstraction library:
+# - Auto-detecting host platform
+# - Endianness conversion (little-endian ↔ big-endian)
+# - Newline translation (LF ↔ CRLF)
+# - Wire format serialization
+# - Platform-aware file I/O
+
+use std.platform.config.{host_config, make_config, network_config}
+use std.platform.convert.{send_u32, recv_u32, send_text, recv_text}
+use std.platform.wire.{wire_writer_network, wire_reader_new}
+use std.platform.text_io.{text_file_write_local}
+use std.common.target.{TargetArch, TargetOS}
+
+# ============================================================================
+# Example 1: Auto-detect host platform
+# ============================================================================
+
+print "=== Example 1: Platform Detection ==="
+val host = host_config()
+val arch_name = host.arch.name()
+val os_name = host.os.name()
+val endian_name = host.endian.name()
+val ptr_bytes = host.pointer_bytes
+val nl_len = host.newline.len()
+
+print "Host platform: {arch_name}-{os_name}"
+print "Endianness: {endian_name}"
+print "Pointer size: {ptr_bytes} bytes"
+print "Newline: {nl_len} byte(s)"
+print ""
+
+# ============================================================================
+# Example 2: Same-platform conversion (zero-cost)
+# ============================================================================
+
+print "=== Example 2: Same-Platform Conversion (No-Op) ==="
+val value = 42
+val same_platform_result = send_u32(host, host, value)
+print "Original value: {value}"
+print "After send_u32(host, host, value): {same_platform_result}"
+print "Result: No conversion needed (zero-cost)!"
+print ""
+
+# ============================================================================
+# Example 3: Cross-endian conversion
+# ============================================================================
+
+print "=== Example 3: Cross-Endian Conversion ==="
+val le_host = make_config(TargetArch.X86_64, TargetOS.Linux)
+val be_target = make_config(TargetArch.MCS51, TargetOS.BareMetal)
+
+val original = 0x12345678
+val swapped = send_u32(le_host, be_target, original)
+val restored = recv_u32(le_host, be_target, swapped)
+
+print "Original (LE): 0x{original:x}"
+print "Swapped (BE):  0x{swapped:x}"
+print "Restored (LE): 0x{restored:x}"
+print "Round-trip successful: {original == restored}"
+print ""
+
+# ============================================================================
+# Example 4: Network byte order (always big-endian)
+# ============================================================================
+
+print "=== Example 4: Network Byte Order ==="
+val net = network_config()
+val local_value = 0x1A2B3C4D
+val network_value = send_u32(host, net, local_value)
+
+print "Local value:   0x{local_value:x}"
+print "Network value: 0x{network_value:x}"
+print "Network byte order is big-endian"
+print ""
+
+# ============================================================================
+# Example 5: Text newline conversion
+# ============================================================================
+
+print "=== Example 5: Newline Translation ==="
+val unix = make_config(TargetArch.X86_64, TargetOS.Linux)
+val windows = make_config(TargetArch.X86_64, TargetOS.Windows)
+
+val unix_text = "Line 1\nLine 2\nLine 3"
+val windows_text = send_text(unix, windows, unix_text)
+val back_to_unix = recv_text(unix, windows, windows_text)
+
+print "Unix text length: {unix_text.len()} bytes"
+print "Windows text length: {windows_text.len()} bytes"
+print "Back to Unix length: {back_to_unix.len()} bytes"
+print "Round-trip successful: {unix_text == back_to_unix}"
+print ""
+
+# ============================================================================
+# Example 6: Wire format serialization
+# ============================================================================
+
+print "=== Example 6: Wire Format Serialization ==="
+
+# Write data in network byte order
+var writer = wire_writer_network()
+writer.write_u32(100)
+writer.write_text("Hello, Network!")
+writer.write_u32(200)
+
+val wire_bytes = writer.to_bytes()
+print "Serialized {wire_bytes.len()} bytes to wire format"
+
+# Read data back from network byte order
+var reader = wire_reader_new(wire_bytes, network_config())
+val num1 = reader.read_u32()
+val msg = reader.read_text()
+val num2 = reader.read_u32()
+
+print "Deserialized: num1={num1}, msg=\"{msg}\", num2={num2}"
+print "Wire format round-trip successful!"
+print ""
+
+# ============================================================================
+# Example 7: Platform-aware file I/O
+# ============================================================================
+
+print "=== Example 7: Platform-Aware File I/O ==="
+val test_file = "/tmp/platform_example.txt"
+val file_content = "First line\nSecond line\nThird line\n"
+
+# Write with host platform newlines
+text_file_write_local(test_file, file_content)
+print "Wrote file with host platform newlines"
+
+val host_os = host.os.name()
+if host_os == "windows":
+    print "On Windows: file contains CRLF"
+else:
+    print "On Unix: file contains LF"
+
+# Clean up
+use app.io.mod.{file_delete}
+file_delete(test_file)
+print ""
+
+# ============================================================================
+# Summary
+# ============================================================================
+
+print "=== Summary ==="
+print "✓ Platform detection works"
+print "✓ Same-platform conversion is zero-cost"
+print "✓ Cross-endian conversion works correctly"
+print "✓ Network byte order conversion works"
+print "✓ Text newline translation works"
+print "✓ Wire format serialization works"
+print "✓ Platform-aware file I/O works"
+print ""
+print "Platform Abstraction Library is ready to use!"

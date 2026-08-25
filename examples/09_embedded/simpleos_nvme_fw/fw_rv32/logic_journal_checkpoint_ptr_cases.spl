@@ -1,0 +1,12 @@
+use logic_journal_core.*
+
+fn rv32_journal_checkpoint_ptr_cases_selftest() -> i32:
+    if _rv32_journal_checkpoint_valid(2) != 1:
+        return 1
+    if _rv32_journal_checkpoint_valid(-1) != 0:
+        return 1
+    if _rv32_journal_checkpoint_ptr(2) != 2:
+        return 1
+    if _rv32_journal_checkpoint_ptr(-1) != -1:
+        return 1
+    0

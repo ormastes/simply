@@ -1,0 +1,11 @@
+# spipe:artifact uid=A-00000000000000000000000000000011 key=test.search
+
+describe "Search compiler":
+    # spipe:scenario uid=SS-00000000000000000000000000000001 key=test.search.exact requirements=[REQ-SPKC-011]
+    it "resolves an exact UID":
+        # REQ-SPKC-011
+        expect true
+
+    it "keeps a stable trace":
+        # tag: [trace, strict]
+        expect true

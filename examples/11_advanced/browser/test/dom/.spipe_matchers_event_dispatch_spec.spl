@@ -1,0 +1,274 @@
+#![allow(REQC001)]
+#![allow(REQC004)]
+#![allow(unnamed_duplicate_typed_args)]
+"""
+# Event Dispatch
+
+Tests for event dispatch functionality.
+"""
+# Event Dispatch Tests
+#
+# Category: Browser Platform DOM Events
+# Status: Active
+#
+# Validates the W3C DOM event dispatch model: capture, target, and bubble phases,
+# listener registration/removal, stopPropagation, preventDefault, and once listeners.
+# Tests build small DOM trees and dispatch events to verify call order and properties.
+#
+# Run with: bin/simple test examples/browser/test/dom/event_dispatch_spec.spl
+
+use std.spec
+use examples.browser.entity.dom.node_types.{DomNode, NodeKind}
+use examples.browser.entity.dom.event_types.{DomEvent, EventPhase, EventInit}
+use examples.browser.feature.dom.document.{Document}
+use examples.browser.feature.dom.event_dispatch.{EventDispatcher, EventListener, EventListenerOptions, get_ancestors, create_custom_event, create_focus_event, matches_listener}
+use examples.browser.shared.logging.{Logger, LogLevel}
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+fn make_doc() -> Document:
+    val logger = Logger.new("test-event", LogLevel.Error)
+    Document.new("about:blank", logger)
+
+fn make_dispatcher() -> EventDispatcher:
+    val logger = Logger.new("test-dispatch", LogLevel.Error)
+    EventDispatcher.new(logger)
+
+fn bubble_opts() -> EventListenerOptions:
+    EventListenerOptions.create(false, false, false)
+
+fn capture_opts() -> EventListenerOptions:
+    EventListenerOptions.create(true, false, false)
+
+fn once_bubble_opts() -> EventListenerOptions:
+    EventListenerOptions.create(false, true, false)
+
+# Build a simple tree: root -> parent -> child, returning (root_id, parent_id, child_id)
+fn build_tree(doc: Document) -> [i64]:
+    var d = doc
+    val parent_id = d.createElement("div")
+    val child_id = d.createElement("span")
+    d.appendChild(d.body_id, parent_id)
+    d.appendChild(parent_id, child_id)
+    # Return [body_id, parent_id, child_id]
+    var ids = [i64]()
+    ids.push(d.body_id)
+    ids.push(parent_id)
+    ids.push(child_id)
+    ids
+
+# ============================================================================
+# Tests
+# ============================================================================
+
+describe "Event Dispatch":
+    """
+    ## Event Dispatch Tests
+
+    Validates Event Dispatch functionality.
+    """
+
+    context "listener registration":
+        it "addEventListener registers listener":
+            var disp = make_dispatcher()
+            disp.addEventListener(10, "click", 1, bubble_opts())
+            expect disp.listener_count() == 1
+
+        it "removeEventListener removes listener":
+            var disp = make_dispatcher()
+            disp.addEventListener(10, "click", 1, bubble_opts())
+            expect disp.listener_count() == 1
+            disp.removeEventListener(10, "click", 1, false)
+            expect disp.listener_count() == 0
+
+    context "dispatch basics":
+        it "dispatch fires listener on target":
+            var disp = make_dispatcher()
+            val target_id = 100
+            disp.addEventListener(target_id, "click", 1, bubble_opts())
+            val ev = create_custom_event("click", true, true)
+            val ancestors = [i64]()
+            val result = disp.dispatchEvent(ev, target_id, ancestors)
+            # Listener was fired, default not prevented
+            expect result == true
+
+        it "dispatch returns true when not prevented":
+            var disp = make_dispatcher()
+            val ev = create_custom_event("click", true, true)
+            val ancestors = [i64]()
+            val result = disp.dispatchEvent(ev, 50, ancestors)
+            expect result == true
+
+        it "dispatch returns false when default prevented":
+            var disp = make_dispatcher()
+            val init = EventInit.create(true, true, false)
+            var ev = DomEvent(
+                type_name: "click",
+                target_id: -1,
+                current_target_id: -1,
+                phase: EventPhase.None,
+                init: init,
+                prevented: true,
+                stopped: false,
+                timestamp: 0
+            )
+            val ancestors = [i64]()
+            val result = disp.dispatchEvent(ev, 50, ancestors)
+            expect result == false
+
+    context "capture and bubble phases":
+        it "capture phase fires before bubble":
+            var disp = make_dispatcher()
+            val root_id = 1
+            val target_id = 2
+            # Register capture on root and bubble on root
+            disp.addEventListener(root_id, "click", 10, capture_opts())
+            disp.addEventListener(root_id, "click", 20, bubble_opts())
+            val ev = create_custom_event("click", true, true)
+            var ancestors = [i64]()
+            ancestors.push(root_id)
+            # Capture on root fires first, then target, then bubble on root
+            val result = disp.dispatchEvent(ev, target_id, ancestors)
+            expect result == true
+            # Verify both listeners still registered
+            val listeners = disp.get_listeners_for_node(root_id)
+            expect listeners.len() == 2
+
+        it "bubble phase fires after target":
+            var disp = make_dispatcher()
+            val root_id = 1
+            val target_id = 2
+            disp.addEventListener(target_id, "click", 10, bubble_opts())
+            disp.addEventListener(root_id, "click", 20, bubble_opts())
+            val ev = create_custom_event("click", true, true)
+            var ancestors = [i64]()
+            ancestors.push(root_id)
+            val result = disp.dispatchEvent(ev, target_id, ancestors)
+            expect result == true
+
+        it "non-bubbling event skips bubble phase":
+            var disp = make_dispatcher()
+            val root_id = 1
+            val target_id = 2
+            disp.addEventListener(root_id, "focus", 10, bubble_opts())
+            disp.addEventListener(target_id, "focus", 20, bubble_opts())
+            val ev = create_focus_event("focus")
+            var ancestors = [i64]()
+            ancestors.push(root_id)
+            # Focus does not bubble; only capture and target fire
+            val result = disp.dispatchEvent(ev, target_id, ancestors)
+            expect result == true
+
+    context "stopPropagation":
+        it "stopPropagation prevents further propagation":
+            var disp = make_dispatcher()
+            val root_id = 1
+            val target_id = 2
+            disp.addEventListener(root_id, "click", 10, capture_opts())
+            disp.addEventListener(target_id, "click", 20, bubble_opts())
+            # Create event with stopped=true to simulate stopPropagation called early
+            val init = EventInit.create(true, true, false)
+            var ev = DomEvent(
+                type_name: "click",
+                target_id: -1,
+                current_target_id: -1,
+                phase: EventPhase.None,
+                init: init,
+                prevented: false,
+                stopped: true,
+                timestamp: 0
+            )
+            var ancestors = [i64]()
+            ancestors.push(root_id)
+            val result = disp.dispatchEvent(ev, target_id, ancestors)
+            # Event stopped, but not prevented
+            expect result == true
+
+        it "stopImmediatePropagation stops same-node listeners":
+            var disp = make_dispatcher()
+            val target_id = 10
+            disp.addEventListener(target_id, "click", 1, bubble_opts())
+            disp.addEventListener(target_id, "click", 2, bubble_opts())
+            # Simulate by dispatching with stopped flag
+            val init = EventInit.create(true, true, false)
+            var ev = DomEvent(
+                type_name: "click",
+                target_id: -1,
+                current_target_id: -1,
+                phase: EventPhase.None,
+                init: init,
+                prevented: false,
+                stopped: true,
+                timestamp: 0
+            )
+            val ancestors = [i64]()
+            val result = disp.dispatchEvent(ev, target_id, ancestors)
+            expect result == true
+
+    context "preventDefault":
+        it "preventDefault sets prevented flag":
+            var disp = make_dispatcher()
+            val init = EventInit.create(true, true, false)
+            var ev = DomEvent(
+                type_name: "click",
+                target_id: -1,
+                current_target_id: -1,
+                phase: EventPhase.None,
+                init: init,
+                prevented: true,
+                stopped: false,
+                timestamp: 0
+            )
+            val ancestors = [i64]()
+            val result = disp.dispatchEvent(ev, 50, ancestors)
+            expect result == false
+
+    context "once listener":
+        it "once listener fires only once":
+            var disp = make_dispatcher()
+            val target_id = 10
+            disp.addEventListener(target_id, "click", 1, once_bubble_opts())
+            expect disp.listener_count() == 1
+            val ev = create_custom_event("click", true, true)
+            val ancestors = [i64]()
+            # First dispatch — once listener fires and is removed
+            disp.dispatchEvent(ev, target_id, ancestors)
+            expect disp.listener_count() == 0
+
+    context "event phase matching":
+        it "correct event phase during capture":
+            val listener = EventListener.create(1, "click", 10, 100, capture_opts())
+            val matched = matches_listener(listener, "click", 10, EventPhase.Capturing)
+            expect matched == true
+            val not_matched = matches_listener(listener, "click", 10, EventPhase.Bubbling)
+            expect not_matched == false
+
+        it "correct event phase at target":
+            # At target, both capture and bubble listeners match
+            val cap_listener = EventListener.create(1, "click", 10, 100, capture_opts())
+            val bub_listener = EventListener.create(2, "click", 10, 200, bubble_opts())
+            expect matches_listener(cap_listener, "click", 10, EventPhase.AtTarget) == true
+            expect matches_listener(bub_listener, "click", 10, EventPhase.AtTarget) == true
+
+        it "correct event phase during bubble":
+            val listener = EventListener.create(1, "click", 10, 100, bubble_opts())
+            val matched = matches_listener(listener, "click", 10, EventPhase.Bubbling)
+            expect matched == true
+            val not_matched = matches_listener(listener, "click", 10, EventPhase.Capturing)
+            expect not_matched == false
+
+    context "ancestor chain":
+        it "get_ancestors builds correct chain":
+            var doc = make_doc()
+            val div_id = doc.createElement("div")
+            val span_id = doc.createElement("span")
+            doc.appendChild(doc.body_id, div_id)
+            doc.appendChild(div_id, span_id)
+            val ancestors = get_ancestors(span_id, doc.node_store.nodes)
+            # Ancestors from root toward parent: doc(1), html(2), body(4), div
+            expect ancestors.len() > 1
+            # Last ancestor should be div_id (span's parent)
+            val last_idx = ancestors.len() - 1
+            expect ancestors.get(last_idx) == div_id

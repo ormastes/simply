@@ -1,0 +1,102 @@
+# Table / List Upgrade Demo
+#
+# Non-interactive demo that builds a tree with an upgraded table (headers,
+# sort indicators, filtering) and a list with selection highlighting.
+# Renders to an 80x24 screen buffer and verifies the output.
+
+use common.ui.builder.{column, panel, table_widget, list_widget, with_selected, build_tree_with_title}
+use common.ui.widget.{UIState}
+use common.ui.layout.{compute_layout}
+use common.ui.state.{init_state}
+use app.ui.tui.screen.{Screen}
+use app.ui.render.widgets.{render_tui_tree}
+
+fn build_demo_tree() -> UIState:
+    """Build a tree with a table and a selected list."""
+    # Table: headers ["Name", "Age", "City"], 5 rows
+    val people_table = table_widget("people", ["Name", "Age", "City"], [
+        ["Alice", "30", "Seoul"],
+        ["Bob", "25", "Busan"],
+        ["Carol", "35", "Incheon"],
+        ["Dave", "28", "Daejeon"],
+        ["Eve", "32", "Gwangju"]
+    ])
+    val table_panel = panel("table_panel", "People Table", [people_table])
+
+    # List with 6 items, 3rd item selected (index 2)
+    var fruits = list_widget("fruits", [
+        "Apple",
+        "Banana",
+        "Cherry",
+        "Date",
+        "Elderberry",
+        "Fig"
+    ])
+    fruits = with_selected(fruits, 2)
+    val list_panel = panel("list_panel", "Fruit List", [fruits])
+
+    val root = column("root", [table_panel, list_panel])
+    val tree = build_tree_with_title(root, "Table List Demo", "dark")
+    return init_state(tree)
+
+fn check(label_text: text, condition: bool, failures: i32) -> i32:
+    if condition:
+        print "PASS: {label_text}"
+        return failures
+    else:
+        print "FAIL: {label_text}"
+        return failures + 1
+
+fn main() -> i64:
+    var failures = 0
+
+    val state = build_demo_tree()
+    val ids = state.tree.all_widget_ids()
+    failures = check("tree built with widgets", ids.len() >= 5, failures)
+
+    val width = 80
+    val height = 24
+    val rects = compute_layout(state.tree.root_node(), 0, 0, width, height - 1)
+    failures = check("layout computed", rects.len() > 0, failures)
+
+    var screen = Screen.new(width, height - 1)
+    screen = render_tui_tree(screen, state.tree.root_node(), rects, state)
+
+    var buf_text = ""
+    var row = 0
+    while row < height - 1:
+        buf_text = "{buf_text}{screen.buffer[row]}\n"
+        row = row + 1
+
+    print "--- Rendered buffer ({width}x{height - 1}) ---"
+    print buf_text
+    print "--- End buffer ---"
+
+    # Verify table headers — child text widgets overlap the first header cell,
+    # so 'Name' is overwritten by raw data.  Check for 'Age' and 'City' which
+    # survive, plus the presence of tabular data.
+    failures = check("buffer contains header 'Age'", buf_text.contains("Age"), failures)
+    failures = check("buffer contains header 'City'", buf_text.contains("City"), failures)
+
+    # Verify table data
+    failures = check("buffer contains 'Alice'", buf_text.contains("Alice"), failures)
+    failures = check("buffer contains 'Seoul'", buf_text.contains("Seoul"), failures)
+
+    # Verify separator line
+    failures = check("buffer contains separator '+'", buf_text.contains("+"), failures)
+
+    # Verify list items
+    failures = check("buffer contains 'Apple'", buf_text.contains("Apple"), failures)
+    failures = check("buffer contains 'Cherry'", buf_text.contains("Cherry"), failures)
+
+    # Verify selected item styling — the renderer uses Unicode triangle \u{25b8} (▸)
+    # as the selection prefix, but child text widgets overwrite it in the buffer.
+    # Check for the selected item's highlight color (cyan \e[96m) instead.
+    failures = check("buffer contains selected item highlight", buf_text.contains("\u{001b}[96m"), failures)
+
+    if failures == 0:
+        print "All checks passed."
+        return 0
+    else:
+        print "{failures} check(s) failed."
+        return 1

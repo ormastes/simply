@@ -1,0 +1,364 @@
+#![allow(unnamed_duplicate_typed_args)]
+#!/usr/bin/env simple
+# GPU Async Pipeline - Producer-Consumer Pattern
+#
+# Demonstrates 3-way overlap: upload batch N, compute batch N-1, download batch N-2
+# This pattern maximizes GPU utilization by hiding transfer latency behind compute.
+
+use std.gpu.{Context}
+use std.torch.{TorchStream}
+
+# ============================================================================
+# Simulated Training Operations
+# ============================================================================
+
+fn generate_batch(batch_id: i64, batch_size: i64) -> [f32]:
+    """Generate synthetic batch data."""
+    var data = []
+    for i in 0..batch_size:
+        val value = (batch_id * batch_size + i) as f32
+        data = data + [value]
+    data
+
+fn compute_batch_cpu(data: [f32]) -> [f32]:
+    """Simulate CPU preprocessing (lightweight)."""
+    var result = []
+    for x in data:
+        result = result + [x * 2.0]
+    result
+
+# ============================================================================
+# Example 1: Sequential Baseline (No Overlap)
+# ============================================================================
+
+fn example_sequential():
+    """Sequential execution: upload → compute → download (no overlap)."""
+    print "=== Example 1: Sequential Baseline (No Overlap) ==="
+
+    val ctx = Context.default()
+    val batch_size = 1000
+    val num_batches = 5
+
+    print "Processing {num_batches} batches sequentially..."
+
+    for i in 0..num_batches:
+        # Generate batch
+        val data = generate_batch(i, batch_size)
+
+        # Upload (blocking)
+        val gpu_data = ctx.alloc_upload(data)
+
+        # Compute on GPU (could use operations here)
+        # For now we just allocate and sync
+        ctx.synchronize()
+
+        # Download (blocking)
+        val result = gpu_data.download()
+
+        print "  Batch {i}: {result.len()} elements processed"
+
+    print "✓ Sequential processing complete\n"
+
+# ============================================================================
+# Example 2: Double Buffering (2-Way Overlap)
+# ============================================================================
+
+fn example_double_buffer():
+    """Double buffering: overlap upload N with compute N-1."""
+    print "=== Example 2: Double Buffering (2-Way Overlap) ==="
+
+    val ctx = Context.default()
+    val batch_size = 1000
+    val num_batches = 5
+
+    # Create two streams
+    val upload_stream = ctx.create_stream()
+    val compute_stream = ctx.create_stream()
+
+    print "Using 2 streams for upload/compute overlap..."
+
+    # Initial batch
+    var current_data = generate_batch(0, batch_size)
+    var current_gpu = ctx.alloc_upload(current_data)
+    ctx.synchronize()
+
+    for i in 1..num_batches:
+        # Stream 1: Upload next batch (async, non-blocking)
+        val next_data = generate_batch(i, batch_size)
+        val next_gpu = ctx.alloc_upload(next_data)
+
+        # Stream 2: Compute current batch (parallel with upload)
+        # In real code: launch kernel on compute_stream
+        # Here we just demonstrate the pattern
+
+        # Wait for both to finish
+        upload_stream.synchronize()
+        compute_stream.synchronize()
+
+        print "  Batch {i}: upload and compute overlapped"
+
+        # Move to next
+        current_gpu = next_gpu
+
+    # Process last batch
+    compute_stream.synchronize()
+    print "  Batch {num_batches - 1}: final compute"
+
+    print "✓ Double buffering complete\n"
+
+# ============================================================================
+# Example 3: Triple Buffering (3-Way Overlap)
+# ============================================================================
+
+fn example_triple_buffer():
+    """Triple buffering: upload N, compute N-1, download N-2 (max overlap)."""
+    print "=== Example 3: Triple Buffering (3-Way Overlap) ==="
+
+    val ctx = Context.default()
+    val batch_size = 1000
+    val num_batches = 7
+
+    # Create three streams for maximum overlap
+    val upload_stream = ctx.create_stream()
+    val compute_stream = ctx.create_stream()
+    val download_stream = ctx.create_stream()
+
+    print "Using 3 streams for upload/compute/download overlap..."
+    print "Pipeline: Upload batch N | Compute batch N-1 | Download batch N-2\n"
+
+    # Warmup: fill pipeline with first 2 batches
+    val data0 = generate_batch(0, batch_size)
+    val gpu0 = ctx.alloc_upload(data0)
+    upload_stream.synchronize()
+
+    val data1 = generate_batch(1, batch_size)
+    val gpu1 = ctx.alloc_upload(data1)
+    upload_stream.synchronize()
+
+    var prev_prev_gpu = gpu0
+    var prev_gpu = gpu1
+    var batch_id = 2
+
+    # Main loop: 3-way overlap
+    while batch_id < num_batches:
+        print "Iteration {batch_id}:"
+
+        # Stage 1: Upload batch N (async on upload_stream)
+        val next_data = generate_batch(batch_id, batch_size)
+        val next_gpu = ctx.alloc_upload(next_data)
+        print "  - Uploading batch {batch_id} (async)"
+
+        # Stage 2: Compute batch N-1 (async on compute_stream)
+        # In real code: ctx.launch_async(kernel, prev_gpu, compute_stream)
+        print "  - Computing batch {batch_id - 1} (async)"
+
+        # Stage 3: Download batch N-2 (async on download_stream)
+        val result = prev_prev_gpu.download()
+        print "  - Downloading batch {batch_id - 2} (async)"
+        print "  ✓ All 3 stages running in parallel!\n"
+
+        # Synchronize before moving to next iteration
+        upload_stream.synchronize()
+        compute_stream.synchronize()
+        download_stream.synchronize()
+
+        # Shift pipeline forward
+        prev_prev_gpu = prev_gpu
+        prev_gpu = next_gpu
+        batch_id = batch_id + 1
+
+    # Drain pipeline: process remaining batches
+    print "Draining pipeline..."
+
+    # Compute batch N-1
+    compute_stream.synchronize()
+    val result_n1 = prev_gpu.download()
+    print "  - Downloaded batch {num_batches - 2}"
+
+    # Download batch N-2
+    download_stream.synchronize()
+    val result_n2 = prev_prev_gpu.download()
+    print "  - Downloaded batch {num_batches - 1}"
+
+    print "✓ Triple buffering complete\n"
+
+# ============================================================================
+# Example 4: Training Loop with Async Pipeline
+# ============================================================================
+
+fn example_training_loop():
+    """Realistic training loop with async data pipeline."""
+    print "=== Example 4: Training Loop with Async Pipeline ==="
+
+    val ctx = Context.default()
+    val batch_size = 256
+    val num_epochs = 2
+    val batches_per_epoch = 4
+
+    val upload_stream = ctx.create_stream()
+    val compute_stream = ctx.create_stream()
+
+    print "Training for {num_epochs} epochs, {batches_per_epoch} batches each"
+    print "Batch size: {batch_size}\n"
+
+    for epoch in 0..num_epochs:
+        print "Epoch {epoch + 1}/{num_epochs}:"
+
+        # Prefetch first batch
+        var current_data = generate_batch(0, batch_size)
+        var current_gpu = ctx.alloc_upload(current_data)
+        upload_stream.synchronize()
+
+        var total_loss = 0.0
+
+        for batch_idx in 1..batches_per_epoch:
+            # Prefetch next batch (async upload)
+            val next_data = generate_batch(batch_idx, batch_size)
+            val next_gpu = ctx.alloc_upload(next_data)
+
+            # Train on current batch (parallel with upload)
+            # In real code: forward pass, backward pass, optimizer step
+            # Simulated compute
+            compute_stream.synchronize()
+
+            # Compute loss (download small tensor, async)
+            val batch_loss = 1.0 / (batch_idx + 1) as f32
+            total_loss = total_loss + batch_loss
+
+            # Wait for upload to finish before next iteration
+            upload_stream.synchronize()
+
+            print "  Batch {batch_idx}: loss = {batch_loss}"
+
+            # Move to next batch
+            current_gpu = next_gpu
+
+        # Final batch
+        compute_stream.synchronize()
+        val final_loss = 1.0 / batches_per_epoch as f32
+        total_loss = total_loss + final_loss
+        print "  Batch {batches_per_epoch}: loss = {final_loss}"
+
+        val avg_loss = total_loss / batches_per_epoch as f32
+        print "  Epoch {epoch + 1} average loss: {avg_loss}\n"
+
+    ctx.synchronize()
+    print "✓ Training complete\n"
+
+# ============================================================================
+# Example 5: Multi-Stream Kernel Launch
+# ============================================================================
+
+fn example_multi_stream_kernels():
+    """Launch multiple operations on different streams (parallel execution)."""
+    print "=== Example 5: Multi-Stream Kernel Launch ==="
+
+    val ctx = Context.default()
+
+    if ctx.backend_name() != "CUDA":
+        print "⚠ CUDA not available, skipping multi-stream example\n"
+        return
+
+    # Create 4 independent streams
+    val stream1 = ctx.create_stream()
+    val stream2 = ctx.create_stream()
+    val stream3 = ctx.create_stream()
+    val stream4 = ctx.create_stream()
+
+    print "Launching 4 operations in parallel on separate streams..."
+
+    # Create 4 independent data arrays
+    val data1 = [1.0, 2.0, 3.0, 4.0]
+    val data2 = [5.0, 6.0, 7.0, 8.0]
+    val data3 = [9.0, 10.0, 11.0, 12.0]
+    val data4 = [13.0, 14.0, 15.0, 16.0]
+
+    # Upload to GPU (async, all in parallel)
+    val gpu1 = ctx.alloc_upload(data1)
+    val gpu2 = ctx.alloc_upload(data2)
+    val gpu3 = ctx.alloc_upload(data3)
+    val gpu4 = ctx.alloc_upload(data4)
+
+    print "  - Stream 1: uploaded {gpu1.count} elements"
+    print "  - Stream 2: uploaded {gpu2.count} elements"
+    print "  - Stream 3: uploaded {gpu3.count} elements"
+    print "  - Stream 4: uploaded {gpu4.count} elements"
+
+    # In real code: launch kernels on each stream
+    # ctx.launch_async(kernel1, gpu1, stream1)
+    # ctx.launch_async(kernel2, gpu2, stream2)
+    # ctx.launch_async(kernel3, gpu3, stream3)
+    # ctx.launch_async(kernel4, gpu4, stream4)
+
+    # Synchronize all streams
+    stream1.synchronize()
+    stream2.synchronize()
+    stream3.synchronize()
+    stream4.synchronize()
+
+    print "✓ All 4 streams synchronized\n"
+
+# ============================================================================
+# Example 6: Stream Query (Non-Blocking Check)
+# ============================================================================
+
+fn example_stream_query():
+    """Check stream completion without blocking."""
+    print "=== Example 6: Stream Query (Non-Blocking) ==="
+
+    val ctx = Context.default()
+
+    if ctx.backend_name() != "CUDA":
+        print "⚠ CUDA not available, skipping stream query example\n"
+        return
+
+    val stream = ctx.create_stream()
+
+    # Upload data (async)
+    val data = generate_batch(0, 10000)
+    val gpu_data = ctx.alloc_upload(data)
+
+    print "Checking stream status without blocking..."
+
+    # Query stream status (non-blocking)
+    var iteration = 0
+    var complete = stream.query()
+
+    while not complete:
+        print "  Iteration {iteration}: stream still busy..."
+        iteration = iteration + 1
+
+        # Do other work here (simulation)
+        val dummy = compute_batch_cpu([1.0, 2.0, 3.0])
+
+        # Check again
+        complete = stream.query()
+
+        # Prevent infinite loop in case of issues
+        if iteration > 100:
+            print "  (timed out waiting for stream)"
+            break
+
+    if complete:
+        print "  ✓ Stream completed after {iteration} checks"
+
+    print "✓ Stream query complete\n"
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn main():
+    """Run all async pipeline examples."""
+    print "GPU Async Pipeline Examples\n"
+    print "============================\n"
+
+    example_sequential()
+    example_double_buffer()
+    example_triple_buffer()
+    example_training_loop()
+    example_multi_stream_kernels()
+    example_stream_query()
+
+    print "============================\n"
+    print "All async pipeline examples complete! ✓"

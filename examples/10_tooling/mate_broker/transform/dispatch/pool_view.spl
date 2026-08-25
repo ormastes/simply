@@ -1,0 +1,30 @@
+# transform/dispatch/pool_view — Adapter: broker → agent pool
+
+fn pool_available_agents() -> [text]:
+    var available: [text] = []
+    var i = 0
+    while i < BK_AGENT_COUNT:
+        if BK_AGENT_STATUSES[i] != "offline" and BK_AGENT_LOADS[i] < BK_AGENT_MAX_CONCURRENT[i]:
+            available.push(BK_AGENT_IDS[i])
+        i = i + 1
+    available
+
+fn pool_agents_with_capability(cap: text) -> [text]:
+    var matches: [text] = []
+    var i = 0
+    while i < BK_AGENT_COUNT:
+        val caps = BK_AGENT_CAPS[i].split(",")
+        for c in caps:
+            if c.trim() == cap:
+                matches.push(BK_AGENT_IDS[i])
+                break
+        i = i + 1
+    matches
+
+fn pool_total_capacity() -> i64:
+    var total = 0
+    var i = 0
+    while i < BK_AGENT_COUNT:
+        total = total + BK_AGENT_MAX_CONCURRENT[i] - BK_AGENT_LOADS[i]
+        i = i + 1
+    total

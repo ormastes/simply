@@ -1,0 +1,359 @@
+#!/bin/sh
+set -eu
+
+ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+cd "$ROOT_DIR"
+
+required_paths="
+README.md
+doc/00_llm_process/spipe/skill.md
+doc/00_llm_process/spipe/llm_finetune.md
+doc/00_llm_process/spipe/llm_model_research.md
+doc/00_llm_process/spipe/llm_finetune_attempt_template.sdn
+doc/00_llm_process/skill_command
+doc/00_llm_process/template
+doc/00_llm_process/project_expert
+doc/00_llm_process/project_expert/subproject_links.example.sdn
+doc/00_llm_process/domain_expert
+doc/00_llm_process/tool_expert
+.claude/skills/spipe.md
+.claude/templates/spipe_template.spl
+.codex/skills/dev/SKILL.md
+.codex/skills/sp_dev/SKILL.md
+.gemini/commands/dev.toml
+.gemini/commands/sp_dev.toml
+package.json
+cli/spipe.js
+mcp/server.js
+schema/artifact.schema.sdn
+src/core/knowledge_compiler.js
+plugin/.codex-plugin/plugin.json
+plugin/manifest.sdn
+plugin
+mcp
+cli
+"
+
+missing=0
+for path in $required_paths; do
+  if [ ! -e "$path" ]; then
+    echo "missing $path" >&2
+    missing=$((missing + 1))
+  fi
+done
+
+if [ "$missing" -ne 0 ]; then
+  echo "spipe_build_status=fail missing=$missing"
+  exit 1
+fi
+
+node --check cli/spipe.js >/dev/null
+node --check mcp/server.js >/dev/null
+if git -C "$ROOT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git -C "$ROOT_DIR" ls-files --error-unmatch package.json >/dev/null
+fi
+node -e 'const p=require("./package.json"); if (p.bin.spipe !== "cli/spipe.js" || p.bin["spipe-mcp"] !== "mcp/server.js") process.exit(1)'
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | node mcp/server.js | grep -q "spipe_fine_tune_guide"
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"spipe_fine_tune_template","arguments":{}}}' | node mcp/server.js | grep -q "attempt_id"
+node cli/spipe.js info >/dev/null
+node cli/spipe.js experts >/dev/null
+node cli/spipe.js fine-tune-guide >/dev/null
+node cli/spipe.js fine-tune-model-guide >/dev/null
+node cli/spipe.js fine-tune-template >/dev/null
+
+tmp_link_host="$(mktemp -d)"
+tmp_host="$(mktemp -d)"
+trap 'rm -rf "$tmp_host" "$tmp_link_host"' EXIT
+printf '%s\n' '# Fine-tune app handoff evidence' > "$tmp_host/doc.md"
+mkdir -p "$tmp_link_host/examples" "$tmp_link_host/.spipe/project_expert" "$tmp_link_host/.spipe/tool_expert"
+ln -s "$ROOT_DIR" "$tmp_link_host/examples/spipe"
+ln -s "../examples/spipe" "$tmp_link_host/.spipe/spipe"
+ln -s "../examples/spipe" "$tmp_link_host/.spipe/spipe_project"
+ln -s "../doc/llm_process" "$tmp_link_host/.spipe/doc"
+ln -s "../examples/spipe/doc/00_llm_process/domain_expert" "$tmp_link_host/.spipe/domain_expert"
+ln -s "../examples/spipe/doc/00_llm_process/template" "$tmp_link_host/.spipe/template"
+ln -s "../examples/spipe/doc/00_llm_process/spipe" "$tmp_link_host/.spipe/spipe_docs"
+ln -s "../../examples/spipe/doc/00_llm_process/project_expert/simple" "$tmp_link_host/.spipe/project_expert/spipe"
+ln -s "../../examples/spipe/doc/00_llm_process/tool_expert/spipe_submodule" "$tmp_link_host/.spipe/tool_expert/spipe_submodule"
+SPIPE_HOST_ROOT="$tmp_link_host" sh scripts/setup-spipe-links.shs --dry-run | grep -q "doc/llm_process/spipe"
+SPIPE_HOST_ROOT="$tmp_link_host" sh scripts/setup-spipe-links.shs >/dev/null
+node cli/spipe.js doc-root "$tmp_link_host" | grep -q "^doc/llm_process$"
+node cli/spipe.js doctor "$tmp_link_host" >/dev/null
+node cli/spipe.js doctor "$tmp_link_host" | grep -q "host_ok spipe_project_link"
+node cli/spipe.js doctor "$tmp_link_host" | grep -q "host_ok doc_link"
+node cli/spipe.js doctor "$tmp_link_host" | grep -q "host_ok domain_expert_link"
+node cli/spipe.js doctor "$tmp_link_host" | grep -q "host_ok template_link"
+node cli/spipe.js doctor "$tmp_link_host" | grep -q "host_ok spipe_docs_link"
+mkdir -p "$tmp_link_host/.spipe"
+printf 'docs:\n  host_process_doc: doc/00_llm_process\n' > "$tmp_link_host/.spipe/config.sdn"
+SPIPE_HOST_ROOT="$tmp_link_host" sh scripts/setup-spipe-links.shs --dry-run | grep -q "doc/00_llm_process/spipe"
+node cli/spipe.js doc-root "$tmp_link_host" | grep -q "^doc/00_llm_process$"
+node cli/spipe.js link-plan "$tmp_link_host" | grep -q "target=${tmp_link_host}/doc/00_llm_process/spipe"
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-init >/dev/null)
+test -f "$tmp_host/.spipe/llm-finetune-process/attempts/template.sdn"
+mkdir -p "$tmp_host/doc/02_requirements/feature" "$tmp_host/doc/02_requirements/nfr"
+cat > "$tmp_host/doc/02_requirements/feature/spipe_llm_finetune_process_options.md" <<'FEATURE_OPTIONS'
+# SPipe LLM Fine-Tune Process Requirement Options
+
+## Option A: Fine-Tune Process Scaffold
+
+Requirements:
+- Record fine-tune process evidence.
+
+Pros: Auditable.
+Cons: Scaffold only.
+Effort: Medium.
+
+## Option B: Local QLoRA-First Tuning Pipeline
+
+Requirements:
+- Record local QLoRA training evidence.
+
+Pros: Local ownership.
+Cons: Hardware dependent.
+Effort: High.
+FEATURE_OPTIONS
+cat > "$tmp_host/doc/02_requirements/nfr/spipe_llm_finetune_process_options.md" <<'NFR_OPTIONS'
+# SPipe LLM Fine-Tune Process NFR Options
+
+## Option A: Auditability First
+
+Targets:
+- Durable attempt records.
+
+Pros: Traceable.
+Cons: Does not ensure speed.
+Effort: Medium.
+
+## Option B: Reproducibility First
+
+Targets:
+- Deterministic records and checksums.
+
+Pros: Repeatable.
+Cons: More setup.
+Effort: High.
+NFR_OPTIONS
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-options | grep -q "A: Fine-Tune Process Scaffold")
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-select-requirements select_check A,B A,B tester "build check" >/dev/null)
+test -f "$tmp_host/doc/02_requirements/feature/spipe_llm_finetune_process.md"
+test -f "$tmp_host/doc/02_requirements/nfr/spipe_llm_finetune_process.md"
+grep -q "Selected option: Option A: Fine-Tune Process Scaffold -> Option B: Local QLoRA-First Tuning Pipeline" "$tmp_host/doc/02_requirements/feature/spipe_llm_finetune_process.md"
+grep -q "Selected option: Option A: Auditability First -> Option B: Reproducibility First" "$tmp_host/doc/02_requirements/nfr/spipe_llm_finetune_process.md"
+test ! -f "$tmp_host/doc/02_requirements/feature/spipe_llm_finetune_process_options.md"
+test ! -f "$tmp_host/doc/02_requirements/nfr/spipe_llm_finetune_process_options.md"
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-record-data build_check sample https://example.invalid/data.txt not-applicable "echo no-download" .spipe/cache/sample none >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-record-data-check build_check sample .spipe/cache/sample skipped none "build check" >/dev/null)
+mkdir -p "$tmp_host/.spipe/llm-finetune-process/scripts"
+cat > "$tmp_host/.spipe/llm-finetune-process/scripts/check_build_data_gate.shs" <<'DATA_GATE'
+#!/bin/sh
+set -eu
+echo "training_allowed=false"
+echo "STATUS: WARN build-data-gate"
+DATA_GATE
+chmod +x "$tmp_host/.spipe/llm-finetune-process/scripts/check_build_data_gate.shs"
+cat >> "$tmp_host/.spipe/llm-finetune-process/data_checks.sdn" <<'DATA_CHECKER'
+  - attempt_id: "build_check"
+    name: "build-data-gate"
+    cache_path: ".spipe/cache/sample"
+    result: "blocked-build-fixture"
+    checksum: "none"
+    checker: ".spipe/llm-finetune-process/scripts/check_build_data_gate.shs"
+    notes: "Build fixture proves fine-tune status surfaces executable data-checker WARN states."
+  - attempt_id: "unsafe_checker"
+    name: "unsafe-checker-gate"
+    cache_path: ".spipe/cache/sample"
+    result: "blocked-unsafe-checker-path"
+    checksum: "none"
+    checker: ".spipe/llm-finetune-process/scripts/../../escape.shs"
+    notes: "Build fixture proves checker paths cannot escape the SPipe scripts directory."
+DATA_CHECKER
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-status unsafe_checker | grep -q "data_check_status=\"STATUS: FAIL llm-finetune-data-gate\"")
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-doctor unsafe_checker | grep -q "FAIL data_check_execution STATUS: FAIL llm-finetune-data-gate")
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-scaffold-process-docs process_scaffold process_scaffold "Process Scaffold" >/dev/null)
+test -f "$tmp_host/doc/01_research/local/process_scaffold.md"
+test -f "$tmp_host/doc/03_plan/agent_tasks/process_scaffold.md"
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-record-process build_check research.md req.md nfr.md plan.md arch.md design.md >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-record-requirements build_check option-a nfr-a user req.md "build check" >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-record-model-research build_check candidate mit 8192 code-fit local-ok selected >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-record-model-arch build_check arch.md adapter data-strategy train-strategy local fallback >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-scaffold-model-arch build_check doc/04_architecture/build_check_model.md adapter data-strategy train-strategy local fallback >/dev/null)
+test -f "$tmp_host/doc/04_architecture/build_check_model.md"
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-record-method build_check provider-fine-tune "build check" try-other-way user >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-record-model build_check not-selected none "build check" none >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-scaffold-training build_check provider-fine-tune .spipe/llm-finetune-process/scripts/build_check_train.sh not-created >/dev/null)
+test -x "$tmp_host/.spipe/llm-finetune-process/scripts/build_check_train.sh"
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-record-training build_check dry-run provider-managed "echo train" model://dry-run >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-record-eval build_check "echo eval" "accuracy=1" "accuracy>=1" pass >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-record-decision build_check try-other-way requirements-selection next "build check" >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-create-retry build_check build_retry "retry build check" app >/dev/null)
+test -f "$tmp_host/.spipe/llm-finetune-process/attempts/build_retry.sdn"
+grep -q 'next_attempt: "build_retry"' "$tmp_host/.spipe/llm-finetune-process/retune_requests.sdn"
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-new-attempt verify_loop_source "verify loop source" app >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-record-verify-loop verify_loop_source "echo eval" "score=0" "score>=1" fail retry-tuning-method tuning-method verify_loop_retry "build check" >/dev/null)
+test -f "$tmp_host/.spipe/llm-finetune-process/attempts/verify_loop_retry.sdn"
+grep -q 'next_attempt: "verify_loop_retry"' "$tmp_host/.spipe/llm-finetune-process/retune_requests.sdn"
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-new-attempt build_check "build check" app >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-record-app build_check app runtime doc.md "test license constraints" "refusal and disclaimer checks pass" "runtime=node memory=1g latency=100ms fallback=base-model" >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-record-retune build_check eval-failed eval.md next requirements-selection >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-app-handoff build_check | grep -q "SPipe LLM App/Server Handoff")
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-status build_check | grep -q "STATUS: WARN llm-finetune-status")
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-doctor build_check | grep -q "WARN data_check_execution STATUS: WARN build-data-gate")
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-data-plan build_check | grep -q "status_line: \"STATUS: WARN build-data-gate\"")
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-next missing_check | grep -q "next_action=create-attempt")
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-next build_check | grep -q "next_action=try-other-way")
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-next build_check | grep -q "retry_target=requirements-selection")
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-new-attempt registry_ready "registry ready check" app >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-record-requirements registry_ready option-a nfr-a user req.md "build check" >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-record-model-research registry_ready candidate mit 8192 code-fit local-ok selected >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-model-method-options registry_ready | grep -q "provider-fine-tune")
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-select-model-method registry_ready base-model rev1 local provider-fine-tune user retry-base-model "build check" >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-record-training registry_ready provider-fine-tune provider-managed "provider train" model://registry-ready >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-record-eval registry_ready "echo eval" "accuracy=1" "accuracy>=1" pass >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-record-decision registry_ready accepted none none "build check" >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-record-app registry_ready app "deploy via provider-managed artifact" doc.md "license constraints reviewed" "safety eval complete" "deployment evidence ready" >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-ready registry_ready >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-status registry_ready | grep -q "readiness_blocker=none")
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-doctor registry_ready | grep -q "STATUS: PASS llm-finetune-doctor")
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-new-attempt eval_pending "eval pending check" app >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-record-requirements eval_pending option-a nfr-a user req.md "build check" >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-select-model-method eval_pending base-model rev1 local provider-fine-tune user retry-base-model "build check" >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-record-training eval_pending provider-fine-tune provider-managed "provider train" model://eval-pending >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-record-eval eval_pending "echo eval" "accuracy=0.5" "accuracy>=1" fail >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-record-decision eval_pending accepted none none "build check" >/dev/null)
+(cd "$tmp_host" && ! node "$ROOT_DIR/cli/spipe.js" fine-tune-ready eval_pending >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-status eval_pending | grep -q "readiness_blocker=target-eval")
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-doctor eval_pending | grep -q "WARN target_eval_not_reached reason=metric-below-target")
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-doctor eval_pending | grep -q 'target="accuracy>=1"')
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-next eval_pending | grep -q "next_action=target-eval")
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-new-attempt missing_artifact "missing artifact check" app >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-record-requirements missing_artifact option-a nfr-a user req.md "build check" >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-select-model-method missing_artifact base-model rev1 local provider-fine-tune user retry-base-model "build check" >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-record-training missing_artifact provider-fine-tune provider-managed "provider train" build/test/missing-local-model-artifact.sdn >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-record-eval missing_artifact "echo eval" "accuracy=1" "accuracy>=1" pass >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-record-decision missing_artifact accepted none none "build check" >/dev/null)
+(cd "$tmp_host" && ! node "$ROOT_DIR/cli/spipe.js" fine-tune-ready missing_artifact >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-ready missing_artifact | grep -q "model_artifact_created=pending")
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-doctor missing_artifact | grep -q "WARN missing_local_model_artifact model_artifact=build/test/missing-local-model-artifact.sdn")
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-next missing_artifact | grep -q "readiness_blocker=model-artifact")
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-new-attempt missing_handoff_doc "missing handoff doc check" app >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-record-requirements missing_handoff_doc option-a nfr-a user req.md "build check" >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-select-model-method missing_handoff_doc base-model rev1 local provider-fine-tune user retry-base-model "build check" >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-record-training missing_handoff_doc provider-fine-tune provider-managed "provider train" model://missing-handoff-doc >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-record-eval missing_handoff_doc "echo eval" "accuracy=1" "accuracy>=1" pass >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-record-decision missing_handoff_doc accepted none none "build check" >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-record-app missing_handoff_doc app "deploy via provider-managed artifact" missing-doc.md "license constraints reviewed" "safety eval complete" "deployment evidence ready" >/dev/null)
+(cd "$tmp_host" && ! node "$ROOT_DIR/cli/spipe.js" fine-tune-ready missing_handoff_doc >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-ready missing_handoff_doc | grep -q "app_handoff_doc_ready=pending")
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-doctor missing_handoff_doc | grep -q "WARN missing_local_handoff_doc handoff_doc=missing-doc.md")
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-next missing_handoff_doc | grep -q "readiness_blocker=app-handoff-doc")
+cat > "$tmp_host/.spipe/llm-finetune-process/attempts/ready_check.sdn" <<'READY'
+attempt:
+  attempt_id: "ready_check"
+  goal: "ready check"
+research:
+  research_doc: "research.md"
+model:
+  base_model: "base-model"
+  base_model_reason: "build check"
+tuning:
+  method: "provider-fine-tune"
+  training_script: "provider-managed"
+  training_command: "provider train"
+  model_artifact: "model://ready"
+evaluation:
+  eval_command: "echo eval"
+  metrics: "accuracy=1"
+  target: "accuracy>=1"
+  result: "pass"
+decision:
+  status: "accepted"
+app_handoff:
+  app_target: "app"
+  usage: "deploy via provider-managed artifact"
+  handoff_doc: "doc.md"
+  license_constraints: "license constraints reviewed"
+  safety_eval: "safety eval complete"
+  deployment_evidence: "deployment evidence ready"
+READY
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-record-requirements ready_check option-a nfr-a user req.md "build check" >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-ready ready_check >/dev/null)
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-next ready_check | grep -q "next_action=ready")
+cat > "$tmp_host/.spipe/llm-finetune-process/attempts/full_verify.sdn" <<'VERIFY'
+attempt:
+  attempt_id: "full_verify"
+  goal: "full verify"
+  app_or_server_target: "app"
+research:
+  research_doc: "doc/01_research/local/full_verify.md"
+  data_sources:
+    - name: "sample"
+      source: "https://example.invalid/data.txt"
+      license: "not-applicable"
+      download_command: "echo no-download"
+      checksum: "none"
+      cache_path: ".spipe/cache/sample"
+requirements:
+  feature_option: "A"
+  nfr_option: "A"
+  selected_by: "build"
+  selection_doc: "doc/02_requirements/feature/full_verify.md"
+process_docs:
+  requirements_doc: "doc/02_requirements/feature/full_verify.md"
+  nfr_doc: "doc/02_requirements/nfr/full_verify.md"
+  plan_doc: "doc/03_plan/agent_tasks/full_verify.md"
+  architecture_doc: "doc/04_architecture/full_verify.md"
+  design_doc: "doc/05_design/full_verify.md"
+model_research:
+  research_doc: "doc/01_research/domain/full_verify_model.md"
+  candidate_model: "base-model"
+  license: "test"
+  context_length: "8192"
+  fit: "build check"
+  constraints: "none"
+  decision: "selected"
+model:
+  base_model: "base-model"
+  base_model_revision: "rev1"
+  base_model_reason: "build check"
+  deployment_target: "local"
+tuning:
+  method: "provider-fine-tune"
+  training_script: "provider-managed"
+  training_command: "provider train"
+  model_artifact: "model://full-verify"
+evaluation:
+  eval_command: "echo eval"
+  metrics: "accuracy=1"
+  target: "accuracy>=1"
+  result: "pass"
+decision:
+  status: "accepted"
+  retry_target: "none"
+  next_attempt: "none"
+  notes: "build check"
+app_handoff:
+  app_target: "app"
+  usage: "runtime"
+  handoff_doc: "doc/05_design/full_verify_app.md"
+  license_constraints: "test license constraints"
+  safety_eval: "refusal and disclaimer checks pass"
+  deployment_evidence: "runtime=node memory=1g latency=100ms fallback=base-model"
+VERIFY
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-verify .spipe/llm-finetune-process/attempts/full_verify.sdn | grep -q "STATUS: PASS llm-finetune-attempt-record")
+(cd "$tmp_host" && node "$ROOT_DIR/cli/spipe.js" fine-tune-report build_check | grep -q "SPipe Fine-Tune Attempt Report")
+test -f "$tmp_host/.spipe/llm-finetune-process/data_downloads.sdn"
+test -f "$tmp_host/.spipe/llm-finetune-process/data_checks.sdn"
+test -f "$tmp_host/.spipe/llm-finetune-process/process_docs.sdn"
+test -f "$tmp_host/.spipe/llm-finetune-process/requirements_selection.sdn"
+test -f "$tmp_host/.spipe/llm-finetune-process/model_research.sdn"
+test -f "$tmp_host/.spipe/llm-finetune-process/model_architecture.sdn"
+test -f "$tmp_host/.spipe/llm-finetune-process/tuning_methods.sdn"
+test -f "$tmp_host/.spipe/llm-finetune-process/models.sdn"
+test -f "$tmp_host/.spipe/llm-finetune-process/training_scripts.sdn"
+test -f "$tmp_host/.spipe/llm-finetune-process/eval_results.sdn"
+test -f "$tmp_host/.spipe/llm-finetune-process/decisions.sdn"
+test -f "$tmp_host/.spipe/llm-finetune-process/app_handoffs.sdn"
+test -f "$tmp_host/.spipe/llm-finetune-process/retune_requests.sdn"
+
+echo "spipe_build_status=pass"

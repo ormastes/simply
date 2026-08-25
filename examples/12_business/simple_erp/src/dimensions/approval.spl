@@ -1,0 +1,22 @@
+# UBS Dimension — Approval / Workflow
+#
+# Owns "who must consent before an action". Modelled as a gate over a state
+# transition; in the design target this is woven as AOP `around` advice so no
+# module open-codes the check (doc §2.5).
+
+struct ApprovalGate:
+    val threshold_minor: i64
+    val required_role: text
+
+fn gate(threshold_minor: i64, required_role: text) -> ApprovalGate:
+    return ApprovalGate { threshold_minor: threshold_minor, required_role: required_role }
+
+# Whether an action of the given amount requires approval under this gate.
+fn requires_approval(g: ApprovalGate, amount_minor: i64) -> bool:
+    return amount_minor >= g.threshold_minor
+
+# Whether an actor's role satisfies the gate for the given amount.
+fn approved(g: ApprovalGate, amount_minor: i64, actor_role: text) -> bool:
+    if !requires_approval(g, amount_minor):
+        return true
+    return actor_role == g.required_role

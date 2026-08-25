@@ -1,0 +1,11 @@
+# Optional host-repo configuration for linking project experts from submodules.
+#
+# Copy this file to the host repository as:
+#   .spipe/subproject_links.sdn
+#
+# Each non-comment line is:
+#   <host-target-relative-path>|<source-relative-path>
+#
+# Example:
+# doc/00_llm_process/project_expert/simple_cuda_example|examples/simple_cuda_example/doc/00_llm_process/project_expert/simple_cuda_example
+# doc/00_llm_process/project_expert/nvfs|src/os/services/nvfs/doc/00_llm_process/project_expert/nvfs

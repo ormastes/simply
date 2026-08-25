@@ -1,0 +1,12 @@
+use logic_sched_core.*
+
+fn rv32_sched_balanced_cases_selftest() -> i32:
+    if _rv32_sched_balanced_steps(0) != 0:
+        return 1
+    if _rv32_sched_balanced_steps(1) != 1:
+        return 1
+    if _rv32_sched_balanced_steps(16) != 2:
+        return 1
+    if _rv32_sched_balanced_steps(17) != 3:
+        return 1
+    0

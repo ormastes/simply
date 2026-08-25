@@ -1,0 +1,18 @@
+# Example build.ninja for simple_ninja
+# Compiles hello.c into a hello executable
+
+cc = cc
+cflags = -O2 -Wall
+
+rule cc
+  command = $cc $cflags -c $in -o $out
+  description = CC $out
+
+rule link
+  command = $cc $cflags -o $out $in
+  description = LINK $out
+
+build hello.o: cc hello.c
+build hello: link hello.o
+
+default hello

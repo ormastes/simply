@@ -1,0 +1,12 @@
+use logic_dram_alloc_cases.*
+use logic_dram_recovery_cases.*
+use logic_dram_stage_cases.*
+
+fn rv32_dram_durability_cases_selftest() -> i32:
+    if rv32_dram_alloc_cases_selftest() != 0:
+        return 1
+    if rv32_dram_stage_cases_selftest() != 0:
+        return 1
+    if rv32_dram_recovery_cases_selftest() != 0:
+        return 1
+    0

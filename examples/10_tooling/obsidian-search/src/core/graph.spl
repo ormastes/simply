@@ -1,0 +1,328 @@
+# Graph — link graph, backlinks, authority scoring, BFS traversal
+#
+# Performance: uses dict-based dedup, cached authority scores,
+# and indexed backlink lookups via get_links_to_target().
+
+use src.core.indexer.{IndexDb, NoteRecord, LinkRecord, get_note_by_id, get_note_by_path, get_links_from_note, get_links_to_target, all_notes, get_cached_authority, get_cached_backlink_count, is_cache_valid}
+use src.core.search_engine.{SearchResult}
+
+struct GraphNode:
+    note_id: i64
+    path: text
+    title: text
+    depth: i64
+
+fn strip_extension(path: text) -> text:
+    val dot_idx_result = path.last_index_of(".")
+    match dot_idx_result:
+        Some(i):
+            return path.substring(0, i)
+        nil:
+            return path
+    path
+
+fn note_name_from_path(path: text) -> text:
+    var name = path
+    val slash_idx_result = path.last_index_of("/")
+    match slash_idx_result:
+        Some(i):
+            name = path.substring(i + 1, path.len())
+        nil: pass_dn
+    val dot_idx_result = name.last_index_of(".")
+    match dot_idx_result:
+        Some(i):
+            return name.substring(0, i)
+        nil:
+            return name
+    name
+
+fn find_note_by_link_target(db: IndexDb, target: text) -> NoteRecord:
+    # Try exact path match first (O(1) via index)
+    val by_path = get_note_by_path(db, target)
+    if by_path.id > 0:
+        return by_path
+
+    # Try with .md extension
+    val with_md = get_note_by_path(db, target + ".md")
+    if with_md.id > 0:
+        return with_md
+
+    # Fall back to name matching
+    val notes = all_notes(db)
+    for n in notes:
+        val name = note_name_from_path(n.path)
+        if name == target:
+            return n
+    for n in notes:
+        if n.path.contains(target):
+            return n
+    NoteRecord(id: 0, path: "", title: "", aliases: "", tags: "", frontmatter: "", mtime: 0, weight: 0.0)
+
+fn find_backlinks(db: IndexDb, note_path: text) -> [SearchResult]:
+    var results: [SearchResult] = []
+    val note_name = note_name_from_path(note_path)
+    val stripped = strip_extension(note_path)
+    var seen: {text: bool} = {}
+
+    # Collect links targeting this note by name, path, and stripped path
+    var target_keys: [text] = [note_name]
+    if note_path != note_name:
+        target_keys.push(note_path)
+    if stripped != note_name and stripped != note_path:
+        target_keys.push(stripped)
+
+    for target_key in target_keys:
+        val links = get_links_to_target(db, target_key)
+        for link in links:
+            val src_key = str(link.src_note_id)
+            if not seen[src_key].?:
+                val src_note = get_note_by_id(db, link.src_note_id)
+                if src_note.id > 0:
+                    seen[src_key] = true
+                    val sr = SearchResult(
+                        note_id: src_note.id,
+                        path: src_note.path,
+                        title: src_note.title,
+                        snippet: "links to {note_path}",
+                        bm25_score: 1.0,
+                        tags: src_note.tags,
+                        mtime: src_note.mtime
+                    )
+                    results.push(sr)
+    results
+
+fn find_forward_links(db: IndexDb, note_path: text) -> [SearchResult]:
+    var results: [SearchResult] = []
+    val note = get_note_by_path(db, note_path)
+    if note.id == 0:
+        return results
+    val links = get_links_from_note(db, note.id)
+    var seen: {text: bool} = {}
+    for link in links:
+        val dst_note = find_note_by_link_target(db, link.dst_path)
+        val seen_key = if dst_note.id > 0: dst_note.path else: link.dst_path
+        if not seen[seen_key].?:
+            seen[seen_key] = true
+            if dst_note.id > 0:
+                val sr = SearchResult(
+                    note_id: dst_note.id,
+                    path: dst_note.path,
+                    title: dst_note.title,
+                    snippet: "linked from {note_path}",
+                    bm25_score: 1.0,
+                    tags: dst_note.tags,
+                    mtime: dst_note.mtime
+                )
+                results.push(sr)
+            else:
+                val sr = SearchResult(
+                    note_id: 0,
+                    path: link.dst_path,
+                    title: link.dst_path,
+                    snippet: "unresolved link from {note_path}",
+                    bm25_score: 0.5,
+                    tags: "",
+                    mtime: 0
+                )
+                results.push(sr)
+    results
+
+fn find_related(db: IndexDb, note_path: text) -> [SearchResult]:
+    var results: [SearchResult] = []
+    var seen_paths: {text: bool} = {}
+
+    val backlinks = find_backlinks(db, note_path)
+    for bl in backlinks:
+        if bl.path != note_path:
+            seen_paths[bl.path] = true
+            results.push(bl)
+
+    val fwd_links = find_forward_links(db, note_path)
+    for fl in fwd_links:
+        if not seen_paths[fl.path].? and fl.path != note_path:
+            seen_paths[fl.path] = true
+            results.push(fl)
+
+    val note = get_note_by_path(db, note_path)
+    if note.tags != "":
+        val tags = note.tags.split(",")
+        val notes = all_notes(db)
+        for tag in tags:
+            val trimmed_tag = tag.trim()
+            if trimmed_tag == "":
+                pass_dn
+            else:
+                for other_note in notes:
+                    if other_note.path == note_path:
+                        pass_dn
+                    elif other_note.tags.contains(trimmed_tag):
+                        if not seen_paths[other_note.path].?:
+                            seen_paths[other_note.path] = true
+                            val sr = SearchResult(
+                                note_id: other_note.id,
+                                path: other_note.path,
+                                title: other_note.title,
+                                snippet: "shared tag: {trimmed_tag}",
+                                bm25_score: 0.8,
+                                tags: other_note.tags,
+                                mtime: other_note.mtime
+                            )
+                            results.push(sr)
+    results
+
+fn compute_authority(db: IndexDb, note_path: text) -> f64:
+    # Use cached value if available
+    if is_cache_valid():
+        return get_cached_authority(note_path)
+
+    # Fallback: compute on the fly (only during incremental updates)
+    val note_name = note_name_from_path(note_path)
+    val stripped = strip_extension(note_path)
+
+    var backlink_count: i64 = 0
+    var seen_sources: {text: bool} = {}
+    var source_ids: [i64] = []
+
+    # Use indexed lookup for each target variant
+    var target_keys: [text] = [note_name]
+    if note_path != note_name:
+        target_keys.push(note_path)
+    if stripped != note_name and stripped != note_path:
+        target_keys.push(stripped)
+
+    for target_key in target_keys:
+        val links = get_links_to_target(db, target_key)
+        for link in links:
+            val src_key = str(link.src_note_id)
+            if not seen_sources[src_key].?:
+                seen_sources[src_key] = true
+                source_ids.push(link.src_note_id)
+                backlink_count = backlink_count + 1
+
+    var authority = float(backlink_count)
+
+    for src_id in source_ids:
+        val src_note = get_note_by_id(db, src_id)
+        if src_note.id > 0:
+            val src_name = note_name_from_path(src_note.path)
+            var src_backlinks: i64 = 0
+            val src_links = get_links_to_target(db, src_name)
+            # Use dict to count unique sources
+            var src_seen: {text: bool} = {}
+            for l2 in src_links:
+                val k = str(l2.src_note_id)
+                if not src_seen[k].?:
+                    src_seen[k] = true
+                    src_backlinks = src_backlinks + 1
+            authority = authority + float(src_backlinks) * 0.3
+    authority
+
+fn find_authoritative_docs(db: IndexDb, query_text: text, limit: i64) -> [SearchResult]:
+    var results: [SearchResult] = []
+    val lower_query = ("" + query_text).lower()
+    val notes = all_notes(db)
+
+    struct ScoredNote:
+        result: SearchResult
+        authority: f64
+
+    var scored: [ScoredNote] = []
+    for note in notes:
+        val lower_title = ("" + note.title).lower()
+        val lower_tags = ("" + note.tags).lower()
+        val lower_aliases = ("" + note.aliases).lower()
+        if lower_title.contains(lower_query) or lower_tags.contains(lower_query) or lower_aliases.contains(lower_query):
+            val auth = compute_authority(db, note.path)
+            val sr = SearchResult(
+                note_id: note.id,
+                path: note.path,
+                title: note.title,
+                snippet: "authority: {auth}",
+                bm25_score: auth,
+                tags: note.tags,
+                mtime: note.mtime
+            )
+            scored.push(ScoredNote(result: sr, authority: auth))
+
+    # Quicksort by authority descending
+    if scored.len() > 1:
+        quicksort_scored_notes(scored, 0, scored.len() - 1)
+
+    var count = 0
+    for s in scored:
+        if count >= limit:
+            break
+        results.push(s.result)
+        count = count + 1
+    results
+
+fn quicksort_scored_notes(arr: [ScoredNote], low: i64, high: i64):
+    if low >= high:
+        return
+    val pivot_val = arr[(low + high) / 2].authority
+    var i = low
+    var j = high
+    while i <= j:
+        while arr[i].authority > pivot_val:
+            i = i + 1
+        while arr[j].authority < pivot_val:
+            j = j - 1
+        if i <= j:
+            val tmp = arr[i]
+            arr[i] = arr[j]
+            arr[j] = tmp
+            i = i + 1
+            j = j - 1
+    if low < j:
+        quicksort_scored_notes(arr, low, j)
+    if i < high:
+        quicksort_scored_notes(arr, i, high)
+
+fn graph_walk(db: IndexDb, seed_path: text, max_hops: i64) -> [GraphNode]:
+    var visited: {text: bool} = {}
+    var queue: [GraphNode] = []
+    var result: [GraphNode] = []
+
+    val seed = get_note_by_path(db, seed_path)
+    if seed.id == 0:
+        return result
+
+    queue.push(GraphNode(note_id: seed.id, path: seed.path, title: seed.title, depth: 0))
+    visited[seed.path] = true
+
+    var qi: i64 = 0
+    while qi < queue.len():
+        val current = queue[qi]
+        qi = qi + 1
+
+        result.push(current)
+
+        if current.depth >= max_hops:
+            pass_dn
+        else:
+            val links = get_links_from_note(db, current.note_id)
+            for link in links:
+                val dst = find_note_by_link_target(db, link.dst_path)
+                if dst.id > 0:
+                    if not visited[dst.path].?:
+                        visited[dst.path] = true
+                        queue.push(GraphNode(note_id: dst.id, path: dst.path, title: dst.title, depth: current.depth + 1))
+
+            # Backlinks — use indexed lookup
+            val current_name = note_name_from_path(current.path)
+            val stripped = strip_extension(current.path)
+            var bl_targets: [text] = [current_name]
+            if current.path != current_name:
+                bl_targets.push(current.path)
+            if stripped != current_name and stripped != current.path:
+                bl_targets.push(stripped)
+
+            for bl_target in bl_targets:
+                val bl_links = get_links_to_target(db, bl_target)
+                for bl in bl_links:
+                    val src = get_note_by_id(db, bl.src_note_id)
+                    if src.id > 0:
+                        if not visited[src.path].?:
+                            visited[src.path] = true
+                            queue.push(GraphNode(note_id: src.id, path: src.path, title: src.title, depth: current.depth + 1))
+    result

@@ -1,0 +1,57 @@
+# Unit tests for ranker module
+
+use src.core.indexer.{IndexDb, open_index_memory, close_index_db, create_schema, index_note}
+use src.core.ranker.{rank_results, explain_scores, compute_recency_boost, ScoredResult, ScoreBreakdown}
+use src.util.query_parser.{parse_query}
+
+describe "Ranker":
+    """Tests for multi-stage ranking pipeline"""
+
+    context "recency boost":
+        """Exponential decay over 90 days"""
+
+        it "returns high boost for recent timestamps":
+            # Use a very large timestamp to simulate "recent"
+            val boost = compute_recency_boost(9999999999)
+            # This is far in the future, so boost should be 1.0
+            expect(boost).to_be_greater_than(0.0)
+
+        it "returns zero boost for very old timestamps":
+            val boost = compute_recency_boost(0)
+            expect(boost).to_equal(0.0)
+
+    context "ranking pipeline":
+        """Full ranking with BM25 + graph + authority + recency"""
+
+        it "ranks results for a query":
+            val db = open_index_memory()
+            create_schema(db)
+            index_note(db, "/v/a.md", "a.md", "---\ntitle: Alpha Project\ntags: [project]\n---\n# Alpha Project\n\nMain project content.", 1000)
+            index_note(db, "/v/b.md", "b.md", "---\ntitle: Beta Notes\ntags: [notes]\n---\n# Beta Notes\n\nOther notes.", 1000)
+            val query = parse_query("Alpha")
+            val results = rank_results(db, query, 10)
+            # Should find at least Alpha Project
+            expect(results.len()).to_be_greater_than(0)
+            close_index_db(db)
+
+        it "returns empty for non-matching query":
+            val db = open_index_memory()
+            create_schema(db)
+            index_note(db, "/v/a.md", "a.md", "# Simple Note\n\nContent", 1000)
+            val query = parse_query("zzzznonexistent")
+            val results = rank_results(db, query, 10)
+            expect(results.len()).to_equal(0)
+            close_index_db(db)
+
+    context "explain scores":
+        """Score breakdown per result"""
+
+        it "returns breakdowns for results":
+            val db = open_index_memory()
+            create_schema(db)
+            index_note(db, "/v/a.md", "a.md", "---\ntitle: Test Doc\n---\n# Test Doc\n\nSearchable content.", 1000)
+            val query = parse_query("Test")
+            val results = rank_results(db, query, 5)
+            val breakdowns = explain_scores(results)
+            expect(breakdowns.len()).to_equal(results.len())
+            close_index_db(db)

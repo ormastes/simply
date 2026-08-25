@@ -1,0 +1,23 @@
+# codex-impl
+# One-guest ARM64 primitive admission entry: virtio-snd completes before the
+# canonical Vulkan-required desktop takes ownership of input and DrawIR.
+
+use arch.arm64.gui_entry_desktop.{gui_entry_desktop_start}
+use simple_os.arch.common.virtio_snd_probe.{simpleos_virtio_snd_probe}
+use common.gpu.simpleos_host_gpu_protocol.{SIMPLEOS_HOST_GPU_BACKEND_VULKAN}
+use os.kernel.boot.mmio.{mmio_disable_test_mode}
+
+extern fn serial_println(msg: text)
+
+fn spl_start():
+    mmio_disable_test_mode()
+    if not simpleos_virtio_snd_probe("aarch64", 0x0A000000u64, 32, 0x200u64):
+        serial_println("SIMPLEOS_UNIFIED_PRIMITIVE_FAIL reason=audio")
+        while true:
+            rt_memory_barrier()
+    serial_println("SIMPLEOS_UNIFIED_AUDIO_READY arch=aarch64")
+    gui_entry_desktop_start(0u64, SIMPLEOS_HOST_GPU_BACKEND_VULKAN, true)
+    # The production desktop is not permitted to return into startup state.
+    serial_println("SIMPLEOS_UNIFIED_PRIMITIVE_FAIL reason=desktop-returned")
+    while true:
+        rt_memory_barrier()

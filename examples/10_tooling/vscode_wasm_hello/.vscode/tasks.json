@@ -1,0 +1,39 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "build-wasm",
+            "type": "shell",
+            "command": "sh",
+            "args": ["scripts/build_wasm.shs"],
+            "group": "build"
+        },
+        {
+            "label": "build-extension",
+            "type": "shell",
+            "command": "npx",
+            "args": ["tsc", "-p", "./"],
+            "options": { "cwd": "${workspaceFolder}/extension" },
+            "group": "build"
+        },
+        {
+            "label": "build-all",
+            "dependsOn": ["build-wasm", "build-extension"],
+            "dependsOrder": "sequence",
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
+        },
+        {
+            "label": "test",
+            "type": "shell",
+            "command": "sh",
+            "args": ["scripts/run_tests.shs"],
+            "group": {
+                "kind": "test",
+                "isDefault": true
+            }
+        }
+    ]
+}

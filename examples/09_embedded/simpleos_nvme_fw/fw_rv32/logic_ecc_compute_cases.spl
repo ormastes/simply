@@ -1,0 +1,9 @@
+use logic_ecc_compute_range_cases.*
+use logic_ecc_compute_sensitivity_cases.*
+
+fn rv32_ecc_compute_cases_selftest() -> i32:
+    if rv32_ecc_compute_range_cases_selftest() != 0:
+        return 1
+    if rv32_ecc_compute_sensitivity_cases_selftest() != 0:
+        return 1
+    0

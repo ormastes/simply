@@ -1,0 +1,13 @@
+{
+  "schema": "spipe-operation-receipt-vector-v1",
+  "seed_hex": "0707070707070707070707070707070707070707070707070707070707070707",
+  "public_key_hex": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
+  "key_id": "ed25519:fe812c12f3ab4ce6ac5db69ac352f906cb1b11ef43fb33e252ef7ff552263889",
+  "domain_ascii_with_nul": "SPKC-OPERATION-RECEIPT-V1\u0000",
+  "unsigned_canonical": "{\"authority_generation\":1,\"authority_id\":\"AUTH-TEST\",\"base_logical_root\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\",\"candidate_uid\":\"cand-1\",\"expires_at_ms\":86400001,\"issued_at_ms\":1,\"key_id\":\"ed25519:fe812c12f3ab4ce6ac5db69ac352f906cb1b11ef43fb33e252ef7ff552263889\",\"operation\":\"index_apply\",\"operation_id\":\"apply-1\",\"outcome\":\"applied\",\"payload_hash\":\"sha256:2222222222222222222222222222222222222222222222222222222222222222\",\"policy_digest\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"policy_version\":1,\"provider_generation\":\"pg-00000000000000000000000000000001\",\"result_logical_root\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"revocation_generation\":0,\"schema\":\"spipe-operation-receipt-v1\",\"scope_digest\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"snapshot\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\",\"workspace\":\"WS-PROVIDER\"}",
+  "unsigned_utf8_length": 987,
+  "domain_bytes_length": 1021,
+  "domain_bytes_sha256": "136bb55040a8e5408f6aa5e1d1fd36f1cbb70f25de3ffefee0183c92f20e0d14",
+  "receipt_id": "or-136bb55040a8e5408f6aa5e1d1fd36f1cbb70f25de3ffefee0183c92f20e0d14",
+  "signature_base64url": "H891VOndzp6tfKQoBWCTaQlRG8fEaKp00ONdD-ExLKC6URXxIguC5p1Tx5z4LpOst5C85EFC6krMk_yxqiFYDg"
+}

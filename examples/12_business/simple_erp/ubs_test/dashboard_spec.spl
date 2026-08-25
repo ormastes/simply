@@ -1,0 +1,48 @@
+# @cover src/web/dashboard.spl 80%
+"""
+# Web Dashboard — self-contained HTML KPI dashboard
+
+render_dashboard produces one self-contained HTML document: no external
+assets, one inline <style> block, a KPI tile row, and one card per lane
+carrying a data-lane attribute plus a status chip.
+"""
+
+use std.spec
+use report.summary.{LaneKpi, kpi}
+use web.dashboard.{render_dashboard, html_escape, money_display}
+
+describe "html_escape — order matters (& before < and >)":
+    it "escapes ampersand, then angle brackets":
+        expect(html_escape("a<b&c")).to_equal("a&lt;b&amp;c")
+
+    it "does not re-escape ampersands introduced by escaping angle brackets":
+        expect(html_escape("<>")).to_equal("&lt;&gt;")
+
+describe "money_display — integer-only minor-unit formatting":
+    it "formats a whole-hundreds amount with a zero-padded fraction":
+        expect(money_display(11000)).to_equal("110.00")
+
+    it "zero-pads a single-digit fraction":
+        expect(money_display(5)).to_equal("0.05")
+
+describe "render_dashboard — self-contained HTML document":
+    it "starts with the doctype and contains the KPI and lane sections":
+        var kpis: [LaneKpi] = []
+        kpis.push(kpi("crm", 1, 1, 0))
+        kpis.push(kpi("sale", 1, 1, 11000))
+        val html = render_dashboard("Simple Business Suite", kpis)
+        expect(html.starts_with("<!doctype html>")).to_equal(true)
+        expect(html).to_contain("data-lane=\"sale\"")
+        expect(html).to_contain("kpis")
+
+    it "shows a status chip for each lane":
+        var kpis: [LaneKpi] = []
+        kpis.push(kpi("sale", 1, 1, 11000))
+        val html = render_dashboard("Simple Business Suite", kpis)
+        expect(html).to_contain("chip ok")
+
+    it "html-escapes a lane name containing reserved characters":
+        var kpis: [LaneKpi] = []
+        kpis.push(kpi("a<b&c", 1, 0, 100))
+        val html = render_dashboard("Simple Business Suite", kpis)
+        expect(html).to_contain("a&lt;b&amp;c")

@@ -1,0 +1,234 @@
+# 64. GPT Architecture
+#
+# A complete (tiny) decoder-only GPT forward pass and greedy generation:
+#   x      = embed(ids) + pos(ids)                   (module 61)
+#   x      = block_i(x)  for i in 0..n_layers        (module 63: pre-norm blocks)
+#   x      = LayerNorm(x)
+#   logits = x W_lm      (seq x vocab)               LM head
+#   next   = argmax(logits[last])                    greedy decode
+#
+# C/CUDA equivalent (64.GPT_Architecture): the same graph with cuBLAS GEMMs
+# for every linear layer and a per-row argmax / top-k kernel for sampling.
+#
+# The CPU reference model always runs and is the checked result. The LM-head
+# kernel is a `@gpu_kernel` in module 12's std.gpu style whose output is
+# compared against the CPU model and reported honestly (a `<<<>>>` launch is
+# a no-op on the Rust seed, so it reads back zeros and prints MISMATCH).
+
+use std.gpu.*
+
+# ============================================================================
+# Config
+# ============================================================================
+
+class GptConfig:
+    vocab_size: i64
+    d_model: i64
+    n_layers: i64
+    max_len: i64
+
+    fn param_count(self) -> i64:
+        # embeddings + per-layer (attention folded, FFN 2 x d*4d) + LM head
+        val embed = self.vocab_size * self.d_model + self.max_len * self.d_model
+        val per_layer = 2 * self.d_model * (4 * self.d_model)
+        embed + self.n_layers * per_layer + self.d_model * self.vocab_size
+
+# ============================================================================
+# CPU reference model (f64 math, f32 storage; row-major flat arrays)
+# ============================================================================
+
+fn make_param(count: i64, scale: f64) -> [f32]:
+    var m: [f32] = []
+    for i in 0..count:
+        m.push(((((i * 7) % 11) as f64) * 0.1 - 0.5) * scale as f32)
+    m
+
+fn embed_cpu(ids: [i64], cfg: GptConfig) -> [f32]:
+    val table = make_param(cfg.vocab_size * cfg.d_model, 1.0)
+    var out: [f32] = []
+    for t in 0..ids.len():
+        for d in 0..cfg.d_model:
+            val pair = (d / 2) as f64
+            val angle = (t as f64) / (10000.0).pow(2.0 * pair / (cfg.d_model as f64))
+            val pe = if d % 2 == 0: angle.sin() else: angle.cos()
+            out.push(table[ids[t] * cfg.d_model + d] + (pe as f32))
+    out
+
+fn layer_norm_cpu(x: [f32], rows: i64, dim: i64) -> [f32]:
+    var out: [f32] = []
+    for r in 0..rows:
+        var mean = 0.0
+        for d in 0..dim:
+            mean = mean + (x[r * dim + d] as f64)
+        mean = mean / (dim as f64)
+        var variance = 0.0
+        for d in 0..dim:
+            val c = (x[r * dim + d] as f64) - mean
+            variance = variance + c * c
+        val inv = 1.0 / (variance / (dim as f64) + 0.00001).sqrt()
+        for d in 0..dim:
+            out.push((((x[r * dim + d] as f64) - mean) * inv) as f32)
+    out
+
+fn gelu_scalar(x: f64) -> f64:
+    0.5 * x * (1.0 + (0.7978845608 * (x + 0.044715 * x * x * x)).tanh())
+
+fn linear_cpu(x: [f32], rows: i64, in_dim: i64, w: [f32], out_dim: i64) -> [f32]:
+    var out: [f32] = []
+    for r in 0..rows:
+        for o in 0..out_dim:
+            var acc = 0.0
+            for i in 0..in_dim:
+                acc = acc + (x[r * in_dim + i] as f64) * (w[i * out_dim + o] as f64)
+            out.push(acc as f32)
+    out
+
+fn self_attention_cpu(x: [f32], seq_len: i64, dim: i64) -> [f32]:
+    val scale = 1.0 / (dim as f64).sqrt()
+    var out: [f32] = []
+    for i in 0..seq_len:
+        var weights: [f64] = []
+        var row_max = -1.0e300
+        for j in 0..seq_len:
+            var s = -1.0e9
+            if j <= i:
+                s = 0.0
+                for d in 0..dim:
+                    s = s + (x[i * dim + d] as f64) * (x[j * dim + d] as f64)
+                s = s * scale
+            weights.push(s)
+            if s > row_max:
+                row_max = s
+        var total = 0.0
+        for j in 0..seq_len:
+            weights[j] = (weights[j] - row_max).exp()
+            total = total + weights[j]
+        for d in 0..dim:
+            var acc = 0.0
+            for j in 0..seq_len:
+                acc = acc + weights[j] / total * (x[j * dim + d] as f64)
+            out.push(acc as f32)
+    out
+
+# Pre-norm block with folded attention weights (see module 63).
+fn block_cpu(x: [f32], seq_len: i64, d_model: i64, layer: i64) -> [f32]:
+    val d_ff = 4 * d_model
+    val attn = self_attention_cpu(layer_norm_cpu(x, seq_len, d_model), seq_len, d_model)
+    var h: [f32] = []
+    for i in 0..x.len():
+        h.push(x[i] + attn[i])
+    val w1 = make_param(d_model * d_ff, 0.2 + 0.05 * (layer as f64))
+    val w2 = make_param(d_ff * d_model, 0.2)
+    var hidden = linear_cpu(layer_norm_cpu(h, seq_len, d_model), seq_len, d_model, w1, d_ff)
+    for i in 0..hidden.len():
+        hidden[i] = gelu_scalar(hidden[i] as f64) as f32
+    val ff = linear_cpu(hidden, seq_len, d_ff, w2, d_model)
+    var y: [f32] = []
+    for i in 0..h.len():
+        y.push(h[i] + ff[i])
+    y
+
+fn lm_head_weights(cfg: GptConfig) -> [f32]:
+    make_param(cfg.d_model * cfg.vocab_size, 0.5)
+
+# Forward pass -> logits (seq x vocab)
+fn gpt_forward_cpu(ids: [i64], cfg: GptConfig) -> [f32]:
+    val seq_len = ids.len()
+    var x = embed_cpu(ids, cfg)
+    for layer in 0..cfg.n_layers:
+        x = block_cpu(x, seq_len, cfg.d_model, layer)
+    val normed = layer_norm_cpu(x, seq_len, cfg.d_model)
+    linear_cpu(normed, seq_len, cfg.d_model, lm_head_weights(cfg), cfg.vocab_size)
+
+fn argmax(xs: [f32], offset: i64, count: i64) -> i64:
+    var best = 0
+    for i in 1..count:
+        if xs[offset + i] > xs[offset + best]:
+            best = i
+    best
+
+# Greedy decoding: append argmax of the last row until max_new tokens.
+fn generate_greedy(prompt: [i64], cfg: GptConfig, max_new: i64) -> [i64]:
+    var ids = prompt
+    for step in 0..max_new:
+        if ids.len() >= cfg.max_len:
+            break
+        val logits = gpt_forward_cpu(ids, cfg)
+        val last = ids.len() - 1
+        ids.push(argmax(logits, last * cfg.vocab_size, cfg.vocab_size))
+    ids
+
+fn arrays_close(a: [f32], b: [f32], tol: f32) -> bool:
+    if a.len() != b.len():
+        return false
+    for i in 0..a.len():
+        val diff = a[i] - b[i]
+        val ad = if diff < 0.0: 0.0 - diff else: diff
+        if ad > tol:
+            return false
+    true
+
+# ============================================================================
+# GPU kernel (std.gpu, module-12 pattern): LM head, one thread per logit
+# ============================================================================
+
+@gpu_kernel
+fn lm_head_kernel(x: GpuPtr, w: GpuPtr, logits: GpuPtr, seq_len: i64, d_model: i64, vocab: i64):
+    val t = gpu_block_id_y() * gpu_block_dim_y() + gpu_local_id_y()
+    val v = gpu_block_id_x() * gpu_block_dim_x() + gpu_local_id_x()
+    if t < seq_len and v < vocab:
+        var acc: f32 = 0.0
+        var d = 0
+        while d < d_model:
+            acc = acc + gpu_load_f32(x, t * d_model + d) * gpu_load_f32(w, d * vocab + v)
+            d = d + 1
+        gpu_store_f32(logits, t * vocab + v, acc)
+
+fn run_gpu_lm_head(x: [f32], w: [f32], seq_len: i64, d_model: i64, vocab: i64) -> Result<[f32], GpuError>:
+    gpu_init()?
+    gpu_set_device(0)?
+    val d_x = gpu_alloc(x.len() * 4)?
+    val d_w = gpu_alloc(w.len() * 4)?
+    val d_l = gpu_alloc(seq_len * vocab * 4)?
+    gpu_upload_f32(d_x, x)?
+    gpu_upload_f32(d_w, w)?
+    val block = 16
+    val gx = (vocab + block - 1) / block
+    val gy = (seq_len + block - 1) / block
+    lm_head_kernel<<<grid: (gx, gy, 1), block: (block, block, 1)>>>(d_x, d_w, d_l, seq_len, d_model, vocab)
+    gpu_sync()?
+    val out = gpu_download_f32(d_l, seq_len * vocab)?
+    gpu_free(d_x)?
+    gpu_free(d_w)?
+    gpu_free(d_l)?
+    Ok(out)
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn main():
+    val cfg = GptConfig(vocab_size: 16, d_model: 8, n_layers: 2, max_len: 8)
+    print "=== Tiny GPT ==="
+    print "vocab {cfg.vocab_size}, d_model {cfg.d_model}, layers {cfg.n_layers}, params {cfg.param_count()}"
+
+    val prompt: [i64] = [3, 7, 11]
+    val logits = gpt_forward_cpu(prompt, cfg)
+    print "  logits shape: [{prompt.len()}, {cfg.vocab_size}] ({logits.len()} values)"
+    val next = argmax(logits, (prompt.len() - 1) * cfg.vocab_size, cfg.vocab_size)
+    print "  greedy next token after {prompt}: {next}"
+    val out = generate_greedy(prompt, cfg, 3)
+    print "  generated: {out} ({out.len()} tokens)"
+
+    val normed = layer_norm_cpu(embed_cpu(prompt, cfg), prompt.len(), cfg.d_model)
+    val w = lm_head_weights(cfg)
+    val cpu_logits = linear_cpu(normed, prompt.len(), cfg.d_model, w, cfg.vocab_size)
+    match run_gpu_lm_head(normed, w, prompt.len(), cfg.d_model, cfg.vocab_size):
+        case Ok(gpu_logits):
+            if arrays_close(gpu_logits, cpu_logits, 0.001):
+                print "GPU LM head: PASSED (matches CPU reference)"
+            else:
+                print "GPU LM head: MISMATCH vs CPU reference (launch is a no-op on this engine)"
+        case Err(e):
+            print "GPU LM head skipped: {e.to_text()}"
+    print "=== Done ==="

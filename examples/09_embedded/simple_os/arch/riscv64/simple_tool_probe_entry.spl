@@ -1,0 +1,52 @@
+# Lane BR64 board gate: prove the OpenSBI -> SimpleOS rv64 kernel ->
+# virtio-blk -> FAT32 path locates and reads the REAL cross-built
+# riscv64-unknown-simpleos `simple` interpreter ELF (staged at /FSEXEC.ELF,
+# aliased /usr/bin/simple) and its /hello.spl source.
+#
+# Build (bootstrap seed, llvm backend):
+#   <seed> native-build --source build/os/generated \
+#     --source examples/09_embedded/simple_os/arch/riscv64 --backend llvm \
+#     --opt-level=aggressive --log on --entry-closure \
+#     --entry examples/09_embedded/simple_os/arch/riscv64/simple_tool_probe_entry.spl \
+#     --target riscv64-unknown-none -o build/os/simpleos_riscv64_simple_tool_probe.elf \
+#     --linker-script examples/09_embedded/simple_os/arch/riscv64/linker.ld
+# Run:
+#   qemu-system-riscv64 -machine virt -cpu rv64 -m 512M -bios default \
+#     -kernel build/os/simpleos_riscv64_simple_tool_probe.elf \
+#     -global virtio-mmio.force-legacy=false \
+#     -drive file=build/os/fat32-rv64-simple.img,if=none,id=rvdisk,format=raw \
+#     -device virtio-blk-device,drive=rvdisk -nographic
+
+extern fn serial_println(msg: text)
+extern fn rt_qemu_exit_success()
+extern fn rt_riscv_simple_tool_probe() -> i64
+extern fn rt_riscv_simple_tool_size() -> i64
+extern fn rt_riscv_simple_tool_entry_hi20() -> i64
+extern fn rt_riscv_simple_hello_probe() -> i64
+
+fn spl_start():
+    serial_println("")
+    serial_println("=== SimpleOS RV64 simple-tool staging gate ===")
+    # NOTE: no rt_riscv_nvfs_probe here — that checks the SMF acceptance
+    # image's /SYS/NVFSVER.TXT marker, which the fsexec_mkimg_simple.spl
+    # staging image intentionally does not carry. The probes below do their
+    # own virtio-blk init + FAT32 BPB parse.
+    if rt_riscv_simple_tool_probe():
+        val size = rt_riscv_simple_tool_size()
+        val entry_hi20 = rt_riscv_simple_tool_entry_hi20()
+        serial_println("RV64_SIMPLE_TOOL_ELF_OK path=/usr/bin/simple size={size} entry_hi20={entry_hi20}")
+    else:
+        serial_println("[rv64-gate] /usr/bin/simple ELF probe failed")
+        serial_println("TEST FAILED")
+        rt_qemu_exit_success()
+        return
+    if rt_riscv_simple_hello_probe():
+        serial_println("RV64_HELLO_SPL_OK path=/hello.spl")
+    else:
+        serial_println("[rv64-gate] /hello.spl probe failed")
+        serial_println("TEST FAILED")
+        rt_qemu_exit_success()
+        return
+    serial_println("RV64_SIMPLE_TOOL_GATE_PASS")
+    serial_println("TEST PASSED")
+    rt_qemu_exit_success()

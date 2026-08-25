@@ -1,0 +1,732 @@
+#![allow(unnamed_duplicate_typed_args)]
+## make_parser — Enhanced Makefile parser
+##
+## Supports:
+## - Variable assignment: =, :=, +=, ?=
+## - Rules and pattern rules
+## - .PHONY targets
+## - include directive
+## - ifeq/ifneq/ifdef/ifndef conditionals
+## - $(function ARG) built-in functions
+## - VPATH and vpath directives
+## - Tab-indented recipe lines
+
+use std.text
+use std.fs
+use std.process
+
+# --- Data structures ---
+
+struct MakeVar:
+    name: text
+    value: text
+    flavor: text    # "recursive" (=), "simple" (:=), or "env"
+
+struct MakeRule:
+    target: text
+    deps: [text]
+    order_only_deps: [text]   # deps after |
+    commands: [text]
+    is_pattern: bool
+    is_phony: bool
+
+struct MakeVpath:
+    pattern: text     # e.g. "%.c" or "" for VPATH
+    directories: [text]
+
+struct MakeFile:
+    vars: [MakeVar]
+    rules: [MakeRule]
+    vpaths: [MakeVpath]
+    default_target: text
+    phony_targets: [text]
+
+# --- Built-in function evaluation ---
+
+fn eval_function(func_name: text, func_arg: text, vars: [MakeVar]) -> text:
+    """Evaluate a $(function ARG) call."""
+
+    if func_name == "shell":
+        val result = process.run("sh", ["-c", func_arg])
+        if result.exit_code == 0:
+            # Replace newlines with spaces (like real make)
+            return result.stdout.trim().replace_all("\n", " ")
+        return ""
+
+    if func_name == "wildcard":
+        return eval_wildcard(func_arg)
+
+    if func_name == "patsubst":
+        # $(patsubst pattern,replacement,text)
+        val parts = split_function_args(func_arg)
+        if parts.len() >= 3:
+            return eval_patsubst(parts[0], parts[1], parts[2])
+        return func_arg
+
+    if func_name == "foreach":
+        # $(foreach var,list,text)
+        val parts = split_function_args(func_arg)
+        if parts.len() >= 3:
+            return eval_foreach(parts[0], parts[1], parts[2], vars)
+        return func_arg
+
+    if func_name == "filter":
+        # $(filter pattern,text)
+        val parts = split_function_args(func_arg)
+        if parts.len() >= 2:
+            return eval_filter(parts[0], parts[1])
+        return func_arg
+
+    if func_name == "filter-out":
+        # $(filter-out pattern,text)
+        val parts = split_function_args(func_arg)
+        if parts.len() >= 2:
+            return eval_filter_out(parts[0], parts[1])
+        return func_arg
+
+    if func_name == "notdir":
+        val words = func_arg.split(" ").filter(_.len() > 0)
+        return words.map(notdir(_)).join(" ")
+
+    if func_name == "dir":
+        val words = func_arg.split(" ").filter(_.len() > 0)
+        return words.map(dir_of(_)).join(" ")
+
+    if func_name == "basename":
+        val words = func_arg.split(" ").filter(_.len() > 0)
+        return words.map(basename(_)).join(" ")
+
+    if func_name == "addsuffix":
+        val parts = split_function_args(func_arg)
+        if parts.len() >= 2:
+            val suffix = parts[0]
+            val words = parts[1].split(" ").filter(_.len() > 0)
+            return words.map("{_}{suffix}").join(" ")
+        return func_arg
+
+    if func_name == "addprefix":
+        val parts = split_function_args(func_arg)
+        if parts.len() >= 2:
+            val prefix = parts[0]
+            val words = parts[1].split(" ").filter(_.len() > 0)
+            return words.map("{prefix}{_}").join(" ")
+        return func_arg
+
+    if func_name == "strip":
+        return func_arg.trim()
+
+    if func_name == "subst":
+        # $(subst from,to,text)
+        val parts = split_function_args(func_arg)
+        if parts.len() >= 3:
+            return parts[2].replace_all(parts[0], parts[1])
+        return func_arg
+
+    if func_name == "word":
+        # $(word n,text)
+        val parts = split_function_args(func_arg)
+        if parts.len() >= 2:
+            val n = parts[0].trim().parse_int()
+            val words = parts[1].split(" ").filter(_.len() > 0)
+            if n >= 1 and n <= words.len():
+                return words[n - 1]
+        return ""
+
+    if func_name == "words":
+        val words = func_arg.split(" ").filter(_.len() > 0)
+        return "{words.len()}"
+
+    if func_name == "firstword":
+        val words = func_arg.split(" ").filter(_.len() > 0)
+        if words.len() > 0:
+            return words[0]
+        return ""
+
+    if func_name == "lastword":
+        val words = func_arg.split(" ").filter(_.len() > 0)
+        if words.len() > 0:
+            return words[words.len() - 1]
+        return ""
+
+    if func_name == "sort":
+        var words = func_arg.split(" ").filter(_.len() > 0)
+        words.sort()
+        # Remove duplicates
+        var result: [text] = []
+        for w in words:
+            if result.len() == 0 or result[result.len() - 1] != w:
+                result.push(w)
+        return result.join(" ")
+
+    # Unknown function — return as-is
+    "$({func_name} {func_arg})"
+
+fn split_function_args(input: text) -> [text]:
+    """Split function arguments on commas, respecting nesting."""
+    var parts: [text] = []
+    var current = ""
+    var depth = 0
+
+    for ch in input.chars():
+        if ch == "(" or ch == "{":
+            depth = depth + 1
+            current = current + ch
+        else if ch == ")" or ch == "}":
+            depth = depth - 1
+            current = current + ch
+        else if ch == "," and depth == 0:
+            parts.push(current.trim())
+            current = ""
+        else:
+            current = current + ch
+
+    if current.len() > 0:
+        parts.push(current.trim())
+
+    parts
+
+fn eval_wildcard(pattern: text) -> text:
+    """Expand wildcard pattern to matching file names."""
+    # Use shell glob expansion
+    val result = process.run("sh", ["-c", "ls -d {pattern} 2>/dev/null"])
+    if result.exit_code == 0:
+        return result.stdout.trim().replace_all("\n", " ")
+    ""
+
+fn eval_patsubst(pattern: text, replacement: text, input: text) -> text:
+    """$(patsubst %.c,%.o,foo.c bar.c) -> foo.o bar.o"""
+    val words = input.split(" ").filter(_.len() > 0)
+    var result: [text] = []
+
+    for word in words:
+        val matched = match_make_pattern(pattern, word)
+        if matched != nil:
+            result.push(apply_make_pattern(replacement, matched))
+        else:
+            result.push(word)
+
+    result.join(" ")
+
+fn eval_foreach(var_name: text, list_str: text, body: text, vars: [MakeVar]) -> text:
+    """$(foreach x,a b c,$(x).o) -> a.o b.o c.o"""
+    val items = list_str.split(" ").filter(_.len() > 0)
+    var result: [text] = []
+
+    for item in items:
+        var expanded = body.replace_all("$({var_name})", item)
+        expanded = expanded.replace_all("${var_name}", item)
+        result.push(expanded)
+
+    result.join(" ")
+
+fn eval_filter(pattern: text, input: text) -> text:
+    """$(filter %.c,foo.c bar.h baz.c) -> foo.c baz.c"""
+    val words = input.split(" ").filter(_.len() > 0)
+    var result: [text] = []
+    for w in words:
+        if match_make_pattern(pattern, w) != nil:
+            result.push(w)
+    result.join(" ")
+
+fn eval_filter_out(pattern: text, input: text) -> text:
+    """$(filter-out %.h,foo.c bar.h baz.c) -> foo.c baz.c"""
+    val words = input.split(" ").filter(_.len() > 0)
+    var result: [text] = []
+    for w in words:
+        if match_make_pattern(pattern, w) == nil:
+            result.push(w)
+    result.join(" ")
+
+# --- Pattern matching ---
+
+fn match_make_pattern(pattern: text, target: text) -> text?:
+    """Match target against a % pattern. Returns the stem or nil."""
+    val pct_pos = pattern.index_of("%")
+    if pct_pos < 0:
+        # Literal match
+        if pattern == target:
+            return target
+        return nil
+
+    val prefix = pattern.slice(0, pct_pos)
+    val suffix = pattern.slice(pct_pos + 1, pattern.len())
+
+    if target.starts_with(prefix) and target.ends_with(suffix):
+        val stem_end = target.len() - suffix.len()
+        if stem_end >= prefix.len():
+            return target.slice(prefix.len(), stem_end)
+    nil
+
+fn apply_make_pattern(pattern: text, stem: text) -> text:
+    """Apply stem to a % pattern."""
+    pattern.replace_all("%", stem)
+
+# --- Path helpers ---
+
+fn notdir(path: text) -> text:
+    """Return the filename part of a path."""
+    val slash = path.rfind("/")
+    if slash >= 0:
+        path.slice(slash + 1, path.len())
+    else:
+        path
+
+fn dir_of(path: text) -> text:
+    """Return the directory part of a path (with trailing /)."""
+    val slash = path.rfind("/")
+    if slash >= 0:
+        path.slice(0, slash + 1)
+    else:
+        "./"
+
+fn basename(path: text) -> text:
+    """Remove the suffix from a filename."""
+    val name = notdir(path)
+    val dot = name.rfind(".")
+    if dot > 0:
+        val dir = if path.contains("/"): dir_of(path) else: ""
+        "{dir}{name.slice(0, dot)}"
+    else:
+        path
+
+# --- Variable expansion (full) ---
+
+fn expand_all(input: text, vars: [MakeVar]) -> text:
+    """Expand all variable references and function calls in a string.
+
+    Handles:
+    - $(VAR) and ${VAR} simple variable expansion
+    - $(function args) built-in function calls
+    - Nested expansions
+    """
+    var result = input
+    var max_iterations = 20  # prevent infinite recursion
+    var iteration = 0
+
+    while iteration < max_iterations:
+        val expanded = expand_one_pass(result, vars)
+        if expanded == result:
+            break
+        result = expanded
+        iteration = iteration + 1
+
+    result
+
+fn expand_one_pass(input: text, vars: [MakeVar]) -> text:
+    """Single pass of variable/function expansion."""
+    var result = ""
+    var pos = 0
+    val len = input.len()
+
+    while pos < len:
+        val ch = input.char_at(pos)
+
+        if ch == "$" and pos + 1 < len:
+            val next = input.char_at(pos + 1)
+
+            # $$ -> literal $
+            if next == "$":
+                result = result + "$"
+                pos = pos + 2
+                continue
+
+            # $@ $< $^ $* — single-char automatic variables
+            if next == "@" or next == "<" or next == "^" or next == "*":
+                result = result + "$" + next
+                pos = pos + 2
+                continue
+
+            # $( ... ) or ${ ... }
+            if next == "(" or next == "{":
+                val close = if next == "(": ")" else: "}"
+                val start = pos + 2
+                var depth = 1
+                var end = start
+                while end < len and depth > 0:
+                    if input.char_at(end) == next:
+                        depth = depth + 1
+                    else if input.char_at(end) == close:
+                        depth = depth - 1
+                    if depth > 0:
+                        end = end + 1
+
+                val inner = input.slice(start, end)
+                pos = end + 1
+
+                # Check if it's a function call (first word followed by space)
+                val space_pos = inner.index_of(" ")
+                if space_pos > 0:
+                    val maybe_func = inner.slice(0, space_pos)
+                    val maybe_arg = inner.slice(space_pos + 1, inner.len())
+                    if is_builtin_function(maybe_func):
+                        val expanded_arg = expand_one_pass(maybe_arg, vars)
+                        result = result + eval_function(maybe_func, expanded_arg, vars)
+                        continue
+
+                # Simple variable lookup
+                val var_value = lookup_var(inner, vars)
+                result = result + var_value
+                continue
+
+            # Single-char variable $X
+            result = result + lookup_var(next, vars)
+            pos = pos + 2
+            continue
+
+        result = result + ch
+        pos = pos + 1
+
+    result
+
+fn lookup_var(name: text, vars: [MakeVar]) -> text:
+    """Look up a variable by name. Returns empty string if not found."""
+    # Search in reverse order (last assignment wins)
+    var i = vars.len() - 1
+    while i >= 0:
+        if vars[i].name == name:
+            return vars[i].value
+        i = i - 1
+    ""
+
+fn is_builtin_function(name: text) -> bool:
+    """Check if a name is a built-in make function."""
+    val funcs = ["shell", "wildcard", "patsubst", "foreach", "filter",
+                 "filter-out", "notdir", "dir", "basename", "addsuffix",
+                 "addprefix", "strip", "subst", "word", "words",
+                 "firstword", "lastword", "sort"]
+    funcs.contains(name)
+
+# --- Main parser ---
+
+fn parse_makefile(path: text) -> MakeFile:
+    """Parse a Makefile from disk, handling includes and conditionals."""
+    val content = fs.read_text(path)
+    val dir = file_dir(path)
+    parse_makefile_content(content, dir)
+
+fn parse_makefile_content(content: text, base_dir: text) -> MakeFile:
+    """Parse Makefile content string."""
+    var vars: [MakeVar] = []
+    var rules: [MakeRule] = []
+    var vpaths: [MakeVpath] = []
+    var phony_targets: [text] = []
+    var default_target = ""
+    var current_rule: MakeRule? = nil
+
+    # Add MAKE variable for recursive make
+    vars.push(MakeVar(name: "MAKE", value: "make", flavor: "simple"))
+
+    val lines = content.split("\n")
+    var i = 0
+    var cond_stack: [bool] = []   # stack of "are we active" flags
+
+    while i < lines.len():
+        val line = lines[i]
+
+        # Handle line continuations (backslash at end)
+        var full_line = line
+        while full_line.ends_with("\\") and i + 1 < lines.len():
+            full_line = full_line.slice(0, full_line.len() - 1)
+            i = i + 1
+            full_line = full_line + " " + lines[i].trim()
+
+        val trimmed = full_line.trim()
+
+        # Skip empty lines and comments
+        if trimmed.len() == 0 or trimmed.starts_with("#"):
+            if trimmed.len() == 0 and current_rule != nil:
+                rules.push(current_rule)
+                current_rule = nil
+            i = i + 1
+            continue
+
+        # --- Conditional directives (always processed, even inside false blocks) ---
+
+        if trimmed.starts_with("ifeq ") or trimmed.starts_with("ifeq("):
+            val is_active = cond_stack.len() == 0 or cond_stack_all_true(cond_stack)
+            if is_active:
+                val result = eval_ifeq(trimmed, vars)
+                cond_stack.push(result)
+            else:
+                cond_stack.push(false)
+            i = i + 1
+            continue
+
+        if trimmed.starts_with("ifneq ") or trimmed.starts_with("ifneq("):
+            val is_active = cond_stack.len() == 0 or cond_stack_all_true(cond_stack)
+            if is_active:
+                val result = not eval_ifeq(trimmed.replace_all("ifneq", "ifeq"), vars)
+                cond_stack.push(result)
+            else:
+                cond_stack.push(false)
+            i = i + 1
+            continue
+
+        if trimmed.starts_with("ifdef "):
+            val var_name = trimmed.slice(6, trimmed.len()).trim()
+            val is_active = cond_stack.len() == 0 or cond_stack_all_true(cond_stack)
+            if is_active:
+                val defined = lookup_var(var_name, vars).len() > 0
+                cond_stack.push(defined)
+            else:
+                cond_stack.push(false)
+            i = i + 1
+            continue
+
+        if trimmed.starts_with("ifndef "):
+            val var_name = trimmed.slice(7, trimmed.len()).trim()
+            val is_active = cond_stack.len() == 0 or cond_stack_all_true(cond_stack)
+            if is_active:
+                val defined = lookup_var(var_name, vars).len() > 0
+                cond_stack.push(not defined)
+            else:
+                cond_stack.push(false)
+            i = i + 1
+            continue
+
+        if trimmed == "else":
+            if cond_stack.len() > 0:
+                val last = cond_stack[cond_stack.len() - 1]
+                cond_stack[cond_stack.len() - 1] = not last
+            i = i + 1
+            continue
+
+        if trimmed == "endif":
+            if cond_stack.len() > 0:
+                cond_stack.pop()
+            i = i + 1
+            continue
+
+        # If inside a false conditional block, skip
+        if cond_stack.len() > 0 and not cond_stack_all_true(cond_stack):
+            i = i + 1
+            continue
+
+        # --- Active content ---
+
+        # Command line (tab-indented) belongs to current rule
+        if full_line.starts_with("\t") and current_rule != nil:
+            current_rule.commands.push(trimmed)
+            i = i + 1
+            continue
+
+        # Include directive
+        if trimmed.starts_with("include ") or trimmed.starts_with("-include "):
+            val optional = trimmed.starts_with("-include")
+            val inc_str = if optional:
+                trimmed.slice(9, trimmed.len()).trim()
+            else:
+                trimmed.slice(8, trimmed.len()).trim()
+            val inc_path_raw = expand_all(inc_str, vars)
+            val inc_path = if inc_path_raw.starts_with("/"):
+                inc_path_raw
+            else:
+                "{base_dir}/{inc_path_raw}"
+            if fs.exists(inc_path):
+                val included = parse_makefile(inc_path)
+                # Merge included content
+                for v in included.vars:
+                    vars.push(v)
+                for r in included.rules:
+                    rules.push(r)
+                for vp in included.vpaths:
+                    vpaths.push(vp)
+                for pt in included.phony_targets:
+                    phony_targets.push(pt)
+            else if not optional:
+                print "[make] Warning: include file not found: {inc_path}"
+            i = i + 1
+            continue
+
+        # VPATH directive
+        if trimmed.starts_with("VPATH") and trimmed.contains("="):
+            val eq_pos = trimmed.index_of("=")
+            val value = expand_all(trimmed.slice(eq_pos + 1, trimmed.len()).trim(), vars)
+            val dirs = value.split(":").filter(_.len() > 0)
+            vpaths.push(MakeVpath(pattern: "", directories: dirs))
+            i = i + 1
+            continue
+
+        if trimmed.starts_with("vpath "):
+            val rest = trimmed.slice(6, trimmed.len()).trim()
+            val space_pos = rest.index_of(" ")
+            if space_pos > 0:
+                val pattern = rest.slice(0, space_pos)
+                val dirs_str = expand_all(rest.slice(space_pos + 1, rest.len()).trim(), vars)
+                val dirs = dirs_str.split(":").filter(_.len() > 0)
+                vpaths.push(MakeVpath(pattern: pattern, directories: dirs))
+            i = i + 1
+            continue
+
+        # .PHONY: target1 target2
+        if trimmed.starts_with(".PHONY:"):
+            # Save current rule if any
+            if current_rule != nil:
+                rules.push(current_rule)
+                current_rule = nil
+            val targets_str = trimmed.slice(7, trimmed.len()).trim()
+            val targets = targets_str.split(" ").filter(_.len() > 0)
+            for t in targets:
+                phony_targets.push(t)
+            i = i + 1
+            continue
+
+        # Variable assignment: VAR = value, VAR := value, VAR += value, VAR ?= value
+        if is_variable_assignment(trimmed):
+            val parsed = parse_variable_assignment(trimmed, vars)
+            if parsed != nil:
+                vars.push(parsed)
+            i = i + 1
+            continue
+
+        # Rule: target: dep1 dep2 ...
+        if trimmed.contains(":") and not trimmed.starts_with("\t"):
+            # Save previous rule
+            if current_rule != nil:
+                rules.push(current_rule)
+
+            val colon_pos = trimmed.index_of(":")
+            val target_str = expand_all(trimmed.slice(0, colon_pos).trim(), vars)
+            val deps_str = expand_all(trimmed.slice(colon_pos + 1, trimmed.len()).trim(), vars)
+
+            # Split deps on | for order-only
+            var normal_deps: [text] = []
+            var order_only: [text] = []
+            val pipe_pos = deps_str.index_of("|")
+            if pipe_pos >= 0:
+                val normal_str = deps_str.slice(0, pipe_pos).trim()
+                val order_str = deps_str.slice(pipe_pos + 1, deps_str.len()).trim()
+                normal_deps = normal_str.split(" ").filter(_.len() > 0)
+                order_only = order_str.split(" ").filter(_.len() > 0)
+            else:
+                normal_deps = deps_str.split(" ").filter(_.len() > 0)
+
+            val is_phony = phony_targets.contains(target_str)
+
+            current_rule = MakeRule(
+                target: target_str,
+                deps: normal_deps,
+                order_only_deps: order_only,
+                commands: [],
+                is_pattern: target_str.contains("%"),
+                is_phony: is_phony,
+            )
+
+            if default_target.len() == 0 and not target_str.starts_with(".") and not target_str.contains("%"):
+                default_target = target_str
+
+        i = i + 1
+
+    # Save last rule
+    if current_rule != nil:
+        rules.push(current_rule)
+
+    # Mark phony rules
+    for rule in rules:
+        if phony_targets.contains(rule.target):
+            rule.is_phony = true
+
+    MakeFile(
+        vars: vars,
+        rules: rules,
+        vpaths: vpaths,
+        default_target: default_target,
+        phony_targets: phony_targets,
+    )
+
+fn is_variable_assignment(line: text) -> bool:
+    """Check if a line is a variable assignment (not a rule)."""
+    # Must contain = but not : before it (or := which is an assignment operator)
+    if not line.contains("="):
+        return false
+    val eq_pos = line.index_of("=")
+    val colon_pos = line.index_of(":")
+
+    # := is variable assignment
+    if colon_pos >= 0 and colon_pos + 1 == eq_pos:
+        return true
+    # No colon, or colon after = — it's a variable assignment
+    if colon_pos < 0 or colon_pos > eq_pos:
+        return true
+    false
+
+fn parse_variable_assignment(line: text, vars: [MakeVar]) -> MakeVar?:
+    """Parse a variable assignment line."""
+    # Check for += first
+    val plus_eq = line.index_of("+=")
+    if plus_eq > 0:
+        val name = line.slice(0, plus_eq).trim()
+        val value = expand_all(line.slice(plus_eq + 2, line.len()).trim(), vars)
+        val existing = lookup_var(name, vars)
+        val new_value = if existing.len() > 0: "{existing} {value}" else: value
+        return MakeVar(name: name, value: new_value, flavor: "recursive")
+
+    # Check for ?=
+    val qmark_eq = line.index_of("?=")
+    if qmark_eq > 0:
+        val name = line.slice(0, qmark_eq).trim()
+        val existing = lookup_var(name, vars)
+        if existing.len() > 0:
+            return nil  # Already defined, skip
+        val value = line.slice(qmark_eq + 2, line.len()).trim()
+        return MakeVar(name: name, value: value, flavor: "recursive")
+
+    # Check for :=
+    val colon_eq = line.index_of(":=")
+    if colon_eq > 0:
+        val name = line.slice(0, colon_eq).trim()
+        val value = expand_all(line.slice(colon_eq + 2, line.len()).trim(), vars)
+        return MakeVar(name: name, value: value, flavor: "simple")
+
+    # Plain =
+    val eq_pos = line.index_of("=")
+    if eq_pos > 0:
+        val name = line.slice(0, eq_pos).trim()
+        val value = line.slice(eq_pos + 1, line.len()).trim()
+        return MakeVar(name: name, value: value, flavor: "recursive")
+
+    nil
+
+fn eval_ifeq(line: text, vars: [MakeVar]) -> bool:
+    """Evaluate an ifeq(A,B) or ifeq 'A' 'B' conditional."""
+    # Try (A,B) format
+    val paren_start = line.index_of("(")
+    if paren_start >= 0:
+        val paren_end = line.rfind(")")
+        if paren_end > paren_start:
+            val inner = line.slice(paren_start + 1, paren_end)
+            val comma = inner.index_of(",")
+            if comma > 0:
+                val a = expand_all(inner.slice(0, comma).trim(), vars)
+                val b = expand_all(inner.slice(comma + 1, inner.len()).trim(), vars)
+                return a == b
+
+    # Try 'A' 'B' format
+    val first_q = line.index_of("'")
+    if first_q >= 0:
+        val second_q = line.index_of("'", first_q + 1)
+        if second_q > first_q:
+            val a = expand_all(line.slice(first_q + 1, second_q), vars)
+            val third_q = line.index_of("'", second_q + 1)
+            if third_q > second_q:
+                val fourth_q = line.index_of("'", third_q + 1)
+                if fourth_q > third_q:
+                    val b = expand_all(line.slice(third_q + 1, fourth_q), vars)
+                    return a == b
+
+    false
+
+fn cond_stack_all_true(stack: [bool]) -> bool:
+    """Check if all conditions in the stack are true."""
+    for cond in stack:
+        if not cond:
+            return false
+    true
+
+fn file_dir(path: text) -> text:
+    """Get the directory part of a file path."""
+    val slash = path.rfind("/")
+    if slash >= 0:
+        path.slice(0, slash)
+    else:
+        "."

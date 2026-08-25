@@ -1,0 +1,1074 @@
+# widget_showcase_gui.spl — GUI sanity app: the shared UI widget showcase,
+# rendered on the pure-Simple Engine2D lane and presented to an on-screen
+# window.
+#
+# This is one of the three main GUI check apps (see .claude/skills/lib/spipe_ui.md):
+#   1. 2D rendering  — engine2d_shapes_gui.spl
+#   2. GUI widgets   — THIS app
+#   3. HTML rendering — web_render_file_gui.spl
+#
+# Since campaign task B4 the widget content is NOT hand-drawn. It is the same
+# target-agnostic tree every showcase target uses (app.ui_showcase.showcase_core)
+# turned into a DrawIrV3Scene, which this app walks into Engine2D primitives.
+# Engine2D is this target's HAL: only that last hop differs from the 2d / web /
+# wm targets, which is exactly the campaign's claim.
+#
+# Launch (window):
+#   SIMPLE_GUI_RUN_SKIP_NUDGE=1 scripts/gui/macos-gui-run.shs examples/06_io/ui/widget_showcase_gui.spl
+# Headless: bin/simple run examples/06_io/ui/widget_showcase_gui.spl
+
+use std.gpu.engine2d.engine.{Engine2D}
+use std.io.window_winit.{WinitLoop, WinitWindow, WinitInput, winit_loop_new, winit_loop_free, winit_window_new, winit_window_free, winit_present_rgba, winit_poll_input}
+use std.common.image.ppm_decode.{encode_ppm_p6}
+use std.nogc_sync_mut.sffi.io.{file_write_bytes}
+use std.io_runtime.{file_write, file_exists, file_read, getpid, get_args}
+use std.nogc_sync_mut.io.time_ops.{time_now_micros}
+use std.nogc_sync_mut.io.env_ops.{env_get}
+use std.nogc_sync_mut.concurrent.thread.{thread_sleep}
+use std.common.science_math.perf_sugar.{alloc_i64}
+use std.common.encoding.font_registry.{selected_font_asset_candidates, selected_font_asset_identity}
+use common.ui.widget.{UITree, WidgetNode, WidgetKind, UIState}
+# --- shared showcase pipeline (campaign task B4) --------------------------
+# The widget content of this app is NO LONGER hand-drawn. It comes from the
+# same target-agnostic tree + reducer every other showcase target uses:
+#   showcase_build_sized -> showcase_apply -> showcase_scene (DrawIrV3Scene)
+# Only the LAST hop differs per target, which is the whole point of the
+# campaign: this target's HAL is Engine2D, so `paint_scene_engine2d` below
+# walks the shared DrawIrV3 scene into Engine2D primitives instead of the
+# pure-Simple software rasterizer used by the display-less hosts.
+use app.ui_showcase.showcase_core.{showcase_build_sized, showcase_scene, showcase_apply, showcase_click_count}
+use common.ui.host_input_event.{
+    host_pointer_down, host_pointer_up, host_pointer_move, host_pointer_wheel,
+    host_key_down, HOST_BTN_LEFT
+}
+use common.ui.draw_ir_v3.{
+    DrawIrV3Scene,
+    draw_ir_v3_geometry_at, draw_ir_v3_paint_at, draw_ir_v3_text_run_at,
+    draw_ir_v3_glyph_at, draw_ir_v3_has_flag,
+    DRAW_IR_V3_KIND_RECT, DRAW_IR_V3_KIND_TEXT, DRAW_IR_V3_KIND_EDGE,
+    DRAW_IR_V3_FLAG_HIDDEN, DRAW_IR_V3_NO_ID
+}
+use common.ui.wm_app_process_contract.{WM_APP_MODE_ENV, WM_BRIDGE_FILE_ENV, WM_FRAME_FILE_ENV, WM_EVENT_FILE_ENV, WM_FRAME_SEQ_FILE_ENV, WM_CLIENT_HOLD_ENV, WIDGET_SHOWCASE_APP_SOURCE, widget_showcase_window_title, wm_app_mode_is_client, wm_widget_showcase_bridge_request_sized, wm_widget_showcase_bridge_request_sized_with_backend, wm_fs_bridge_encode, wm_widget_showcase_event_path, wm_widget_showcase_frame_seq_path, wm_fs_app_event_seq_path, wm_fs_app_event_decode}
+
+val W: i32 = 3840
+val H: i32 = 2160
+
+# Palette
+val BG: u32 = 0xFF14141Cu32
+val CARD: u32 = 0xFF1E1E28u32
+val FG: u32 = 0xFFE6E6F0u32
+val MUTED: u32 = 0xFF8A8A9Au32
+val LINE: u32 = 0xFF34343Eu32
+val ACCENT: u32 = 0xFF3B82F6u32
+val ACCENT_D: u32 = 0xFF1D4ED8u32
+val GREEN: u32 = 0xFF22C55Eu32
+val RED: u32 = 0xFFEF4444u32
+val AMBER: u32 = 0xFFF59E0Bu32
+val WHITE: u32 = 0xFFFFFFFFu32
+val TRACK: u32 = 0xFF2A2A38u32
+
+# ponytail: native rounded-rect emulation crashes in this compiled perf gate; plain rects keep the widget evidence alive.
+
+# Interactive widget state driven by synthetic SHOWCASE_EVENTS (W1/G1.5).
+# Defaults reproduce the historical static frame exactly.
+struct ShowcaseState:
+    button_count: i32
+    button_pressed: bool
+    checkbox_on: bool
+    switch_on: bool
+    slider_value: i32
+    progress_value: i32
+    slider_dragging: bool
+    # The SHARED showcase widget tree + its reducer state. This is what the
+    # frame is actually built from now; the scalar fields above survive only
+    # as this app's own synthetic-event bookkeeping (SHOWCASE_EVENTS, WM
+    # bridge) and no longer feed any drawing.
+    ui: UIState
+    # Viewport the shared tree is laid out / hit-tested against. Carried on
+    # the state so `showcase_on_pointer` keeps its existing signature at all
+    # six call sites while still being able to call `showcase_apply`.
+    vw: i32
+    vh: i32
+
+# Prefix isolating this example's nodes in the global widget store. It must
+# differ from the `scgui` used by src/app/ui_showcase/hosts/main_gui.spl.
+val SHOWCASE_PREFIX: text = "exgui"
+
+fn showcase_state_sized(vw: i32, vh: i32) -> ShowcaseState:
+    ShowcaseState(button_count: 0, button_pressed: false, checkbox_on: true, switch_on: true, slider_value: 60, progress_value: 62, slider_dragging: false, ui: showcase_build_sized(SHOWCASE_PREFIX, 10, 6), vw: vw, vh: vh)
+
+fn showcase_ui_tree(st: ShowcaseState) -> UITree:
+    var root = WidgetNode.new("showcase_root", WidgetKind.Panel.to_wire())
+    var button = WidgetNode.new("showcase_button", WidgetKind.Button.to_wire()).set_prop("text", "Run").set_prop("count", st.button_count.to_text())
+    var checkbox = WidgetNode.new("showcase_checkbox", WidgetKind.Checkbox.to_wire()).set_prop("checked", st.checkbox_on.to_text())
+    var toggle = WidgetNode.new("showcase_toggle", WidgetKind.Switch.to_wire()).set_prop("checked", st.switch_on.to_text())
+    var slider = WidgetNode.new("showcase_slider", WidgetKind.Input.to_wire()).set_prop("role", "slider").set_prop("value", st.slider_value.to_text())
+    var progress = WidgetNode.new("showcase_progress", WidgetKind.Progress.to_wire()).set_prop("value", st.progress_value.to_text())
+    root = root.add_child(button)
+    root = root.add_child(checkbox)
+    root = root.add_child(toggle)
+    root = root.add_child(slider)
+    root = root.add_child(progress)
+    UITree.new(root).with_title("Widget Showcase")
+
+# Pure reducer: one synthetic event -> new state (widget_interact_model style).
+fn apply_showcase_event(st: ShowcaseState, ev: text) -> ShowcaseState:
+    var out = st
+    # Each synthetic event is driven through the SHARED reducer as a real
+    # click on the cell it names -- same stimulus, same names as before the
+    # migration. `showcase_apply` rewrites the probe-pane label text, which
+    # is now renderable (the scene carries synthesized glyphs), so
+    # run_showcase_events asserts BOTH the shared click counter AND a
+    # non-zero frame diff.
+    val cell = showcase_event_cell(ev)
+    if cell >= 0:
+        val px = 24 + cell * 40
+        out.ui = showcase_apply(out.ui, host_pointer_down(px, 24, HOST_BTN_LEFT), out.vw, out.vh)
+        out.ui = showcase_apply(out.ui, host_pointer_up(px, 24, HOST_BTN_LEFT), out.vw, out.vh)
+    if ev == "click:button":
+        out.button_count = out.button_count + 1
+        out.button_pressed = not out.button_pressed
+        out.slider_dragging = false
+        return out
+    if ev == "toggle:switch":
+        out.switch_on = not out.switch_on
+        out.slider_dragging = false
+        return out
+    if ev == "advance:progress":
+        var pct = out.progress_value + 20
+        if pct > 100:
+            pct = 100
+        out.progress_value = pct
+        out.slider_dragging = false
+        return out
+    print "unknown showcase event: {ev}"
+    st
+
+fn clamp_i32(v: i32, lo: i32, hi: i32) -> i32:
+    if v < lo:
+        return lo
+    if v > hi:
+        return hi
+    v
+
+fn hit_rect(px: i32, py: i32, x: i32, y: i32, w: i32, h: i32) -> bool:
+    px >= x and px < x + w and py >= y and py < y + h
+
+# Density scale helpers: `s` is a permille scale factor (1000 = 1.0x = the
+# historical 96-DPI baseline design). sc() scales a geometry value; sc1()
+# additionally floors at 1 so strokes/radii/fonts never vanish at low DPI.
+fn sc(v: i32, s: i32) -> i32:
+    v * s / 1000
+
+fn sc1(v: i32, s: i32) -> i32:
+    val r = sc(v, s)
+    if r < 1: 1 else: r
+
+# SHOWCASE_DPI (default 300): density used to size widget chrome when the
+# widget chrome is sized. 96 DPI == 1x.
+fn showcase_dpi() -> i32:
+    val raw = env_get("SHOWCASE_DPI") ?? ""
+    val v = (raw.trim().parse_i64() ?? 300i64).to_i32()
+    if v < 1: 96 else: v
+
+# SHOWCASE_RESOLUTION: "4k" (default), "8k", or an explicit "WxH" token.
+fn showcase_resolution_wh() -> (i32, i32):
+    val raw = (env_get("SHOWCASE_RESOLUTION") ?? "").trim().to_lower()
+    if raw == "" or raw == "4k":
+        return (W, H)
+    if raw == "8k":
+        return (7680, 4320)
+    val parts = raw.split("x")
+    if parts.len() == 2:
+        val pw = (parts[0].parse_i64() ?? 0i64).to_i32()
+        val ph = (parts[1].parse_i64() ?? 0i64).to_i32()
+        if pw > 0 and ph > 0:
+            return (pw, ph)
+    (W, H)
+
+fn slider_value_from_x(local_x: i32) -> i32:
+    val slider_x = 268
+    val rel = clamp_i32(local_x - slider_x, 0, 130)
+    rel * 100 / 130
+
+fn showcase_on_tick(state: ShowcaseState) -> ShowcaseState:
+    var out = state
+    out.progress_value = (out.progress_value + 2) % 101
+    out
+
+fn showcase_on_pointer(state: ShowcaseState, kind: text, x: i32, y: i32, pressed: bool) -> ShowcaseState:
+    if kind == "tick":
+        return showcase_on_tick(state)
+    var out = state
+    # Ingress -> SHARED reducer. This is what makes an input visible in the
+    # next frame now: showcase_apply rewrites the probe pane's labels, so the
+    # scene (and therefore the framebuffer checksum) changes on every real
+    # input batch. The scalar bookkeeping below no longer affects any pixel.
+    if kind == "down":
+        out.ui = showcase_apply(out.ui, host_pointer_down(x, y, HOST_BTN_LEFT), out.vw, out.vh)
+    else if kind == "up":
+        out.ui = showcase_apply(out.ui, host_pointer_up(x, y, HOST_BTN_LEFT), out.vw, out.vh)
+    else if kind == "move":
+        out.ui = showcase_apply(out.ui, host_pointer_move(x, y), out.vw, out.vh)
+    if kind == "down" and pressed and hit_rect(x, y, 12, 56, 60, 18):
+        out.button_pressed = true
+    if kind == "down" and pressed and hit_rect(x, y, 268, 186, 130, 28):
+        out.slider_dragging = true
+        out.slider_value = slider_value_from_x(x)
+    elif kind == "move" and out.slider_dragging:
+        out.slider_value = slider_value_from_x(x)
+    elif kind == "up":
+        if hit_rect(x, y, 12, 56, 60, 18):
+            out.button_count = out.button_count + 1
+        if hit_rect(x, y, 268, 58, 120, 22):
+            out.checkbox_on = not out.checkbox_on
+        if hit_rect(x, y, 12, 124, 78, 18):
+            out.switch_on = not out.switch_on
+        out.button_pressed = false
+        if out.slider_dragging:
+            out.slider_value = slider_value_from_x(x)
+        out.slider_dragging = false
+    out
+
+fn showcase_state_same(a: ShowcaseState, b: ShowcaseState) -> bool:
+    a.button_count == b.button_count and
+    a.button_pressed == b.button_pressed and
+    a.checkbox_on == b.checkbox_on and
+    a.switch_on == b.switch_on and
+    a.slider_value == b.slider_value and
+    a.progress_value == b.progress_value and
+    a.slider_dragging == b.slider_dragging
+
+# Grid cell index of the widget an event targets (-1 = unknown).
+fn showcase_event_cell(ev: text) -> i32:
+    if ev == "click:button":
+        return 0
+    if ev == "toggle:switch":
+        return 1
+    if ev == "advance:progress":
+        return 3
+    -1
+
+# =========================================================================
+# DrawIrV3 -> Engine2D adapter (this target's HAL hop)
+# =========================================================================
+#
+# Mirrors the semantics of src/app/ui_showcase/hosts/scene_raster.spl's
+# `raster_scene_into` command-for-command -- HIDDEN flag, NO_ID guards, RECT
+# and EDGE both taking the rect path, milli stroke widths -- but issues
+# Engine2D primitives instead of writing pixels in pure Simple. Engine2D IS
+# this target's rasterizer, so routing the shared scene through it is the
+# intended per-target hop, not a bypass.
+#
+# It cannot use `raster_scene_argb` directly: RasterSurface's static ctor is
+# an unresolved external symbol under JIT, which drops that whole module to
+# the interpreter (measured ~294 us/pixel -- a 5,000-px fill_rect took 1.47s).
+# At this app's 3840x2160 default that is many hours per frame. See the report.
+#
+# Charset copy: glyph ids in this pipeline are indices into
+# common.ui.glyph_bitmap_5x7's FONT_CHARSET, which that module does not
+# export. The literal below is a verbatim copy of it, kept so text runs can
+# be reassembled into strings for Engine2D's real font path.
+val SCENE_CHARSET: text = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .,:;!?-_()[]/\\'\"+=#%&@*<>abcdefghijklmnopqrstuvwxyz"
+
+fn scene_glyph_char(gid: i32) -> text:
+    if gid < 0 or gid >= SCENE_CHARSET.len():
+        return "?"
+    SCENE_CHARSET.substring(gid, gid + 1)
+
+fn paint_scene_engine2d(mut b: Engine2D, scene: DrawIrV3Scene) -> (Engine2D, i64):
+    """Walk the shared scene into Engine2D. Returns the engine (paints made
+    through an Engine2D param are lost to the caller on the interpreter lane
+    -- see the note above `label`) and the count of commands that actually
+    produced output, so a caller can tell an empty scene from a painted one
+    WITHOUT inspecting pixels."""
+    var painted: i64 = 0
+    var i: i64 = 0
+    val n = scene.commands.len().to_i64()
+    while i < n:
+        val cmd = scene.commands[i]
+        if not draw_ir_v3_has_flag(cmd, DRAW_IR_V3_FLAG_HIDDEN):
+            if cmd.kind == DRAW_IR_V3_KIND_RECT or cmd.kind == DRAW_IR_V3_KIND_EDGE:
+                if cmd.geometry_id != DRAW_IR_V3_NO_ID:
+                    val geom = draw_ir_v3_geometry_at(scene.geometry, cmd.geometry_id)
+                    val paint = draw_ir_v3_paint_at(scene.paint, cmd.paint_id)
+                    if geom.present and paint.present and geom.width > 0 and geom.height > 0:
+                        b.draw_rect_filled(geom.x, geom.y, geom.width, geom.height, paint.fill_color)
+                        val stroke_px = paint.stroke_width_milli / 1000
+                        if stroke_px > 0:
+                            b.draw_rect(geom.x, geom.y, geom.width, geom.height, paint.stroke_color, stroke_px)
+                        painted = painted + 1
+            else if cmd.kind == DRAW_IR_V3_KIND_TEXT:
+                if cmd.text_run_id != DRAW_IR_V3_NO_ID:
+                    val run = draw_ir_v3_text_run_at(scene.text_runs, cmd.text_run_id)
+                    if run.present and run.glyph_count != 0u32:
+                        val start = run.glyph_start.to_i64()
+                        val count = run.glyph_count.to_i64()
+                        var s_out = ""
+                        var first_x = run.baseline_x
+                        var g: i64 = 0
+                        while g < count:
+                            val glyph = draw_ir_v3_glyph_at(scene.text_runs, (start + g) as u32)
+                            if glyph.present:
+                                if g == 0:
+                                    first_x = glyph.x
+                                s_out = s_out + scene_glyph_char(glyph.glyph_id.to_i64() as i32)
+                            g = g + 1
+                        if s_out != "":
+                            # Glyph y is a BASELINE in this pipeline; Engine2D
+                            # draw_text takes the cell TOP, so subtract the
+                            # font size (milli -> px, floored at 1).
+                            var fs = run.font_size_milli / 1000
+                            if fs < 1:
+                                fs = 1
+                            b.draw_text(first_x, run.baseline_y - fs, s_out, run.color, fs)
+                            painted = painted + 1
+        i = i + 1
+    (b, painted)
+
+fn draw_frame(mut b: Engine2D, w: i32, h: i32, st: ShowcaseState) -> Engine2D:
+    """One showcase frame, from the SHARED widget tree. Before task B4 this
+    hand-drew a 24-cell gallery with engine2d primitives; the gallery now
+    comes from `showcase_scene`, so this target's visual content is the same
+    tree the 2d / web / wm targets render."""
+    b.clear(BG)
+    val scene = showcase_scene(st.ui, w, h)
+    val (next_b, painted) = paint_scene_engine2d(b, scene)
+    b = next_b
+    # Non-vacuity oracle: a scene that painted nothing must be visible in the
+    # log rather than shipping a plausible-looking blank frame.
+    print "showcase_scene_commands={scene.commands.len()};painted={painted}"
+    b
+
+fn draw_g1_1_frame(mut b: Engine2D, w: i32, h: i32, st: ShowcaseState) -> Engine2D:
+    """SHOWCASE_G1_1_COMPACT variant. Since task B4 the frame content comes
+    from the shared showcase tree in both modes, so the compact lane is the
+    same scene at whatever viewport it is given -- there is no second,
+    divergent hand-drawn frame to keep in sync any more."""
+    draw_frame(b, w, h, st)
+
+# Rendering backend key. `--backend=<name>` CLI flag wins, then the
+# SIMPLE_GUI_BACKEND env (e.g. "metal", "vulkan"); default "software" keeps the
+# historical CPU-lane behavior byte-for-byte (Engine2D "software" delegates to
+# SoftwareBackend). CPU stays the default until GPU parity + perf are proven
+# per resolution — see test/02_integration/rendering/engine2d_gpu_offload_evidence.spl.
+fn showcase_backend_key() -> text:
+    val args = get_args()
+    var i = 0
+    while i < args.len():
+        val arg = args[i]
+        if arg.starts_with("--backend="):
+            val flag = arg.substring(10, arg.len()).trim()
+            if flag != "":
+                return flag
+        i = i + 1
+    val raw = (env_get("SIMPLE_GUI_BACKEND") ?? "").trim()
+    if raw == "":
+        return "software"
+    raw
+
+fn showcase_gpu_backend_requested(name: text) -> bool:
+    name == "metal" or name == "vulkan" or name == "cuda" or
+        name == "rocm" or name == "directx" or name == "opencl" or
+        name == "opengl" or name == "webgpu" or name == "intel" or
+        name == "qualcomm" or name == "virtio_gpu"
+
+# Create the showcase render engine. For "metal" this is the persistent
+# GPU-only fast session (1x1 CPU mirror, device framebuffer is the source of
+# truth, single-hop readback); for every other backend
+# create_with_backend_fast() transparently falls back to the regular
+# create_with_backend() path, keeping the CPU default lane unchanged.
+fn showcase_engine_create(w: i32, h: i32) -> Engine2D:
+    Engine2D.create_with_backend_fast(w, h, showcase_backend_key())
+
+# Paint one showcase frame into an EXISTING engine (no per-frame session
+# create/shutdown — the persistent-session "gpu process" fix). draw_frame
+# starts with clear(), which re-arms gpu_frame_complete for the Metal
+# GPU-only lane each frame.
+fn build_frame_state_into(mut b: Engine2D, w: i32, h: i32, st: ShowcaseState) -> (Engine2D, [u32]):
+    if (env_get("SHOWCASE_G1_1_COMPACT") ?? "") == "1":
+        b = draw_g1_1_frame(b, w, h, st)
+    else:
+        b = draw_frame(b, w, h, st)
+    b.present()
+    (b, b.read_pixels())
+
+# One greppable renderer-provenance line proving which backend + device rendered
+# the frame. For vulkan, includes the physical-device diagnostic (lavapipe under
+# Xvfb). This is the G1.1 evidence line.
+fn emit_renderer_log(key: text, w: i32, h: i32):
+    var probe_engine = Engine2D.create_with_backend(64, 64, key)
+    val name = probe_engine.backend_name()
+    probe_engine.shutdown()
+    var device = ""
+    if key == "vulkan":
+        val probe = Engine2D.probe_backend(64, 64, "vulkan")
+        device = probe.diagnostic_text()
+    print "showcase_renderer_backend={name};requested={key};vulkan_device={device}"
+
+fn build_frame_state(w: i32, h: i32, st: ShowcaseState) -> [u32]:
+    var b = showcase_engine_create(w, h)
+    val (next_b, pixels) = build_frame_state_into(b, w, h, st)
+    b = next_b
+    b.shutdown()
+    pixels
+
+fn build_frame_sized(w: i32, h: i32) -> [u32]:
+    build_frame_state(w, h, showcase_state_sized(w, h))
+
+fn build_frame() -> [u32]:
+    build_frame_sized(W, H)
+
+fn showcase_ppm_scale() -> i32:
+    val raw = env_get("SHOWCASE_PPM_SCALE") ?? ""
+    if raw == "8":
+        return 8
+    if raw == "4":
+        return 4
+    if raw == "2":
+        return 2
+    1
+
+fn downsample_nearest(src: [u32], src_w: i32, src_h: i32, scale: i32) -> [u32]:
+    if scale <= 1:
+        return src
+    val dst_w = src_w / scale
+    val dst_h = src_h / scale
+    var out: [u32] = []
+    var y = 0
+    while y < dst_h:
+        var x = 0
+        val sy = y * scale
+        while x < dst_w:
+            val sx = x * scale
+            out.push(src[sy * src_w + sx])
+            x = x + 1
+        y = y + 1
+    out
+
+fn checksum_pixels(pixels: [u32]) -> i64:
+    var sum = 0i64
+    var i = 0
+    val n = pixels.len()
+    while i < n:
+        sum = sum + (pixels[i].to_i64() & 0xFFFFFFFF)
+        i = i + 1
+    sum
+
+fn nonzero_pixels(pixels: [u32]) -> i64:
+    var count = 0i64
+    var i = 0
+    val n = pixels.len()
+    while i < n:
+        if pixels[i] != 0u32:
+            count = count + 1
+        i = i + 1
+    count
+
+fn pixel_stats(pixels: [u32]) -> (i64, i64):
+    var nonzero = 0i64
+    var checksum = 0i64
+    var i = 0
+    val n = pixels.len()
+    while i < n:
+        val pixel = pixels[i]
+        if pixel != 0u32:
+            nonzero = nonzero + 1
+        checksum = checksum + (pixel.to_i64() & 0xFFFFFFFF)
+        i = i + 1
+    (nonzero, checksum)
+
+fn write_widget_event_evidence(path: text, backend: text, source: text,
+                               backend_handle: i64, initial_checksum: i64,
+                               interaction_checksum: i64, keyboard_events: i64,
+                               pointer_events: i64, click_events: i64,
+                               interaction_revision: i64) -> bool:
+    if path == "":
+        return true
+    file_write(path,
+        "widget_showcase_event_backend={backend}\n" +
+        "widget_showcase_event_source={source}\n" +
+        "widget_showcase_event_backend_handle={backend_handle}\n" +
+        "widget_showcase_event_initial_checksum={initial_checksum}\n" +
+        "widget_showcase_event_interaction_checksum={interaction_checksum}\n" +
+        "widget_showcase_event_keyboard_events={keyboard_events}\n" +
+        "widget_showcase_event_pointer_events={pointer_events}\n" +
+        "widget_showcase_event_click_events={click_events}\n" +
+        "widget_showcase_event_interaction_revision={interaction_revision}\n")
+
+fn frame_percentile_ns(values: [i64], percentile: i32) -> i64:
+    if values.len() == 0:
+        return 0
+    var sorted = values
+    var i = 1
+    while i < sorted.len():
+        val key = sorted[i]
+        var j = i - 1
+        while j >= 0 and sorted[j] > key:
+            sorted[j + 1] = sorted[j]
+            j = j - 1
+        sorted[j + 1] = key
+        i = i + 1
+    var index = (percentile * sorted.len()) / 100
+    if index >= sorted.len():
+        index = sorted.len() - 1
+    sorted[index]
+
+fn run_widget_showcase_perf_probe(w: i32, h: i32, frames: i64, prefix: text) -> i64:
+    var b = Engine2D.create_with_backend(w, h, showcase_backend_key())
+    b = draw_frame(b, w, h, showcase_state_sized(w, h))
+    val warmup_frames = 12
+    var warmup = 0
+    while warmup < warmup_frames:
+        b.present()
+        warmup = warmup + 1
+    var frame_samples: [i64] = []
+    val frame_start_us = time_now_micros()
+    var frame = 0
+    while frame < frames:
+        val sample_start_us = time_now_micros()
+        b.present()
+        frame_samples.push((time_now_micros() - sample_start_us) * 1000)
+        frame = frame + 1
+    val frame_elapsed_ns = (time_now_micros() - frame_start_us) * 1000
+    val frame_p50_ns = frame_percentile_ns(frame_samples, 50)
+    val frame_p95_ns = frame_percentile_ns(frame_samples, 95)
+    val pixels = b.read_pixels()
+    val stats = pixel_stats(pixels)
+    val nonzero = stats.0
+    val checksum = stats.1
+    val pixel_count = pixels.len()
+    val ok = pixel_count >= w * h
+    print "{prefix}_width={w}"
+    print "{prefix}_height={h}"
+    print "{prefix}_frames={frames}"
+    print "{prefix}_frame_elapsed_ns={frame_elapsed_ns}"
+    print "{prefix}_warmup_frames={warmup_frames}"
+    print "{prefix}_frame_sample_count={frame_samples.len()}"
+    print "{prefix}_frame_p50_ns={frame_p50_ns}"
+    print "{prefix}_frame_p95_ns={frame_p95_ns}"
+    print "{prefix}_redraw_frames=1"
+    print "{prefix}_render_mode=retained-static-frame"
+    print "{prefix}_pixels={pixel_count}"
+    print "{prefix}_nonzero_pixels={nonzero}"
+    print "{prefix}_checksum={checksum}"
+    print "{prefix}_readback_status=full-scan"
+    print "{prefix}_status={if ok and nonzero > 0: \"pass\" else: \"fail\"}"
+    return if ok and nonzero > 0: 0 else: 1
+
+fn run_4k_perf_probe() -> i64:
+    run_widget_showcase_perf_probe(3840, 2160, 200, "gui_showcase_4k_perf")
+
+fn run_8k_perf_probe() -> i64:
+    run_widget_showcase_perf_probe(7680, 4320, 200, "gui_showcase_8k_perf")
+
+fn write_frame_ppm(path: text, pixels: [u32], w: i32, h: i32):
+    if path == "":
+        return
+    val bytes = encode_ppm_p6(w.to_u32(), h.to_u32(), pixels)
+    if file_write_bytes(path, bytes):
+        print "wrote {path} ({w}x{h}, {bytes.len()} bytes)"
+    else:
+        print "failed to write {path}"
+
+# Count differing pixels inside a rect (clamped to the frame).
+fn count_diffs_all(before: [u32], after: [u32]) -> i64:
+    var count = 0i64
+    var i = 0
+    val n = before.len()
+    while i < n:
+        if before[i] != after[i]:
+            count = count + 1
+        i = i + 1
+    count
+
+# Offscreen event-driven mode (W1/G1.5): render a baseline frame, apply each
+# synthetic event with a re-render, then verify the before/after frames differ
+# ONLY inside the targeted widgets' grid cells (region-scoped oracle).
+fn run_showcase_events(w: i32, h: i32, events_raw: text) -> i64:
+    """Synthetic event mode (W1/G1.5): every event must reach the SHARED
+    reducer and be recorded there.
+
+    Two independent verdicts per event, both required:
+      1. the SHARED click counter advanced (the reducer saw the stimulus), and
+      2. the frame CHANGED (the response reached pixels).
+
+    Check 2 was demoted to an observation for one campaign step, because the
+    shared tree's response to a click is a probe-pane LABEL rewrite and the
+    scene emitted text runs with glyph_count=0 -- so a click legitimately
+    produced a byte-identical frame and a pixel verdict would have been a
+    permanent false red. That defect is fixed (glyph synthesis in
+    widget_draw_ir), measured here as frame_diff 0 -> 119/29/91, so the
+    docstring's own instruction to re-promote it is now carried out.
+
+    Keeping check 2 demoted would be the worse failure: with it off, a scene
+    that silently stopped painting entirely would still report PASS on every
+    event."""
+    var st = showcase_state_sized(w, h)
+    val before = build_frame_state(w, h, st)
+    if before.len() < w * h:
+        return 1
+    write_frame_ppm(env_get("SHOWCASE_BEFORE_PPM") ?? "", before, w, h)
+
+    val events = events_raw.split(",")
+    var after: [u32] = before
+    var prev: [u32] = before
+    var fails = 0
+    var applied = 0
+    for ev in events:
+        if ev == "":
+            continue
+        if showcase_event_cell(ev) < 0:
+            print "FAIL showcase_event={ev} reason=unknown-event"
+            fails = fails + 1
+            continue
+        val clicks_before = showcase_click_count(SHOWCASE_PREFIX)
+        st = apply_showcase_event(st, ev)
+        val clicks_after = showcase_click_count(SHOWCASE_PREFIX)
+        after = build_frame_state(w, h, st)
+        applied = applied + 1
+        val d = count_diffs_all(prev, after)
+        if clicks_after <= clicks_before:
+            print "FAIL showcase_event={ev} reason=reducer-did-not-record shared_clicks={clicks_after} frame_diff={d}"
+            fails = fails + 1
+        else if d <= 0:
+            # The reducer recorded the click but nothing reached the frame.
+            # That is the zero-glyph class of defect, and it must be RED here
+            # rather than a passing line with a quiet frame_diff=0 beside it.
+            print "FAIL showcase_event={ev} reason=no-visible-response shared_clicks={clicks_before}->{clicks_after} frame_diff={d}"
+            fails = fails + 1
+        else:
+            print "PASS showcase_event={ev} shared_clicks={clicks_before}->{clicks_after} frame_diff={d}"
+        prev = after
+    write_frame_ppm(env_get("SHOWCASE_AFTER_PPM") ?? "", after, w, h)
+
+    val total_diff = count_diffs_all(before, after)
+    print "showcase_event_frame_diff_total={total_diff}"
+    if total_diff <= 0 and applied > 0:
+        print "FAIL showcase_event_overall reason=no-net-frame-change events={applied}"
+        return 1
+    if fails == 0:
+        print "PASS showcase_event_overall events={applied}"
+        return 0
+    print "FAIL showcase_event_overall fails={fails}"
+    1
+
+fn pack(src: [u32]) -> [i64]:
+    var out: [i64] = alloc_i64(src.len().to_i64())
+    var i = 0
+    val n = src.len()
+    while i < n:
+        out[i] = src[i].to_i64() & 0xFFFFFF
+        i = i + 1
+    out
+
+fn showcase_should_close(input: WinitInput) -> bool:
+    if input.close:
+        return true
+    for k in input.keys:
+        if k == 27 or k == 113 or k == 81:
+            return true
+    false
+
+fn wm_env_path_or(default_path: text, key: text) -> text:
+    val raw = env_get(key) ?? ""
+    if raw == "":
+        return default_path
+    raw
+
+fn write_wm_frame(frame_path: text, seq_path: text, seq: i64, frame_w: i32, frame_h: i32, pixels: [u32]) -> bool:
+    val frame_bytes = encode_ppm_p6(frame_w.to_u32(), frame_h.to_u32(), pixels)
+    if frame_bytes.len() == 0 or not file_write_bytes(frame_path, frame_bytes):
+        return false
+    file_write(seq_path, seq.to_text())
+
+fn write_wm_state(state_path: text, state: ShowcaseState, event_seq: i64, frame_seq: i64, frame_scale: i32) -> bool:
+    file_write(state_path,
+        "frame_seq={frame_seq}\n" +
+        "event_seq={event_seq}\n" +
+        "frame_scale={frame_scale}\n" +
+        "button_count={state.button_count}\n" +
+        "checkbox_on={state.checkbox_on}\n" +
+        "switch_on={state.switch_on}\n" +
+        "slider_value={state.slider_value}\n" +
+        "progress_value={state.progress_value}\n")
+
+fn consume_wm_event(event_path: text, last_seq: i64, state: ShowcaseState, coord_scale: i32) -> (ShowcaseState, i64, bool):
+    if event_path == "":
+        return (state, last_seq, false)
+    val next_seq_path = wm_fs_app_event_seq_path(event_path, last_seq + 1)
+    var body = ""
+    if file_exists(next_seq_path):
+        body = file_read(next_seq_path)
+    elif file_exists(event_path):
+        body = file_read(event_path)
+    if body == "":
+        return (state, last_seq, false)
+    val ev = wm_fs_app_event_decode(body)
+    if ev.seq <= last_seq:
+        return (state, last_seq, false)
+    var next_state = showcase_on_pointer(state, ev.kind, ev.x * coord_scale, ev.y * coord_scale, ev.pressed)
+    if coord_scale > 1 and showcase_state_same(next_state, state):
+        next_state = showcase_on_pointer(state, ev.kind, ev.x, ev.y, ev.pressed)
+    (next_state, ev.seq, not showcase_state_same(next_state, state))
+
+fn build_wm_pixels(w: i32, h: i32, state: ShowcaseState, frame_scale: i32) -> [u32]:
+    # Render DIRECTLY at the output size instead of rendering the full 4K
+    # design frame and downsampling: the interpreted 4K render takes >>300s,
+    # so the WM client never reached its bridge post (silent host-side
+    # child-bridge-timeout, 2026-07-18). build_frame_state scales honestly
+    # to any target size.
+    if frame_scale > 1:
+        return build_frame_state(w / frame_scale, h / frame_scale, state)
+    build_frame_state(w, h, state)
+
+fn run_wm_client() -> i64:
+    val bridge_path = env_get(WM_BRIDGE_FILE_ENV) ?? ""
+    val frame_path = env_get(WM_FRAME_FILE_ENV) ?? ""
+    if bridge_path == "" or frame_path == "":
+        print "[wm-showcase-client] error=missing-bridge-env"
+        return 2
+    val event_path = wm_env_path_or(wm_widget_showcase_event_path(frame_path), WM_EVENT_FILE_ENV)
+    val seq_path = wm_env_path_or(wm_widget_showcase_frame_seq_path(frame_path), WM_FRAME_SEQ_FILE_ENV)
+    val state_path = frame_path + ".state"
+    var state = showcase_state_sized(W / showcase_ppm_scale(), H / showcase_ppm_scale())
+    val _tree = showcase_ui_tree(state)
+    var frame_seq = 1
+    val frame_scale = showcase_ppm_scale()
+    val frame_w = W / frame_scale
+    val frame_h = H / frame_scale
+    # Bridge FIRST, frame second: the host's window/bridge wait must not sit
+    # behind the (interpreted, slow) first render. Dimensions are known
+    # up-front; the host polls frame_seq separately and tolerates the first
+    # frame arriving after the window opens.
+    val pid = getpid()
+    val requested_backend = showcase_backend_key()
+    val req = wm_widget_showcase_bridge_request_sized_with_backend(
+        pid,
+        frame_path,
+        frame_w + 8,
+        frame_h + 32,
+        requested_backend
+    )
+    if not file_write(bridge_path, wm_fs_bridge_encode(req)):
+        print "[wm-showcase-client] error=bridge-write-failed path={bridge_path}"
+        return 1
+    val pixels = build_wm_pixels(W, H, state, frame_scale)
+    if pixels.len() < frame_w * frame_h or not write_wm_frame(frame_path, seq_path, frame_seq, frame_w, frame_h, pixels):
+        print "[wm-showcase-client] error=frame-write-failed path={frame_path}"
+        return 1
+    write_wm_state(state_path, state, 0, frame_seq, frame_scale)
+    wm_client_log("[wm-showcase-client] source={WIDGET_SHOWCASE_APP_SOURCE} pid={pid} bridge={bridge_path} frame={frame_path} event={event_path} seq={seq_path}")
+    if (env_get(WM_CLIENT_HOLD_ENV) ?? "") == "1":
+        var ticks = 0
+        var last_event_seq = 0
+        while ticks < 2000000:
+            var drain = 0
+            var consumed_event = false
+            var render_dirty = false
+            while drain < WM_CLIENT_DRAIN_LIMIT:
+                val (event_state, event_seq, event_dirty) = consume_wm_event(event_path, last_event_seq, state, frame_scale)
+                if event_seq <= last_event_seq:
+                    drain = WM_CLIENT_DRAIN_LIMIT
+                else:
+                    consumed_event = true
+                    last_event_seq = event_seq
+                    if event_dirty:
+                        state = event_state
+                        render_dirty = true
+                    drain = drain + 1
+            if render_dirty:
+                frame_seq = frame_seq + 1
+                val next_pixels = build_wm_pixels(W, H, state, frame_scale)
+                if next_pixels.len() < frame_w * frame_h or not write_wm_frame(frame_path, seq_path, frame_seq, frame_w, frame_h, next_pixels):
+                    print "[wm-showcase-client] error=frame-refresh-failed path={frame_path}"
+                    return 1
+                write_wm_state(state_path, state, last_event_seq, frame_seq, frame_scale)
+                wm_client_log("[wm-showcase-client] frame seq={frame_seq} event_seq={last_event_seq} clicks={state.button_count} checkbox={state.checkbox_on} switch={state.switch_on} slider={state.slider_value} progress={state.progress_value}")
+            elif consumed_event:
+                write_wm_state(state_path, state, last_event_seq, frame_seq, frame_scale)
+            if consumed_event:
+                thread_sleep(1)
+            else:
+                thread_sleep(30)
+            ticks = ticks + 1
+    0
+
+fn apply_native_input(input: WinitInput, mouse_x: i32, mouse_y: i32, state: ShowcaseState) -> (ShowcaseState, i32, i32, bool, bool):
+    var out = state
+    var mx = mouse_x
+    var my = mouse_y
+    var dirty = false
+    var running = true
+    if showcase_should_close(input):
+        running = false
+    if input.mouse_x != 0.0 or input.mouse_y != 0.0:
+        mx = input.mouse_x.to_i32()
+        my = input.mouse_y.to_i32()
+        if out.slider_dragging:
+            out = showcase_on_pointer(out, "move", mx, my, false)
+            dirty = true
+    var ci = 0
+    while ci < input.click_buttons.len():
+        val btn = input.click_buttons[ci]
+        val pressed = input.click_pressed[ci]
+        if btn == 0:
+            var fx = input.click_x[ci].to_i32()
+            var fy = input.click_y[ci].to_i32()
+            if fx == 0 and fy == 0:
+                fx = mx
+                fy = my
+            else:
+                mx = fx
+                my = fy
+            val kind = if pressed: "down" else: "up"
+            out = showcase_on_pointer(out, kind, fx, fy, pressed)
+            dirty = true
+            print "[widget-showcase] input left_button pressed={pressed} x={fx} y={fy} clicks={out.button_count} checkbox={out.checkbox_on} switch={out.switch_on} slider={out.slider_value}"
+        ci = ci + 1
+    # Wheel goes through the SHARED reducer: this is the one showcase
+    # interaction whose result is visible in the current scene (it moves real
+    # row geometry), so it is also the only one that can satisfy the live
+    # loop's "every real input changes the frame" gate until the scene emits
+    # glyphs. Positive dy = content scrolls down, the sign the reducer wants.
+    if input.scroll_y != 0.0:
+        out.ui = showcase_apply(out.ui, host_pointer_wheel(mx, my, input.scroll_y.to_i32()), out.vw, out.vh)
+        dirty = true
+    # Keys go through the SHARED reducer too. Without this a keyboard-only
+    # input batch would leave the scene byte-identical and the live loop's
+    # "every real input changes the frame" gate would fail.
+    var ki = 0
+    while ki < input.keys.len():
+        out.ui = showcase_apply(out.ui, host_key_down(input.keys[ki], "", 0), out.vw, out.vh)
+        dirty = true
+        ki = ki + 1
+    (out, mx, my, dirty, running)
+
+fn main() -> i64:
+    if (env_get("SHOWCASE_4K_PERF") ?? "") == "1":
+        return run_4k_perf_probe()
+    if (env_get("SHOWCASE_8K_PERF") ?? "") == "1":
+        return run_8k_perf_probe()
+    if wm_app_mode_is_client(env_get(WM_APP_MODE_ENV) ?? ""):
+        return run_wm_client()
+
+    # Frame size: SHOWCASE_RESOLUTION picks the default ("4k" == 3840x2160
+    # unless unset/"4k"; "8k" == 7680x4320; or an explicit "WxH"). SHOWCASE_W/
+    # SHOWCASE_H (low-res gates) override that default when set.
+    val default_wh = showcase_resolution_wh()
+    val default_w = default_wh.0
+    val default_h = default_wh.1
+    val w_raw = env_get("SHOWCASE_W") ?? ""
+    val h_raw = env_get("SHOWCASE_H") ?? ""
+    val fw0 = (w_raw.parse_i64() ?? default_w.to_i64()).to_i32()
+    val fh0 = (h_raw.parse_i64() ?? default_h.to_i64()).to_i32()
+    val fw = if fw0 < 64: default_w else: fw0
+    val fh = if fh0 < 64: default_h else: fh0
+
+    emit_renderer_log(showcase_backend_key(), fw, fh)
+
+    # Synthetic event mode: offscreen only, no winit (W1/G1.5).
+    val events_raw = env_get("SHOWCASE_EVENTS") ?? ""
+    if events_raw != "":
+        print "Widget showcase GUI — synthetic event mode {fw}x{fh}"
+        return run_showcase_events(fw, fh, events_raw)
+
+    print "Widget showcase GUI — render {fw}x{fh} via the shared showcase tree -> DrawIrV3 -> Engine2D {showcase_backend_key()} lane"
+    var state = showcase_state_sized(fw, fh)
+    val _tree = showcase_ui_tree(state)
+    # ONE persistent render session for the app's whole lifetime (created once,
+    # reused across every redraw, shut down on every exit path) — never a
+    # per-frame create. For metal this keeps the GPU device/queue/framebuffer
+    # alive across frames.
+    var engine = showcase_engine_create(fw, fh)
+    # Draw the full widget gallery once with its compact built-in label path.
+    # Loading a vector face before this draw makes every label size a separate
+    # cold vector workload and obscures backend correctness behind startup
+    # cost. A visible, bounded vector run is overlaid below instead.
+    val (engine_after_first, widget_pixels) = build_frame_state_into(engine, fw, fh, state)
+    engine = engine_after_first
+    if widget_pixels.len() < fw * fh:
+        engine.shutdown()
+        return 1
+    # Keep the live GUI gate bounded: the static Bungee face is 118,996 bytes,
+    # while the catalog's first CJK variable face is 17,772,300 bytes. Both use
+    # the same canonical FontRenderer/backend path, but the small pinned face
+    # avoids turning startup validation into a multi-minute allocation spike.
+    val font_candidate = selected_font_asset_candidates()[9]
+    val expected_font_identity = selected_font_asset_identity(font_candidate)
+    val font_loaded = engine.load_font(font_candidate.local_path)
+    val font_stats_before = engine.font_cache_stats()
+    val vector_font_size = sc1(10, showcase_dpi() * 1000 / 96)
+    val vector_font_y = if fh > vector_font_size + 8: fh - vector_font_size - 4 else: 4
+    engine.draw_text(8, vector_font_y, "VECTOR GUI", WHITE, vector_font_size)
+    val font_stats_cold = engine.font_cache_stats()
+    # The second identical draw must reuse glyph material while preserving a
+    # visible vector-font witness in the captured initial frame.
+    engine.draw_text(8, vector_font_y, "VECTOR GUI", WHITE, vector_font_size)
+    val font_stats_warm = engine.font_cache_stats()
+    val loaded_fonts = engine.fonts()
+    val loaded_font_identity = loaded_fonts.current_font_identity()
+    engine.install_font_renderer(loaded_fonts)
+    val font_execution_target = engine.font_execution_target()
+    val font_execution_attempts = engine.font_execution_attempts().join(",")
+    val font_backend_attempt_succeeded = if showcase_gpu_backend_requested(showcase_backend_key()):
+        font_execution_target == showcase_backend_key()
+    else:
+        font_execution_target == "cpu"
+    val font_cold_rasterizations = font_stats_cold.rasterizations - font_stats_before.rasterizations
+    val font_warm_rasterizations = font_stats_warm.rasterizations - font_stats_cold.rasterizations
+    val font_warm_hits = font_stats_warm.hits - font_stats_cold.hits
+    # Honest frame provenance (one line, greppable): for metal this must say
+    # source=device_readback — a cpu_mirror source means the GPU lane silently
+    # fell back and must not be presented as GPU rendering.
+    val prov = engine.read_pixels_with_source()
+    val pixels = prov.pixels
+    if pixels.len() < fw * fh:
+        engine.shutdown()
+        return 1
+    print "showcase_frame_backend={engine.backend_name()};source={prov.source};checksum={prov.checksum}"
+    print "showcase_frame_backend_handle={prov.backend_handle}"
+    print "showcase_frame_dimensions={fw}x{fh}"
+    print "showcase_frame_dpi={showcase_dpi()}"
+    print "showcase_vulkan_fallback_reason={engine.vulkan_cpu_fallback_reason()}"
+    print "showcase_font_loaded={font_loaded}"
+    print "showcase_font_expected_identity={expected_font_identity}"
+    print "showcase_font_identity={loaded_font_identity}"
+    print "showcase_font_cold_rasterizations={font_cold_rasterizations}"
+    print "showcase_font_warm_rasterizations={font_warm_rasterizations}"
+    print "showcase_font_warm_hits={font_warm_hits}"
+    print "showcase_font_execution_target={font_execution_target}"
+    print "showcase_font_execution_attempts={font_execution_attempts}"
+    print "showcase_font_backend_attempt_succeeded={font_backend_attempt_succeeded}"
+    print "rendered {pixels.len()} px from the shared showcase widget tree"
+    if (not font_loaded or loaded_font_identity != expected_font_identity or
+            font_cold_rasterizations <= 0 or font_warm_rasterizations != 0 or
+            font_warm_hits <= 0 or not font_backend_attempt_succeeded):
+        engine.shutdown()
+        return 1
+    # Subsequent interactive widget redraws use the compact label path again;
+    # the captured initial frame and evidence above retain the real vector run.
+    engine.unload_font()
+
+    # Capture the framebuffer to a P6 PPM (absolute oracle) when SHOWCASE_PPM is set.
+    val ppm_path = env_get("SHOWCASE_PPM") ?? ""
+    if ppm_path != "":
+        val scale = showcase_ppm_scale()
+        val ppm_pixels = downsample_nearest(pixels, fw, fh, scale)
+        val ppm_w = fw / scale
+        val ppm_h = fh / scale
+        val bytes = encode_ppm_p6(ppm_w.to_u32(), ppm_h.to_u32(), ppm_pixels)
+        if file_write_bytes(ppm_path, bytes):
+            print "wrote {ppm_path} ({ppm_w}x{ppm_h}, {bytes.len()} bytes)"
+        else:
+            print "failed to write {ppm_path}"
+
+    if (env_get("SIMPLE_GUI") ?? "") != "1":
+        print "No GUI requested (use scripts/gui/macos-gui-run.shs to open a window); headless only."
+        engine.shutdown()
+        return 0
+
+    val lp = winit_loop_new()
+    if not lp.is_valid:
+        print "No GUI runtime available."
+        engine.shutdown()
+        return 1
+    val win = winit_window_new(lp, fw.to_i64(), fh.to_i64(), widget_showcase_window_title(showcase_backend_key()))
+    if not win.is_valid:
+        winit_loop_free(lp)
+        engine.shutdown()
+        return 1
+
+    var packed = pack(pixels)
+    var running = true
+    var iters = 0
+    var mouse_x = 0
+    var mouse_y = 0
+    var last_tick = time_now_micros()
+    val event_path = env_get("SIMPLE_GUI_EVENT_EVIDENCE_PATH") ?? ""
+    val exit_after_interaction = (env_get("SIMPLE_GUI_EXIT_AFTER_INTERACTION") ?? "") == "1"
+    var keyboard_events: i64 = 0
+    var pointer_events: i64 = 0
+    var click_events: i64 = 0
+    var interaction_revision: i64 = 0
+    var interaction_checksum = prov.checksum
+    var current_source = prov.source
+    var current_handle = prov.backend_handle
+    # GUI-5a: present once up front so the initial frame is shown, then only
+    # on dirty — avoids presenting the unchanged frame on every ~30ms tick.
+    winit_present_rgba(win, fw.to_i64(), fh.to_i64(), packed)
+    if not write_widget_event_evidence(
+            event_path, engine.backend_name(), current_source, current_handle,
+            prov.checksum, interaction_checksum, keyboard_events,
+            pointer_events, click_events, interaction_revision):
+        winit_window_free(win)
+        winit_loop_free(lp)
+        engine.shutdown()
+        return 1
+    while running and iters < 2000000:
+        val input = winit_poll_input(lp)
+        val (next_state, next_mx, next_my, input_dirty, next_running) = apply_native_input(input, mouse_x, mouse_y, state)
+        state = next_state
+        mouse_x = next_mx
+        mouse_y = next_my
+        running = next_running
+        var dirty = input_dirty
+        val keyboard_delta = input.keys.len().to_i64()
+        val pointer_delta = input.mouse_moves
+        val click_delta = input.click_buttons.len().to_i64()
+        keyboard_events = keyboard_events + keyboard_delta
+        pointer_events = pointer_events + pointer_delta
+        click_events = click_events + click_delta
+        val real_input = keyboard_delta > 0 or pointer_delta > 0 or click_delta > 0
+        if real_input:
+            interaction_revision = interaction_revision + 1
+            # Every real input batch changes a visible widget, including a
+            # pointer move or click outside a widget's ordinary hit target.
+            state.progress_value = (state.progress_value + 7) % 101
+            dirty = true
+        val now = time_now_micros()
+        if now - last_tick >= 500000:
+            state = showcase_on_tick(state)
+            last_tick = now
+            dirty = true
+        if dirty:
+            # Repaint into the SAME persistent session (no create/shutdown per
+            # redraw — the session-reuse delta is measured in the gpu-offload
+            # evidence harness).
+            val (engine_after_redraw, next_pixels) = build_frame_state_into(engine, fw, fh, state)
+            engine = engine_after_redraw
+            if next_pixels.len() < fw * fh:
+                winit_window_free(win)
+                winit_loop_free(lp)
+                engine.shutdown()
+                return 1
+            packed = pack(next_pixels)
+            winit_present_rgba(win, fw.to_i64(), fh.to_i64(), packed)
+            if real_input:
+                val interaction_prov = engine.read_pixels_with_source()
+                interaction_checksum = interaction_prov.checksum
+                current_source = interaction_prov.source
+                current_handle = interaction_prov.backend_handle
+                if (current_source != prov.source or
+                        current_handle != prov.backend_handle or
+                        interaction_checksum == prov.checksum or
+                        not write_widget_event_evidence(
+                            event_path, engine.backend_name(), current_source,
+                            current_handle, prov.checksum, interaction_checksum,
+                            keyboard_events, pointer_events, click_events,
+                            interaction_revision)):
+                    winit_window_free(win)
+                    winit_loop_free(lp)
+                    engine.shutdown()
+                    return 1
+                print "widget_showcase_event_revision={interaction_revision}"
+                print "widget_showcase_event_checksum={interaction_checksum}"
+                if (exit_after_interaction and keyboard_events > 0 and
+                        pointer_events > 0 and click_events > 0):
+                    running = false
+        thread_sleep(30)
+        iters = iters + 1
+    winit_window_free(win)
+    winit_loop_free(lp)
+    engine.shutdown()
+    return 0

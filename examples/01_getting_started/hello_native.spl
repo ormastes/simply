@@ -1,0 +1,3 @@
+# Hello World - can be compiled to a native binary
+# Usage: simple native-build --entry examples/01_getting_started/hello_native.spl -o hello --entry-closure --runtime-bundle auto && ./hello
+print "Hello World"

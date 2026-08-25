@@ -1,0 +1,6 @@
+# TRACE32 catalog key extraction shared by window, action, and bridge modules.
+
+fn t32_key_before_pipe(entry: text) -> text:
+    entry.split("|")[0]
+
+export t32_key_before_pipe

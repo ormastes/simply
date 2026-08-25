@@ -1,0 +1,180 @@
+# 18. Thread Hierarchy - Grid/Block Configurations
+#
+# Five kernels over the same data showing how the grid/block shape decides
+# which thread touches which element:
+#   1. 1D grid, one thread per element        (vec_add_1d)
+#   2. 2D grid, one thread per matrix element (mat_add_2d)
+#   3. 1D grid, one thread per matrix ROW     (matmul_row_per_thread)
+#   4. 2D grid, one thread per output element (matmul_2d)
+#   5. 1D grid smaller than the data: grid-stride loop (vec_add_grid_stride)
+#
+# C/CUDA equivalent (grid-stride):
+#   __global__ void vec_add_grid_stride(float *a, float *b, float *c, int n) {
+#       int stride = gridDim.x * blockDim.x;
+#       for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride)
+#           c[i] = a[i] + b[i];
+#   }
+#
+# Index builtins: gpu_local_id_{x,y} = threadIdx, gpu_block_id_{x,y} = blockIdx,
+# gpu_block_dim_{x,y} = blockDim, gpu_grid_dim_{x,y} = gridDim.
+
+use std.gpu.*
+
+# ============================================================================
+# Kernels
+# ============================================================================
+
+@gpu_kernel
+fn vec_add_1d(a: GpuPtr, b: GpuPtr, c: GpuPtr, n: i64):
+    val idx = gpu_block_id_x() * gpu_block_dim_x() + gpu_local_id_x()
+    if idx < n:
+        gpu_store_f32(c, idx, gpu_load_f32(a, idx) + gpu_load_f32(b, idx))
+
+@gpu_kernel
+fn mat_add_2d(a: GpuPtr, b: GpuPtr, c: GpuPtr, rows: i64, cols: i64):
+    val col = gpu_block_id_x() * gpu_block_dim_x() + gpu_local_id_x()
+    val row = gpu_block_id_y() * gpu_block_dim_y() + gpu_local_id_y()
+    if row < rows and col < cols:
+        val idx = row * cols + col
+        gpu_store_f32(c, idx, gpu_load_f32(a, idx) + gpu_load_f32(b, idx))
+
+@gpu_kernel
+fn matmul_row_per_thread(a: GpuPtr, b: GpuPtr, c: GpuPtr, n: i64):
+    val row = gpu_block_id_x() * gpu_block_dim_x() + gpu_local_id_x()
+    if row < n:
+        var col = 0
+        while col < n:
+            var sum = 0.0
+            var k = 0
+            while k < n:
+                sum = sum + gpu_load_f32(a, row * n + k) * gpu_load_f32(b, k * n + col)
+                k = k + 1
+            gpu_store_f32(c, row * n + col, sum)
+            col = col + 1
+
+@gpu_kernel
+fn matmul_2d(a: GpuPtr, b: GpuPtr, c: GpuPtr, n: i64):
+    val col = gpu_block_id_x() * gpu_block_dim_x() + gpu_local_id_x()
+    val row = gpu_block_id_y() * gpu_block_dim_y() + gpu_local_id_y()
+    if row < n and col < n:
+        var sum = 0.0
+        var k = 0
+        while k < n:
+            sum = sum + gpu_load_f32(a, row * n + k) * gpu_load_f32(b, k * n + col)
+            k = k + 1
+        gpu_store_f32(c, row * n + col, sum)
+
+@gpu_kernel
+fn vec_add_grid_stride(a: GpuPtr, b: GpuPtr, c: GpuPtr, n: i64):
+    val stride = gpu_grid_dim_x() * gpu_block_dim_x()
+    var idx = gpu_block_id_x() * gpu_block_dim_x() + gpu_local_id_x()
+    while idx < n:
+        gpu_store_f32(c, idx, gpu_load_f32(a, idx) + gpu_load_f32(b, idx))
+        idx = idx + stride
+
+# ============================================================================
+# Host helpers (pure - also used by spec.spl)
+# ============================================================================
+
+fn create_vec(n: i64, fill: f32) -> [f32]:
+    [for i in 0..n: fill]
+
+fn blocks_for(total: i64, block_size: i64) -> i64:
+    (total + block_size - 1) / block_size
+
+fn grid_stride_iterations(n: i64, blocks: i64, block_size: i64) -> i64:
+    # How many elements the FIRST thread of a grid-stride loop visits.
+    val stride = blocks * block_size
+    (n + stride - 1) / stride
+
+# ============================================================================
+# Host drivers: allocate, upload, launch, download
+# ============================================================================
+
+struct Launch:
+    gx: i64
+    gy: i64
+    bx: i64
+    by: i64
+
+fn with_buffers(a_host: [f32], b_host: [f32], out_len: i64, kernel_id: i64, cfg: Launch, p: i64, q: i64) -> Result<[f32], GpuError>:
+    val a_dev = gpu_alloc(a_host.len() * 4)?
+    val b_dev = gpu_alloc(b_host.len() * 4)?
+    val c_dev = gpu_alloc(out_len * 4)?
+    gpu_upload_f32(a_dev, a_host)?
+    gpu_upload_f32(b_dev, b_host)?
+    if kernel_id == 1:
+        vec_add_1d<<<grid: (cfg.gx, cfg.gy, 1), block: (cfg.bx, cfg.by, 1)>>>(a_dev, b_dev, c_dev, p)
+    elif kernel_id == 2:
+        mat_add_2d<<<grid: (cfg.gx, cfg.gy, 1), block: (cfg.bx, cfg.by, 1)>>>(a_dev, b_dev, c_dev, p, q)
+    elif kernel_id == 3:
+        matmul_row_per_thread<<<grid: (cfg.gx, cfg.gy, 1), block: (cfg.bx, cfg.by, 1)>>>(a_dev, b_dev, c_dev, p)
+    elif kernel_id == 4:
+        matmul_2d<<<grid: (cfg.gx, cfg.gy, 1), block: (cfg.bx, cfg.by, 1)>>>(a_dev, b_dev, c_dev, p)
+    else:
+        vec_add_grid_stride<<<grid: (cfg.gx, cfg.gy, 1), block: (cfg.bx, cfg.by, 1)>>>(a_dev, b_dev, c_dev, p)
+    gpu_sync()?
+    val result = gpu_download_f32(c_dev, out_len)?
+    gpu_free(a_dev)?
+    gpu_free(b_dev)?
+    gpu_free(c_dev)?
+    Ok(result)
+
+fn run_vec_add_1d(a: [f32], b: [f32], n: i64) -> Result<[f32], GpuError>:
+    with_buffers(a, b, n, 1, Launch(gx: blocks_for(n, 256), gy: 1, bx: 256, by: 1), n, 0)
+
+fn run_mat_add_2d(a: [f32], b: [f32], rows: i64, cols: i64) -> Result<[f32], GpuError>:
+    with_buffers(a, b, rows * cols, 2, Launch(gx: blocks_for(cols, 16), gy: blocks_for(rows, 16), bx: 16, by: 16), rows, cols)
+
+fn run_matmul_row(a: [f32], b: [f32], n: i64) -> Result<[f32], GpuError>:
+    with_buffers(a, b, n * n, 3, Launch(gx: blocks_for(n, 128), gy: 1, bx: 128, by: 1), n, 0)
+
+fn run_matmul_2d(a: [f32], b: [f32], n: i64) -> Result<[f32], GpuError>:
+    with_buffers(a, b, n * n, 4, Launch(gx: blocks_for(n, 16), gy: blocks_for(n, 16), bx: 16, by: 16), n, 0)
+
+fn run_vec_add_grid_stride(a: [f32], b: [f32], n: i64) -> Result<[f32], GpuError>:
+    # Deliberately only 32 blocks: each thread loops over several elements.
+    with_buffers(a, b, n, 5, Launch(gx: 32, gy: 1, bx: 256, by: 1), n, 0)
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn run() -> Result<(), GpuError>:
+    val n = 64
+    gpu_init()?
+    gpu_set_device(0)?
+
+    val va = create_vec(n * n, 1.0)
+    val vb = create_vec(n * n, 2.0)
+
+    print "1D vec_add: {n * n} elements, {blocks_for(n * n, 256)} blocks x 256 threads..."
+    val r1 = run_vec_add_1d(va, vb, n * n)?
+    print "  result[0] = {r1[0]} (expected 3.0)"
+
+    print "2D mat_add: {n}x{n} matrix, {blocks_for(n, 16)}x{blocks_for(n, 16)} blocks of 16x16..."
+    val r2 = run_mat_add_2d(va, vb, n, n)?
+    print "  result[0] = {r2[0]} (expected 3.0)"
+
+    val ones = create_vec(n * n, 1.0)
+    print "Row-per-thread matmul: {n}x{n}, {blocks_for(n, 128)} block x 128 threads..."
+    val r3 = run_matmul_row(ones, ones, n)?
+    print "  result[0] = {r3[0]} (expected {n}.0)"
+
+    print "2D matmul: {n}x{n}, 16x16 blocks..."
+    val r4 = run_matmul_2d(ones, ones, n)?
+    print "  result[0] = {r4[0]} (expected {n}.0)"
+
+    print "Grid-stride vec_add: {n * n} elements, only 32 blocks ({grid_stride_iterations(n * n, 32, 256)} iteration(s) per thread)..."
+    val r5 = run_vec_add_grid_stride(va, vb, n * n)?
+    print "  result[0] = {r5[0]} (expected 3.0)"
+
+    print "All thread hierarchy variants complete."
+    Ok(())
+
+fn main():
+    match run():
+        case Ok(_):
+            print "=== Done ==="
+        case Err(e):
+            print "GPU error: {e.to_text()}"

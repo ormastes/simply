@@ -1,0 +1,47 @@
+app:
+    title: "Simple UI Demo"
+    mode: normal
+    theme: glass_dark
+
+layout:
+    type: vbox
+    children:
+        menu:
+            type: menubar
+            id: menu
+        main_layout:
+            type: hbox
+            id: main_layout
+            children:
+                sidebar:
+                    type: panel
+                    id: sidebar
+                    width: 30
+                    title: Navigation
+                    children:
+                        nav_list:
+                            type: list
+                            id: nav_list
+                content:
+                    type: panel
+                    id: content
+                    flex: 1
+                    title: Content
+                    children:
+                        welcome_text:
+                            type: text
+                            id: welcome_text
+                            content: "Welcome to the Simple UI Demo!"
+                        info_text:
+                            type: text
+                            id: info_text
+                            content: "Use j/k to navigate, : for commands, q to quit."
+                        build_progress:
+                            type: progress
+                            id: build_progress
+                            value: 75
+        status:
+            type: statusbar
+            id: status
+            left: "NORMAL MODE"
+            right: "Simple UI Demo"

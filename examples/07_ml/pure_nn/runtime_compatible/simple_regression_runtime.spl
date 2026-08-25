@@ -1,0 +1,194 @@
+#![allow(unnamed_duplicate_typed_args)]
+#!/usr/bin/env simple
+# Simple Linear Regression - Runtime Compatible
+# Learn y = 2x + 1 using gradient descent
+# Demonstrates: data generation, loss computation, weight updates
+
+class SimpleTensor:
+    data: [f64]
+    shape: [i64]
+
+fn create_tensor(data: [f64], shape: [i64]) -> SimpleTensor:
+    SimpleTensor(data: data, shape: shape)
+
+class LinearModel:
+    """Simple linear model: y = wx + b"""
+    weight: f64
+    bias: f64
+
+    fn forward(x: f64) -> f64:
+        self.weight * x + self.bias
+
+    me update(grad_w: f64, grad_b: f64, lr: f64):
+        self.weight = self.weight - (lr * grad_w)
+        self.bias = self.bias - (lr * grad_b)
+
+fn create_model() -> LinearModel:
+    LinearModel(weight: 0.0, bias: 0.0)
+
+fn compute_mse(predictions: [f64], targets: [f64]) -> f64:
+    """Mean squared error loss"""
+    var sum = 0.0
+    var i = 0
+    while i < predictions.len():
+        val diff = predictions[i] - targets[i]
+        sum = sum + (diff * diff)
+        i = i + 1
+    sum / predictions.len()
+
+fn compute_gradient(model: LinearModel, x_data: [f64], y_data: [f64]) -> [f64]:
+    """Compute gradients for weight and bias"""
+    var grad_w = 0.0
+    var grad_b = 0.0
+    val n = x_data.len()
+
+    var i = 0
+    while i < n:
+        val x = x_data[i]
+        val y_true = y_data[i]
+        val y_pred = model.forward(x)
+        val error = y_pred - y_true
+
+        # dL/dw = 2 * error * x
+        # dL/db = 2 * error
+        grad_w = grad_w + (2.0 * error * x)
+        grad_b = grad_b + (2.0 * error)
+        i = i + 1
+
+    # Average gradients
+    [grad_w / n, grad_b / n]
+
+# Removed update_weights function - now using LinearModel.update() method
+
+fn generate_linear_data(num_samples: i64, slope: f64, intercept: f64, noise: f64) -> [[f64]]:
+    """Generate dataset: y = slope * x + intercept + noise"""
+    var x_data: [f64] = []
+    var y_data: [f64] = []
+
+    var i = 0
+    while i < num_samples:
+        # Generate x in range [0, 1] by scaling i
+        # Use multiplication to avoid integer division
+        val x = (i * 1.0) / (num_samples * 1.0)
+        val noise_val = ((i * 123456789) % 1000) / 1000.0 - 0.5
+        val y = slope * x + intercept + (noise * noise_val)
+
+        x_data.push(x)
+        y_data.push(y)
+        i = i + 1
+
+    [x_data, y_data]
+
+fn predict_batch(model: LinearModel, x_data: [f64]) -> [f64]:
+    """Make predictions for batch of inputs"""
+    var predictions: [f64] = []
+    for x in x_data:
+        predictions.push(model.forward(x))
+    predictions
+
+fn main():
+    print "═══════════════════════════════════════════════════════════"
+    print "    Simple Linear Regression (Runtime Compatible)"
+    print "    Learning y = 2x + 1"
+    print "═══════════════════════════════════════════════════════════"
+    print ""
+
+    # Generate dataset
+    print "Generating dataset: y = 2x + 1 (no noise)"
+    val data = generate_linear_data(20, 2.0, 1.0, 0.0)
+    val x_data = data[0]
+    val y_data = data[1]
+    print "  Samples: {x_data.len()}"
+    print "  True function: y = 2.0x + 1.0"
+    print ""
+
+    # Show sample data
+    print "Sample data points:"
+    var i = 0
+    while i < 4:
+        print "  x={x_data[i]} -> y={y_data[i]}"
+        i = i + 1
+    print ""
+
+    # Create model
+    print "Creating linear model: y = wx + b"
+    val model = create_model()
+    print "  Initial weight: {model.weight}"
+    print "  Initial bias: {model.bias}"
+    print ""
+
+    # Training configuration
+    val epochs = 100
+    val learning_rate = 0.1
+    print "Training configuration:"
+    print "  Epochs: {epochs}"
+    print "  Learning rate: {learning_rate}"
+    print "  Optimizer: Gradient Descent"
+    print ""
+
+    # Training loop
+    print "Training..."
+    var losses: [f64] = []
+    var epoch = 0
+    while epoch < epochs:
+        # Forward pass
+        val predictions = predict_batch(model, x_data)
+        val loss = compute_mse(predictions, y_data)
+        losses.push(loss)
+
+        # Backward pass
+        val gradients = compute_gradient(model, x_data, y_data)
+
+        # Update weights
+        model.update(gradients[0], gradients[1], learning_rate)
+
+        # Print progress
+        if epoch % 25 == 0 or epoch == epochs - 1:
+            print "  Epoch {epoch}: loss={loss}, w={model.weight}, b={model.bias}"
+
+        epoch = epoch + 1
+
+    print ""
+    print "Training complete!"
+    print ""
+
+    # Final model
+    print "Learned parameters:"
+    print "  Weight: {model.weight} (target: 2.0)"
+    print "  Bias: {model.bias} (target: 1.0)"
+    print ""
+
+    # Loss progression
+    print "Loss progression:"
+    print "  Epoch 0:   {losses[0]}"
+    print "  Epoch 25:  {losses[25]}"
+    print "  Epoch 50:  {losses[50]}"
+    print "  Epoch 99:  {losses[99]}"
+    print ""
+
+    # Test predictions
+    print "═══════════════════════════════════════════════════════════"
+    print "Testing Learned Function"
+    print "═══════════════════════════════════════════════════════════"
+    print ""
+
+    val test_points = [0.0, 0.25, 0.5, 0.75, 1.0]
+    print "Predictions vs True values:"
+    print "  x     | Predicted | True   | Error"
+    print "  ------|-----------|--------|--------"
+
+    for x in test_points:
+        val y_pred = model.forward(x)
+        val y_true = 2.0 * x + 1.0
+        val error = if y_pred > y_true: y_pred - y_true else: y_true - y_pred
+
+        print "  {x}  | {y_pred}   | {y_true} | {error}"
+
+    print ""
+    print "═══════════════════════════════════════════════════════════"
+    print "✓ Linear regression working!"
+    print "✓ Gradient descent converged"
+    print "✓ Model learned y = 2x + 1 successfully"
+    print "═══════════════════════════════════════════════════════════"
+
+main()

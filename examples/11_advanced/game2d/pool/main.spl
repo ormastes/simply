@@ -1,0 +1,83 @@
+# Pool/Billiards — physics + game2d demo
+use std.nogc_sync_mut.game2d.app.run.{run}
+use std.nogc_sync_mut.game2d.input.api.{key_down}
+use std.nogc_sync_mut.game2d.input.keys.{Key}
+use std.nogc_sync_mut.game2d.render.canvas.{Canvas}
+use std.nogc_sync_mut.game2d.math.{DrawMode}
+use std.common.engine.ids.{NodeId}
+use std.common.engine.math2d.{Vec2}
+use std.common.engine.rect.{Rect2}
+use std.common.engine.color.{EngineColor}
+use std.nogc_sync_mut.engine.physics.config.{default_physics_config_2d}
+use std.nogc_sync_mut.engine.physics.world2d.{PhysicsWorld2D}
+
+fn node(i: i64) -> NodeId:
+    NodeId(raw: i)
+
+class Game:
+    world: PhysicsWorld2D
+    shot: bool
+
+    fn load(self):
+        pass_do_nothing
+
+    me update(self, dt: f32):
+        val _ = dt
+        if not self.shot:
+            if key_down(Key(32)):
+                self.world.apply_impulse(node(0), 8.0, 0.5)
+                self.shot = true
+
+    fn fixed_update(self, step: f32):
+        self.world.step(0.016)
+
+    fn draw(self, ctx: Canvas):
+        ctx.clear(EngineColor(r: 0.0, g: 0.5, b: 0.2, a: 1.0))
+        val brown = EngineColor(r: 0.4, g: 0.2, b: 0.05, a: 1.0)
+        ctx.rect(DrawMode.Fill, Rect2(x: 0.0, y: 0.0, width: 800.0, height: 25.0), brown)
+        ctx.rect(DrawMode.Fill, Rect2(x: 0.0, y: 575.0, width: 800.0, height: 25.0), brown)
+        ctx.rect(DrawMode.Fill, Rect2(x: 0.0, y: 0.0, width: 25.0, height: 600.0), brown)
+        ctx.rect(DrawMode.Fill, Rect2(x: 775.0, y: 0.0, width: 25.0, height: 600.0), brown)
+        var i = 0
+        while i < 11:
+            val pos = self.world.get_position(node(i))
+            val px = pos.x * 50.0
+            val py = pos.y * 50.0
+            val c = if i == 0: EngineColor(r: 1.0, g: 1.0, b: 1.0, a: 1.0) else: EngineColor(r: 1.0, g: 0.5, b: 0.0, a: 1.0)
+            ctx.circle(DrawMode.Fill, Vec2(x: px, y: py), 15.0, c)
+            i = i + 1
+        if not self.shot:
+            ctx.text("SPACE to shoot", Vec2(x: 300.0, y: 560.0), EngineColor(r: 1.0, g: 1.0, b: 1.0, a: 1.0))
+
+fn setup_world() -> PhysicsWorld2D:
+    var config = default_physics_config_2d()
+    config.gravity = Vec2(x: 0.0, y: 0.0)
+    config.restitution = 0.9
+    config.friction = 0.3
+    var world = PhysicsWorld2D.create(config)
+    world.add_static_body(node(100), 8.0, 0.2)
+    world.add_box_collider(node(100), 8.0, 0.3)
+    world.add_static_body(node(101), 8.0, 11.8)
+    world.add_box_collider(node(101), 8.0, 0.3)
+    world.add_static_body(node(102), 0.2, 6.0)
+    world.add_box_collider(node(102), 0.3, 6.0)
+    world.add_static_body(node(103), 15.8, 6.0)
+    world.add_box_collider(node(103), 0.3, 6.0)
+    world.add_dynamic_body(node(0), 4.0, 6.0, 1.0)
+    world.add_circle_collider(node(0), 0.3)
+    var idx = 1
+    var row = 0
+    while row < 4:
+        var col = 0
+        while col <= row:
+            val bx = 10.0 + row.to_f64() * 0.7
+            val by = 6.0 + (col.to_f64() - row.to_f64() * 0.5) * 0.7
+            world.add_dynamic_body(node(idx), bx, by, 1.0)
+            world.add_circle_collider(node(idx), 0.3)
+            idx = idx + 1
+            col = col + 1
+        row = row + 1
+    world
+
+fn main():
+    run(Game(world: setup_world(), shot: false), "Pool", 800, 600)

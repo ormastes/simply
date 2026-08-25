@@ -1,0 +1,76 @@
+# 71. MatMul SIMD vs GPU - Tests
+#
+# CPU-reference asserts run unconditionally: naive, Vec4f, Vec8f and the
+# std.gpu gemm (CPU fallback on this seed) must all agree exactly on small,
+# exactly-representable inputs.
+
+use std.gpu.*
+use self.main.{matmul_naive, matmul_simd_vec4f, matmul_simd_vec8f, matmul_gpu, transpose, blocks_for, max_abs_diff, TILE_SIZE}
+
+describe "MatMul SIMD vs GPU":
+    it "should compute naive matmul correctly":
+        val c = matmul_naive([1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0], 2, 2, 2)
+        # [1*5+2*7, 1*6+2*8, 3*5+4*7, 3*6+4*8] = [19, 22, 43, 50]
+        expect(c[0]).to_equal(19.0)
+        expect(c[1]).to_equal(22.0)
+        expect(c[2]).to_equal(43.0)
+        expect(c[3]).to_equal(50.0)
+
+    it "should compute SIMD Vec4f matmul correctly (k=4 uses one full lane group)":
+        # A = 1x4 row [1,2,3,4], B = 4x1 column [5,6,7,8] -> 70
+        val c = matmul_simd_vec4f([1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0], 1, 1, 4)
+        expect(c[0]).to_equal(70.0)
+
+    it "should handle SIMD remainder lanes (k=2 < 4)":
+        val c = matmul_simd_vec4f([1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0], 2, 2, 2)
+        expect(c[0]).to_equal(19.0)
+        expect(c[3]).to_equal(50.0)
+
+    it "should compute SIMD Vec8f matmul correctly on transposed B":
+        val n = 8
+        val a = [for i in 0..(n * n): 2.0]
+        val b = [for i in 0..(n * n): 3.0]
+        val c = matmul_simd_vec8f(a, transpose(b, n, n), n, n, n)
+        # each element = 8 * (2*3) = 48
+        expect(c[0]).to_equal(48.0)
+        expect(c[n * n - 1]).to_equal(48.0)
+
+    it "should compute GPU matmul correctly":
+        val c = matmul_gpu([1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0], 2, 2, 2)?
+        expect(c[0]).to_equal(19.0)
+        expect(c[1]).to_equal(22.0)
+        expect(c[2]).to_equal(43.0)
+        expect(c[3]).to_equal(50.0)
+
+    it "should agree between all implementations":
+        val n = 16
+        val a = [for i in 0..(n * n): ((i % 7) + 1) * 1.0]
+        val b = [for i in 0..(n * n): ((i % 5) + 1) * 1.0]
+        val c_naive = matmul_naive(a, b, n, n, n)
+        val c_simd4 = matmul_simd_vec4f(a, b, n, n, n)
+        val c_simd8 = matmul_simd_vec8f(a, transpose(b, n, n), n, n, n)
+        val c_gpu = matmul_gpu(a, b, n, n, n)?
+        expect(max_abs_diff(c_naive, c_simd4)).to_equal(0.0)
+        expect(max_abs_diff(c_naive, c_simd8)).to_equal(0.0)
+        expect(max_abs_diff(c_naive, c_gpu)).to_equal(0.0)
+
+    it "should handle identity matrix":
+        val c_naive = matmul_naive([1.0, 0.0, 0.0, 1.0], [3.0, 4.0, 5.0, 6.0], 2, 2, 2)
+        val c_gpu = matmul_gpu([1.0, 0.0, 0.0, 1.0], [3.0, 4.0, 5.0, 6.0], 2, 2, 2)?
+        expect(c_naive[0]).to_equal(3.0)
+        expect(c_naive[3]).to_equal(6.0)
+        expect(c_gpu[0]).to_equal(3.0)
+        expect(c_gpu[3]).to_equal(6.0)
+
+    it "should transpose correctly":
+        val t = transpose([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, 3)  # 2x3 -> 3x2
+        expect(t[0]).to_equal(1.0)
+        expect(t[1]).to_equal(4.0)
+        expect(t[2]).to_equal(2.0)
+        expect(t[3]).to_equal(5.0)
+
+    it "should size the GPU grid in TILE_SIZE blocks":
+        expect(TILE_SIZE).to_equal(16)
+        expect(blocks_for(16)).to_equal(1)
+        expect(blocks_for(17)).to_equal(2)
+        expect(blocks_for(512)).to_equal(32)

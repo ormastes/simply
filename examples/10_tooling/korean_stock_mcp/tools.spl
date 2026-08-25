@@ -1,0 +1,189 @@
+#![allow(unnamed_duplicate_typed_args)]
+# Korean Stock MCP - Tool dispatch and implementations
+
+fn dispatch_tool(id: text, tool_name: text, body: text) -> text:
+    if tool_name == "":
+        return make_tool_error(id, -32602, "Missing tool name")
+
+    # Stock price tools
+    if tool_name == "stock_price":
+        return handle_stock_price(id, body)
+    elif tool_name == "stock_ohlcv":
+        return handle_stock_ohlcv(id, body)
+    elif tool_name == "stock_search":
+        return handle_stock_search(id, body)
+    elif tool_name == "stock_list":
+        return handle_stock_list(id, body)
+
+    # Market tools
+    elif tool_name == "market_index":
+        return handle_market_index(id, body)
+    elif tool_name == "market_cap":
+        return handle_market_cap(id, body)
+    elif tool_name == "sector_performance":
+        return handle_sector_performance(id, body)
+    elif tool_name == "stock_compare":
+        return handle_stock_compare(id, body)
+
+    # Company info (DART)
+    elif tool_name == "company_info":
+        return handle_company_info(id, body)
+    elif tool_name == "financial_statements":
+        return handle_financial_statements(id, body)
+
+    # News
+    elif tool_name == "market_news":
+        return handle_market_news(id, body)
+    elif tool_name == "stock_news":
+        return handle_stock_news(id, body)
+
+    make_tool_error(id, -32601, "Unknown tool: " + tool_name)
+
+# ============================================================================
+# Stock Price Tools
+# ============================================================================
+
+fn handle_stock_price(id: text, body: text) -> text:
+    val ticker = extract_arguments_field(body, "ticker")
+    if ticker == "":
+        return make_tool_error(id, -32602, "Missing required parameter: ticker")
+    val result = krx_get_stock_price(ticker)
+    if result.starts_with("ERROR"):
+        return make_tool_error(id, -32000, result)
+    make_tool_result(id, result)
+
+fn handle_stock_ohlcv(id: text, body: text) -> text:
+    val ticker = extract_arguments_field(body, "ticker")
+    if ticker == "":
+        return make_tool_error(id, -32602, "Missing required parameter: ticker")
+    var days_str = extract_arguments_field(body, "days")
+    if days_str == "":
+        days_str = "30"
+    val days = int(days_str) ?? 30
+    val market = extract_arguments_field(body, "market")
+    val result = krx_get_ohlcv(ticker, days, market)
+    if result.starts_with("ERROR"):
+        return make_tool_error(id, -32000, result)
+    make_tool_result(id, result)
+
+fn handle_stock_search(id: text, body: text) -> text:
+    val query = extract_arguments_field(body, "query")
+    if query == "":
+        return make_tool_error(id, -32602, "Missing required parameter: query")
+    val result = krx_search_stock(query)
+    make_tool_result(id, result)
+
+fn handle_stock_list(id: text, body: text) -> text:
+    var market = extract_arguments_field(body, "market")
+    if market == "":
+        market = "ALL"
+    val result = krx_get_stock_list(market)
+    make_tool_result(id, result)
+
+# ============================================================================
+# Market Tools
+# ============================================================================
+
+fn handle_market_index(id: text, body: text) -> text:
+    var index_name = extract_arguments_field(body, "index_name")
+    if index_name == "":
+        index_name = "KOSPI"
+    val result = krx_get_market_index(index_name)
+    if result.starts_with("ERROR"):
+        return make_tool_error(id, -32000, result)
+    make_tool_result(id, result)
+
+fn handle_market_cap(id: text, body: text) -> text:
+    var market = extract_arguments_field(body, "market")
+    if market == "":
+        market = "KOSPI"
+    var top_n_str = extract_arguments_field(body, "top_n")
+    if top_n_str == "":
+        top_n_str = "20"
+    val top_n = int(top_n_str) ?? 20
+    val result = krx_get_market_cap(market, top_n)
+    if result.starts_with("ERROR"):
+        return make_tool_error(id, -32000, result)
+    make_tool_result(id, result)
+
+fn handle_sector_performance(id: text, body: text) -> text:
+    var market = extract_arguments_field(body, "market")
+    if market == "":
+        market = "KOSPI"
+    val result = krx_get_sector_performance(market)
+    if result.starts_with("ERROR"):
+        return make_tool_error(id, -32000, result)
+    make_tool_result(id, result)
+
+fn handle_stock_compare(id: text, body: text) -> text:
+    val tickers_str = extract_arguments_field(body, "tickers")
+    if tickers_str == "":
+        return make_tool_error(id, -32602, "Missing required parameter: tickers")
+    val tickers = tickers_str.split(",")
+    var results: [text] = []
+    var header = "Ticker | Name | Price | Change | Change% | Volume"
+    results.push(header)
+    results.push("-------|------|-------|--------|---------|-------")
+    for ticker in tickers:
+        val t = ticker.trim()
+        if t != "":
+            val info = krx_get_stock_price(t)
+            results.push(info)
+    make_tool_result(id, results.join("\n"))
+
+# ============================================================================
+# Company Info Tools (DART)
+# ============================================================================
+
+fn handle_company_info(id: text, body: text) -> text:
+    val corp_code = extract_arguments_field(body, "corp_code")
+    if corp_code == "":
+        return make_tool_error(id, -32602, "Missing required parameter: corp_code")
+    val api_key = get_dart_api_key()
+    if api_key == "":
+        return make_tool_error(id, -32000, "DART_API_KEY environment variable not set. Get your key at https://opendart.fss.or.kr/")
+    val result = dart_get_company_info(corp_code, api_key)
+    if result.starts_with("ERROR"):
+        return make_tool_error(id, -32000, result)
+    make_tool_result(id, result)
+
+fn handle_financial_statements(id: text, body: text) -> text:
+    val corp_code = extract_arguments_field(body, "corp_code")
+    if corp_code == "":
+        return make_tool_error(id, -32602, "Missing required parameter: corp_code")
+    val api_key = get_dart_api_key()
+    if api_key == "":
+        return make_tool_error(id, -32000, "DART_API_KEY environment variable not set. Get your key at https://opendart.fss.or.kr/")
+    var year = extract_arguments_field(body, "year")
+    if year == "":
+        year = get_current_year()
+    var report_type = extract_arguments_field(body, "report_type")
+    if report_type == "":
+        report_type = "annual"
+    val result = dart_get_financial_statements(corp_code, api_key, year, report_type)
+    if result.starts_with("ERROR"):
+        return make_tool_error(id, -32000, result)
+    make_tool_result(id, result)
+
+# ============================================================================
+# News Tools
+# ============================================================================
+
+fn handle_market_news(id: text, body: text) -> text:
+    var max_items_str = extract_arguments_field(body, "max_items")
+    if max_items_str == "":
+        max_items_str = "10"
+    val max_items = int(max_items_str) ?? 10
+    val result = get_market_news(max_items)
+    make_tool_result(id, result)
+
+fn handle_stock_news(id: text, body: text) -> text:
+    val query = extract_arguments_field(body, "query")
+    if query == "":
+        return make_tool_error(id, -32602, "Missing required parameter: query")
+    var max_items_str = extract_arguments_field(body, "max_items")
+    if max_items_str == "":
+        max_items_str = "10"
+    val max_items = int(max_items_str) ?? 10
+    val result = get_stock_news(query, max_items)
+    make_tool_result(id, result)

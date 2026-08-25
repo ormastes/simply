@@ -1,0 +1,14 @@
+use logic_flush_core.*
+
+fn rv32_flush_cmd_cases_selftest() -> i32:
+    if _rv32_flush_cmd_valid(0, 0, 0, 0) != 0:
+        return 1
+    if _rv32_flush_cmd_valid(1, 0, 0, 0) == 0:
+        return 1
+    if _rv32_flush_cmd_valid(0, 1, 0, 0) == 0:
+        return 1
+    if _rv32_flush_cmd_valid(0, 0, 1, 0) == 0:
+        return 1
+    if _rv32_flush_cmd_valid(0, 0, 0, 1) == 0:
+        return 1
+    0

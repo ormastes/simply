@@ -1,0 +1,71 @@
+#![allow(unnamed_duplicate_typed_args)]
+@allow(unnamed_duplicate_typed_args)
+# mcpgdb MCP — raw debugger command classification and policy
+
+use examples.mcpgdb.json_helpers.{LB, RB, jp, js}
+
+class RuleDecision:
+    allowed: bool
+    rule_class: text
+    reason: text
+
+fn command_prefix(command: text) -> text:
+    val trimmed = command.trim()
+    if trimmed == "":
+        return ""
+    val parts = trimmed.split(" ")
+    if parts.len() == 0:
+        return ""
+    parts[0].to_lower()
+
+fn contains_any(text_value: text, needles: [text]) -> bool:
+    val lower = text_value.to_lower()
+    for needle in needles:
+        if lower.contains(needle):
+            return true
+    false
+
+fn classify_command(backend: text, command: text) -> text:
+    val prefix = command_prefix(command)
+    val lower = command.trim().to_lower()
+    if lower == "":
+        return "invalid"
+    if prefix == "shell" or prefix == "script" or lower.starts_with("command source") or lower.starts_with("source "):
+        return "shell_escape"
+    if prefix == "continue" or prefix == "c" or prefix == "step" or prefix == "s" or prefix == "next" or prefix == "n" or prefix == "finish" or prefix == "interrupt" or lower.starts_with("process continue") or lower.starts_with("process interrupt") or lower.starts_with("thread step-"):
+        return "execution_control"
+    if prefix == "target" or prefix == "attach" or prefix == "file" or prefix == "symbol-file" or prefix == "run" or prefix == "start" or lower.starts_with("process launch") or lower.starts_with("process attach"):
+        return "session_topology"
+    if prefix == "set" or prefix == "restore" or prefix == "load" or prefix == "memory" or prefix == "register":
+        if contains_any(lower, ["register write", "memory write", "set {", "set $", " restore ", "load", "flash", "erase"]):
+            return "target_mutation"
+    if prefix == "monitor":
+        if backend == "openocd_gdb" or backend == "t32_gdb":
+            if contains_any(lower, ["flash", "erase", "program"]):
+                return "target_mutation"
+            return "read_only"
+        return "shell_escape"
+    "read_only"
+
+fn evaluate_command_rule(backend: text, command: text, dangerous: bool, allow_topology: bool) -> RuleDecision:
+    val kind = classify_command(backend, command)
+    if kind == "invalid":
+        return RuleDecision(allowed: false, rule_class: kind, reason: "empty command")
+    if kind == "shell_escape":
+        return RuleDecision(allowed: false, rule_class: kind, reason: "shell and script escape commands are blocked")
+    if kind == "session_topology" and not allow_topology:
+        return RuleDecision(allowed: false, rule_class: kind, reason: "topology-changing commands must go through structured tools")
+    if kind == "target_mutation" and not dangerous:
+        return RuleDecision(allowed: false, rule_class: kind, reason: "target mutation requires dangerous=true")
+    RuleDecision(allowed: true, rule_class: kind, reason: "allowed")
+
+fn decision_json(decision: RuleDecision) -> text:
+    var result = LB()
+    var allowed = "false"
+    if decision.allowed:
+        allowed = "true"
+    result = result + jp("allowed", allowed)
+    result = result + "," + jp("rule_class", js(decision.rule_class))
+    result = result + "," + jp("reason", js(decision.reason))
+    result = result + RB()
+    result

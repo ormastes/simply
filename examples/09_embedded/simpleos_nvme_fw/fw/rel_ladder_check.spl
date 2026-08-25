@@ -1,0 +1,221 @@
+"""
+rel_ladder_check — absolute oracles for the L4 lane rel_ladder.spl (contract:
+doc/05_design/hardware/nand_recovery/recovery_algorithms_design.md §2, design §9
+L4, verification matrix §10 "Recovery ladder" rows). Known values at known points,
+not self-comparison.
+
+Two parts:
+
+  (a) PURE-MACHINE oracles — scripted sense outcomes drive the pure `rel_ladder_step`
+      state machine with no device at all:
+        1. Clean first read (obs decodes at offset 0) -> Accept, ZERO retries.
+        2. Fail then success at table[k]: exact RetryAtOffset sequence in design
+           order (-8,-16,+8,-24,+16,-32,+24) up to k, then a CalibrateBlock verdict
+           carrying the block, with state.best_offset == the winning offset.
+        3. All-fail on an UNCALIBRATED block: exactly `rel_vref_table_len()` (= 7)
+           RetryAtOffset steps covering the whole table in order, then Uncorrectable
+           on the very next step — the step budget is exact.
+        4. A CALIBRATED block seeds first: the very first retry uses the cached ROR
+           seed (not table[0]), and table_idx stays 0 so the whole table is still
+           ahead if the seed misses.
+
+  (b) EMU-VALIDATED oracle (verification matrix §10 "Recovery ladder" #1) — the
+      recovery payoff end-to-end on the Vt-physics NeChip, NO faking:
+        Program a page 0x00; drive genuine retention drift (emu_set_block_wear +
+        emu_advance_time_s); a plain read at the default reference FAILS
+        (NAND_ECC_FAIL, senses 0xFF). Then DRIVE THE LADDER MANUALLY — ask the pure
+        machine for the next action, execute each RetryAtOffset via fil.read_at_vref,
+        feed the real corrected/code outcome back — until the page RECOVERS the exact
+        programmed 0x00 at a NEGATIVE offset and the machine emits CalibrateBlock for
+        that block.
+
+Chosen emu drift parameters (documented per the task's "calibrate empirically"):
+  wear = 3000 P/E + advance_time_s(31536000) (one year) on an all-programmed 0x00
+  page. This is the drift regime the LANDED rel_seams_check.spl already proves
+  (seam 1b/2): 0x00 -> senses 0xFF at the default reference (uncorrectable, corrected
+  2) and recovers to 0x00 at read_at_vref(-20). The recovery table brackets -20 with
+  -16 and -24, and for an all-programmed page a more-negative reference is
+  monotonically safer, so recovery is guaranteed at a negative table offset. The
+  design §2 note pins ~5K P/E for the single-cell 0xFE *correctable* regime, but the
+  ladder payoff needs an offset-0 *FAIL* to be entered at all — the all-cells 0x00
+  uncorrectable-at-0 case is the correct driver, and 3000+1yr is the seams-proven
+  point for it. The winning offset is probe-printed, not hard-asserted.
+
+Addresses stay in the S1 window (block 0, page 0) so nothing fold-aliases.
+
+Run: bin/simple run examples/09_embedded/simpleos_nvme_fw/fw/rel_ladder_check.spl
+Gate: prints "REL LADDER OK" and exits 0.
+"""
+
+use nvme_types.*
+use nd_types.*
+use rel_types.*
+use rel_vref.*
+use rel_ladder.*
+use fil.*
+
+# A failing sense at a given offset/depth: NAND_ECC_FAIL, coarse corrected 2.
+fn fail_obs(offset: i64, depth: i64) -> RelReadObs:
+    rel_read_obs(NAND_ECC_FAIL, 2, offset, depth)
+
+# A decoded (clean) sense at a given offset/depth: NAND_OK, coarse corrected 0.
+fn ok_obs(offset: i64, depth: i64) -> RelReadObs:
+    rel_read_obs(NAND_OK, 0, offset, depth)
+
+fn main():
+    var fail: i64 = 0
+
+    # ═══ (a) PURE-MACHINE ORACLES ═════════════════════════════════════════════
+
+    # ── Oracle 1: clean first read -> Accept, zero retries ────────────────────
+    # The machine is entered with a sense that already decoded at offset 0 (the
+    # degenerate "never should have entered" case) -> Accept, no retry emitted.
+    val st1: RelLadderState = rel_ladder_state_new(nd_block(2))
+    val s1: RelLadderStep = rel_ladder_step(st1, ok_obs(0, 0), 0)
+    fail = fail + expect_eq(s1.action.kind, rel_act_accept(), "clean read -> Accept")
+    fail = fail + expect_eq(s1.action.arg, 0, "Accept arg == 0 (no block/offset payload)")
+    fail = fail + expect_eq(s1.state.depth, 0, "clean read consumes 0 retry rungs")
+    fail = fail + expect_eq(s1.state.phase, rel_phase_done(), "clean read -> phase done")
+
+    # ── Oracle 2: fail, fail, then success at table[2] == +8 ──────────────────
+    # Uncalibrated (seed==0). Trace the exact RetryAtOffset sequence the machine
+    # emits, feeding each retry back as a failing sense until table[2] decodes.
+    val blk2: NdBlock = nd_block(5)
+    var st: RelLadderState = rel_ladder_state_new(blk2)
+
+    # entry: hard read at offset 0 already failed -> the ladder was entered.
+    var stp: RelLadderStep = rel_ladder_step(st, fail_obs(0, 0), 0)
+    fail = fail + expect_eq(stp.action.kind, rel_act_retry(), "rung1 (no seed) -> RetryAtOffset")
+    fail = fail + expect_eq(stp.action.arg, 0 - 8, "rung1 retry uses table[0] == -8 (seed rung, seed==0)")
+    fail = fail + expect_eq(stp.state.depth, 1, "depth == 1 after first escalation")
+    st = stp.state
+
+    stp = rel_ladder_step(st, fail_obs(0 - 8, st.depth), 0)
+    fail = fail + expect_eq(stp.action.arg, 0 - 16, "table walk step -> table[1] == -16")
+    fail = fail + expect_eq(stp.state.depth, 2, "depth == 2")
+    st = stp.state
+
+    # The machine itself must REQUEST table[2] == +8 next (this is the offset that
+    # will succeed — tie "offset requested" to "winning offset", not a hand-fed one).
+    stp = rel_ladder_step(st, fail_obs(0 - 16, st.depth), 0)
+    fail = fail + expect_eq(stp.action.kind, rel_act_retry(), "table walk step -> RetryAtOffset")
+    fail = fail + expect_eq(stp.action.arg, 8, "machine requests table[2] == +8 next")
+    fail = fail + expect_eq(stp.state.depth, 3, "depth == 3")
+    st = stp.state
+
+    # Execute that requested +8 sense and let it decode -> CalibrateBlock, and the
+    # winner in state.best_offset is exactly the offset the machine just requested.
+    stp = rel_ladder_step(st, ok_obs(8, st.depth), 0)
+    fail = fail + expect_eq(stp.action.kind, rel_act_calibrate(), "decode at the requested +8 -> CalibrateBlock verdict")
+    fail = fail + expect_eq(stp.action.arg, 5, "Calibrate arg == blk.idx (5), flat-boundary conversion")
+    fail = fail + expect_eq(stp.state.best_offset, 8, "state.best_offset == the requested-then-winning offset +8")
+    fail = fail + expect_eq(stp.state.phase, rel_phase_done(), "successful recovery -> phase done")
+
+    # ── Oracle 3: all-fail uncalibrated -> exactly table_len retries then UECC ─
+    # Feed only failing senses. Assert the machine emits table[0..6] in order as
+    # RetryAtOffset (7 retries == the step budget), then Uncorrectable on step 8.
+    var stf: RelLadderState = rel_ladder_state_new(nd_block(9))
+    var expect_seq: [i64] = []
+    expect_seq.push(0 - 8)
+    expect_seq.push(0 - 16)
+    expect_seq.push(8)
+    expect_seq.push(0 - 24)
+    expect_seq.push(16)
+    expect_seq.push(0 - 32)
+    expect_seq.push(24)
+
+    var i: i64 = 0
+    var retries: i64 = 0
+    var last_off: i64 = 0
+    while i < rel_vref_table_len():
+        val fstp: RelLadderStep = rel_ladder_step(stf, fail_obs(last_off, stf.depth), 0)
+        fail = fail + expect_eq(fstp.action.kind, rel_act_retry(), "all-fail step is a RetryAtOffset")
+        fail = fail + expect_eq(fstp.action.arg, expect_seq[i], "retry offset matches the fixed table order")
+        stf = fstp.state
+        last_off = fstp.action.arg
+        retries = retries + 1
+        i = i + 1
+    fail = fail + expect_eq(retries, rel_vref_table_len(), "exactly table_len (7) retries before exhaustion")
+
+    # The next step exhausts the table -> Uncorrectable, arg == blk.idx.
+    val uecc: RelLadderStep = rel_ladder_step(stf, fail_obs(last_off, stf.depth), 0)
+    fail = fail + expect_eq(uecc.action.kind, rel_act_uncorrectable(), "table exhausted -> Uncorrectable")
+    fail = fail + expect_eq(uecc.action.arg, 9, "Uncorrectable arg == blk.idx (9)")
+    fail = fail + expect_eq(uecc.state.phase, rel_phase_fail(), "exhaustion -> phase fail")
+
+    # ── Oracle 4: a calibrated block seeds first ──────────────────────────────
+    # seed == -16 (a persisted ROR winner). The FIRST retry must use the seed,
+    # NOT table[0]; table_idx stays 0 so the whole table is still ahead.
+    val seed: i64 = 0 - 16
+    var stc: RelLadderState = rel_ladder_state_new(nd_block(7))
+    val cstp: RelLadderStep = rel_ladder_step(stc, fail_obs(0, 0), seed)
+    fail = fail + expect_eq(cstp.action.kind, rel_act_retry(), "calibrated block -> RetryAtOffset")
+    fail = fail + expect_eq(cstp.action.arg, seed, "calibrated-seed-first: first retry uses the cached seed -16")
+    fail = fail + expect_eq(cstp.state.table_idx, 0, "table_idx stays 0 -> full table still ahead if seed misses")
+    # If the seed misses, the walk then starts at table[0] == -8 (not skipped).
+    val cstp2: RelLadderStep = rel_ladder_step(cstp.state, fail_obs(seed, cstp.state.depth), seed)
+    fail = fail + expect_eq(cstp2.action.arg, 0 - 8, "seed miss -> table walk begins at table[0] == -8")
+
+    # ═══ (b) EMU-VALIDATED ORACLE — the recovery payoff, end to end ════════════
+    # Build the emu-backed FIL stack, program 0x00, drive genuine retention drift.
+    var emu: Fil = fil_new_emu()
+    val page_ppn: i64 = block_first_ppn(0)               # block 0, page 0 (in-window)
+    val prog_byte: i64 = 0x00
+    fail = fail + expect_eq(emu.program(page_ppn, 100, 1, prog_byte), NAND_OK, "emu: program 0x00 clean")
+    fail = fail + expect_eq(emu.read(page_ppn).data, prog_byte, "emu: fresh page reads back 0x00")
+
+    emu.emu_set_block_wear(0, 3000)                      # heavily P/E-cycled block
+    emu.emu_advance_time_s(31536000.0)                   # age one year -> retention drift
+
+    # Plain read at the default reference must now FAIL (this is what enters the ladder).
+    val hard: FilRead = emu.read(page_ppn)
+    print "  PROBE hard-read: data={hard.data} code={hard.code} corrected={hard.corrected}"
+    fail = fail + expect_eq(hard.code, NAND_ECC_FAIL, "emu: aged worn 0x00 page FAILS at default reference")
+
+    # Drive the ladder MANUALLY: machine -> action -> device -> outcome -> machine.
+    val blk_e: NdBlock = nd_block(ppn_block(page_ppn))
+    var est: RelLadderState = rel_ladder_state_new(blk_e)
+    var eobs: RelReadObs = rel_read_obs(hard.code, hard.corrected, 0, 0)
+    var recovered: i64 = 0                               # 1 once the exact 0x00 comes back
+    var recovered_data: i64 = 0 - 1
+    var win_offset: i64 = 0
+    var calibrated: i64 = 0                              # 1 iff the machine emitted CalibrateBlock
+    var uncorrectable: i64 = 0                           # 1 iff the machine gave up
+    var guard: i64 = 0                                   # defensive loop cap (machine is bounded)
+    # This block is freshly programmed and never calibrated, so its ROR seed is 0
+    # ("no seed") — the value rel_vref_lookup would return for an uncalibrated
+    # block. Pass 0 directly; the seams-proven drift is recoverable via the table.
+    while guard < 16:
+        val estp: RelLadderStep = rel_ladder_step(est, eobs, 0)
+        est = estp.state
+        val act: RelAction = estp.action
+        if act.kind == rel_act_calibrate():
+            calibrated = 1
+            win_offset = est.best_offset
+            break
+        if act.kind == rel_act_accept():
+            break
+        if act.kind == rel_act_uncorrectable():
+            uncorrectable = 1
+            break
+        # RetryAtOffset: execute the shifted sense on the real device, feed it back.
+        val rd: FilRead = emu.read_at_vref(page_ppn, act.arg)
+        print "  PROBE retry offset={act.arg} -> data={rd.data} code={rd.code} corrected={rd.corrected}"
+        if rd.code != NAND_ECC_FAIL and rd.data == prog_byte:
+            recovered = 1
+            recovered_data = rd.data
+        eobs = rel_read_obs(rd.code, rd.corrected, act.arg, est.depth)
+        guard = guard + 1
+
+    print "  PROBE outcome: recovered={recovered} data={recovered_data} win_offset={win_offset} calibrated={calibrated} uncorrectable={uncorrectable}"
+    fail = fail + expect_eq(uncorrectable, 0, "emu: ladder did NOT exhaust — the drift is recoverable")
+    fail = fail + expect_eq(recovered, 1, "emu: a shifted-reference sense recovered the page")
+    fail = fail + expect_eq(recovered_data, prog_byte, "emu: recovered the EXACT programmed 0x00")
+    fail = fail + expect_eq(calibrated, 1, "emu: machine emitted CalibrateBlock for the recovered read")
+    fail = fail + expect_eq(if win_offset < 0: 1 else: 0, 1, "emu: the winning offset is NEGATIVE (retention charge-loss direction)")
+    fail = fail + expect_eq(est.blk.idx, 0, "emu: CalibrateBlock is for block 0 (the recovered block)")
+
+    if fail == 0:
+        print "REL LADDER OK"
+    else:
+        print "REL LADDER FAIL ({fail})"

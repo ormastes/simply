@@ -1,0 +1,78 @@
+# web_text_gui.spl — render an HTML document whose body is "hello world!" through
+# the pure-Simple web renderer (Engine2D CPU lane) and present it on-screen.
+#
+# The page is laid out at a small surface (fast: the web-layout render is
+# interpreter-bound, ~1.5 ms/pixel) and then presented SCALED into a larger
+# window so the text is clearly visible rather than a tiny patch.
+#
+# Launch (window):
+#   SIMPLE_GUI_RUN_SKIP_NUDGE=1 scripts/gui/macos-gui-run.shs examples/06_io/ui/web_text_gui.spl
+# Headless: bin/simple run examples/06_io/ui/web_text_gui.spl
+
+use std.gc_async_mut.gpu.browser_engine.simple_web_renderer.{
+    simple_web_render_html_to_pixels_with_engine2d_backend}
+use std.io.window_winit.{WinitLoop, WinitWindow, winit_loop_new, winit_loop_free, winit_window_new, winit_window_free, winit_present_rgba, winit_poll_close_requested}
+
+use std.io_runtime.{env_get}
+
+# Rendered at NATIVE resolution (presented 1:1, no upscaling) so CSS-styled text
+# is crisp. The web-layout render is interpreter-bound (~1.5 ms/px), so this one
+# takes ~90s to lay out once before the window appears.
+val RW: i32 = 340
+val RH: i32 = 200
+val WIN_W: i32 = 340
+val WIN_H: i32 = 200
+
+fn page_html() -> text:
+    "<html><head><style>" +
+        "body{background-color:#0f1420}" +
+        ".card{background-color:#1b2436;color:#e6e6f0;padding:14px}" +
+        "h1{color:#7fd7ff;font-size:26px}" +
+        "p{color:#b8c0d0;font-size:16px}" +
+        "</style></head><body>" +
+        "<div class='card'>" +
+        "<h1>hello world!</h1>" +
+        "<p>second line here</p>" +
+        "<p>styled with css on the cpu web lane.</p>" +
+        "</div></body></html>"
+
+fn pack(src: [u32]) -> [i64]:
+    var out: [i64] = [0; src.len()]
+    var i = 0
+    while i < src.len():
+        out[i] = src[i].to_i64() & 0xFFFFFF
+        i = i + 1
+    out
+
+fn main() -> i64:
+    print "Web 'hello world!' — render {RW}x{RH} via Engine2D CPU lane, present {WIN_W}x{WIN_H}"
+    val pixels = simple_web_render_html_to_pixels_with_engine2d_backend(page_html(), RW, RH, "cpu_simd")
+    if pixels.len() < RW * RH:
+        print "render produced {pixels.len()} px (short)"
+        return 1
+    print "rendered {pixels.len()} px"
+
+    if (env_get("SIMPLE_GUI") ?? "") != "1":
+        print "No GUI requested (use scripts/gui/macos-gui-run.shs to open a window); headless only."
+        return 0
+
+    val lp = winit_loop_new()
+    if not lp.is_valid:
+        print "No GUI runtime available."
+        return 1
+    val win = winit_window_new(lp, WIN_W.to_i64(), WIN_H.to_i64(), "Simple Web: hello world!")
+    if not win.is_valid:
+        winit_loop_free(lp)
+        return 1
+
+    val packed = pack(pixels)
+    var running = true
+    var iters = 0
+    while running and iters < 2000000:
+        winit_present_rgba(win, RW.to_i64(), RH.to_i64(), packed)
+        if winit_poll_close_requested(lp):
+            running = false
+        iters = iters + 1
+    winit_window_free(win)
+    winit_loop_free(lp)
+    return 0

@@ -1,0 +1,36 @@
+{{#layout "application"}}
+
+<h1>{{template_name}}</h1>
+<p>{{template_description}}</p>
+
+{{#each groups}}
+<section class="menu-group">
+    <h2>{{name}}</h2>
+    <p class="group-desc">{{description}}</p>
+
+    {{#each items}}
+    <div class="menu-item {{#unless available}}unavailable{{/unless}}">
+        <div class="item-header">
+            <span class="item-name">{{name}}</span>
+            <span class="item-price">${{price_display}}</span>
+        </div>
+        <p class="item-desc">{{description}}</p>
+
+        {{#if has_conditions}}
+        <span class="condition-badge">Conditional</span>
+        {{/if}}
+
+        {{#if has_additional}}
+        <div class="additional-items">
+            <strong>Extras:</strong>
+            {{#each additionals}}
+            <span class="extra">{{name}} (+${{price_display}})</span>
+            {{/each}}
+        </div>
+        {{/if}}
+    </div>
+    {{/each}}
+</section>
+{{/each}}
+
+{{/layout}}

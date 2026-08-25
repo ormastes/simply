@@ -1,0 +1,148 @@
+# 12. First Kernel - Vector Add 2D
+#
+# Element-wise addition of two vectors using a 2D grid of thread blocks.
+# Direct translation of the classic CUDA vector_add example.
+#
+# C/CUDA equivalent:
+#   __device__ int flat_index() {
+#       int row = blockIdx.y * blockDim.y + threadIdx.y;
+#       int col = blockIdx.x * blockDim.x + threadIdx.x;
+#       return row * gridDim.x * blockDim.x + col;
+#   }
+#   __global__ void vector_add(float *a, float *b, float *c, int n) {
+#       int i = flat_index();
+#       if (i < n) c[i] = a[i] + b[i];
+#   }
+
+use std.gpu.*
+
+# ============================================================================
+# Device helper: compute flat 1D index from 2D grid/block layout
+# ============================================================================
+
+@gpu_device
+fn flat_index() -> i64:
+    # row = blockIdx.y * blockDim.y + threadIdx.y
+    val row = gpu_block_id_y() * gpu_block_dim_y() + gpu_local_id_y()
+    # col = blockIdx.x * blockDim.x + threadIdx.x
+    val col = gpu_block_id_x() * gpu_block_dim_x() + gpu_local_id_x()
+    # Flatten: row * total_columns + col
+    row * gpu_grid_dim_x() * gpu_block_dim_x() + col
+
+# ============================================================================
+# Kernel: vector_add  --  c[i] = a[i] + b[i]
+# ============================================================================
+
+@gpu_kernel
+fn vector_add(a: GpuPtr, b: GpuPtr, c: GpuPtr, n: i64):
+    val i = flat_index()
+    if i < n:
+        val va = gpu_load_f32(a, i)
+        val vb = gpu_load_f32(b, i)
+        gpu_store_f32(c, i, va + vb)
+
+# ============================================================================
+# Host helpers
+# ============================================================================
+
+fn make_host_data(n: i64, start: f32) -> [f32]:
+    # Create an array [start, start+1, start+2, ...]
+    var data: [f32] = []
+    for i in 0..n:
+        data = data + [start + (i as f32)]
+    data
+
+fn verify_results(host_a: [f32], host_b: [f32], host_c: [f32], n: i64) -> bool:
+    var ok = true
+    for i in 0..n:
+        val expected = host_a[i] + host_b[i]
+        val actual = host_c[i]
+        val diff = actual - expected
+        val abs_diff = if diff < 0.0: 0.0 - diff else: diff
+        if abs_diff > 0.001:
+            print "MISMATCH at [{i}]: expected {expected}, got {actual}"
+            ok = false
+    ok
+
+# ============================================================================
+# Main
+#
+# `main` itself returns nothing: the whole pipeline lives in `run()` so every
+# GPU call can use `?`, and `main` matches the final Result and prints it.
+# ============================================================================
+
+fn main():
+    match run():
+        case Ok(_):
+            print "=== Done ==="
+        case Err(e):
+            print "GPU error: {e.to_text()}"
+
+fn run() -> Result<(), GpuError>:
+    print "=== Vector Add 2D (Simple) ==="
+    print ""
+
+    # --- Parameters ---
+    val width = 64
+    val height = 32
+    val n = width * height   # 2048 elements
+    val elem_size = 4        # f32 = 4 bytes
+    val total_bytes = n * elem_size
+
+    print "Vector size: {n} elements ({width} x {height})"
+
+    # --- Prepare host data ---
+    val host_a = make_host_data(n, 1.0)
+    val host_b = make_host_data(n, 100.0)
+    print "Host data prepared."
+
+    # --- Initialise GPU ---
+    gpu_init()?
+    gpu_set_device(0)?
+
+    # --- Allocate device memory ---
+    val d_a = gpu_alloc(total_bytes)?
+    val d_b = gpu_alloc(total_bytes)?
+    val d_c = gpu_alloc(total_bytes)?
+    print "Device memory allocated: 3 x {total_bytes} bytes"
+
+    # --- Upload host -> device ---
+    gpu_upload_f32(d_a, host_a)?
+    gpu_upload_f32(d_b, host_b)?
+    print "Data uploaded to device."
+
+    # --- Launch kernel with 2D grid ---
+    val block_x = 16
+    val block_y = 16
+    val grid_x = (width + block_x - 1) / block_x
+    val grid_y = (height + block_y - 1) / block_y
+
+    print "Launch config:"
+    print "  Grid:  ({grid_x}, {grid_y}, 1)"
+    print "  Block: ({block_x}, {block_y}, 1)"
+    print "  Total threads: {grid_x * block_x * grid_y * block_y}"
+
+    vector_add<<<grid: (grid_x, grid_y, 1), block: (block_x, block_y, 1)>>>(d_a, d_b, d_c, n)
+
+    # --- Synchronise ---
+    gpu_sync()?
+    print "Kernel finished."
+
+    # --- Download device -> host ---
+    val host_c = gpu_download_f32(d_c, n)?
+    print "Results downloaded."
+
+    # --- Verify ---
+    val ok = verify_results(host_a, host_b, host_c, n)
+    if ok:
+        print "PASSED: all {n} elements match."
+    else:
+        print "FAILED: result mismatch detected."
+
+    # --- Free device memory ---
+    gpu_free(d_a)?
+    gpu_free(d_b)?
+    gpu_free(d_c)?
+    print "Device memory freed."
+    print ""
+    Ok(())

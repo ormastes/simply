@@ -1,0 +1,20 @@
+use logic_feature_guard_core.*
+
+fn rv32_feature_guard_id_cases_selftest() -> i32:
+    if _rv32_feature_id_valid(2) != 0:
+        return 1
+    if _rv32_feature_id_valid(4) != 0:
+        return 1
+    if _rv32_feature_id_valid(6) != 0:
+        return 1
+    if _rv32_feature_id_valid(7) != 0:
+        return 1
+    if _rv32_feature_id_valid(-1) == 0:
+        return 1
+    if _rv32_feature_id_valid(0) == 0:
+        return 1
+    if _rv32_feature_id_valid(15) == 0:
+        return 1
+    if _rv32_feature_id_valid(16) == 0:
+        return 1
+    0

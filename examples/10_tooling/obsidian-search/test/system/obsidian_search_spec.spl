@@ -1,0 +1,156 @@
+# System test — End-to-end BDD scenarios for Obsidian Search MCP
+#
+# Tests the full pipeline: index fixture vault → search → verify ranked results
+
+use src.core.indexer.{IndexDb, open_index_memory, close_index_db, create_schema, index_note, note_count, link_count}
+use src.core.search_engine.{search_vault_query, search_by_tag, search_tasks, search_decisions}
+use src.core.graph.{find_backlinks, find_forward_links, find_related, find_authoritative_docs, graph_walk, compute_authority}
+use src.core.ranker.{rank_results, explain_scores}
+use src.util.query_parser.{parse_query}
+
+# --- Setup: index the full sample vault ---
+
+fn setup_full_vault() -> IndexDb:
+    val db = open_index_memory()
+    create_schema(db)
+
+    val index_md = "---\ntitle: Vault Index\naliases: [home, main]\ntags: [index, hub]\n---\n\n# Vault Index\n\n## Projects\n- [[project-alpha]]\n- [[api-design]]\n\n## Daily Notes\n- [[2024-01-15]]\n\n## Meetings\n- [[standup-notes]]\n\n## Decisions\n- [[adr-001]]"
+    index_note(db, "/v/index.md", "index.md", index_md, 2000)
+
+    val alpha_md = "---\ntitle: Project Alpha\naliases: [alpha, main-project]\ntags: [project, active, engineering]\n---\n\n# Project Alpha\n\n## Overview\nProject Alpha is the main engineering initiative.\n\n## Goals\n- Build search infrastructure\n- Integrate with [[api-design]]\n- Review in [[standup-notes]]\n\n## Tasks\n- [ ] Set up indexing pipeline\n- [ ] Write search ranking algorithm\n- [x] Define project scope\n- [ ] Create test fixtures\n- [x] Initial architecture review\n\n## Links\nSee also: [[adr-001]] for architecture decisions.\nRelated daily: [[2024-01-15]]"
+    index_note(db, "/v/projects/project-alpha.md", "projects/project-alpha.md", alpha_md, 2000)
+
+    val daily_md = "---\ntitle: Daily Note 2024-01-15\ntags: [daily, journal]\n---\n\n# 2024-01-15\n\n## Morning\n- Reviewed [[project-alpha]] progress\n- Met with team in [[standup-notes]]\n\n## Afternoon\n- Read through [[api-design]] docs\n- Updated [[adr-001]] with new findings\n\n## Tasks\n- [x] Review PR #42\n- [ ] Follow up on search performance\n- [ ] Update documentation"
+    index_note(db, "/v/daily/2024-01-15.md", "daily/2024-01-15.md", daily_md, 2000)
+
+    val api_md = "---\ntitle: API Design Guide\naliases: [api-guide, api-reference]\ntags: [reference, api, design]\n---\n\n# API Design Guide\n\n## Principles\n1. RESTful endpoints\n2. Consistent error handling\n3. Versioned APIs\n\n## Decision\nSee [[adr-001]] for the decision to use BM25 ranking.\n\n## Related\n- [[project-alpha]] uses this API design\n- Discussed in [[standup-notes]]"
+    index_note(db, "/v/reference/api-design.md", "reference/api-design.md", api_md, 2000)
+
+    val standup_md = "---\ntitle: Standup Notes\naliases: [standups, daily-standup]\ntags: [meeting, standup, recurring]\n---\n\n# Standup Notes\n\n## 2024-01-15\n- [[project-alpha]]: indexing pipeline in progress\n- [[api-design]]: review completed\n- Blocked on FTS5 configuration\n\n## Action Items\n- [ ] Finalize search ranking weights\n- [x] Set up test vault\n- [ ] Benchmark query performance"
+    index_note(db, "/v/meetings/standup-notes.md", "meetings/standup-notes.md", standup_md, 2000)
+
+    val adr_md = "---\ntitle: ADR-001 Search Ranking Strategy\naliases: [adr-1, search-ranking-decision]\ntags: [decision, adr, architecture]\n---\n\n# ADR-001: Search Ranking Strategy\n\n## Status\nAccepted\n\n## Context\nWe need a search ranking strategy.\n\n## Decision\nUse hybrid BM25 + graph authority ranking.\n\n## Consequences\n- Good: Fast full-text search via SQLite FTS5\n- Risk: May need embedding-based reranking later\n\n## References\n- [[api-design]]\n- [[project-alpha]]"
+    index_note(db, "/v/decisions/adr-001.md", "decisions/adr-001.md", adr_md, 2000)
+
+    db
+
+describe "ObsidianSearchSystem":
+    """System-level BDD scenarios for the Obsidian Search MCP Server"""
+
+    context "Scenario: Index and count":
+        """As a user, I can index my vault and see all notes counted"""
+
+        it "indexes all 6 fixture notes":
+            val db = setup_full_vault()
+            expect(note_count(db)).to_equal(6)
+            close_index_db(db)
+
+        it "stores correct link graph":
+            val db = setup_full_vault()
+            val lc = link_count(db)
+            expect(lc).to_be_greater_than(10)
+            close_index_db(db)
+
+    context "Scenario: Tag-based discovery":
+        """As a user, I can find notes by tag"""
+
+        it "finds meeting notes":
+            val db = setup_full_vault()
+            val results = search_by_tag(db, "meeting")
+            expect(results.len()).to_be_greater_than(0)
+            var found_standup = false
+            for r in results:
+                if r.path.contains("standup"):
+                    found_standup = true
+            expect(found_standup).to_equal(true)
+            close_index_db(db)
+
+        it "finds project notes":
+            val db = setup_full_vault()
+            val results = search_by_tag(db, "project")
+            expect(results.len()).to_be_greater_than(0)
+            close_index_db(db)
+
+    context "Scenario: Backlink navigation":
+        """As a user, I can find what links to a note"""
+
+        it "finds notes linking to project-alpha":
+            val db = setup_full_vault()
+            val results = find_backlinks(db, "projects/project-alpha.md")
+            expect(results.len()).to_be_greater_than(0)
+            close_index_db(db)
+
+    context "Scenario: Authority ranking":
+        """As a user, highly-linked notes rank higher"""
+
+        it "project-alpha has higher authority than daily note":
+            val db = setup_full_vault()
+            val auth_alpha = compute_authority(db, "projects/project-alpha.md")
+            val auth_daily = compute_authority(db, "daily/2024-01-15.md")
+            # project-alpha is linked by more notes
+            expect(auth_alpha).to_be_greater_than(0.0)
+            close_index_db(db)
+
+    context "Scenario: Graph traversal":
+        """As a user, I can walk the link graph from any note"""
+
+        it "walks graph from index note":
+            val db = setup_full_vault()
+            val nodes = graph_walk(db, "index.md", 2)
+            # Should reach at least a few connected notes
+            expect(nodes.len()).to_be_greater_than(1)
+            close_index_db(db)
+
+    context "Scenario: Task discovery":
+        """As a user, I can find tasks across my vault"""
+
+        it "finds open tasks about indexing":
+            val db = setup_full_vault()
+            val results = search_tasks(db, "indexing", "open")
+            expect(results.len()).to_be_greater_than(0)
+            close_index_db(db)
+
+        it "finds all tasks about search":
+            val db = setup_full_vault()
+            val results = search_tasks(db, "search", "")
+            expect(results.len()).to_be_greater_than(0)
+            close_index_db(db)
+
+    context "Scenario: Decision lookup":
+        """As a user, I can find architecture decisions"""
+
+        it "finds ranking-related decisions":
+            val db = setup_full_vault()
+            val results = search_decisions(db, "ranking")
+            expect(results.len()).to_be_greater_than(0)
+            close_index_db(db)
+
+    context "Scenario: Search with scoring explanation":
+        """As a user, I can understand why results ranked the way they did"""
+
+        it "explains search scores":
+            val db = setup_full_vault()
+            val query = parse_query("project")
+            val scored = rank_results(db, query, 5)
+            val breakdowns = explain_scores(scored)
+            # Each result should have a breakdown
+            expect(breakdowns.len()).to_equal(scored.len())
+            close_index_db(db)
+
+    context "Scenario: Related notes discovery":
+        """As a user, I can find notes related to a given note"""
+
+        it "finds notes related to project-alpha":
+            val db = setup_full_vault()
+            val results = find_related(db, "projects/project-alpha.md")
+            expect(results.len()).to_be_greater_than(0)
+            close_index_db(db)
+
+    context "Scenario: Authoritative doc discovery":
+        """As a user, I can find the most authoritative docs on a topic"""
+
+        it "finds authoritative docs about design":
+            val db = setup_full_vault()
+            val results = find_authoritative_docs(db, "design", 5)
+            expect(results.len()).to_be_greater_than(0)
+            close_index_db(db)

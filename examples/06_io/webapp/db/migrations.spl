@@ -1,0 +1,58 @@
+use std.database.{Database, Migration, MigrationRunner}
+
+fn create_migrations() -> List<Migration>:
+    val migrations = List<Migration>.new()
+
+    migrations.push(Migration(
+        id: "001_create_users",
+        description: "Create users table for authentication",
+        up_sql: """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                email TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email);
+        """,
+        down_sql: """
+            DROP INDEX IF EXISTS idx_users_email;
+            DROP INDEX IF EXISTS idx_users_username;
+            DROP TABLE IF EXISTS users;
+        """
+    ))
+
+    migrations.push(Migration(
+        id: "002_create_todos",
+        description: "Create todos table with user foreign key",
+        up_sql: """
+            CREATE TABLE IF NOT EXISTS todos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                completed INTEGER NOT NULL DEFAULT 0,
+                user_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_todos_user_id ON todos(user_id);
+            CREATE INDEX IF NOT EXISTS idx_todos_completed ON todos(user_id, completed);
+        """,
+        down_sql: """
+            DROP INDEX IF EXISTS idx_todos_completed;
+            DROP INDEX IF EXISTS idx_todos_user_id;
+            DROP TABLE IF EXISTS todos;
+        """
+    ))
+
+    migrations
+
+fn run_migrations(db: Database) -> Result<(), text>:
+    val runner = MigrationRunner(db: db)
+    val migrations = create_migrations()
+    for migration in migrations:
+        runner.apply(migration)?
+    Result.ok(())

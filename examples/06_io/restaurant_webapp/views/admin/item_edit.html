@@ -1,0 +1,82 @@
+{{#layout "application"}}
+
+<h1>Edit Item &mdash; {{item_name}}</h1>
+<a href="/admin/groups/{{group_id}}/items" class="btn">&larr; Back to Items</a>
+
+<form method="POST" action="/admin/items/{{item_id}}/update" class="form">
+    <input type="hidden" name="csrf_token" value="{{csrf_token}}">
+
+    <div class="form-group">
+        <label for="name">Name</label>
+        <input type="text" id="name" name="name" value="{{item_name}}" required>
+    </div>
+
+    <div class="form-group">
+        <label for="description">Description</label>
+        <textarea id="description" name="description" rows="2">{{item_description}}</textarea>
+    </div>
+
+    <div class="form-group">
+        <label for="price">Price (cents)</label>
+        <input type="number" id="price" name="price" value="{{item_price}}">
+        <span class="help-text">Display: ${{item_price_display}}</span>
+    </div>
+
+    <div class="form-group">
+        <label>
+            <input type="checkbox" name="available" value="1" {{#if item_available}}checked{{/if}}>
+            Available
+        </label>
+    </div>
+
+    <button type="submit" class="btn btn-primary">Update</button>
+</form>
+
+<hr>
+
+<h2>Conditions</h2>
+<form method="POST" action="/admin/items/{{item_id}}/conditions" class="form form-inline">
+    <input type="hidden" name="csrf_token" value="{{csrf_token}}">
+    <select name="condition_type">
+        <option value="time_after">Available after time</option>
+        <option value="time_before">Available before time</option>
+        <option value="day_of_week">Day of week</option>
+        <option value="always_available">Always available</option>
+        <option value="seasonal">Seasonal</option>
+    </select>
+    <input type="text" name="condition_value" placeholder="e.g. 11:00 or mon,tue,wed">
+    <button type="submit" class="btn btn-sm btn-primary">Add Condition</button>
+</form>
+
+{{#each conditions}}
+<div class="condition-row">
+    <span>{{condition_type}}: {{condition_value}}</span>
+    <form method="POST" action="/admin/conditions/{{id}}/delete" style="display:inline;">
+        <input type="hidden" name="csrf_token" value="{{../csrf_token}}">
+        <button type="submit" class="btn btn-sm btn-danger">Remove</button>
+    </form>
+</div>
+{{/each}}
+
+<hr>
+
+<h2>Additional Menu Items</h2>
+<form method="POST" action="/admin/items/{{item_id}}/additional" class="form form-inline">
+    <input type="hidden" name="csrf_token" value="{{csrf_token}}">
+    <input type="text" name="name" placeholder="Extra name" required>
+    <input type="text" name="description" placeholder="Description">
+    <input type="number" name="price" placeholder="Price (cents)" value="0">
+    <button type="submit" class="btn btn-sm btn-primary">Add Extra</button>
+</form>
+
+{{#each additionals}}
+<div class="additional-row">
+    <span>{{name}} &mdash; ${{price_display}}: {{description}}</span>
+    <form method="POST" action="/admin/additional/{{id}}/delete" style="display:inline;">
+        <input type="hidden" name="csrf_token" value="{{../csrf_token}}">
+        <button type="submit" class="btn btn-sm btn-danger">Remove</button>
+    </form>
+</div>
+{{/each}}
+
+{{/layout}}

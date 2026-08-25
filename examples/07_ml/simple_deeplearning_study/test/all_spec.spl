@@ -1,0 +1,265 @@
+# Master test suite for simple_deeplearning_study
+# Runs all test specs
+
+use std.spec.{describe, it, expect}
+
+# Phase 1: Primitives
+use examples.simple_deeplearning_study.lib.util.math_helpers.{dl_exp, dl_sqrt, dl_log, dl_abs, dl_tanh, dl_sigmoid}
+use examples.simple_deeplearning_study.lib.prim.linear.{StudyLinear}
+use examples.simple_deeplearning_study.lib.prim.embedding.{StudyEmbedding}
+use examples.simple_deeplearning_study.lib.prim.layer_norm.{StudyLayerNorm}
+use examples.simple_deeplearning_study.lib.prim.gelu.{StudyGELU, gelu}
+use examples.simple_deeplearning_study.lib.prim.dropout.{StudyDropout}
+use examples.simple_deeplearning_study.lib.prim.softmax.{study_softmax_1d, study_softmax_2d}
+
+# Phase 2: Architecture
+use examples.simple_deeplearning_study.lib.attention.causal_mask.{create_causal_mask}
+use examples.simple_deeplearning_study.lib.attention.self_attention.{scaled_dot_product, StudyCausalSelfAttention}
+use examples.simple_deeplearning_study.lib.attention.multi_head_attention.{StudyMultiHeadAttention}
+use examples.simple_deeplearning_study.lib.transformer.feed_forward.{StudyFeedForward}
+use examples.simple_deeplearning_study.lib.transformer.transformer_block.{StudyTransformerBlock}
+use examples.simple_deeplearning_study.lib.gpt.gpt_config.{GPTConfig, gpt_config_tiny}
+use examples.simple_deeplearning_study.lib.gpt.gpt_model.{StudyGPT}
+
+# Phase 3: Tokenizer & Data
+use examples.simple_deeplearning_study.lib.tokenizer.simple_tokenizer.{CharTokenizer}
+use examples.simple_deeplearning_study.lib.dataset.text_dataset.{TextDataset}
+use examples.simple_deeplearning_study.lib.dataset.data_utils.{train_val_split, create_batches}
+
+# Phase 4: Training & Generation
+use examples.simple_deeplearning_study.lib.training.train_loop.{cross_entropy_loss}
+use examples.simple_deeplearning_study.lib.training.generate.{generate_greedy}
+
+# Tensor imports
+use std.pure.tensor.{PureTensor, tensor_from_data, tensor_zeros, tensor_ones}
+use std.pure.tensor_ops.{sum}
+
+fn close(a: f64, b: f64, eps: f64) -> bool:
+    val diff = a - b
+    val abs_diff = if diff < 0.0: 0.0 - diff else: diff
+    abs_diff < eps
+
+describe "simple_deeplearning_study":
+
+    # ===== Phase 1: Primitives =====
+
+    describe "math_helpers":
+        it "dl_exp computes e^0 = 1":
+            expect(close(dl_exp(0.0), 1.0, 0.001)).to_equal(true)
+
+        it "dl_exp computes e^1 ≈ 2.718":
+            expect(close(dl_exp(1.0), 2.718281828, 0.01)).to_equal(true)
+
+        it "dl_sqrt computes sqrt(4) = 2":
+            expect(close(dl_sqrt(4.0), 2.0, 0.001)).to_equal(true)
+
+        it "dl_sqrt computes sqrt(2) ≈ 1.414":
+            expect(close(dl_sqrt(2.0), 1.41421, 0.001)).to_equal(true)
+
+        it "dl_log computes ln(1) = 0":
+            expect(close(dl_log(1.0), 0.0, 0.01)).to_equal(true)
+
+        it "dl_sigmoid(0) = 0.5":
+            expect(close(dl_sigmoid(0.0), 0.5, 0.001)).to_equal(true)
+
+        it "dl_tanh(0) = 0":
+            expect(close(dl_tanh(0.0), 0.0, 0.001)).to_equal(true)
+
+    describe "softmax":
+        it "softmax produces probabilities that sum to 1":
+            val x = tensor_from_data([1.0, 2.0, 3.0], [3])
+            val result = study_softmax_1d(x)
+            val total = sum(result)
+            expect(close(total, 1.0, 0.001)).to_equal(true)
+
+        it "softmax highest input gets highest probability":
+            val x = tensor_from_data([1.0, 5.0, 2.0], [3])
+            val result = study_softmax_1d(x)
+            expect(result.data[1] > result.data[0]).to_equal(true)
+            expect(result.data[1] > result.data[2]).to_equal(true)
+
+        it "softmax 2D normalizes each row":
+            val x = tensor_from_data([1.0, 2.0, 3.0, 1.0], [2, 2])
+            val result = study_softmax_2d(x)
+            val row0_sum = result.data[0] + result.data[1]
+            val row1_sum = result.data[2] + result.data[3]
+            expect(close(row0_sum, 1.0, 0.001)).to_equal(true)
+            expect(close(row1_sum, 1.0, 0.001)).to_equal(true)
+
+    describe "gelu":
+        it "GELU(0) ≈ 0":
+            expect(close(gelu(0.0), 0.0, 0.001)).to_equal(true)
+
+        it "GELU is approximately identity for large positive x":
+            val result = gelu(3.0)
+            expect(close(result, 3.0, 0.1)).to_equal(true)
+
+        it "GELU is near zero for large negative x":
+            val result = gelu(-3.0)
+            expect(close(result, 0.0, 0.02)).to_equal(true)
+
+    describe "linear":
+        it "Linear produces correct output shape":
+            val lin = StudyLinear.create(4, 3, true)
+            val x = tensor_from_data([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], [2, 4])
+            val out = lin.forward(x)
+            expect(out.shape[0]).to_equal(2)
+            expect(out.shape[1]).to_equal(3)
+
+    describe "embedding":
+        it "Embedding looks up correct vectors":
+            val emb = StudyEmbedding.create(10, 4)
+            val out = emb.forward([0, 3, 7])
+            expect(out.shape[0]).to_equal(3)
+            expect(out.shape[1]).to_equal(4)
+
+        it "Same token produces same embedding":
+            val emb = StudyEmbedding.create(10, 4)
+            val out = emb.forward([2, 2])
+            # Row 0 and row 1 should be identical
+            expect(close(out.get([0, 0]), out.get([1, 0]), 0.0001)).to_equal(true)
+            expect(close(out.get([0, 1]), out.get([1, 1]), 0.0001)).to_equal(true)
+
+    describe "layer_norm":
+        it "LayerNorm normalizes to approximately zero mean":
+            val ln = StudyLayerNorm.create(4)
+            val x = tensor_from_data([10.0, 20.0, 30.0, 40.0], [1, 4])
+            val out = ln.forward(x)
+            val row_mean = (out.get([0, 0]) + out.get([0, 1]) + out.get([0, 2]) + out.get([0, 3])) / 4.0
+            expect(close(row_mean, 0.0, 0.01)).to_equal(true)
+
+    describe "dropout":
+        it "Dropout in eval mode is identity":
+            var drop = StudyDropout.create(0.5)
+            drop.set_training(false)
+            val x = tensor_from_data([1.0, 2.0, 3.0], [3])
+            val out = drop.forward(x)
+            expect(close(out.data[0], 1.0, 0.0001)).to_equal(true)
+            expect(close(out.data[1], 2.0, 0.0001)).to_equal(true)
+            expect(close(out.data[2], 3.0, 0.0001)).to_equal(true)
+
+    # ===== Phase 2: Architecture =====
+
+    describe "causal_mask":
+        it "creates lower triangular mask":
+            val mask = create_causal_mask(3)
+            expect(mask.shape[0]).to_equal(3)
+            expect(mask.shape[1]).to_equal(3)
+            # Diagonal and below should be 0.0
+            expect(close(mask.get([0, 0]), 0.0, 0.001)).to_equal(true)
+            expect(close(mask.get([1, 0]), 0.0, 0.001)).to_equal(true)
+            expect(close(mask.get([1, 1]), 0.0, 0.001)).to_equal(true)
+            # Above diagonal should be -999999.0
+            expect(mask.get([0, 1]) < -999.0).to_equal(true)
+            expect(mask.get([0, 2]) < -999.0).to_equal(true)
+
+    describe "self_attention":
+        it "scaled dot-product produces correct shapes":
+            val q = tensor_from_data([1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0], [4, 2])
+            val k = tensor_from_data([1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0], [4, 2])
+            val v = tensor_from_data([1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0], [4, 2])
+            val result = scaled_dot_product(q, k, v, nil)
+            expect(result.output.shape[0]).to_equal(4)
+            expect(result.output.shape[1]).to_equal(2)
+
+        it "causal self-attention creates correct output shape":
+            val attn = StudyCausalSelfAttention.create(4, 2)
+            val x = tensor_from_data([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0], [3, 4])
+            val result = attn.forward(x)
+            expect(result.output.shape[0]).to_equal(3)
+            expect(result.output.shape[1]).to_equal(2)
+
+    describe "multi_head_attention":
+        it "MHA produces correct output shape":
+            val mha = StudyMultiHeadAttention.create(8, 2, 0.0)
+            val x = tensor_from_data([
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,
+                9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0
+            ], [2, 8])
+            val out = mha.forward(x)
+            expect(out.shape[0]).to_equal(2)
+            expect(out.shape[1]).to_equal(8)
+
+    describe "feed_forward":
+        it "FFN preserves shape":
+            val ffn = StudyFeedForward.create(8, 32, 0.0)
+            val x = tensor_from_data([
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,
+                9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0
+            ], [2, 8])
+            val out = ffn.forward(x)
+            expect(out.shape[0]).to_equal(2)
+            expect(out.shape[1]).to_equal(8)
+
+    describe "transformer_block":
+        it "TransformerBlock preserves shape":
+            val block = StudyTransformerBlock.create(8, 2, 0.0)
+            val x = tensor_from_data([
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,
+                9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0
+            ], [2, 8])
+            val out = block.forward(x)
+            expect(out.shape[0]).to_equal(2)
+            expect(out.shape[1]).to_equal(8)
+
+    describe "gpt_model":
+        it "GPT forward produces logits with correct shape":
+            val config = gpt_config_tiny()
+            val model = StudyGPT.create(config)
+            val logits = model.forward([0, 1, 2, 3])
+            expect(logits.shape[0]).to_equal(4)
+            expect(logits.shape[1]).to_equal(config.vocab_size)
+
+    # ===== Phase 3: Tokenizer & Data =====
+
+    describe "char_tokenizer":
+        it "encode and decode are inverse operations":
+            val tok = CharTokenizer.from_text("hello world")
+            val ids = tok.encode("hello")
+            val decoded = tok.decode(ids)
+            expect(decoded).to_equal("hello")
+
+        it "vocabulary size matches unique characters":
+            val tok = CharTokenizer.from_text("aabbc")
+            expect(tok.vocab_size).to_equal(3)
+
+    describe "text_dataset":
+        it "creates correct number of samples":
+            val ids: [i64] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+            val ds = TextDataset.create(ids, 4, 1)
+            # With ctx_len=4 and stride=1: positions 0,1,2,3,4,5 -> 6 samples
+            expect(ds.len()).to_equal(6)
+
+        it "target is shifted by 1":
+            val ids: [i64] = [10, 20, 30, 40, 50]
+            val ds = TextDataset.create(ids, 3, 1)
+            val sample = ds.get(0)
+            expect(sample.input[0]).to_equal(10)
+            expect(sample.input[1]).to_equal(20)
+            expect(sample.input[2]).to_equal(30)
+            expect(sample.target[0]).to_equal(20)
+            expect(sample.target[1]).to_equal(30)
+            expect(sample.target[2]).to_equal(40)
+
+    describe "data_utils":
+        it "train_val_split preserves total count":
+            val ids: [i64] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+            val split = train_val_split(ids, 0.8)
+            expect(split.train_ids.len() + split.val_ids.len()).to_equal(10)
+
+    # ===== Phase 4: Training =====
+
+    describe "cross_entropy_loss":
+        it "loss is positive":
+            val logits = tensor_from_data([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], [2, 3])
+            val targets: [i64] = [0, 1]
+            val loss = cross_entropy_loss(logits, targets)
+            expect(loss > 0.0).to_equal(true)
+
+    describe "generate":
+        it "greedy generation produces correct length":
+            val config = gpt_config_tiny()
+            val model = StudyGPT.create(config)
+            val result = generate_greedy(model, [0, 1], 3)
+            # start_ids (2) + max_new_tokens (3) = 5
+            expect(result.len()).to_equal(5)

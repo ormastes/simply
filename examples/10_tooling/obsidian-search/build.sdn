@@ -1,0 +1,23 @@
+project:
+  name: simple-obsidian-tools
+  version: 0.1.0
+  type: application
+  description: "Obsidian vault search MCP server with hybrid BM25/graph ranking"
+
+vault:
+  default_path: ""
+  index_db: ".obsidian-search/index.db"
+  file_extensions: [".md"]
+  exclude_patterns: [".obsidian/", ".trash/", "node_modules/"]
+
+search:
+  default_limit: 20
+  max_limit: 100
+  fts5_tokenizer: "unicode61"
+  recency_decay_days: 90
+  authority_iterations: 3
+
+mcp:
+  server_name: "obsidian-search"
+  server_version: "0.1.0"
+  protocol: "stdio"

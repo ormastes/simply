@@ -1,0 +1,68 @@
+# @cover src/kernel/snapshot.spl 80%
+"""
+# Balance Snapshots — materialized cache with re-sum parity
+
+A snapshot materialises one account's balance up to a cut point; a later read
+sums only the tail past the cut and adds the snapshot. Because balances are a
+deterministic projection, snapshot + tail must always equal a full re-sum, at
+any cut point, ignoring lines for other accounts and currencies.
+"""
+
+use std.spec
+use units.money.{money}
+use kernel.projection.{JournalLine, JournalEntry, line, account_balance}
+use kernel.snapshot.{BalanceSnapshot, take_snapshot, balance_with_snapshot}
+
+fn ledger6() -> [JournalEntry]:
+    var e1: [JournalLine] = [line(1, money("USD", 100)), line(2, money("USD", -100))]
+    var e2: [JournalLine] = [line(1, money("USD", 200)), line(2, money("USD", -200))]
+    var e3: [JournalLine] = [line(1, money("EUR", 500)), line(2, money("EUR", -500))]
+    var e4: [JournalLine] = [line(1, money("USD", 50)), line(3, money("USD", -50))]
+    var e5: [JournalLine] = [line(2, money("USD", 300)), line(1, money("USD", -300))]
+    var e6: [JournalLine] = [line(1, money("USD", 400)), line(2, money("USD", -400))]
+    var entries: [JournalEntry] = []
+    entries.push(JournalEntry { id: 1, lines: e1 })
+    entries.push(JournalEntry { id: 2, lines: e2 })
+    entries.push(JournalEntry { id: 3, lines: e3 })
+    entries.push(JournalEntry { id: 4, lines: e4 })
+    entries.push(JournalEntry { id: 5, lines: e5 })
+    entries.push(JournalEntry { id: 6, lines: e6 })
+    return entries
+
+fn tail_from(entries: [JournalEntry], start: i64) -> [JournalEntry]:
+    var out: [JournalEntry] = []
+    var i = start
+    while i < entries.length():
+        out.push(entries[i])
+        i = i + 1
+    return out
+
+describe "Snapshot — re-sum parity for account 1 / USD":
+    it "snapshot at cut 3 plus tail equals a full re-sum":
+        val entries = ledger6()
+        val full = account_balance(entries, 1, "USD").minor
+        expect(full).to_equal(450)
+        val snap = take_snapshot(entries, 3, 1, "USD")
+        val tail = tail_from(entries, 3)
+        expect(balance_with_snapshot(snap, tail)).to_equal(full)
+
+    it "snapshot at 0 is a pure tail read":
+        val entries = ledger6()
+        val full = account_balance(entries, 1, "USD").minor
+        val snap0 = take_snapshot(entries, 0, 1, "USD")
+        expect(snap0.balance_minor).to_equal(0)
+        expect(balance_with_snapshot(snap0, entries)).to_equal(full)
+
+    it "snapshot at len is the full balance with an empty tail":
+        val entries = ledger6()
+        val full = account_balance(entries, 1, "USD").minor
+        val snapAll = take_snapshot(entries, entries.length(), 1, "USD")
+        expect(snapAll.balance_minor).to_equal(full)
+        var empty: [JournalEntry] = []
+        expect(balance_with_snapshot(snapAll, empty)).to_equal(full)
+
+    it "ignores other accounts and currencies at the cut":
+        val entries = ledger6()
+        val snap = take_snapshot(entries, 4, 1, "USD")
+        # entries[0..4) for account 1 USD: 100 + 200 + (EUR ignored) + 50 = 350
+        expect(snap.balance_minor).to_equal(350)

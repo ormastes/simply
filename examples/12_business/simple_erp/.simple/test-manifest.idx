@@ -1,0 +1,29 @@
+# test-manifest v1
+scan_timestamp=1783042109956012
+entry_count=21
+sdoctest_count=0
+
+# entries (path|size|mtime|level|slow|skip|pending|tags|platform|fuzz|chaos|deploy|security|bare|duration_ms)
+ubs_test/event_log_spec.spl|930|930|0|0|0|0|||0|0|0|0|0|0
+ubs_test/projection_spec.spl|1866|1866|0|0|0|0|||0|0|0|0|0|0
+ubs_test/commit_loop_spec.spl|1120|1120|0|0|0|0|||0|0|0|0|0|0
+ubs_test/dimensions_spec.spl|2460|2460|0|0|0|0|||0|0|0|0|0|0
+ubs_test/money_spec.spl|1337|1337|0|0|0|0|||0|0|0|0|0|0
+ubs_test/restaurant_lane_spec.spl|5858|5858|0|0|0|0|||0|0|0|0|0|0
+ubs_test/web_routes_spec.spl|4705|4705|0|0|0|0|||0|0|0|0|0|0
+ubs_test/reservation_lane_spec.spl|5270|5270|0|0|0|0|||0|0|0|0|0|0
+ubs_test/market_lane_spec.spl|5570|5570|0|0|0|0|||0|0|0|0|0|0
+ubs_test/crm_lane_spec.spl|5239|5239|0|0|0|0|||0|0|0|0|0|0
+ubs_test/sale_lane_spec.spl|4413|4413|0|0|0|0|||0|0|0|0|0|0
+ubs_test/report_spec.spl|1959|1959|0|0|0|0|||0|0|0|0|0|0
+ubs_test/dashboard_spec.spl|1970|1970|0|0|0|0|||0|0|0|0|0|0
+ubs_test/framework_approval_spec.spl|3186|3186|0|0|0|0|||0|0|0|0|0|0
+ubs_test/posting_spec.spl|2557|2557|0|0|0|0|||0|0|0|0|0|0
+ubs_test/registry_spec.spl|3204|3204|0|0|0|0|||0|0|0|0|0|0
+ubs_test/commit_queue_spec.spl|2924|2924|0|0|0|0|||0|0|0|0|0|0
+ubs_test/org_spec.spl|3085|3085|0|0|0|0|||0|0|0|0|0|0
+ubs_test/durable_log_spec.spl|4068|4068|0|0|0|0|||0|0|0|0|0|0
+ubs_test/snapshot_spec.spl|3109|3109|0|0|0|0|||0|0|0|0|0|0
+ubs_test/key_index_spec.spl|2256|2256|0|0|0|0|||0|0|0|0|0|0
+
+# sdoctest (path|size|mtime|blocks)

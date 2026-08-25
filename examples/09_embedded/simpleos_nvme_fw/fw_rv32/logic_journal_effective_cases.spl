@@ -1,0 +1,12 @@
+use logic_journal_core.*
+
+fn rv32_journal_effective_cases_selftest() -> i32:
+    if _rv32_journal_effective_count(3, 512) != 3:
+        return 1
+    if _rv32_journal_effective_count(-4, 512) != 0:
+        return 1
+    if _rv32_journal_effective_count(513, 512) != 512:
+        return 1
+    if _rv32_journal_effective_count(3, -1) != 0:
+        return 1
+    0

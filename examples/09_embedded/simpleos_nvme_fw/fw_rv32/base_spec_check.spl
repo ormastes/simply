@@ -1,0 +1,31 @@
+use logic_admin.{rv32_admin_selftest}
+use logic_backpressure_abort.{rv32_backpressure_abort_selftest}
+use logic_feature_guard.{rv32_feature_guard_selftest}
+use logic_flush.{rv32_flush_selftest}
+use logic_hil.{rv32_hil_selftest}
+use logic_io_command.{rv32_io_command_selftest}
+use logic_namespace_guard.{rv32_namespace_guard_selftest}
+use logic_queue_phase.{rv32_queue_phase_selftest}
+
+fn _report(name: text, fail_count: i64) -> i64:
+    if fail_count == 0:
+        print name + " PASS"
+    else:
+        print name + " FAIL"
+    fail_count
+
+fn main():
+    var fail_count = 0
+    fail_count = fail_count + _report("NVME-ADMIN-IDENTIFY-FEATURES-LOG-FORMAT-FW", rv32_admin_selftest())
+    fail_count = fail_count + _report("NVME-QUEUE-PHASE-CREATE-DELETE", rv32_queue_phase_selftest())
+    fail_count = fail_count + _report("NVME-HIL-OPCODE-BOUNDS", rv32_hil_selftest())
+    fail_count = fail_count + _report("NVME-NVM-READ-WRITE-ZEROES-DSM-TRIM", rv32_io_command_selftest())
+    fail_count = fail_count + _report("NVME-NVM-FLUSH", rv32_flush_selftest())
+    fail_count = fail_count + _report("NVME-FEATURE-RESERVED-FIELD-GUARD", rv32_feature_guard_selftest())
+    fail_count = fail_count + _report("NVME-NAMESPACE-RESERVED-FIELD-GUARD", rv32_namespace_guard_selftest())
+    fail_count = fail_count + _report("NVME-ABORT-BACKPRESSURE", rv32_backpressure_abort_selftest())
+    if fail_count == 0:
+        print "NVME BASE SPEC CHECKS PASS"
+    else:
+        print "NVME BASE SPEC CHECKS FAIL"
+

@@ -1,0 +1,15 @@
+# Embedded Lean block example
+# Demonstrates: lean{} blocks with handwritten proofs
+#
+# The lean{} block is passed through verbatim into the generated .lean file.
+# Use this when the auto-generated sorry stub needs a hand-written proof.
+
+@verify
+fn double(x: i64) -> i64:
+    out(ret): ret == x + x
+    x * 2
+
+lean {
+    theorem double_correct (x : Int) : double x = x + x := by
+        simp [double]
+}

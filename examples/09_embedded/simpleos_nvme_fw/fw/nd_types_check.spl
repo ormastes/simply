@@ -1,0 +1,127 @@
+"""
+nd_types_check — oracles for the typed NAND physical-address dimensions in
+nd_types.spl (contract:
+doc/01_research/hardware/nand_recovery/typed_nand_addressing_local.md §4).
+
+Absolute oracles (known values at known points), not self-comparison:
+  1. Round-trip identity: ppn -> NdAddr -> ppn, exhaustive over every ppn in
+     the small flat geometry (0..NUM_PAGES-1).
+  2. Anti-drift: NdAddr.block/page agree with nvme_types' canonical
+     ppn_block/ppn_page on every ppn (nd_types.spl must never silently
+     re-derive a fifth, disagreeing copy of that math).
+  3. Anti-drift: nd_channel_of_ppn agrees with fil_scheduler.channel_of AND
+     with rain.spl's own rain_ppn(group,channel,page) composer on sampled
+     ppns (nd_types.spl deliberately duplicates NUM_CHANNELS=8 as
+     ND_NUM_CHANNELS to stay a peer leaf of nvme_types — this is the guard
+     that catches the two ever disagreeing).
+  4. v1 SLC identity: nd_wordline_of_page(page).idx == page.idx for every
+     in-block page (the types stay distinct so a future MLC v2 upgrade
+     cannot silently corrupt a wordline-keyed policy).
+  5. Constructors preserve idx.
+  6. Module-boundary gate: this file is a module SEPARATE from nd_types.spl.
+     Every Nd* struct built below is constructed here, passed into
+     nd_types.spl functions (nd_addr, nd_ppn_of, nd_addr_of_ppn), and read
+     back via .idx — proving no cross-module struct decay (the interpreter
+     landmine documented in the agent guide).
+  7. Honesty check: nd_addr_of_ppn leaves way/bank/plane at index 0 (no fake
+     conversion math for dimensions that are not yet live in address math,
+     per the research doc's live-vs-decorative finding, §3).
+
+Run: bin/simple run examples/09_embedded/simpleos_nvme_fw/fw/nd_types_check.spl
+Gate: prints "ND TYPES OK" and exits 0.
+"""
+
+use nvme_types.*
+use nd_types.*
+use rain.*
+use fil_scheduler.*   # NUM_CHANNELS, channel_of — independent oracle for nd_channel_of_ppn
+
+fn main():
+    var fail: i64 = 0
+
+    # ── Oracle 1+2: exhaustive round-trip + anti-drift against nvme_types' canonical helpers ──
+    var roundtrip_mismatches: i64 = 0
+    var block_mismatches: i64 = 0
+    var page_mismatches: i64 = 0
+    var ppn: i64 = 0
+    while ppn < NUM_PAGES:
+        val addr: NdAddr = nd_addr_of_ppn(ppn)
+        val back: i64 = nd_ppn_of(addr)
+        if back != ppn:
+            roundtrip_mismatches = roundtrip_mismatches + 1
+        if addr.block.idx != ppn_block(ppn):
+            block_mismatches = block_mismatches + 1
+        if addr.page.idx != ppn_page(ppn):
+            page_mismatches = page_mismatches + 1
+        ppn = ppn + 1
+    fail = fail + expect_eq(roundtrip_mismatches, 0, "nd_addr: ppn -> NdAddr -> ppn identity holds for every ppn 0..NUM_PAGES-1")
+    fail = fail + expect_eq(block_mismatches, 0, "nd_addr: NdAddr.block agrees with nvme_types.ppn_block on every ppn")
+    fail = fail + expect_eq(page_mismatches, 0, "nd_addr: NdAddr.page agrees with nvme_types.ppn_page on every ppn")
+
+    # ── Oracle 3: channel-of-ppn matches rain.spl's stripe math on sampled ppns ──
+    var channel_mismatches: i64 = 0
+    var blk: i64 = 0
+    while blk < NUM_BLOCKS:
+        val sample_ppn: i64 = block_first_ppn(blk)   # sampled: first page of every block
+        val want_channel: i64 = channel_of(blk)      # fil_scheduler's independent oracle
+        if nd_channel_of_ppn(sample_ppn).idx != want_channel:
+            channel_mismatches = channel_mismatches + 1
+        blk = blk + 1
+    fail = fail + expect_eq(channel_mismatches, 0, "nd_channel_of_ppn agrees with fil_scheduler.channel_of on every block's first page")
+
+    var rain_mismatches: i64 = 0
+    var group: i64 = 0
+    while group < rain_num_groups():
+        var ch: i64 = 0
+        while ch < NUM_CHANNELS:
+            val rp: i64 = rain_ppn(group, ch, 3)   # sampled page=3, not exhaustive
+            if nd_channel_of_ppn(rp).idx != ch:
+                rain_mismatches = rain_mismatches + 1
+            ch = ch + 1
+        group = group + 1
+    fail = fail + expect_eq(rain_mismatches, 0, "nd_channel_of_ppn agrees with rain.spl's rain_ppn(group,channel,page) channel assignment")
+
+    # ── Oracle 4: wordline == page numerically in v1 SLC ──
+    var wordline_mismatches: i64 = 0
+    var p: i64 = 0
+    while p < PAGES_PER_BLOCK:
+        val wl: NdWordline = nd_wordline_of_page(nd_page(p))
+        if wl.idx != p:
+            wordline_mismatches = wordline_mismatches + 1
+        p = p + 1
+    fail = fail + expect_eq(wordline_mismatches, 0, "nd_wordline_of_page is numerically the identity in v1 SLC for every in-block page")
+
+    # ── Oracle 5: constructors preserve idx ──
+    fail = fail + expect_eq(nd_channel(5).idx, 5, "nd_channel constructor preserves idx")
+    fail = fail + expect_eq(nd_way(3).idx, 3, "nd_way constructor preserves idx")
+    fail = fail + expect_eq(nd_bank(2).idx, 2, "nd_bank constructor preserves idx")
+    fail = fail + expect_eq(nd_plane(1).idx, 1, "nd_plane constructor preserves idx")
+    fail = fail + expect_eq(nd_block(9).idx, 9, "nd_block constructor preserves idx")
+    fail = fail + expect_eq(nd_wordline(4).idx, 4, "nd_wordline constructor preserves idx")
+    fail = fail + expect_eq(nd_page(7).idx, 7, "nd_page constructor preserves idx")
+
+    # ── Oracle 6: module-boundary gate — construct Nd types HERE (a module
+    # separate from nd_types.spl), pass them into nd_types.spl functions, and
+    # read .idx back off the result. ──
+    val local_channel: NdChannel = nd_channel(6)
+    val local_way: NdWay = nd_way(0)
+    val local_bank: NdBank = nd_bank(0)
+    val local_plane: NdPlane = nd_plane(0)
+    val local_block: NdBlock = nd_block(11)
+    val local_page: NdPage = nd_page(22)
+    val composed: NdAddr = nd_addr(local_channel, local_way, local_bank, local_plane, local_block, local_page)
+    fail = fail + expect_eq(composed.channel.idx, 6, "module boundary: NdAddr.channel.idx survives construction in a separate module")
+    fail = fail + expect_eq(composed.block.idx, 11, "module boundary: NdAddr.block.idx survives construction in a separate module")
+    fail = fail + expect_eq(composed.page.idx, 22, "module boundary: NdAddr.page.idx survives construction in a separate module")
+    fail = fail + expect_eq(nd_ppn_of(composed), block_first_ppn(11) + 22, "module boundary: nd_ppn_of(composed) matches block_first_ppn(11)+22")
+
+    # ── Oracle 7: honesty check — way/bank/plane default to 0, no fake conversion math ──
+    val decorative: NdAddr = nd_addr_of_ppn(block_first_ppn(5) + 9)
+    fail = fail + expect_eq(decorative.way.idx, 0, "nd_addr_of_ppn: way has no live conversion math yet, defaults to 0 (honest, not faked)")
+    fail = fail + expect_eq(decorative.bank.idx, 0, "nd_addr_of_ppn: bank has no live conversion math yet, defaults to 0 (honest, not faked)")
+    fail = fail + expect_eq(decorative.plane.idx, 0, "nd_addr_of_ppn: plane has no live conversion math yet, defaults to 0 (honest, not faked)")
+
+    if fail == 0:
+        print "ND TYPES OK"
+    else:
+        print "ND TYPES FAIL ({fail})"

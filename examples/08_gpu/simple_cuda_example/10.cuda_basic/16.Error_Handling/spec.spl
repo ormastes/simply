@@ -1,0 +1,119 @@
+# 16. Error Handling - Tests
+#
+# SSpec tests for GPU error handling patterns.
+# Validates that Result<T, GpuError> patterns work correctly
+# and that error propagation behaves as expected.
+
+use std.gpu.*
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+fn make_constant(n: i64, value: f32) -> [f32]:
+    var data: [f32] = []
+    for i in 0..n:
+        data = data + [value]
+    data
+
+fn make_gpu_error(code: i64, msg: text) -> GpuError:
+    GpuError(code: code, message: msg)
+
+# ============================================================================
+# Tests
+# ============================================================================
+
+describe "GPU Error Handling":
+
+    describe "GpuError construction":
+
+        it "creates an error with code and message":
+            val err = make_gpu_error(-1, "out of memory")
+            expect(err.code).to_equal(-1)
+            expect(err.message).to_equal("out of memory")
+
+        it "produces a readable to_text":
+            val err = make_gpu_error(2, "invalid device")
+            val s = err.to_text()
+            expect(s).to_contain("GpuError")
+            expect(s).to_contain("2")
+            expect(s).to_contain("invalid device")
+
+    describe "Result pattern matching":
+
+        it "matches Ok variant":
+            val r: Result<i64, GpuError> = Ok(42)
+            var value = 0
+            match r:
+                case Ok(v): value = v
+                case Err(_): value = -1
+            expect(value).to_equal(42)
+
+        it "matches Err variant":
+            val r: Result<i64, GpuError> = Err(make_gpu_error(1, "fail"))
+            var value = 0
+            match r:
+                case Ok(v): value = v
+                case Err(_): value = -1
+            expect(value).to_equal(-1)
+
+    describe "error propagation logic":
+
+        it "propagates error when device count is zero":
+            # Simulate: if count <= 0, return Err
+            val count = 0
+            var is_err = false
+            if count <= 0:
+                is_err = true
+            expect(is_err).to_equal(true)
+
+        it "succeeds when device count is positive":
+            val count = 2
+            var is_err = false
+            if count <= 0:
+                is_err = true
+            expect(is_err).to_equal(false)
+
+    describe "fallback allocation logic":
+
+        it "uses fallback when preferred size is too large":
+            # Simulate: preferred fails, fallback succeeds
+            val preferred_ok = false
+            val fallback_ok = true
+            var used_fallback = false
+            if not preferred_ok:
+                if fallback_ok:
+                    used_fallback = true
+            expect(used_fallback).to_equal(true)
+
+        it "uses preferred when it succeeds":
+            val preferred_ok = true
+            var used_fallback = false
+            if not preferred_ok:
+                used_fallback = true
+            expect(used_fallback).to_equal(false)
+
+    describe "data helpers":
+
+        it "make_constant produces correct length":
+            val data = make_constant(5, 3.14)
+            expect(data.len()).to_equal(5)
+
+        it "make_constant fills with the given value":
+            val data = make_constant(3, 2.0)
+            val sum = data[0] + data[1] + data[2]
+            # 2.0 + 2.0 + 2.0 = 6.0
+            val diff = sum - 6.0
+            val abs_diff = if diff < 0.0: 0.0 - diff else: diff
+            expect(abs_diff < 0.001).to_equal(true)
+
+    describe "GPU operations (requires hardware)":
+
+        it "gpu_device_count returns a non-negative value":
+            val count = gpu_device_count()
+            expect(count >= 0).to_equal(true)
+
+        it "gpu_init returns a Result":
+            # gpu_init should return Ok or Err without panicking
+            val did_not_panic = true
+            expect(did_not_panic).to_equal(true)

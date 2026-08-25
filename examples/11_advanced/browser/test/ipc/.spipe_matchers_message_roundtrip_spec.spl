@@ -1,0 +1,148 @@
+#![allow(REQC001)]
+#![allow(REQC004)]
+#![allow(unnamed_duplicate_typed_args)]
+# IPC: Message Serialization Round-trip Tests
+# Category: Browser Platform IPC
+# Status: Active
+#
+# Validates that IPC messages can be serialized and deserialized without loss.
+# Tests cover all major message types: navigation, fetch, GPU surface, and
+# process identity preservation.
+#
+# Run with: bin/simple test examples/browser/test/ipc/message_roundtrip_spec.spl
+
+use std.spec
+use sbp.entity.ipc.message_types.{BrowserIpcMsg, BrowserIpcMethod, IpcFlag}
+use sbp.entity.ipc.process_types.{ProcessId, ProcessKind}
+use sbp.transform.ipc_serialize.{serialize_msg, deserialize_msg}
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+fn make_pid(id: i64, kind: ProcessKind) -> ProcessId:
+    ProcessId(id: id, kind: kind)
+
+fn make_msg(src: ProcessId, dst: ProcessId, method: BrowserIpcMethod, flags: [IpcFlag], req_id: i64) -> BrowserIpcMsg:
+    BrowserIpcMsg(src: src, dst: dst, method: method, flags: flags, request_id: req_id)
+
+# ============================================================================
+# Round-trip tests
+# ============================================================================
+
+describe "IPC message roundtrip":
+    context "navigation messages":
+        it "serialize and deserialize LoadUrl":
+            """Create NavigateTo msg, serialize, deserialize, check fields match."""
+            val browser_pid = make_pid(1, ProcessKind.Browser)
+            val renderer_pid = make_pid(2, ProcessKind.Renderer)
+            val msg = make_msg(
+                browser_pid, renderer_pid,
+                BrowserIpcMethod.NavigateTo,
+                [IpcFlag.Async],
+                100
+            )
+            val bytes = serialize_msg(msg)
+            val restored = deserialize_msg(bytes)
+            if restored.?:
+                val r = restored
+                expect r.method == BrowserIpcMethod.NavigateTo
+                expect r.request_id == 100
+                expect r.src.id == 1
+                expect r.dst.id == 2
+            else:
+                expect "deserialization should succeed" == ""
+
+    context "network messages":
+        it "serialize and deserialize FetchResponse":
+            """Roundtrip with FetchResponse method and flags."""
+            val net_pid = make_pid(3, ProcessKind.Network)
+            val browser_pid = make_pid(1, ProcessKind.Browser)
+            val msg = make_msg(
+                net_pid, browser_pid,
+                BrowserIpcMethod.FetchResponse,
+                [IpcFlag.Reply, IpcFlag.Async],
+                201
+            )
+            val bytes = serialize_msg(msg)
+            val restored = deserialize_msg(bytes)
+            if restored.?:
+                val r = restored
+                expect r.method == BrowserIpcMethod.FetchResponse
+                expect r.request_id == 201
+                expect r.src.kind == ProcessKind.Network
+                expect r.dst.kind == ProcessKind.Browser
+            else:
+                expect "deserialization should succeed" == ""
+
+    context "GPU messages":
+        it "serialize and deserialize CreateSurface":
+            """Roundtrip GPU message preserves method and process info."""
+            val browser_pid = make_pid(1, ProcessKind.Browser)
+            val gpu_pid = make_pid(4, ProcessKind.Gpu)
+            val msg = make_msg(
+                browser_pid, gpu_pid,
+                BrowserIpcMethod.CreateSurface,
+                [IpcFlag.Sync],
+                300
+            )
+            val bytes = serialize_msg(msg)
+            val restored = deserialize_msg(bytes)
+            if restored.?:
+                val r = restored
+                expect r.method == BrowserIpcMethod.CreateSurface
+                expect r.request_id == 300
+                expect r.dst.kind == ProcessKind.Gpu
+            else:
+                expect "deserialization should succeed" == ""
+
+    context "process identity":
+        it "process id survives roundtrip":
+            """src/dst ProcessId preserved including id and kind."""
+            val src = make_pid(42, ProcessKind.Renderer)
+            val dst = make_pid(99, ProcessKind.Network)
+            val msg = make_msg(
+                src, dst,
+                BrowserIpcMethod.CancelFetch,
+                [IpcFlag.Async],
+                500
+            )
+            val bytes = serialize_msg(msg)
+            val restored = deserialize_msg(bytes)
+            if restored.?:
+                val r = restored
+                expect r.src.id == 42
+                expect r.src.kind == ProcessKind.Renderer
+                expect r.dst.id == 99
+                expect r.dst.kind == ProcessKind.Network
+            else:
+                expect "deserialization should succeed" == ""
+
+    context "method coverage":
+        it "all IPC methods have string representation":
+            """Check each variant can be converted to text for serialization."""
+            val methods = [
+                BrowserIpcMethod.NavigateTo,
+                BrowserIpcMethod.CommitNavigation,
+                BrowserIpcMethod.UpdateTitle,
+                BrowserIpcMethod.PaintFrame,
+                BrowserIpcMethod.RequestLayout,
+                BrowserIpcMethod.DomUpdate,
+                BrowserIpcMethod.FetchResource,
+                BrowserIpcMethod.FetchResponse,
+                BrowserIpcMethod.CancelFetch,
+                BrowserIpcMethod.CookieRequest,
+                BrowserIpcMethod.CookieResponse,
+                BrowserIpcMethod.CreateSurface,
+                BrowserIpcMethod.DestroySurface,
+                BrowserIpcMethod.SubmitFrame,
+                BrowserIpcMethod.SwapBuffers,
+                BrowserIpcMethod.GpuMemoryReport
+            ]
+            var all_have_text = true
+            for m in methods:
+                val txt = "{m}"
+                if txt.len() == 0:
+                    all_have_text = false
+            expect all_have_text == true
+            expect methods.len() == 16

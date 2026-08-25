@@ -1,0 +1,400 @@
+# x86_64 FS-exec smoke — the rung above elf_exec_smoke_entry.
+#
+# elf_exec_smoke_entry proved a clang-built ELF embedded as a kernel BLOB could
+# be parsed, mapped, and run ring-3 through the real SYSCALL gate. This entry
+# proves the same for an ELF that lives ON THE FAT32 FILESYSTEM:
+#
+#   1. Bring up the C-backed NVMe controller (simpleos_nvme_init) and read
+#      /FSEXEC.ELF off the FAT32 disk image into the kernel's static path-read
+#      buffer (simpleos_fat32_read_path -> simpleos_fat32_path_read_buffer_addr).
+#      The file is a real clang/lld-built freestanding ring-3 program
+#      (user/fsexec_hello.S, linked 0x8000000000), placed into the image by
+#      scripts/os/build_fsexec_disk.shs (inline FAT32 writer scripts/os/fsexec_mkimg.spl).
+#   2. Parse its ELF64 header + PT_LOAD phdrs inline (function-local consts +
+#      mmio reads — the shared os.kernel.loader.elf_loader keys on module-level
+#      `val`s that never init under freestanding native-build) and map each
+#      segment into a fresh user address space at its p_vaddr.
+#   3. iretq to CPL3; the program emits "FSEXEC_OK rc=42\n" byte-wise via
+#      syscall 60 (debug_write) through the real LSTAR trampoline, then exits
+#      QEMU via out 0xf4.
+#
+# The syscall write path is the same one proven in elf_exec_smoke_entry (kernel
+# ABI 60=debug_write / 0=exit, NOT Linux; syscall 60 implemented natively in the
+# x86_64 boot dispatcher C — see boot/baremetal_stubs.c and the bug note
+# native_build_per_fn_cfg_and_asm_volatile_dropped_2026-07-06.md).
+#
+# Compiler-bug defenses (freestanding cranelift), same as elf_exec_smoke_entry:
+#   - all `val`s are function-local (module-level `val` initializers never run);
+#   - zero-arg accessors are always called with explicit parens;
+#   - no `[u8]` array literals (file bytes come via a raw buffer address).
+
+extern fn serial_println(msg: text)
+extern fn rt_debug_exit_success()
+extern fn rt_port_outb(port: u16, value: u8)
+extern fn pmm_alloc_page_raw() -> u64
+
+# Stage-A syscall surface: anon mmap/brk bump allocator backing store. The exec
+# entry pre-maps a fixed RW heap region into the user AS and hands its bounds to
+# the boot syscall dispatcher (boot/baremetal_stubs.c rt_user_heap_init).
+extern fn rt_user_heap_init(base: u64, size: u64)
+
+# Install a 64-bit TSS (GDT slot 0x30) with RSP0 so CPL3 faults/interrupts land
+# on a kernel stack and log a fault frame instead of triple-faulting.
+extern fn rt_x86_tss_init() -> i64
+
+# C-backed NVMe + FAT32 boot reader (boot/baremetal_stubs.c).
+extern fn simpleos_nvme_init() -> i64
+extern fn simpleos_fat32_path_read_buffer_addr() -> u64
+
+# Streaming FAT reader for big files (clang_static ~119 MB > 4 MiB buffer):
+# stream_open returns file size (>0) or -1; stream_read_at copies len bytes at a
+# file offset directly into a physical/identity destination address.
+extern fn simpleos_fat32_stream_open(path: text) -> i64
+extern fn simpleos_fat32_stream_read_at(file_off: u64, dst: u64, len: u64) -> i64
+
+fn _read_elf_range(prefix: u64, file_off: u64, dst: u64, len: u64) -> i64:
+    val prefix_bytes: u64 = 65536
+    var copied: u64 = 0
+    while copied < len and file_off + copied < prefix_bytes:
+        mmio_write8(dst + copied, _rd8(prefix, file_off + copied) as u8)
+        copied = copied + 1
+    if copied < len:
+        val streamed = simpleos_fat32_stream_read_at(file_off + copied, dst + copied, len - copied)
+        if streamed < 0:
+            return streamed
+        copied = copied + (streamed as u64)
+    copied as i64
+
+# Stage D: build the SysV stack for `clang -cc1 -emit-obj /hello.c -o /hello.o`.
+extern fn rt_bare_build_cc1_stack(stack_phys: u64, base_va: u64) -> u64
+
+use os.kernel.arch.x86_64.arch_init.{arch_x86_64_early_init}
+use os.kernel.memory.pmm.{pmm_init_identity_range, g_pmm}
+use os.kernel.memory.vmm.{vmm_init}
+use os.kernel.memory.vmm_address_space.{
+    create_user_address_space, vmm_map_user_low_page,
+    vmm_clone_kernel_low_private, vmm_zero_phys_range, vmm_map_nvme_bar_high
+}
+use os.kernel.types.memory_types.{VmFlags, VirtAddr, PhysAddr}
+use os.kernel.types.task_types.{TaskContext, AddressSpace}
+use os.kernel.arch.x86_64.context.{arch_x86_64_enter_user_task}
+use os.kernel.boot.mmio.{mmio_read8, mmio_read16, mmio_read32, mmio_read64, mmio_write8}
+
+fn _fail(msg: text):
+    serial_println(msg)
+    serial_println("TEST FAILED")
+    rt_debug_exit_success()
+
+fn _rd8(base: u64, off: u64) -> u64:
+    (mmio_read8(base + off)) as u64
+
+fn _rd16(base: u64, off: u64) -> u64:
+    (mmio_read16(base + off)) as u64
+
+fn _rd32(base: u64, off: u64) -> u64:
+    (mmio_read32(base + off)) as u64
+
+fn _rd64(base: u64, off: u64) -> u64:
+    mmio_read64(base + off)
+
+# Map every PT_LOAD of the ELF64 into `space` at its p_vaddr. `hdr` points at a
+# buffer holding at least the ELF header + program headers (streamed in). Maps
+# the loadable span page-by-page (one frame per page) so segments sharing a page
+# are not double-mapped; zeroes each frame (BSS) before STREAMING overlapping
+# file bytes directly from the FAT stream into the frame (no whole-file buffer).
+# Per-page perms: RW if any covering PT_LOAD is PF_W, else RX.
+fn _map_elf64(space: AddressSpace, blob: u64) -> u64:
+    val PAGE: u64 = 4096
+    val PT_LOAD: u64 = 1
+    val PF_W: u64 = 2
+
+    val phoff = _rd64(blob, 32)
+    val phentsize = _rd16(blob, 54)
+    val phnum = _rd16(blob, 56)
+    serial_println("[fsexec] phoff={phoff} phentsize={phentsize} phnum={phnum}")
+    if phnum == 0:
+        serial_println("[fsexec] FAIL no program headers")
+        return 0
+
+    var lo: u64 = 0xFFFFFFFFFFFFFFFF
+    var hi: u64 = 0
+    var idx: u64 = 0
+    while idx < phnum:
+        val ph = phoff + (idx * phentsize)
+        if _rd32(blob, ph) == PT_LOAD:
+            val sv = _rd64(blob, ph + 16)
+            val se = sv + _rd64(blob, ph + 40)
+            if sv < lo:
+                lo = sv
+            if se > hi:
+                hi = se
+        idx = idx + 1
+    if hi == 0:
+        serial_println("[fsexec] FAIL no PT_LOAD segments")
+        return 0
+
+    val lo_page = lo & (~(PAGE - 1))
+    val hi_page = (hi + PAGE - 1) & (~(PAGE - 1))
+    serial_println("[fsexec] image span lo=0x{lo_page} hi=0x{hi_page}")
+
+    var va = lo_page
+    while va < hi_page:
+        val phys = pmm_alloc_page_raw()
+        if phys == 0:
+            serial_println("[fsexec] FAIL frame alloc va=0x{va}")
+            return 0
+        vmm_zero_phys_range(phys, PAGE)
+
+        var writable = false
+        var j: u64 = 0
+        while j < phnum:
+            val ph = phoff + (j * phentsize)
+            if _rd32(blob, ph) == PT_LOAD:
+                val sv = _rd64(blob, ph + 16)
+                val se = sv + _rd64(blob, ph + 40)
+                val overlaps = (sv < (va + PAGE)) and (se > va)
+                if overlaps and ((_rd32(blob, ph + 4) & PF_W) != 0):
+                    writable = true
+            j = j + 1
+
+        val flags = if writable: VmFlags.user_rw() else: VmFlags.user_rx()
+        if not vmm_map_user_low_page(space, VirtAddr(addr: va), PhysAddr(addr: phys), flags):
+            serial_println("[fsexec] FAIL map page va=0x{va}")
+            return 0
+
+        var k: u64 = 0
+        while k < phnum:
+            val ph = phoff + (k * phentsize)
+            if _rd32(blob, ph) == PT_LOAD:
+                val sv = _rd64(blob, ph + 16)
+                val foff = _rd64(blob, ph + 8)
+                val fsz = _rd64(blob, ph + 32)
+                var copy_start = va
+                if copy_start < sv:
+                    copy_start = sv
+                var copy_end = va + PAGE
+                val sfe = sv + fsz
+                if copy_end > sfe:
+                    copy_end = sfe
+                if copy_start < copy_end:
+                    val read_off = foff + (copy_start - sv)
+                    val read_len = copy_end - copy_start
+                    val _n = _read_elf_range(blob, read_off, phys + (copy_start - va), read_len)
+                    if _n != read_len as i64:
+                        serial_println("[fsexec] FAIL stream read foff=0x{foff} va=0x{va}")
+                        return 0
+            k = k + 1
+
+        va = va + PAGE
+
+    serial_println("[fsexec] PT_LOAD segments mapped")
+    1
+
+# Write a little-endian u64 to a physical byte address (identity-mapped).
+fn _wr64(phys: u64, value: u64):
+    var i: u64 = 0
+    while i < 8:
+        mmio_write8(phys + i, ((value >> (i * 8)) & 0xFF) as u8)
+        i = i + 1
+
+# Pre-map an anonymous RW heap region into the user AS and register its bounds
+# with the boot syscall dispatcher so mmap(10)/brk(15) can bump-allocate.
+fn _map_user_heap(space: AddressSpace, base_va: u64, pages: u64) -> u64:
+    val PAGE: u64 = 4096
+    var i: u64 = 0
+    while i < pages:
+        val phys = pmm_alloc_page_raw()
+        if phys == 0:
+            serial_println("[fsexec] FAIL heap frame alloc i={i}")
+            return 0
+        vmm_zero_phys_range(phys, PAGE)
+        if not vmm_map_user_low_page(space, VirtAddr(addr: base_va + (i * PAGE)), PhysAddr(addr: phys), VmFlags.user_rw()):
+            serial_println("[fsexec] FAIL heap map i={i}")
+            return 0
+        i = i + 1
+    rt_user_heap_init(base_va, pages * PAGE)
+    serial_println("[fsexec] user heap mapped base=0x{base_va} pages={pages}")
+    1
+
+# Build a SysV AMD64 initial process stack (argc/argv/envp/auxv) at the top of
+# the mapped user stack page. Writes through the physical frame; the user sees
+# it at `base_va`. Returns the 16-byte-aligned user rsp (points at argc).
+#   layout @rsp: argc, argv[0], NULL, envp NULL, AT_PAGESZ/4096,
+#                AT_RANDOM/ptr, AT_NULL/0
+# argv = ["clang", "--version"]. Writes the two arg strings high in the page and
+# a SysV vector (argc/argv/envp/auxv) below them, 16-aligned. Returns user rsp.
+fn _build_user_stack(stack_phys: u64, base_va: u64) -> u64:
+    val AT_NULL: u64 = 0
+    val AT_PAGESZ: u64 = 6
+    val AT_RANDOM: u64 = 25
+    val rsp_off: u64 = 3712       # 16-aligned base of the vector (11 slots = 88B)
+    val arg0_off: u64 = 3808      # "clang\0"
+    val arg1_off: u64 = 3816      # "--version\0"
+    val rand_off: u64 = 3840      # 16 bytes AT_RANDOM
+    val arg0_va = base_va + arg0_off
+    val arg1_va = base_va + arg1_off
+    val rand_va = base_va + rand_off
+
+    # argv[0] = "clang"
+    mmio_write8(stack_phys + arg0_off + 0, 0x63 as u8)   # c
+    mmio_write8(stack_phys + arg0_off + 1, 0x6C as u8)   # l
+    mmio_write8(stack_phys + arg0_off + 2, 0x61 as u8)   # a
+    mmio_write8(stack_phys + arg0_off + 3, 0x6E as u8)   # n
+    mmio_write8(stack_phys + arg0_off + 4, 0x67 as u8)   # g
+    mmio_write8(stack_phys + arg0_off + 5, 0x00 as u8)
+
+    # argv[1] = "--version"
+    mmio_write8(stack_phys + arg1_off + 0, 0x2D as u8)   # -
+    mmio_write8(stack_phys + arg1_off + 1, 0x2D as u8)   # -
+    mmio_write8(stack_phys + arg1_off + 2, 0x76 as u8)   # v
+    mmio_write8(stack_phys + arg1_off + 3, 0x65 as u8)   # e
+    mmio_write8(stack_phys + arg1_off + 4, 0x72 as u8)   # r
+    mmio_write8(stack_phys + arg1_off + 5, 0x73 as u8)   # s
+    mmio_write8(stack_phys + arg1_off + 6, 0x69 as u8)   # i
+    mmio_write8(stack_phys + arg1_off + 7, 0x6F as u8)   # o
+    mmio_write8(stack_phys + arg1_off + 8, 0x6E as u8)   # n
+    mmio_write8(stack_phys + arg1_off + 9, 0x00 as u8)
+
+    # 16 bytes AT_RANDOM (deterministic non-zero filler is fine for the smoke)
+    var r: u64 = 0
+    while r < 16:
+        mmio_write8(stack_phys + rand_off + r, ((r * 7) + 1) as u8)
+        r = r + 1
+
+    _wr64(stack_phys + rsp_off + 0,  2)              # argc
+    _wr64(stack_phys + rsp_off + 8,  arg0_va)        # argv[0]
+    _wr64(stack_phys + rsp_off + 16, arg1_va)        # argv[1]
+    _wr64(stack_phys + rsp_off + 24, 0)              # argv NULL
+    _wr64(stack_phys + rsp_off + 32, 0)              # envp NULL
+    _wr64(stack_phys + rsp_off + 40, AT_PAGESZ)      # auxv[0].type
+    _wr64(stack_phys + rsp_off + 48, 4096)           # auxv[0].val
+    _wr64(stack_phys + rsp_off + 56, AT_RANDOM)      # auxv[1].type
+    _wr64(stack_phys + rsp_off + 64, rand_va)        # auxv[1].val
+    _wr64(stack_phys + rsp_off + 72, AT_NULL)        # auxv[2].type
+    _wr64(stack_phys + rsp_off + 80, 0)              # auxv[2].val
+
+    base_va + rsp_off
+
+fn spl_start():
+    serial_println("")
+    serial_println("=== SimpleOS x86_64 FS-exec smoke ===")
+
+    arch_x86_64_early_init()
+    serial_println("[fsexec] arch-init + syscall MSRs done")
+    # TSS.RSP0 so CPL3 faults print a frame instead of triple-faulting.
+    rt_x86_tss_init()
+
+    # 1. Bring up NVMe and read /FSEXEC.ELF off the FAT32 image.
+    if simpleos_nvme_init() != 0:
+        _fail("[fsexec] FAIL nvme init")
+        return
+    serial_println("[fsexec] nvme online")
+
+    # Open the ELF as a STREAM (clang_static ~119 MB > 4 MiB buffer). Read only
+    # the ELF header + program headers into the static buffer; PT_LOAD file bytes
+    # stream page-by-page directly into user frames during mapping.
+    val fsize = simpleos_fat32_stream_open("/FSEXEC.ELF")
+    if fsize <= 0:
+        _fail("[fsexec] FAIL fat32 stream open /FSEXEC.ELF rc={fsize}")
+        return
+    val blob = simpleos_fat32_path_read_buffer_addr()
+    val _hn = simpleos_fat32_stream_read_at(0, blob, 65536)
+    if _hn != 65536:
+        _fail("[fsexec] FAIL stream header read rc={_hn}")
+        return
+    serial_println("[fsexec] stream /FSEXEC.ELF ok size={fsize} hdr=0x{blob}")
+
+    # Validate ELF64 identity (bug-safe, function-local constants).
+    val ELF_MAGIC: u64 = 0x464C457F      # 7F 45 4C 46 little-endian
+    val ELFCLASS64: u64 = 2
+    if _rd32(blob, 0) != ELF_MAGIC:
+        _fail("[fsexec] FAIL bad ELF magic")
+        return
+    if _rd8(blob, 4) != ELFCLASS64:
+        _fail("[fsexec] FAIL not ELFCLASS64")
+        return
+    val entry = _rd64(blob, 24)
+    serial_println("[fsexec] ELF64 ok entry=0x{entry}")
+
+    # 2. PMM + VMM online (after NVMe/FAT — the C NVMe DMA uses the static C
+    #    heap in low .bss, disjoint from this identity range at 0x20000000+).
+    if not pmm_init_identity_range(0x80000000, 0x100000, 0x18000000):
+        _fail("[fsexec] FAIL pmm_init")
+        return
+    vmm_init(g_pmm, 0)
+    serial_println("[fsexec] pmm+vmm online")
+
+    # Install the NVMe BAR at an exclusive higher-half slot in the kernel PML4
+    # (g_vmm). Must run AFTER vmm_init and BEFORE create_user_address_space so
+    # the fresh user AS inherits it via the PML4[256..511] copy. This is the
+    # Phase-2 root fix: makes NVMe reachable under a user cr3 (ring-0 handler).
+    vmm_map_nvme_bar_high()
+
+    val space = create_user_address_space()
+    if space.phys_root == 0 or space.phys_root == 1:
+        _fail("[fsexec] FAIL user-AS synthetic root={space.phys_root}")
+        return
+    if not vmm_clone_kernel_low_private(space.phys_root):
+        _fail("[fsexec] FAIL private low-half clone")
+        return
+    serial_println("[fsexec] user AS ready root={space.phys_root}")
+
+    # 3. Map PT_LOAD segments from the FS-loaded ELF.
+    if _map_elf64(space, blob) == 0:
+        _fail("[fsexec] FAIL segment mapping")
+        return
+
+    # 4. User stack — a MULTI-PAGE region growing down from USER_STACK_TOP. A
+    #    single page is not enough: clang runs ~13 MB into its code and then
+    #    faults writing just below a one-page stack. Map 8 MiB (2048 pages) and
+    #    keep the top page's frame to build the argv/auxv frame in.
+    val PAGE: u64 = 4096
+    val USER_STACK_TOP: u64 = 0x8000200000
+    val STACK_PAGES: u64 = 2048
+    var stack_phys: u64 = 0
+    var sp: u64 = 0
+    while sp < STACK_PAGES:
+        val sva = USER_STACK_TOP - ((sp + 1) * PAGE)   # sp=0 -> top page
+        val sph = pmm_alloc_page_raw()
+        if sph == 0:
+            _fail("[fsexec] FAIL stack alloc sp={sp}")
+            return
+        vmm_zero_phys_range(sph, PAGE)
+        if not vmm_map_user_low_page(space, VirtAddr(addr: sva), PhysAddr(addr: sph), VmFlags.user_rw()):
+            _fail("[fsexec] FAIL stack map sp={sp}")
+            return
+        if sp == 0:
+            stack_phys = sph
+        sp = sp + 1
+    serial_println("[fsexec] user stack mapped top=0x{USER_STACK_TOP} pages={STACK_PAGES}")
+
+    # 4b. Anonymous user heap (2 MiB) backing mmap/brk for libc programs.
+    val USER_HEAP_VA: u64 = 0x9000000000
+    # 64 MiB anon heap (16384 pages): a real clang -cc1 compile mmap-bumps far
+    # more than the --version banner did (2 MiB was exhausted mid-codegen).
+    if _map_user_heap(space, USER_HEAP_VA, 16384) == 0:
+        _fail("[fsexec] FAIL user heap map")
+        return
+
+    # 4c. SysV AMD64 initial stack: argc/argv/envp/auxv (clang/libc _start reads
+    #     argc/argv from rsp; auxv carries AT_PAGESZ + AT_RANDOM).
+    val user_rsp = rt_bare_build_cc1_stack(stack_phys, USER_STACK_TOP - PAGE)
+    serial_println("[fsexec] argv/auxv stack built rsp=0x{user_rsp}")
+
+    # /hello.c is read on demand off FAT32/NVMe by the ring-3 open()/read()
+    # syscall handler (NVMe BAR + DMA buffers are mapped in the user AS), so no
+    # kernel-cr3 RAM preload is needed here.
+    val ctx = TaskContext(
+        rax: 0, rbx: 0, rcx: 0, rdx: 0,
+        rsi: 0, rdi: 0, rbp: 0, rsp: user_rsp,
+        r8: 0, r9: 0, r10: 0, r11: 0,
+        r12: 0, r13: 0, r14: 0, r15: 0,
+        rip: entry,
+        rflags: 0x3002,
+        cs: 0x2b,
+        ss: 0x23,
+        fpu_state: 0
+    )
+    serial_println("[fsexec] entering user cs=0x2b iopl=3 rip=0x{entry} rsp=0x{user_rsp}")
+    arch_x86_64_enter_user_task(ctx, space.phys_root)
+    _fail("[fsexec] returned from user (unexpected)")

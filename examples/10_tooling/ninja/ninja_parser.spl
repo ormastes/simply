@@ -1,0 +1,305 @@
+#![allow(unnamed_duplicate_typed_args)]
+## ninja_parser — Parse build.ninja files
+##
+## Implements the Ninja build file format parser.
+## Reference: https://ninja-build.org/manual.html
+
+use std.text
+use std.fs
+
+# --- Data structures ---
+
+struct NinjaVar:
+    name: text
+    value: text
+
+struct NinjaRule:
+    name: text
+    command: text
+    description: text
+    depfile: text
+    deps: text          # "gcc" or "msvc"
+    pool: text
+    rsp_file: text
+    rsp_content: text
+
+struct NinjaBuildEdge:
+    outputs: [text]
+    rule_name: text
+    inputs: [text]
+    implicit_deps: [text]      # after |
+    order_only_deps: [text]    # after ||
+    vars: [NinjaVar]           # per-build variable overrides
+
+struct NinjaPool:
+    name: text
+    depth: i64
+
+struct NinjaBuildFile:
+    vars: [NinjaVar]
+    rules: [NinjaRule]
+    build_edges: [NinjaBuildEdge]
+    pools: [NinjaPool]
+    defaults: [text]
+    includes: [text]
+    subninjas: [text]
+
+# --- Parser ---
+
+fn parse_ninja(content: text) -> NinjaBuildFile:
+    """Parse a build.ninja file into a structured representation."""
+    var build_file = NinjaBuildFile(
+        vars: [],
+        rules: [],
+        build_edges: [],
+        pools: [],
+        defaults: [],
+        includes: [],
+        subninjas: [],
+    )
+
+    val lines = content.split("\n")
+    var i = 0
+
+    while i < lines.len():
+        val line = lines[i]
+        val trimmed = line.trim()
+
+        # Skip empty lines and comments
+        if trimmed.len() == 0 or trimmed.starts_with("#"):
+            i = i + 1
+            continue
+
+        # Handle line continuations ($ at end of line)
+        var full_line = trimmed
+        while full_line.ends_with("$") and i + 1 < lines.len():
+            full_line = full_line.slice(0, full_line.len() - 1)
+            i = i + 1
+            full_line = full_line + lines[i].trim()
+
+        # Rule declaration
+        if full_line.starts_with("rule "):
+            val rule_name = full_line.slice(5, full_line.len()).trim()
+            var rule = NinjaRule(
+                name: rule_name,
+                command: "",
+                description: "",
+                depfile: "",
+                deps: "",
+                pool: "",
+                rsp_file: "",
+                rsp_content: "",
+            )
+            # Parse indented body lines
+            i = i + 1
+            while i < lines.len():
+                val body_line = lines[i]
+                if body_line.len() == 0 or (not body_line.starts_with(" ") and not body_line.starts_with("\t")):
+                    break
+                val kv = body_line.trim()
+                val eq_pos = kv.index_of("=")
+                if eq_pos > 0:
+                    val key = kv.slice(0, eq_pos).trim()
+                    val value = kv.slice(eq_pos + 1, kv.len()).trim()
+                    if key == "command":
+                        rule.command = value
+                    else if key == "description":
+                        rule.description = value
+                    else if key == "depfile":
+                        rule.depfile = value
+                    else if key == "deps":
+                        rule.deps = value
+                    else if key == "pool":
+                        rule.pool = value
+                    else if key == "rspfile":
+                        rule.rsp_file = value
+                    else if key == "rspfile_content":
+                        rule.rsp_content = value
+                i = i + 1
+            build_file.rules.push(rule)
+            continue
+
+        # Build edge
+        if full_line.starts_with("build "):
+            val edge = parse_build_edge(full_line)
+            # Parse indented per-build variables
+            i = i + 1
+            while i < lines.len():
+                val body_line = lines[i]
+                if body_line.len() == 0 or (not body_line.starts_with(" ") and not body_line.starts_with("\t")):
+                    break
+                val kv = body_line.trim()
+                val eq_pos = kv.index_of("=")
+                if eq_pos > 0:
+                    val key = kv.slice(0, eq_pos).trim()
+                    val value = kv.slice(eq_pos + 1, kv.len()).trim()
+                    edge.vars.push(NinjaVar(name: key, value: value))
+                i = i + 1
+            build_file.build_edges.push(edge)
+            continue
+
+        # Pool declaration
+        if full_line.starts_with("pool "):
+            val pool_name = full_line.slice(5, full_line.len()).trim()
+            var depth = 1
+            i = i + 1
+            while i < lines.len():
+                val body_line = lines[i]
+                if body_line.len() == 0 or (not body_line.starts_with(" ") and not body_line.starts_with("\t")):
+                    break
+                val kv = body_line.trim()
+                if kv.starts_with("depth"):
+                    val eq_pos = kv.index_of("=")
+                    if eq_pos > 0:
+                        depth = kv.slice(eq_pos + 1, kv.len()).trim().parse_int()
+                i = i + 1
+            build_file.pools.push(NinjaPool(name: pool_name, depth: depth))
+            continue
+
+        # Default target
+        if full_line.starts_with("default "):
+            val targets_str = full_line.slice(8, full_line.len()).trim()
+            val targets = targets_str.split(" ").filter(_.len() > 0)
+            for t in targets:
+                build_file.defaults.push(t)
+            i = i + 1
+            continue
+
+        # Include directive
+        if full_line.starts_with("include "):
+            val inc_path = full_line.slice(8, full_line.len()).trim()
+            build_file.includes.push(inc_path)
+            i = i + 1
+            continue
+
+        # Subninja directive
+        if full_line.starts_with("subninja "):
+            val sub_path = full_line.slice(9, full_line.len()).trim()
+            build_file.subninjas.push(sub_path)
+            i = i + 1
+            continue
+
+        # Top-level variable assignment
+        val eq_pos = full_line.index_of("=")
+        if eq_pos > 0 and not full_line.starts_with("build "):
+            val name = full_line.slice(0, eq_pos).trim()
+            val value = full_line.slice(eq_pos + 1, full_line.len()).trim()
+            build_file.vars.push(NinjaVar(name: name, value: value))
+            i = i + 1
+            continue
+
+        i = i + 1
+
+    build_file
+
+fn parse_build_edge(line: text) -> NinjaBuildEdge:
+    """Parse a build line: build OUTPUT...: RULE INPUT... | IMPLICIT... || ORDER_ONLY..."""
+    # Remove "build " prefix
+    val rest = line.slice(6, line.len())
+
+    # Split on ":"
+    val colon_pos = rest.index_of(":")
+    if colon_pos < 0:
+        return NinjaBuildEdge(
+            outputs: [rest.trim()],
+            rule_name: "phony",
+            inputs: [],
+            implicit_deps: [],
+            order_only_deps: [],
+            vars: [],
+        )
+
+    val outputs_str = rest.slice(0, colon_pos).trim()
+    val after_colon = rest.slice(colon_pos + 1, rest.len()).trim()
+
+    val outputs = outputs_str.split(" ").filter(_.len() > 0)
+
+    # Split after colon: first token is rule name, rest are inputs
+    val parts = after_colon.split(" ").filter(_.len() > 0)
+    var rule_name = "phony"
+    var inputs: [text] = []
+    var implicit_deps: [text] = []
+    var order_only_deps: [text] = []
+
+    if parts.len() >= 1:
+        rule_name = parts[0]
+
+    # Parse remaining tokens, watching for | and ||
+    var mode = "input"  # "input", "implicit", "order_only"
+    var idx = 1
+    while idx < parts.len():
+        val p = parts[idx]
+        if p == "||":
+            mode = "order_only"
+            idx = idx + 1
+            continue
+        if p == "|":
+            mode = "implicit"
+            idx = idx + 1
+            continue
+
+        if mode == "input":
+            inputs.push(p)
+        else if mode == "implicit":
+            implicit_deps.push(p)
+        else if mode == "order_only":
+            order_only_deps.push(p)
+        idx = idx + 1
+
+    NinjaBuildEdge(
+        outputs: outputs,
+        rule_name: rule_name,
+        inputs: inputs,
+        implicit_deps: implicit_deps,
+        order_only_deps: order_only_deps,
+        vars: [],
+    )
+
+fn parse_ninja_file(path: text) -> NinjaBuildFile:
+    """Parse a build.ninja file from disk."""
+    val content = fs.read_text(path)
+    var build_file = parse_ninja(content)
+
+    # Process includes
+    val dir = file_dir(path)
+    for inc in build_file.includes:
+        val inc_path = if inc.starts_with("/"): inc else: "{dir}/{inc}"
+        if fs.exists(inc_path):
+            val included = parse_ninja_file(inc_path)
+            merge_build_file(build_file, included)
+
+    # Process subninjas (variables scoped separately)
+    for sub in build_file.subninjas:
+        val sub_path = if sub.starts_with("/"): sub else: "{dir}/{sub}"
+        if fs.exists(sub_path):
+            val sub_file = parse_ninja_file(sub_path)
+            # Subninja: rules and build edges are merged, but vars stay scoped
+            for r in sub_file.rules:
+                build_file.rules.push(r)
+            for e in sub_file.build_edges:
+                build_file.build_edges.push(e)
+            for p in sub_file.pools:
+                build_file.pools.push(p)
+
+    build_file
+
+fn merge_build_file(target: NinjaBuildFile, source: NinjaBuildFile):
+    """Merge an included file into the target build file."""
+    for v in source.vars:
+        target.vars.push(v)
+    for r in source.rules:
+        target.rules.push(r)
+    for e in source.build_edges:
+        target.build_edges.push(e)
+    for p in source.pools:
+        target.pools.push(p)
+    for d in source.defaults:
+        target.defaults.push(d)
+
+fn file_dir(path: text) -> text:
+    """Get the directory component of a file path."""
+    val slash_pos = path.rfind("/")
+    if slash_pos >= 0:
+        path.slice(0, slash_pos)
+    else:
+        "."

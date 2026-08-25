@@ -1,0 +1,4 @@
+use logic_reactor_cases.*
+
+fn rv32_reactor_selftest() -> i32:
+    rv32_reactor_cases_selftest()

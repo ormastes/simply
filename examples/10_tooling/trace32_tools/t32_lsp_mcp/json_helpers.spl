@@ -1,0 +1,233 @@
+@allow(unnamed_duplicate_typed_args)
+# T32 LSP MCP Server — JSON helpers
+# Inlined for zero-import startup. All functions prefixed lsp_ to avoid name collisions.
+
+# --- JSON character helpers ---
+
+fn lsp_Q() -> text:
+    "\""
+
+fn lsp_LB() -> text:
+    "{"
+
+fn lsp_RB() -> text:
+    "}"
+
+fn lsp_SB_L() -> text:
+    "["
+
+fn lsp_SB_R() -> text:
+    "]"
+
+# --- JSON encoding ---
+
+fn lsp_escape_json(s: text) -> text:
+    var result = s
+    result = result.replace(r"\", r"\\")
+    result = result.replace(lsp_Q(), r"\" + lsp_Q())
+    result = result.replace("\n", r"\n")
+    result = result.replace("\r", r"\r")
+    result = result.replace("\t", r"\t")
+    result
+
+fn lsp_js(s: text) -> text:
+    lsp_Q() + lsp_escape_json(s) + lsp_Q()
+
+fn lsp_jp(key: text, value: text) -> text:
+    lsp_Q() + key + lsp_Q() + ":" + value
+
+fn lsp_jo1(p1: text) -> text:
+    lsp_LB() + p1 + lsp_RB()
+
+fn lsp_jo2(p1: text, p2: text) -> text:
+    lsp_LB() + p1 + "," + p2 + lsp_RB()
+
+fn lsp_jo3(p1: text, p2: text, p3: text) -> text:
+    lsp_LB() + p1 + "," + p2 + "," + p3 + lsp_RB()
+
+fn lsp_jo4(p1: text, p2: text, p3: text, p4: text) -> text:
+    lsp_LB() + p1 + "," + p2 + "," + p3 + "," + p4 + lsp_RB()
+
+fn lsp_find_text(haystack: text, needle: text) -> i64:
+    if needle == "":
+        return 0
+    if haystack.len() < needle.len():
+        return -1
+    var i = 0
+    while i <= haystack.len() - needle.len():
+        if lsp_starts_with_at(haystack, i, needle):
+            return i
+        i = i + 1
+    return -1
+
+fn lsp_char_at(s: text, index: i64) -> text:
+    s.substring(index, index + 1)
+
+fn lsp_starts_with_at(s: text, start: i64, needle: text) -> bool:
+    if start < 0:
+        return false
+    if start + needle.len() > s.len():
+        return false
+    var i = 0
+    while i < needle.len():
+        if lsp_char_at(s, start + i) != lsp_char_at(needle, i):
+            return false
+        i = i + 1
+    true
+
+fn lsp_skip_ws(s: text, start: i64) -> i64:
+    var i = start
+    while i < s.len():
+        val ch = lsp_char_at(s, i)
+        if ch != " " and ch != "\t" and ch != "\r" and ch != "\n":
+            return i
+        i = i + 1
+    return i
+
+fn lsp_read_string_end(s: text, start_quote: i64) -> i64:
+    var i = start_quote + 1
+    var escaped = false
+    while i < s.len():
+        val ch = lsp_char_at(s, i)
+        if escaped:
+            escaped = false
+        elif ch == "\\":
+            escaped = true
+        elif ch == lsp_Q():
+            return i
+        i = i + 1
+    return -1
+
+fn lsp_read_nested_end(s: text, start_index: i64) -> i64:
+    var i = start_index
+    var depth = 0
+    var in_string = false
+    var escaped = false
+    while i < s.len():
+        val ch = lsp_char_at(s, i)
+        if in_string:
+            if escaped:
+                escaped = false
+            elif ch == "\\":
+                escaped = true
+            elif ch == lsp_Q():
+                in_string = false
+        else:
+            if ch == lsp_Q():
+                in_string = true
+            elif ch == lsp_LB() or ch == lsp_SB_L():
+                depth = depth + 1
+            elif ch == lsp_RB() or ch == lsp_SB_R():
+                depth = depth - 1
+                if depth == 0:
+                    return i
+        i = i + 1
+    return -1
+
+# --- JSON extraction ---
+
+fn lsp_extract_field(json: text, key: text) -> text:
+    val raw = lsp_extract_field_raw(json, key)
+    if raw == "null":
+        return ""
+    if raw.starts_with(lsp_Q()):
+        val parts = raw.split(lsp_Q())
+        if parts.len() >= 2:
+            return parts[1]
+    return raw
+
+fn lsp_unescape_json_string(s: text) -> text:
+    var parts: [text] = []
+    var i = 0
+    while i < s.len():
+        val ch = s.substring(i, i + 1)
+        if ch != "\\":
+            parts.push(ch)
+            i = i + 1
+            continue
+        if i + 1 >= s.len():
+            parts.push(ch)
+            i = i + 1
+            continue
+        val next = s.substring(i + 1, i + 2)
+        if next == "n":
+            parts.push("\n")
+        elif next == "r":
+            parts.push("\r")
+        elif next == "t":
+            parts.push("\t")
+        elif next == "\"":
+            parts.push("\"")
+        elif next == "\\":
+            parts.push("\\")
+        else:
+            parts.push(next)
+        i = i + 2
+    parts.join("")
+
+fn lsp_extract_field_raw(json: text, key: text) -> text:
+    val search = lsp_Q() + key + lsp_Q() + ":"
+    val split_parts = json.split(search)
+    if split_parts.len() < 2:
+        return "null"
+    var rest = split_parts[1]
+    rest = rest.trim()
+    if rest == "":
+        return "null"
+    if rest.starts_with(lsp_Q()):
+        val value_marker = "__LSP_JSON_STRING_MARKER__"
+        val value_marked = rest.replace(lsp_Q(), value_marker)
+        val value_parts = value_marked.split(value_marker)
+        if value_parts.len() < 2:
+            return "null"
+        return lsp_js(value_parts[1])
+    if rest.starts_with(lsp_LB()) or rest.starts_with(lsp_SB_L()):
+        return rest
+    var raw = rest.split(",")[0]
+    raw = raw.split(lsp_RB())[0]
+    raw = raw.split(lsp_SB_R())[0]
+    raw = raw.trim()
+    if raw == "":
+        return "null"
+    raw
+
+fn lsp_extract_id(json: text) -> text:
+    lsp_extract_field_raw(json, "id")
+
+fn lsp_extract_nested(json: text, key: text) -> text:
+    val params = lsp_extract_field_raw(json, "params")
+    if params == "null":
+        return ""
+    lsp_extract_field(params, key)
+
+# --- JSON result helpers ---
+
+fn lsp_result_ok(id: text, result: text) -> text:
+    lsp_jo3(lsp_jp("jsonrpc", lsp_js("2.0")), lsp_jp("id", id), lsp_jp("result", result))
+
+fn lsp_result_error(id: text, code: i64, message: text) -> text:
+    val err = lsp_jo2(lsp_jp("code", str(code)), lsp_jp("message", lsp_js(message)))
+    lsp_jo3(lsp_jp("jsonrpc", lsp_js("2.0")), lsp_jp("id", id), lsp_jp("error", err))
+
+# --- MCP Tool Result helpers ---
+
+fn lsp_make_tool_result(id: text, output: text) -> text:
+    val escaped = lsp_escape_json(output)
+    val quoted = lsp_Q() + escaped + lsp_Q()
+    val content = lsp_SB_L() + lsp_jo2(lsp_jp("type", lsp_js("text")), lsp_jp("text", quoted)) + lsp_SB_R()
+    val result = lsp_jo1(lsp_jp("content", content))
+    lsp_result_ok(id, result)
+
+fn lsp_make_tool_error(id: text, code: i64, msg: text) -> text:
+    val content = lsp_SB_L() + lsp_jo2(lsp_jp("type", lsp_js("text")), lsp_jp("text", lsp_js("ERROR " + str(code) + ": " + msg))) + lsp_SB_R()
+    var err_result = lsp_LB() + lsp_jp("content", content) + "," + lsp_jp("isError", "true") + lsp_RB()
+    lsp_result_ok(id, err_result)
+
+# --- Utility ---
+
+fn lsp_text_byte_len(s: text) -> i64:
+    return s.len()
+
+# Build a JSON string field: "key":"value"
+fn lsp_json_str(key: text, value: text) -> text:
+    lsp_jp(key, lsp_js(value))

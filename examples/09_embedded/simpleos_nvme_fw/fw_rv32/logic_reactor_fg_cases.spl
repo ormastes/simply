@@ -1,0 +1,12 @@
+use logic_reactor_fg_core.*
+
+fn rv32_reactor_fg_cases_selftest() -> i32:
+    if _rv32_reactor_fg_tick_impl(1, 0) != 1:
+        return 1
+    if _rv32_reactor_fg_tick_impl(2, 2) != 0:
+        return 1
+    if _rv32_reactor_service_impl(2, 4096) != 2:
+        return 1
+    if _rv32_reactor_service_impl(5000, 4096) != 4096:
+        return 1
+    0

@@ -1,0 +1,458 @@
+strings |id, value|
+    0, test/unit/query_parser_spec.spl
+    1, "QueryParser > freetext extraction"
+    2, "extracts plain query"
+    3, Unit
+    4, passed
+    5, "handles empty query"
+    6, "QueryParser > operator parsing"
+    7, "extracts tag operator"
+    8, "extracts path operator"
+    9, "extracts title operator"
+    10, "extracts multiple operators"
+    11, "extracts modified:recent"
+    12, "extracts linkto operator"
+    13, "extracts linkedfrom operator"
+    14, "QueryParser > has_filters"
+    15, "returns false for plain query"
+    16, "returns true when tag filter present"
+    17, "returns true for modified:recent"
+    18, test/unit/note_parser_spec.spl
+    19, "NoteParse > parse_frontmatter"
+    20, "extracts title from frontmatter"
+    21, "extracts tags from frontmatter list"
+    22, "extracts aliases from frontmatter"
+    23, "falls back to first heading when no title in frontmatter"
+    24, "handles empty content"
+    25, "NoteParse > extract_wikilinks"
+    26, "extracts simple wikilinks"
+    27, "extracts wikilinks with aliases"
+    28, "extracts multiple wikilinks"
+    29, "handles no wikilinks"
+    30, "NoteParse > extract_tags"
+    31, "extracts inline tags"
+    32, "does not extract headings as tags"
+    33, "handles no tags"
+    34, "NoteParse > extract_tasks"
+    35, "extracts open tasks"
+    36, "extracts done tasks"
+    37, "extracts mixed tasks"
+    38, "NoteParse > chunk_by_heading"
+    39, "creates chunks for each heading"
+    40, "captures heading path"
+    41, test/unit/indexer_spec.spl
+    42, "Indexer > schema creation"
+    43, "creates schema successfully"
+    44, failed
+    45, "creates notes table"
+    46, "creates chunks table"
+    47, "creates links table"
+    48, "creates tasks table"
+    49, "Indexer > indexing notes"
+    50, "indexes a note with frontmatter"
+    51, "indexes wikilinks"
+    52, "indexes tasks"
+    53, "Indexer > removing notes"
+    54, "removes a note and its dependents"
+    55, "Indexer > staleness check"
+    56, "detects stale notes"
+    57, "treats missing notes as stale"
+    58, test/unit/search_engine_spec.spl
+    59, "SearchEngine > search by tag"
+    60, "finds notes with matching tag"
+    61, "returns empty for non-matching tag"
+    62, "SearchEngine > LIKE fallback search"
+    63, "finds notes by title"
+    64, "SearchEngine > task search"
+    65, "finds open tasks"
+    66, "finds all tasks matching query"
+    67, "SearchEngine > operator filtering"
+    68, "filters by tag"
+    69, "filters by path prefix"
+    70, test/unit/graph_spec.spl
+    71, "Graph > backlinks"
+    72, "finds backlinks"
+    73, "returns empty when no backlinks"
+    74, "Graph > forward links"
+    75, "finds forward links"
+    76, "Graph > related notes"
+    77, "finds related notes"
+    78, "Graph > authority score"
+    79, "computes higher authority for well-linked notes"
+    80, "Graph > graph walk"
+    81, "traverses connected notes"
+    82, "Graph > helpers"
+    83, "strips file extension"
+    84, "extracts note name from path"
+    85, test/unit/ranker_spec.spl
+    86, "Ranker > recency boost"
+    87, "returns high boost for recent timestamps"
+    88, "returns zero boost for very old timestamps"
+    89, "Ranker > ranking pipeline"
+    90, "ranks results for a query"
+    91, "returns empty for non-matching query"
+    92, "Ranker > explain scores"
+    93, "returns breakdowns for results"
+    94, "starts with zero notes"
+    95, "stores note title"
+    96, "stores tags from frontmatter and inline"
+    97, "SearchEngine > text search"
+    98, "ranks title matches higher"
+    99, test/integration/vault_index_spec.spl
+    100, "VaultIndex > indexing"
+    101, "indexes all sample notes"
+    102, Integration
+    103, "stores links between notes"
+    104, "VaultIndex > search"
+    105, "finds notes by tag"
+    106, "finds tasks"
+    107, "finds decision content"
+    108, "VaultIndex > graph"
+    109, "finds backlinks to well-connected notes"
+    110, "computes authority for linked notes"
+    111, test/integration/mcp_tools_spec.spl
+    112, "MCPTools > search_vault"
+    113, "returns results for search query"
+    114, "MCPTools > read_note"
+    115, "returns note content"
+    116, "MCPTools > search_by_tag"
+    117, "MCPTools > find_backlinks"
+    118, "MCPTools > search_tasks"
+    119, "MCPTools > search_decisions"
+    120, "MCPTools > find_related"
+    121, "MCPTools > unknown tool"
+    122, "returns error for unknown tool"
+    123, test/system/obsidian_search_spec.spl
+    124, "ObsidianSearchSystem > Scenario: Index and count"
+    125, "indexes all 6 fixture notes"
+    126, System
+    127, "stores correct link graph"
+    128, "ObsidianSearchSystem > Scenario: Tag-based discovery"
+    129, "finds meeting notes"
+    130, "finds project notes"
+    131, "ObsidianSearchSystem > Scenario: Backlink navigation"
+    132, "finds notes linking to project-alpha"
+    133, "ObsidianSearchSystem > Scenario: Authority ranking"
+    134, "project-alpha has higher authority than daily note"
+    135, "ObsidianSearchSystem > Scenario: Graph traversal"
+    136, "walks graph from index note"
+    137, "ObsidianSearchSystem > Scenario: Task discovery"
+    138, "finds open tasks about indexing"
+    139, "finds all tasks about search"
+    140, "ObsidianSearchSystem > Scenario: Decision lookup"
+    141, "finds ranking-related decisions"
+    142, "ObsidianSearchSystem > Scenario: Search with scoring explanation"
+    143, "explains search scores"
+    144, "ObsidianSearchSystem > Scenario: Related notes discovery"
+    145, "finds notes related to project-alpha"
+    146, "ObsidianSearchSystem > Scenario: Authoritative doc discovery"
+    147, "finds authoritative docs about design"
+    148, /home/ormastes/dev/pub/simple_obsidian_tools/test/integration/mcp_tools_spec.spl
+    149, /home/ormastes/dev/pub/simple_obsidian_tools/test/integration/vault_index_spec.spl
+    150, /home/ormastes/dev/pub/simple_obsidian_tools/test/system/obsidian_search_spec.spl
+    151, /home/ormastes/dev/pub/simple_obsidian_tools/test/unit/graph_spec.spl
+    152, /home/ormastes/dev/pub/simple_obsidian_tools/test/unit/indexer_spec.spl
+    153, /home/ormastes/dev/pub/simple_obsidian_tools/test/unit/note_parser_spec.spl
+    154, /home/ormastes/dev/pub/simple_obsidian_tools/test/unit/query_parser_spec.spl
+    155, /home/ormastes/dev/pub/simple_obsidian_tools/test/unit/ranker_spec.spl
+    156, /home/ormastes/dev/pub/simple_obsidian_tools/test/unit/search_engine_spec.spl
+
+files |file_id, path_str|
+    0, 0
+    1, 18
+    2, 41
+    3, 58
+    4, 70
+    5, 85
+    6, 99
+    7, 111
+    8, 123
+    9, 148
+    10, 149
+    11, 150
+    12, 151
+    13, 152
+    14, 153
+    15, 154
+    16, 155
+    17, 156
+
+suites |suite_id, file_id, name_str|
+    0, 0, 1
+    1, 0, 6
+    2, 0, 14
+    3, 1, 19
+    4, 1, 25
+    5, 1, 30
+    6, 1, 34
+    7, 1, 38
+    8, 2, 42
+    9, 2, 49
+    10, 2, 53
+    11, 2, 55
+    12, 3, 59
+    13, 3, 62
+    14, 3, 64
+    15, 3, 67
+    16, 4, 71
+    17, 4, 74
+    18, 4, 76
+    19, 4, 78
+    20, 4, 80
+    21, 4, 82
+    22, 5, 86
+    23, 5, 89
+    24, 5, 92
+    25, 3, 97
+    26, 6, 100
+    27, 6, 104
+    28, 6, 108
+    29, 7, 112
+    30, 7, 114
+    31, 7, 116
+    32, 7, 117
+    33, 7, 118
+    34, 7, 119
+    35, 7, 120
+    36, 7, 121
+    37, 8, 124
+    38, 8, 128
+    39, 8, 131
+    40, 8, 133
+    41, 8, 135
+    42, 8, 137
+    43, 8, 140
+    44, 8, 142
+    45, 8, 144
+    46, 8, 146
+    47, 9, 112
+    48, 9, 114
+    49, 9, 116
+    50, 9, 117
+    51, 9, 118
+    52, 9, 119
+    53, 9, 120
+    54, 9, 121
+    55, 10, 100
+    56, 10, 104
+    57, 10, 108
+    58, 11, 124
+    59, 11, 128
+    60, 11, 131
+    61, 11, 133
+    62, 11, 135
+    63, 11, 137
+    64, 11, 140
+    65, 11, 142
+    66, 11, 144
+    67, 11, 146
+    68, 12, 71
+    69, 12, 74
+    70, 12, 76
+    71, 12, 78
+    72, 12, 80
+    73, 12, 82
+    74, 13, 42
+    75, 13, 49
+    76, 13, 53
+    77, 13, 55
+    78, 14, 19
+    79, 14, 25
+    80, 14, 30
+    81, 14, 34
+    82, 14, 38
+    83, 15, 1
+    84, 15, 6
+    85, 15, 14
+    86, 16, 86
+    87, 16, 89
+    88, 16, 92
+    89, 17, 59
+    90, 17, 97
+    91, 17, 64
+    92, 17, 67
+
+tests |test_id, suite_id, name_str, category_str, status_str, tags_str, description_str, valid, qualified_by, qualified_at, qualified_reason|
+    0, 50, 72, 102, 4, , , true, , , 
+    1, 53, 77, 102, 4, , , true, , , 
+    2, 48, 115, 102, 4, , , true, , , 
+    3, 49, 105, 102, 4, , , true, , , 
+    4, 52, 107, 102, 4, , , true, , , 
+    5, 51, 106, 102, 4, , , true, , , 
+    6, 47, 113, 102, 4, , , true, , , 
+    7, 54, 122, 102, 4, , , true, , , 
+    8, 57, 110, 102, 4, , , true, , , 
+    9, 57, 109, 102, 4, , , true, , , 
+    10, 57, 77, 102, 4, , , true, , , 
+    11, 55, 101, 102, 4, , , true, , , 
+    12, 55, 103, 102, 4, , , true, , , 
+    13, 56, 107, 102, 4, , , true, , , 
+    14, 56, 105, 102, 4, , , true, , , 
+    15, 56, 106, 102, 4, , , true, , , 
+    16, 67, 147, 126, 4, , , true, , , 
+    17, 61, 134, 126, 4, , , true, , , 
+    18, 60, 132, 126, 4, , , true, , , 
+    19, 64, 141, 126, 4, , , true, , , 
+    20, 62, 136, 126, 4, , , true, , , 
+    21, 58, 125, 126, 4, , , true, , , 
+    22, 58, 127, 126, 4, , , true, , , 
+    23, 66, 145, 126, 4, , , true, , , 
+    24, 65, 143, 126, 4, , , true, , , 
+    25, 59, 129, 126, 4, , , true, , , 
+    26, 59, 130, 126, 4, , , true, , , 
+    27, 63, 139, 126, 4, , , true, , , 
+    28, 63, 138, 126, 4, , , true, , , 
+    29, 71, 79, 3, 4, , , true, , , 
+    30, 68, 72, 3, 4, , , true, , , 
+    31, 68, 73, 3, 4, , , true, , , 
+    32, 69, 75, 3, 4, , , true, , , 
+    33, 72, 81, 3, 4, , , true, , , 
+    34, 73, 84, 3, 4, , , true, , , 
+    35, 73, 83, 3, 4, , , true, , , 
+    36, 70, 77, 3, 4, , , true, , , 
+    37, 75, 50, 3, 4, , , true, , , 
+    38, 75, 52, 3, 4, , , true, , , 
+    39, 75, 51, 3, 4, , , true, , , 
+    40, 75, 95, 3, 4, , , true, , , 
+    41, 75, 96, 3, 4, , , true, , , 
+    42, 76, 54, 3, 4, , , true, , , 
+    43, 74, 43, 3, 4, , , true, , , 
+    44, 74, 94, 3, 4, , , true, , , 
+    45, 77, 56, 3, 4, , , true, , , 
+    46, 77, 57, 3, 4, , , true, , , 
+    47, 82, 40, 3, 4, , , true, , , 
+    48, 82, 39, 3, 4, , , true, , , 
+    49, 80, 32, 3, 4, , , true, , , 
+    50, 80, 31, 3, 4, , , true, , , 
+    51, 80, 33, 3, 4, , , true, , , 
+    52, 81, 36, 3, 4, , , true, , , 
+    53, 81, 37, 3, 4, , , true, , , 
+    54, 81, 35, 3, 4, , , true, , , 
+    55, 79, 28, 3, 4, , , true, , , 
+    56, 79, 26, 3, 4, , , true, , , 
+    57, 79, 27, 3, 4, , , true, , , 
+    58, 79, 29, 3, 4, , , true, , , 
+    59, 78, 22, 3, 4, , , true, , , 
+    60, 78, 21, 3, 4, , , true, , , 
+    61, 78, 20, 3, 4, , , true, , , 
+    62, 78, 23, 3, 4, , , true, , , 
+    63, 78, 24, 3, 4, , , true, , , 
+    64, 83, 2, 3, 4, , , true, , , 
+    65, 83, 5, 3, 4, , , true, , , 
+    66, 85, 15, 3, 4, , , true, , , 
+    67, 85, 17, 3, 4, , , true, , , 
+    68, 85, 16, 3, 4, , , true, , , 
+    69, 84, 13, 3, 4, , , true, , , 
+    70, 84, 12, 3, 4, , , true, , , 
+    71, 84, 11, 3, 4, , , true, , , 
+    72, 84, 10, 3, 4, , , true, , , 
+    73, 84, 8, 3, 4, , , true, , , 
+    74, 84, 7, 3, 4, , , true, , , 
+    75, 84, 9, 3, 4, , , true, , , 
+    76, 88, 93, 3, 4, , , true, , , 
+    77, 87, 90, 3, 4, , , true, , , 
+    78, 87, 91, 3, 4, , , true, , , 
+    79, 86, 87, 3, 4, , , true, , , 
+    80, 86, 88, 3, 4, , , true, , , 
+    81, 92, 69, 3, 4, , , true, , , 
+    82, 92, 68, 3, 4, , , true, , , 
+    83, 89, 60, 3, 4, , , true, , , 
+    84, 89, 61, 3, 4, , , true, , , 
+    85, 91, 66, 3, 4, , , true, , , 
+    86, 91, 65, 3, 4, , , true, , , 
+    87, 90, 63, 3, 4, , , true, , , 
+    88, 90, 98, 3, 4, , , true, , , 
+    89, 32, 72, 102, 4, , , true, , , 
+    90, 35, 77, 102, 4, , , true, , , 
+    91, 30, 115, 102, 4, , , true, , , 
+    92, 31, 105, 102, 4, , , true, , , 
+    93, 34, 107, 102, 4, , , true, , , 
+    94, 33, 106, 102, 4, , , true, , , 
+    95, 29, 113, 102, 4, , , true, , , 
+    96, 36, 122, 102, 4, , , true, , , 
+    97, 28, 110, 102, 4, , , true, , , 
+    98, 28, 109, 102, 4, , , true, , , 
+    99, 28, 77, 102, 4, , , true, , , 
+    100, 26, 101, 102, 4, , , true, , , 
+    101, 26, 103, 102, 4, , , true, , , 
+    102, 27, 107, 102, 4, , , true, , , 
+    103, 27, 105, 102, 4, , , true, , , 
+    104, 27, 106, 102, 4, , , true, , , 
+    105, 46, 147, 126, 4, , , true, , , 
+    106, 40, 134, 126, 4, , , true, , , 
+    107, 39, 132, 126, 4, , , true, , , 
+    108, 43, 141, 126, 4, , , true, , , 
+    109, 41, 136, 126, 4, , , true, , , 
+    110, 37, 125, 126, 4, , , true, , , 
+    111, 37, 127, 126, 4, , , true, , , 
+    112, 45, 145, 126, 4, , , true, , , 
+    113, 44, 143, 126, 4, , , true, , , 
+    114, 38, 129, 126, 4, , , true, , , 
+    115, 38, 130, 126, 4, , , true, , , 
+    116, 42, 139, 126, 4, , , true, , , 
+    117, 42, 138, 126, 4, , , true, , , 
+    118, 19, 79, 3, 4, , , true, , , 
+    119, 16, 72, 3, 4, , , true, , , 
+    120, 16, 73, 3, 4, , , true, , , 
+    121, 17, 75, 3, 4, , , true, , , 
+    122, 20, 81, 3, 4, , , true, , , 
+    123, 21, 84, 3, 4, , , true, , , 
+    124, 21, 83, 3, 4, , , true, , , 
+    125, 18, 77, 3, 4, , , true, , , 
+    126, 9, 50, 3, 4, , , true, , , 
+    127, 9, 52, 3, 4, , , true, , , 
+    128, 9, 51, 3, 4, , , true, , , 
+    129, 9, 95, 3, 4, , , true, , , 
+    130, 9, 96, 3, 4, , , true, , , 
+    131, 10, 54, 3, 4, , , true, , , 
+    132, 8, 46, 3, 44, , , true, , , 
+    133, 8, 47, 3, 44, , , true, , , 
+    134, 8, 45, 3, 44, , , true, , , 
+    135, 8, 43, 3, 4, , , true, , , 
+    136, 8, 48, 3, 44, , , true, , , 
+    137, 8, 94, 3, 4, , , true, , , 
+    138, 11, 56, 3, 4, , , true, , , 
+    139, 11, 57, 3, 4, , , true, , , 
+    140, 7, 40, 3, 4, , , true, , , 
+    141, 7, 39, 3, 4, , , true, , , 
+    142, 5, 32, 3, 4, , , true, , , 
+    143, 5, 31, 3, 4, , , true, , , 
+    144, 5, 33, 3, 4, , , true, , , 
+    145, 6, 36, 3, 4, , , true, , , 
+    146, 6, 37, 3, 4, , , true, , , 
+    147, 6, 35, 3, 4, , , true, , , 
+    148, 4, 28, 3, 4, , , true, , , 
+    149, 4, 26, 3, 4, , , true, , , 
+    150, 4, 27, 3, 4, , , true, , , 
+    151, 4, 29, 3, 4, , , true, , , 
+    152, 3, 22, 3, 4, , , true, , , 
+    153, 3, 21, 3, 4, , , true, , , 
+    154, 3, 20, 3, 4, , , true, , , 
+    155, 3, 23, 3, 4, , , true, , , 
+    156, 3, 24, 3, 4, , , true, , , 
+    157, 0, 2, 3, 4, , , true, , , 
+    158, 0, 5, 3, 4, , , true, , , 
+    159, 2, 15, 3, 4, , , true, , , 
+    160, 2, 17, 3, 4, , , true, , , 
+    161, 2, 16, 3, 4, , , true, , , 
+    162, 1, 13, 3, 4, , , true, , , 
+    163, 1, 12, 3, 4, , , true, , , 
+    164, 1, 11, 3, 4, , , true, , , 
+    165, 1, 10, 3, 4, , , true, , , 
+    166, 1, 8, 3, 4, , , true, , , 
+    167, 1, 7, 3, 4, , , true, , , 
+    168, 1, 9, 3, 4, , , true, , , 
+    169, 24, 93, 3, 4, , , true, , , 
+    170, 23, 90, 3, 4, , , true, , , 
+    171, 23, 91, 3, 4, , , true, , , 
+    172, 22, 87, 3, 4, , , true, , , 
+    173, 22, 88, 3, 4, , , true, , , 
+    174, 13, 63, 3, 44, , , true, , , 
+    175, 15, 69, 3, 4, , , true, , , 
+    176, 15, 68, 3, 4, , , true, , , 
+    177, 12, 60, 3, 4, , , true, , , 
+    178, 12, 61, 3, 4, , , true, , , 
+    179, 14, 66, 3, 4, , , true, , , 
+    180, 14, 65, 3, 4, , , true, , , 
+    181, 25, 63, 3, 4, , , true, , , 
+    182, 25, 98, 3, 4, , , true, , , 

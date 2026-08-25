@@ -1,0 +1,30 @@
+#!/usr/bin/env simple
+# Simple regression demo - runtime compatible.
+
+fn main():
+    print "=== Simple Linear Regression ==="
+    val xs = [0.0, 0.25, 0.5, 0.75, 1.0]
+    val ys = [1.0, 1.5, 2.0, 2.5, 3.0]
+    val weight = 2.0
+    val bias = 1.0
+
+    print "Target function: y = 2x + 1"
+    print "Closed-form demo parameters: weight={weight}, bias={bias}"
+    var total = 0.0
+    var mse_i = 0
+    while mse_i < xs.len():
+        val pred = weight * xs[mse_i] + bias
+        val diff = pred - ys[mse_i]
+        total = total + diff * diff
+        mse_i = mse_i + 1
+    print "MSE: {total / xs.len()}"
+    var i = 0
+    while i < xs.len():
+        val pred = weight * xs[i] + bias
+        print "x={xs[i]} -> predicted={pred} target={ys[i]}"
+        i = i + 1
+    print ""
+    print "For iterative training, run:"
+    print "examples/07_ml/pure_nn/runtime_compatible/simple_regression_runtime.spl"
+
+main()

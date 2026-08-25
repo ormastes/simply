@@ -1,0 +1,44 @@
+# shared/state — File-based state management (.build/mate_broker/)
+
+use std.io_runtime.{dir_create_all}
+extern fn rt_file_exists(path: text) -> bool
+extern fn rt_file_read_text(path: text) -> text
+extern fn rt_file_write_text(path: text, content: text) -> bool
+
+val STATE_DIR = ".build/mate_broker"
+
+fn state_init():
+    dir_create_all(STATE_DIR)
+
+fn state_save_agents() -> bool:
+    var lines: [text] = []
+    lines.push("agent_count: " + BK_AGENT_COUNT.to_text())
+    var i = 0
+    while i < BK_AGENT_COUNT:
+        lines.push("")
+        lines.push("agent_" + i.to_text() + ":")
+        lines.push("  id: " + BK_AGENT_IDS[i])
+        lines.push("  caps: " + BK_AGENT_CAPS[i])
+        lines.push("  max: " + BK_AGENT_MAX_CONCURRENT[i].to_text())
+        lines.push("  priority: " + BK_AGENT_PRIORITIES[i].to_text())
+        lines.push("  load: " + BK_AGENT_LOADS[i].to_text())
+        lines.push("  status: " + BK_AGENT_STATUSES[i])
+        i = i + 1
+    rt_file_write_text(STATE_DIR + "/agents.sdn", lines.join("\n") + "\n")
+
+fn state_save_tasks() -> bool:
+    var lines: [text] = []
+    lines.push("task_count: " + BK_TASK_COUNT.to_text())
+    lines.push("next_id: " + BK_NEXT_TASK_ID.to_text())
+    var i = 0
+    while i < BK_TASK_COUNT:
+        lines.push("")
+        lines.push("task_" + i.to_text() + ":")
+        lines.push("  id: " + BK_TASK_IDS[i])
+        lines.push("  content: " + BK_TASK_CONTENTS[i])
+        lines.push("  caps: " + BK_TASK_CAPS[i])
+        lines.push("  urgency: " + BK_TASK_URGENCIES[i].to_text())
+        lines.push("  status: " + BK_TASK_STATUSES[i])
+        lines.push("  agent: " + BK_TASK_AGENTS[i])
+        i = i + 1
+    rt_file_write_text(STATE_DIR + "/tasks.sdn", lines.join("\n") + "\n")

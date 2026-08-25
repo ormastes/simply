@@ -1,0 +1,163 @@
+#![allow(unnamed_duplicate_typed_args)]
+# LLM Caret - Codex CLI Wrapper
+#
+# Wraps the Codex CLI binary as a subprocess.
+# Two pure functions (fully testable without Codex binary):
+#   - build_codex_args: maps config to CLI flags
+#   - parse_codex_jsonl_response: parses JSONL output
+# One impure function (integration):
+#   - codex_cli_send: calls rt_process_run
+
+extern fn rt_process_run(cmd: text, args: [text]) -> (text, text, i64)
+
+use common.text.{escape_json}
+use std.nogc_async_mut.mcp.helpers.{Q, LB, RB}
+use std.nogc_async_mut.llm.json_helpers.{_unwrap_idx, extract_json_string, extract_json_value, extract_json_int, extract_json_bool}
+
+# ============================================================================
+# Response struct
+# ============================================================================
+
+struct CodexCliResponse:
+    content: text
+    model: text
+    session_id: text
+    stop_reason: text
+    input_tokens: i64
+    output_tokens: i64
+    error: text
+    is_error: bool
+    raw: text
+
+# ============================================================================
+# Pure Function: build_codex_args
+# ============================================================================
+
+fn build_codex_args(prompt: text, model: text, json_mode: bool, instructions: text, sandbox: text, extra_args: [text]) -> [text]:
+    var args: [text] = []
+    # Subcommand (required for non-interactive use)
+    args = args + ["exec"]
+    # JSON output
+    if json_mode:
+        args = args + ["--json"]
+    # Model
+    if model != "":
+        args = args + ["--model", model]
+    # Instructions (inline system prompt)
+    if instructions != "":
+        args = args + ["--instructions", instructions]
+    # Always non-interactive
+    args = args + ["--full-auto"]
+    # Sandbox
+    if sandbox != "":
+        args = args + ["--sandbox", sandbox]
+    else:
+        args = args + ["--sandbox", "off"]
+    # Prompt goes LAST (positional)
+    args = args + [prompt]
+    # Extra args (appended at end)
+    for arg in extra_args:
+        if arg != "":
+            args = args + [arg]
+    args
+
+# Simplified builder using defaults
+fn build_codex_args_simple(prompt: text) -> [text]:
+    build_codex_args(prompt, "", true, "", "", [])
+
+# ============================================================================
+# Pure Function: parse_codex_jsonl_response
+# ============================================================================
+
+fn parse_codex_jsonl_response(raw: text) -> CodexCliResponse:
+    if raw.trim() == "":
+        return CodexCliResponse(
+            content: "",
+            model: "",
+            session_id: "",
+            stop_reason: "",
+            input_tokens: 0,
+            output_tokens: 0,
+            error: "empty response",
+            is_error: true,
+            raw: ""
+        )
+    val lines = raw.split("\n")
+    var content = ""
+    var model_text = ""
+    var error_text = ""
+    var is_err = false
+    for line in lines:
+        val trimmed = line.trim()
+        if trimmed == "":
+            continue
+        # Check for error events
+        val etype = extract_json_string(trimmed, "type")
+        if etype == "error":
+            is_err = true
+            error_text = extract_json_string(trimmed, "message")
+            if error_text == "":
+                error_text = extract_json_string(trimmed, "text")
+            if error_text == "":
+                error_text = "unknown error"
+            continue
+        # Check for message with output_text content
+        if etype == "message":
+            val role = extract_json_string(trimmed, "role")
+            if role == "assistant":
+                # Extract text from content array — look for output_text type
+                val text_val = extract_json_string(trimmed, "text")
+                if text_val != "":
+                    content = text_val
+            continue
+        # Fallback: check for output_text type directly
+        if etype == "output_text":
+            val text_val = extract_json_string(trimmed, "text")
+            if text_val != "":
+                content = text_val
+            continue
+        # Try extracting model
+        val mdl = extract_json_string(trimmed, "model")
+        if mdl != "":
+            model_text = mdl
+    var stop = "end_turn"
+    if is_err:
+        stop = "error"
+    CodexCliResponse(
+        content: content,
+        model: model_text,
+        session_id: "",
+        stop_reason: stop,
+        input_tokens: 0,
+        output_tokens: 0,
+        error: error_text,
+        is_error: is_err,
+        raw: raw
+    )
+
+# ============================================================================
+# Impure Function: codex_cli_send
+# ============================================================================
+
+fn codex_cli_send(cli_path: text, prompt: text, model: text, instructions: text, extra_args: [text]) -> CodexCliResponse:
+    val args = build_codex_args(prompt, model, true, instructions, "", extra_args)
+    val result = rt_process_run(cli_path, args)
+    val stdout = result.0 ?? ""
+    val stderr = result.1 ?? ""
+    val exit_code = result.2
+    if exit_code != 0:
+        var err_msg = "codex CLI exited with code " + exit_code.to_text()
+        if stderr != "":
+            err_msg = err_msg + ": " + stderr
+        return CodexCliResponse(
+            content: "",
+            model: "",
+            session_id: "",
+            stop_reason: "error",
+            input_tokens: 0,
+            output_tokens: 0,
+            error: err_msg,
+            is_error: true,
+            raw: stdout
+        )
+    parse_codex_jsonl_response(stdout)

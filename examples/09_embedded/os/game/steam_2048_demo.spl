@@ -1,0 +1,4 @@
+use os.game.steam.steam_2048_demo.{steam_2048_demo_marker, steam_2048_port_marker}
+
+print steam_2048_demo_marker()
+print steam_2048_port_marker()

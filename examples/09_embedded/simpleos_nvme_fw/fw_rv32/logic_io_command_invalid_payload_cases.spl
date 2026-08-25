@@ -1,0 +1,12 @@
+use logic_io_command_core.*
+
+fn rv32_io_command_invalid_payload_cases_selftest() -> i32:
+    if _rv32_io_command_valid(11, 0, 1, 0, 0) == 0:
+        return 1
+    if _rv32_io_command_valid(12, 2, 1, 1, 1) == 0:
+        return 1
+    if _rv32_io_command_valid(13, 8, 1, 1, 1) == 0:
+        return 1
+    if _rv32_io_command_valid(14, 9, 1, 1, 1) == 0:
+        return 1
+    0

@@ -1,0 +1,74 @@
+# two_line_2d_gui.spl — render two lines of text with the Engine2D CPU 2D backend
+# (draw_text) at native window resolution (presented 1:1, no upscaling) so the
+# glyphs are crisp rather than blocky.
+#
+# Launch (window):
+#   SIMPLE_GUI_RUN_SKIP_NUDGE=1 scripts/gui/macos-gui-run.shs examples/06_io/ui/two_line_2d_gui.spl
+# Headless: bin/simple run examples/06_io/ui/two_line_2d_gui.spl
+
+use std.gpu.engine2d.backend_cpu.{CpuBackend}
+use std.io.window_winit.{WinitLoop, WinitWindow, winit_loop_new, winit_loop_free, winit_window_new, winit_window_free, winit_present_rgba, winit_poll_close_requested}
+
+use std.io_runtime.{env_get}
+
+val W: i32 = 460
+val H: i32 = 140
+
+fn build_frame() -> [u32]:
+    var b = CpuBackend.create()
+    if not b.init(W, H):
+        print "CPU 2D backend failed to initialize"
+        return []
+    # Page background
+    b.clear(0xFF0F1420u32)
+    # Styled "card": filled panel + rounded border + padding (CSS-like, drawn
+    # directly on the 2D backend since the web-CSS lane is currently broken).
+    b.draw_rect_filled(16, 16, W - 32, H - 32, 0xFF1B2436u32)
+    b.draw_rounded_rect(16, 16, W - 32, H - 32, 6, 0xFF2E3A50u32)
+    # Title line + sub line (different colors, padded inside the card)
+    b.draw_text(34, 42, "hello world!", 0xFF7FD7FFu32, 18)
+    b.draw_text(34, 84, "second line here", 0xFFC8D0E0u32, 16)
+    b.present()
+    val pixels = b.read_pixels()
+    b.shutdown()
+    pixels
+
+fn pack(src: [u32]) -> [i64]:
+    var out: [i64] = [0; src.len()]
+    var i = 0
+    while i < src.len():
+        out[i] = src[i].to_i64() & 0xFFFFFF
+        i = i + 1
+    out
+
+fn main() -> i64:
+    print "Two-line 2D text — render {W}x{H} via Engine2D CPU backend (native 1:1)"
+    val pixels = build_frame()
+    if pixels.len() < W * H:
+        return 1
+    print "rendered {pixels.len()} px"
+
+    if (env_get("SIMPLE_GUI") ?? "") != "1":
+        print "No GUI requested (use scripts/gui/macos-gui-run.shs to open a window); headless only."
+        return 0
+
+    val lp = winit_loop_new()
+    if not lp.is_valid:
+        print "No GUI runtime available."
+        return 1
+    val win = winit_window_new(lp, W.to_i64(), H.to_i64(), "Engine2D CPU: two lines")
+    if not win.is_valid:
+        winit_loop_free(lp)
+        return 1
+
+    val packed = pack(pixels)
+    var running = true
+    var iters = 0
+    while running and iters < 2000000:
+        winit_present_rgba(win, W.to_i64(), H.to_i64(), packed)
+        if winit_poll_close_requested(lp):
+            running = false
+        iters = iters + 1
+    winit_window_free(win)
+    winit_loop_free(lp)
+    return 0

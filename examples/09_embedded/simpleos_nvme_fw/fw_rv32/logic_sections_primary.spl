@@ -1,0 +1,29 @@
+use logic_sections_core.*
+use logic_rain.{rv32_rain_selftest}
+use logic_ecc.{rv32_ecc_selftest}
+use logic_journal.{rv32_journal_selftest}
+use logic_map.{rv32_map_selftest}
+use logic_band.{rv32_band_selftest}
+use logic_sched.{rv32_sched_selftest}
+use logic_power_thermal.{rv32_pt_selftest}
+use logic_hil.{rv32_hil_selftest}
+use logic_queue_phase.{rv32_queue_phase_selftest}
+use logic_io_command.{rv32_io_command_selftest}
+use logic_flush.{rv32_flush_selftest}
+use logic_admin.{rv32_admin_selftest}
+
+fn nvme_fw_rv32_primary_sections() -> i32:
+    var fail: i32 = 0
+    fail = fail + _nvme_fw_rv32_section_flag(rv32_rain_selftest(), 1)
+    fail = fail + _nvme_fw_rv32_section_flag(rv32_ecc_selftest(), 2)
+    fail = fail + _nvme_fw_rv32_section_flag(rv32_journal_selftest(), 4)
+    fail = fail + _nvme_fw_rv32_section_flag(rv32_map_selftest(), 8)
+    fail = fail + _nvme_fw_rv32_section_flag(rv32_band_selftest(), 16)
+    fail = fail + _nvme_fw_rv32_section_flag(rv32_sched_selftest(), 32)
+    fail = fail + _nvme_fw_rv32_section_flag(rv32_pt_selftest(), 64)
+    fail = fail + _nvme_fw_rv32_section_flag(rv32_hil_selftest(), 128)
+    fail = fail + _nvme_fw_rv32_section_flag(rv32_queue_phase_selftest(), 256)
+    fail = fail + _nvme_fw_rv32_section_flag(rv32_io_command_selftest(), 512)
+    fail = fail + _nvme_fw_rv32_section_flag(rv32_flush_selftest(), 1024)
+    fail = fail + _nvme_fw_rv32_section_flag(rv32_admin_selftest(), 2048)
+    fail

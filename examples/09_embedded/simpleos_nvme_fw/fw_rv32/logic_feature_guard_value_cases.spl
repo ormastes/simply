@@ -1,0 +1,12 @@
+use logic_feature_guard_power_value_cases.*
+use logic_feature_guard_queue_value_cases.*
+use logic_feature_guard_temp_value_cases.*
+
+fn rv32_feature_guard_value_cases_selftest() -> i32:
+    if rv32_feature_guard_queue_value_cases_selftest() != 0:
+        return 1
+    if rv32_feature_guard_temp_value_cases_selftest() != 0:
+        return 1
+    if rv32_feature_guard_power_value_cases_selftest() != 0:
+        return 1
+    0

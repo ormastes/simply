@@ -1,0 +1,225 @@
+# 73. Attention - naive vs flash (online-softmax) attention
+#
+# The original exercise (73.Attention_CPU_PyCUDA) writes a naive attention
+# kernel (materialise the full S = Q K^T / sqrt(d) score row, softmax it,
+# multiply by V) and a flash-attention kernel that streams K/V in blocks and
+# keeps a running max / running sum so the score row never has to exist.
+#
+# Simple version (single head, flat row-major [f32], seq_len x head_dim):
+#   naive_attention   reference: full score row per query, softmax, weighted V
+#   flash_attention   same result computed block-by-block with the online
+#                     softmax rescale (m_new = max(m, m_blk); l = l*e^(m-m_new) + ...)
+#   both take `causal` - position i may only attend to positions <= i
+#
+# Status on this seed: the host functions are the verified path; the two
+# @gpu_kernel bodies are the device-side formulation (one thread per query row,
+# flash version with a BLOCK_SIZE K/V tile in shared memory).
+
+use std.gpu.*
+
+val BLOCK_SIZE = 4  # K/V tile length for flash attention (64 in the original)
+
+# ============================================================================
+# Device-side formulations
+# ============================================================================
+
+@gpu_kernel
+fn naive_attention_kernel(q: GpuPtr, k: GpuPtr, v: GpuPtr, output: GpuPtr,
+                          seq_len: i64, head_dim: i64, scale: f32):
+    val i = gpu_global_id_x()
+    if i < seq_len:
+        var max_score = -1.0e30
+        var j = 0
+        while j < seq_len:
+            var s = 0.0
+            var d = 0
+            while d < head_dim:
+                s = s + gpu_load_f32(q, i * head_dim + d) * gpu_load_f32(k, j * head_dim + d)
+                d = d + 1
+            if s * scale > max_score:
+                max_score = s * scale
+            j = j + 1
+        # second pass: softmax denominator + weighted V accumulate
+        var denom = 0.0
+        var d2 = 0
+        while d2 < head_dim:
+            gpu_store_f32(output, i * head_dim + d2, 0.0)
+            d2 = d2 + 1
+        j = 0
+        while j < seq_len:
+            var s = 0.0
+            var d = 0
+            while d < head_dim:
+                s = s + gpu_load_f32(q, i * head_dim + d) * gpu_load_f32(k, j * head_dim + d)
+                d = d + 1
+            val p = (s * scale - max_score).exp()
+            denom = denom + p
+            d = 0
+            while d < head_dim:
+                gpu_store_f32(output, i * head_dim + d, gpu_load_f32(output, i * head_dim + d) + p * gpu_load_f32(v, j * head_dim + d))
+                d = d + 1
+            j = j + 1
+        d2 = 0
+        while d2 < head_dim:
+            gpu_store_f32(output, i * head_dim + d2, gpu_load_f32(output, i * head_dim + d2) / denom)
+            d2 = d2 + 1
+
+@gpu_kernel
+fn flash_attention_kernel(q: GpuPtr, k: GpuPtr, v: GpuPtr, output: GpuPtr,
+                          seq_len: i64, head_dim: i64, scale: f32):
+    # one thread per query row; K/V tiles staged through shared memory
+    val k_tile = gpu_shared_array_f32(BLOCK_SIZE * head_dim)
+    val v_tile = gpu_shared_array_f32(BLOCK_SIZE * head_dim)
+    val i = gpu_global_id_x()
+    var m = -1.0e30
+    var l = 0.0
+    var start = 0
+    while start < seq_len:
+        val tile_len = if start + BLOCK_SIZE <= seq_len: BLOCK_SIZE else: seq_len - start
+        var t = gpu_local_id_x()
+        while t < tile_len * head_dim:
+            gpu_shared_store_f32(k_tile, t, gpu_load_f32(k, start * head_dim + t))
+            gpu_shared_store_f32(v_tile, t, gpu_load_f32(v, start * head_dim + t))
+            t = t + gpu_block_dim_x()
+        gpu_syncthreads()
+        if i < seq_len:
+            var jj = 0
+            while jj < tile_len:
+                var s = 0.0
+                var d = 0
+                while d < head_dim:
+                    s = s + gpu_load_f32(q, i * head_dim + d) * gpu_shared_load_f32(k_tile, jj * head_dim + d)
+                    d = d + 1
+                val score = s * scale
+                val m_new = if score > m: score else: m
+                val alpha = (m - m_new).exp()
+                val p = (score - m_new).exp()
+                l = l * alpha + p
+                d = 0
+                while d < head_dim:
+                    gpu_store_f32(output, i * head_dim + d, gpu_load_f32(output, i * head_dim + d) * alpha + p * gpu_shared_load_f32(v_tile, jj * head_dim + d))
+                    d = d + 1
+                m = m_new
+                jj = jj + 1
+        gpu_syncthreads()
+        start = start + BLOCK_SIZE
+    if i < seq_len:
+        var d = 0
+        while d < head_dim:
+            gpu_store_f32(output, i * head_dim + d, gpu_load_f32(output, i * head_dim + d) / l)
+            d = d + 1
+
+# ============================================================================
+# Host implementations (verified path)
+# ============================================================================
+
+fn zeros(count: i64) -> [f32]:
+    [for i in 0..count: 0.0]
+
+fn dot_rows(a: [f32], i: i64, b: [f32], j: i64, dim: i64) -> f32:
+    var s = 0.0
+    var d = 0
+    while d < dim:
+        s = s + a[i * dim + d] * b[j * dim + d]
+        d = d + 1
+    s
+
+fn attention_scale(head_dim: i64) -> f32:
+    1.0 / ((head_dim * 1.0).sqrt())
+
+fn naive_attention(q: [f32], k: [f32], v: [f32], seq_len: i64, head_dim: i64, causal: bool) -> [f32]:
+    val scale = attention_scale(head_dim)
+    var output = zeros(seq_len * head_dim)
+    var i = 0
+    while i < seq_len:
+        val limit = if causal: i + 1 else: seq_len
+        # full score row
+        var scores = zeros(limit)
+        var max_score = -1.0e30
+        var j = 0
+        while j < limit:
+            scores[j] = dot_rows(q, i, k, j, head_dim) * scale
+            if scores[j] > max_score:
+                max_score = scores[j]
+            j = j + 1
+        var denom = 0.0
+        j = 0
+        while j < limit:
+            scores[j] = (scores[j] - max_score).exp()
+            denom = denom + scores[j]
+            j = j + 1
+        j = 0
+        while j < limit:
+            val p = scores[j] / denom
+            var d = 0
+            while d < head_dim:
+                output[i * head_dim + d] = output[i * head_dim + d] + p * v[j * head_dim + d]
+                d = d + 1
+            j = j + 1
+        i = i + 1
+    output
+
+fn flash_attention(q: [f32], k: [f32], v: [f32], seq_len: i64, head_dim: i64, causal: bool) -> [f32]:
+    val scale = attention_scale(head_dim)
+    var output = zeros(seq_len * head_dim)
+    var i = 0
+    while i < seq_len:
+        var m = -1.0e30
+        var l = 0.0
+        val limit = if causal: i + 1 else: seq_len
+        var start = 0
+        while start < limit:
+            var j = start
+            while j < start + BLOCK_SIZE and j < limit:
+                val score = dot_rows(q, i, k, j, head_dim) * scale
+                val m_new = if score > m: score else: m
+                val alpha = (m - m_new).exp()
+                val p = (score - m_new).exp()
+                l = l * alpha + p
+                var d = 0
+                while d < head_dim:
+                    output[i * head_dim + d] = output[i * head_dim + d] * alpha + p * v[j * head_dim + d]
+                    d = d + 1
+                m = m_new
+                j = j + 1
+            start = start + BLOCK_SIZE
+        var d = 0
+        while d < head_dim:
+            output[i * head_dim + d] = output[i * head_dim + d] / l
+            d = d + 1
+        i = i + 1
+    output
+
+fn max_abs_diff(x: [f32], y: [f32]) -> f32:
+    var worst = 0.0
+    var i = 0
+    while i < x.len():
+        val d = (x[i] - y[i]).abs()
+        if d > worst:
+            worst = d
+        i = i + 1
+    worst
+
+fn blocks_for(seq_len: i64) -> i64:
+    (seq_len + BLOCK_SIZE - 1) / BLOCK_SIZE
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn main():
+    val seq_len = 6
+    val head_dim = 4
+    val q = [for i in 0..(seq_len * head_dim): ((i % 5) - 2) * 0.5]
+    val k = [for i in 0..(seq_len * head_dim): ((i % 3) - 1) * 0.5]
+    val v = [for i in 0..(seq_len * head_dim): (i % 7) * 1.0]
+    print "Attention: seq_len={seq_len}, head_dim={head_dim}, {blocks_for(seq_len)} K/V blocks of {BLOCK_SIZE}"
+
+    val naive = naive_attention(q, k, v, seq_len, head_dim, false)
+    val flash = flash_attention(q, k, v, seq_len, head_dim, false)
+    print "  non-causal: naive and flash agree = {max_abs_diff(naive, flash) < 1.0e-9}"
+
+    val naive_c = naive_attention(q, k, v, seq_len, head_dim, true)
+    val flash_c = flash_attention(q, k, v, seq_len, head_dim, true)
+    print "  causal:     naive and flash agree = {max_abs_diff(naive_c, flash_c) < 1.0e-9}"
+    print "  causal row 0 equals V row 0: {naive_c[0] == v[0] and naive_c[3] == v[3]}"

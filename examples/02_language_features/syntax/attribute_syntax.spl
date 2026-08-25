@@ -1,0 +1,207 @@
+#!/usr/bin/env simple
+# Attribute Syntax Example (#[...])
+#
+# Demonstrates the new #[...] attribute syntax for tests and declarations.
+# NOTE: Requires parser support (in progress).
+
+use std.spec.{describe, it, expect}
+
+# ================================================================
+# Test Attributes
+# ================================================================
+
+describe "API Tests":
+    # Basic attribute
+    @timeout(5000)
+    it "fetches data within timeout":
+        val data = api.fetch_user(123)
+        expect(data.name).to_equal("Alice")
+
+    # Multiple attributes
+    @timeout(10000)
+    @retry(3)
+    @tag("slow")
+    it "retries on failure":
+        val result = flaky_operation()
+        expect(result).to_equal(true)
+
+    # Attributes with multiple arguments
+    @tag("slow", "integration", "database")
+    it "runs integration test":
+        val db_result = database.query("SELECT * FROM users")
+        expect(db_result.len()).to_be_greater_than(0)
+
+    # Skip attribute
+    @pending("Feature not implemented")
+    it "will be skipped":
+        val future_feature = new_api.advanced_feature()
+        expect(future_feature).to_equal(42)
+
+    # Flaky test marker
+    @flaky
+    it "is known to be flaky":
+        # This test might fail occasionally
+        val timing_result = timing_sensitive_test()
+        expect(timing_result).to_equal(true)
+
+    # Complex attribute combination
+    @timeout(30000)
+    @retry(5)
+    @tag("slow", "integration", "external")
+    @flaky
+    it "tests external service":
+        val api_response = external_service.health_check()
+        expect(api_response.status).to_equal(200)
+
+# ================================================================
+# Declaration Attributes (Future)
+# ================================================================
+
+# Attributes on struct fields
+struct Config:
+    @required
+    api_key: text
+
+    @default("localhost")
+    hostname: text
+
+    @range(1, 65535)
+    port: i64
+
+# Attributes on functions
+@deprecated("Use new_function instead")
+fn old_function() -> i64:
+    42
+
+@inline
+fn hot_path() -> i64:
+    # Critical performance path
+    compute_result()
+
+@test
+fn test_computation():
+    expect(compute_result()).to_equal(42)
+
+# Attributes on classes
+@repr("C")
+@packed
+struct FFIStruct:
+    field1: i32
+    field2: i64
+
+# ================================================================
+# Custom Attributes
+# ================================================================
+
+# Attributes can carry metadata for code generation
+
+@derive("Debug", "Clone", "Eq")
+struct Point:
+    x: i64
+    y: i64
+
+@api_endpoint("/users/{id}")
+@http_method("GET")
+fn get_user(id: i64) -> User:
+    fetch_user_from_db(id)
+
+@cache(ttl: 300)
+@ratelimit(per_second: 100)
+async fn expensive_operation(input: text) -> text:
+    # Cached for 5 minutes, rate-limited to 100/sec
+    await compute(input)
+
+# ================================================================
+# Attribute Syntax Variations
+# ================================================================
+
+# Simple attribute (no arguments)
+@inline
+@test
+fn simple():
+    pass
+
+# Attribute with single argument
+@timeout(1000)
+fn with_timeout():
+    pass
+
+# Attribute with multiple arguments
+@tag("a", "b", "c")
+fn with_tags():
+    pass
+
+# Attribute with named arguments
+@cache(ttl: 300, max_size: 1000)
+fn with_named_args():
+    pass
+
+# Multiple attributes stacked
+@timeout(5000)
+@retry(3)
+@tag("slow")
+fn stacked_attributes():
+    pass
+
+# Multiple attributes on one line (alternative, not recommended)
+@timeout(5000) @retry(3) @tag("slow")
+fn one_line_attributes():
+    pass
+
+# ================================================================
+# Helper Functions
+# ================================================================
+
+fn api_fetch_user(id: i64) -> User:
+    User(id: id, name: "Alice")
+
+fn flaky_operation() -> bool:
+    true
+
+fn database_query(sql: text) -> [Row]:
+    [Row(id: 1)]
+
+fn timing_sensitive_test() -> bool:
+    true
+
+fn compute_result() -> i64:
+    42
+
+fn fetch_user_from_db(id: i64) -> User:
+    User(id: id, name: "User {id}")
+
+async fn compute(input: text) -> text:
+    "result"
+
+# ================================================================
+# Type Definitions
+# ================================================================
+
+struct User:
+    id: i64
+    name: text
+
+struct Row:
+    id: i64
+
+struct ApiResponse:
+    status: i64
+
+# ================================================================
+# Notes
+# ================================================================
+
+# Attributes are parsed at compile time and can:
+# 1. Configure runtime behavior (timeout, retry)
+# 2. Mark declarations for code generation (derive, api_endpoint)
+# 3. Provide hints to the compiler (inline, deprecated)
+# 4. Add metadata for tools (test, benchmark)
+#
+# The #[...] syntax is similar to:
+# - Rust: @attribute
+# - Python: @decorator (but @ is already used for other purposes)
+# - Java: @annotation
+# - C#: [Attribute]
+#
+# In Simple, we use #[ ] to avoid conflicts with @ (which is for
+# general attribute syntax like @repr, @packed).

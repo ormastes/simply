@@ -1,0 +1,4 @@
+use logic_media_retire_cases.*
+
+fn rv32_media_retire_selftest() -> i32:
+    rv32_media_retire_cases_selftest()

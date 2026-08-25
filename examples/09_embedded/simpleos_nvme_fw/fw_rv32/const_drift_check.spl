@@ -1,0 +1,89 @@
+"""
+const_drift_check — host-only source-of-truth drift check between fw_rv32's
+hand-copied geometry/threshold literals and fw/nvme_types.spl's constants.
+
+This is deliberately NOT part of the boot-linked import graph: logic.spl /
+logic_sections_primary.spl / logic_sections_secondary.spl / entry.spl never
+`use const_drift_check`, so the freestanding rv32 boot path stays fully
+decoupled from `fw/` (no arrays, no fw/ import, per README.md / the rv32
+no-alloc constraint). Run host-only:
+
+  bin/simple run examples/09_embedded/simpleos_nvme_fw/fw_rv32/const_drift_check.spl
+
+Why this exists (doc/03_plan/hardware/nvme_fw_rel_rv32_port_plan.md §2.3):
+`logic_map_lba_cases.spl` asserts hand-copied boundary literals (1024, 2048,
+3071, 3072) tied to `fw/nvme_types.spl:LBA_COUNT` only by a code comment. That
+is a REGRESSION oracle (catches rv32 reverting to an old bound) but NOT a
+drift oracle (would not catch LBA_COUNT changing to a brand-new value while
+the rv32 literal stays put). Every assertion below instead derives its
+expected boundary from the LIVE `fw/nvme_types.spl` constant and calls the
+real rv32 function at that boundary, so a future constant change that isn't
+mirrored in fw_rv32 turns this check red instead of staying silently green.
+"""
+
+use fw.nvme_types.*
+use logic_map_core.*
+use logic_band_geometry_core.*
+use logic_wear_scrub_core.*
+
+fn _drift_check_lba_count() -> i32:
+    # fw_rv32/logic_map_core.spl: `if lba >= 3072: return 0` — must track LBA_COUNT
+    if _rv32_map_lba_valid(LBA_COUNT - 1) != 1:
+        return 1
+    if _rv32_map_lba_valid(LBA_COUNT) != 0:
+        return 1
+    0
+
+fn _drift_check_num_blocks() -> i32:
+    # fw_rv32/logic_band_geometry_core.spl: `if block >= 64` — must track NUM_BLOCKS
+    if _rv32_band_block_valid_impl(NUM_BLOCKS - 1) != 1:
+        return 1
+    if _rv32_band_block_valid_impl(NUM_BLOCKS) != 0:
+        return 1
+    0
+
+fn _drift_check_pages_per_block() -> i32:
+    # fw_rv32/logic_band_geometry_core.spl: `block * 64` / `raw > 64` clamp —
+    # must track PAGES_PER_BLOCK
+    if _rv32_band_first_ppn_impl(1) != PAGES_PER_BLOCK:
+        return 1
+    if _rv32_band_valid_count_impl(PAGES_PER_BLOCK + 1) != PAGES_PER_BLOCK:
+        return 1
+    0
+
+fn _drift_check_num_pages() -> i32:
+    # fw_rv32/logic_band_geometry_core.spl: `if ppn >= 4096` — must track NUM_PAGES
+    if _rv32_band_ppn_valid_impl(NUM_PAGES - 1) != 1:
+        return 1
+    if _rv32_band_ppn_valid_impl(NUM_PAGES) != 0:
+        return 1
+    0
+
+fn _drift_check_read_disturb_threshold() -> i32:
+    # fw_rv32/logic_wear_scrub_core.spl: `if read_disturb > 50` — must track
+    # READ_DISTURB_THRESHOLD
+    if _rv32_scrub_needed(1, READ_DISTURB_THRESHOLD) != 0:
+        return 1
+    if _rv32_scrub_needed(1, READ_DISTURB_THRESHOLD + 1) != 1:
+        return 1
+    0
+
+fn nvme_fw_rv32_const_drift_selftest() -> i32:
+    if _drift_check_lba_count() != 0:
+        return 1
+    if _drift_check_num_blocks() != 0:
+        return 1
+    if _drift_check_pages_per_block() != 0:
+        return 1
+    if _drift_check_num_pages() != 0:
+        return 1
+    if _drift_check_read_disturb_threshold() != 0:
+        return 1
+    0
+
+fn main():
+    val fail = nvme_fw_rv32_const_drift_selftest()
+    if fail == 0:
+        print "RV32 NVME FW CONST DRIFT CHECK OK"
+    else:
+        print "RV32 NVME FW CONST DRIFT CHECK FAIL"

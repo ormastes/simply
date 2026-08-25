@@ -1,0 +1,203 @@
+# LLM CLI Tools — Agent Orchestrator
+#
+# Spawns codex/gemini CLI tools as verification/design subagents
+# for the impl workflow (Phase 4g, 4v, 6v).
+#
+# Commands (via AGENT_CMD env var):
+#   spawn  — Execute an LLM agent and save its output
+#   result — Retrieve stored agent output by ID
+#   list   — List all stored agent results
+#
+# Environment variables:
+#   AGENT_CMD          spawn|result|list
+#   AGENT_PROVIDER     codex_cli|gemini_cli  (spawn)
+#   AGENT_ROLE         verify|design         (spawn)
+#   AGENT_SYSTEM       System prompt text    (spawn)
+#   AGENT_PROMPT_FILE  Path to prompt file   (spawn)
+#   AGENT_ID           Agent result ID       (result)
+#
+# @req agent_orchestrator
+# @feature agent_orchestrator
+
+extern fn rt_file_exists(path: text) -> bool
+extern fn rt_file_read_text(path: text) -> text
+extern fn rt_env_get(key: text) -> text
+extern fn rt_process_run(cmd: text, args: [text]) -> (text, text, i64)
+extern fn rt_dir_create_all(path: text) -> bool
+extern fn rt_file_write_text(path: text, content: text) -> bool
+extern fn rt_dir_list(path: text) -> [text]
+
+val DATA_DIR = "data/agents"
+
+# ============================================================================
+# Provider configuration
+# ============================================================================
+
+fn _provider_binary(provider: text) -> text:
+    if provider == "codex_cli":
+        return "codex"
+    elif provider == "gemini_cli":
+        return "gemini"
+    ""
+
+fn _build_args(provider: text, system_prompt: text, prompt: text) -> [text]:
+    val combined = system_prompt + "\n\n" + prompt
+    var args: [text] = []
+    if provider == "codex_cli":
+        # codex exec runs non-interactively
+        args = args + ["exec", combined]
+    elif provider == "gemini_cli":
+        # gemini -p runs headless, --yolo auto-approves
+        args = args + ["-p", combined, "--yolo"]
+    args
+
+# ============================================================================
+# Agent ID generation
+# ============================================================================
+
+fn _generate_id(provider: text, role: text) -> text:
+    val result = rt_process_run("date", ["+%s"])
+    val ts = (result.0 ?? "").trim()
+    provider + "_" + role + "_" + ts
+
+# ============================================================================
+# Result storage
+# ============================================================================
+
+fn _ensure_data_dir():
+    rt_dir_create_all(DATA_DIR)
+
+fn _result_path(agent_id: text) -> text:
+    DATA_DIR + "/" + agent_id + ".txt"
+
+fn _save_result(agent_id: text, provider: text, role: text,
+                stdout: text, stderr: text, exit_code: i64):
+    _ensure_data_dir()
+    var content = "provider: " + provider + "\n"
+    content = content + "role: " + role + "\n"
+    content = content + "exit_code: " + exit_code.to_text() + "\n"
+    content = content + "---\n"
+    content = content + stdout
+    if stderr != "":
+        content = content + "\n--- STDERR ---\n"
+        content = content + stderr
+    rt_file_write_text(_result_path(agent_id), content)
+
+fn _load_result(agent_id: text) -> text:
+    val path = _result_path(agent_id)
+    if not rt_file_exists(path):
+        return "ERROR: No result found for agent ID: " + agent_id
+    rt_file_read_text(path)
+
+# ============================================================================
+# spawn command
+# ============================================================================
+
+fn _cmd_spawn():
+    val provider = rt_env_get("AGENT_PROVIDER") ?? ""
+    val role = rt_env_get("AGENT_ROLE") ?? ""
+    val system_prompt = rt_env_get("AGENT_SYSTEM") ?? ""
+    val prompt_file = rt_env_get("AGENT_PROMPT_FILE") ?? ""
+
+    if provider == "":
+        print "ERROR: AGENT_PROVIDER required (codex_cli, gemini_cli)"
+        return
+    val binary = _provider_binary(provider)
+    if binary == "":
+        print "ERROR: Unknown provider: " + provider
+        return
+    if prompt_file == "":
+        print "ERROR: AGENT_PROMPT_FILE required"
+        return
+    if not rt_file_exists(prompt_file):
+        print "ERROR: Prompt file not found: " + prompt_file
+        return
+
+    val prompt_content = rt_file_read_text(prompt_file)
+    val args = _build_args(provider, system_prompt, prompt_content)
+
+    print "Spawning " + provider + " (" + role + ")..."
+    val result = rt_process_run(binary, args)
+    val stdout = result.0 ?? ""
+    val stderr = result.1 ?? ""
+    val exit_code = result.2
+
+    val agent_id = _generate_id(provider, role)
+    _save_result(agent_id, provider, role, stdout, stderr, exit_code)
+
+    if exit_code != 0:
+        print "WARNING: " + binary + " exited with code " + exit_code.to_text()
+        if stderr != "":
+            print "STDERR: " + stderr
+    print "AGENT_ID=" + agent_id
+    print "---"
+    print stdout
+
+# ============================================================================
+# result command
+# ============================================================================
+
+fn _cmd_result():
+    val agent_id = rt_env_get("AGENT_ID") ?? ""
+    if agent_id == "":
+        print "ERROR: AGENT_ID required"
+        return
+    print _load_result(agent_id)
+
+# ============================================================================
+# list command
+# ============================================================================
+
+fn _cmd_list():
+    _ensure_data_dir()
+    val files = rt_dir_list(DATA_DIR)
+    var count = 0
+    for f in files:
+        val flen = f.len()
+        if flen > 4 and f[flen - 4:flen] == ".txt":
+            val name = f[0:flen - 4]
+            print "  " + name
+            count = count + 1
+    if count == 0:
+        print "No agent results found."
+    else:
+        print "Total: " + count.to_text() + " result(s)"
+
+# ============================================================================
+# Usage
+# ============================================================================
+
+fn _print_usage():
+    print "LLM CLI Tools — Agent Orchestrator"
+    print ""
+    print "Commands (set AGENT_CMD env var):"
+    print "  spawn   Spawn an LLM agent (codex/gemini) with a prompt file"
+    print "  result  Retrieve stored agent output by ID"
+    print "  list    List all stored agent results"
+    print ""
+    print "Spawn:"
+    print "  AGENT_CMD=spawn AGENT_PROVIDER=codex_cli AGENT_ROLE=verify"
+    print "    AGENT_SYSTEM='You are a verification agent.'"
+    print "    AGENT_PROMPT_FILE=doc/plan/feature.md"
+    print "    ../../bin/release/simple run src/app/agent/orchestrator.spl"
+    print ""
+    print "Result:"
+    print "  AGENT_CMD=result AGENT_ID=codex_cli_verify_1710500000"
+    print "    ../../bin/release/simple run src/app/agent/orchestrator.spl"
+
+# ============================================================================
+# Entry point
+# ============================================================================
+
+val _cmd = rt_env_get("AGENT_CMD") ?? ""
+if _cmd == "spawn":
+    _cmd_spawn()
+elif _cmd == "result":
+    _cmd_result()
+elif _cmd == "list":
+    _cmd_list()
+else:
+    _print_usage()
+    if _cmd != "":
+        print ""
+        print "ERROR: Unknown command: " + _cmd

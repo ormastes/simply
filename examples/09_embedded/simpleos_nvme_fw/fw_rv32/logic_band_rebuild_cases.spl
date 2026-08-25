@@ -1,0 +1,10 @@
+use logic_band_core.*
+
+fn rv32_band_rebuild_cases_selftest() -> i32:
+    if _rv32_band_rebuild_state(10, 0) != 2:
+        return 1
+    if _rv32_band_rebuild_state(10, 3) != 3:
+        return 1
+    if _rv32_band_rebuild_state(4096, 0) != 0:
+        return 1
+    0

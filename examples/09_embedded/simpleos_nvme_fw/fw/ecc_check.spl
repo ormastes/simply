@@ -1,0 +1,36 @@
+"""
+ecc_check — wired SECDED ECC floor (gap-closure P3).
+
+Run: bin/simple run examples/09_embedded/simpleos_nvme_fw/fw/ecc_check.spl
+"""
+
+use nvme_types.*
+use fil.*
+
+fn main():
+    var fail: i64 = 0
+    var fil: Fil = fil_new()
+    val ppn: i64 = block_first_ppn(3) + 1
+
+    fail = fail + expect_eq(fil.program(ppn, 7, 1, 0x5A), NAND_OK, "program page")
+
+    fil.corrupt_page_data(ppn, 0x5B)
+    val one: FilRead = fil.read(ppn)
+    fail = fail + expect_eq(one.code, NAND_ECC_FIXED, "single silent payload bit corrected")
+    fail = fail + expect_eq(one.data, 0x5A, "corrected byte returned to FIL caller")
+
+    fil.corrupt_page_data(ppn, 0x59)
+    val two: FilRead = fil.read(ppn)
+    fail = fail + expect_eq(two.code, NAND_ECC_FAIL, "double silent payload bit fails closed")
+
+    val ppn2: i64 = block_first_ppn(3) + 2
+    fail = fail + expect_eq(fil.program(ppn2, 8, 2, 0x123456), NAND_OK, "program high payload page")
+    fil.corrupt_page_data(ppn2, 0x133456)
+    val high: FilRead = fil.read(ppn2)
+    fail = fail + expect_eq(high.code, NAND_ECC_FIXED, "single high payload bit corrected")
+    fail = fail + expect_eq(high.data, 0x123456, "corrected high payload returned to FIL caller")
+
+    if fail == 0:
+        print "ECC OK"
+    else:
+        print "ECC FAIL ({fail})"

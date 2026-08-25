@@ -1,0 +1,185 @@
+"""
+# Matching
+
+Tests for matching functionality.
+"""
+#![allow(unnamed_duplicate_typed_args)]
+# Bid scoring tests — self-contained
+
+# ============================================================================
+# State variables
+# ============================================================================
+var BK_AGENT_IDS: [text] = []
+var BK_AGENT_CAPS: [text] = []
+var BK_AGENT_MAX_CONCURRENT: [i64] = []
+var BK_AGENT_PRIORITIES: [i64] = []
+var BK_AGENT_LOADS: [i64] = []
+var BK_AGENT_STATUSES: [text] = []
+var BK_AGENT_COUNT = 0
+
+# ============================================================================
+# Struct: Bid
+# ============================================================================
+struct Bid:
+    agent_id: text
+    task_id: text
+    score: i64
+    cap_overlap: i64
+    load_score: i64
+    priority_score: i64
+    accepted: bool
+
+fn bid(agent_id: text, task_id: text, cap_overlap: i64,
+       load_score: i64, priority_score: i64) -> Bid:
+    val score = (cap_overlap * 40 + load_score * 30 + priority_score * 30) / 100
+    Bid(
+        agent_id: agent_id,
+        task_id: task_id,
+        score: score,
+        cap_overlap: cap_overlap,
+        load_score: load_score,
+        priority_score: priority_score,
+        accepted: false
+    )
+
+# ============================================================================
+# Functions
+# ============================================================================
+fn worker_register(id: text, capabilities: text, max_concurrent: i64, priority: i64):
+    BK_AGENT_IDS = BK_AGENT_IDS + [id]
+    BK_AGENT_CAPS = BK_AGENT_CAPS + [capabilities]
+    BK_AGENT_MAX_CONCURRENT = BK_AGENT_MAX_CONCURRENT + [max_concurrent]
+    BK_AGENT_PRIORITIES = BK_AGENT_PRIORITIES + [priority]
+    BK_AGENT_LOADS = BK_AGENT_LOADS + [0]
+    BK_AGENT_STATUSES = BK_AGENT_STATUSES + ["idle"]
+    BK_AGENT_COUNT = BK_AGENT_COUNT + 1
+
+fn worker_set_status(agent_id: text, status: text):
+    var i = 0
+    while i < BK_AGENT_COUNT:
+        if BK_AGENT_IDS[i] == agent_id:
+            BK_AGENT_STATUSES[i] = status
+            return
+        i = i + 1
+
+fn broker_solicit_bids(task_id: text, required_caps: [text]) -> [Bid]:
+    var bids: [Bid] = []
+    var i = 0
+    while i < BK_AGENT_COUNT:
+        val agent_id = BK_AGENT_IDS[i]
+        val agent_status = BK_AGENT_STATUSES[i]
+        val agent_load = BK_AGENT_LOADS[i]
+        val agent_max = BK_AGENT_MAX_CONCURRENT[i]
+        val agent_priority = BK_AGENT_PRIORITIES[i]
+        val agent_caps_str = BK_AGENT_CAPS[i]
+
+        if agent_status == "offline":
+            i = i + 1
+            continue
+        if agent_load >= agent_max:
+            i = i + 1
+            continue
+
+        val agent_caps = agent_caps_str.split(",")
+        var overlap_count = 0
+        var total_required = 0
+        for req in required_caps:
+            val trimmed_req = req.trim()
+            if trimmed_req != "":
+                total_required = total_required + 1
+                for ac in agent_caps:
+                    if ac.trim() == trimmed_req:
+                        overlap_count = overlap_count + 1
+                        break
+
+        if overlap_count == 0:
+            i = i + 1
+            continue
+
+        var cap_score = 0
+        if total_required > 0:
+            cap_score = (overlap_count * 100) / total_required
+
+        var load_score = 100
+        if agent_max > 0:
+            load_score = ((agent_max - agent_load) * 100) / agent_max
+
+        val priority_score = agent_priority * 10
+        val b = bid(agent_id, task_id, cap_score, load_score, priority_score)
+        bids.push(b)
+        i = i + 1
+    bids
+
+fn broker_select_best_bid(bids: [Bid]) -> Bid:
+    var best_idx = 0
+    var best_score = -1
+    var i = 0
+    while i < bids.len():
+        if bids[i].score > best_score:
+            best_score = bids[i].score
+            best_idx = i
+        i = i + 1
+    bids[best_idx]
+
+# ============================================================================
+# Test setup helper
+# ============================================================================
+fn _setup_test_agents():
+    BK_AGENT_IDS = []
+    BK_AGENT_CAPS = []
+    BK_AGENT_MAX_CONCURRENT = []
+    BK_AGENT_PRIORITIES = []
+    BK_AGENT_LOADS = []
+    BK_AGENT_STATUSES = []
+    BK_AGENT_COUNT = 0
+
+    worker_register("coder", "code,refactor,test", 3, 10)
+    worker_register("reviewer", "review,security,docs", 2, 8)
+    worker_register("researcher", "research,analysis,docs", 2, 5)
+
+# ============================================================================
+# Tests
+# ============================================================================
+describe "Bid Scoring":
+    """
+    ## Bid Scoring Tests
+
+    Validates Bid Scoring functionality.
+    """
+
+    it "scores capability overlap":
+        _setup_test_agents()
+        val required: [text] = ["code", "test"]
+        val bids = broker_solicit_bids("task-1", required)
+        # coder has both code and test
+        expect(bids.len()).to_be_greater_than(0)
+        expect(bids[0].agent_id).to_equal("coder")
+        expect(bids[0].cap_overlap).to_equal(100)
+
+    it "filters agents without matching capabilities":
+        _setup_test_agents()
+        val required: [text] = ["code"]
+        val bids = broker_solicit_bids("task-2", required)
+        # Only coder has "code" capability
+        var has_reviewer = false
+        for b in bids:
+            if b.agent_id == "reviewer":
+                has_reviewer = true
+        expect(has_reviewer).to_equal(false)
+
+    it "selects best bid by composite score":
+        _setup_test_agents()
+        val required: [text] = ["docs"]
+        val bids = broker_solicit_bids("task-3", required)
+        # Both reviewer and researcher have "docs"
+        expect(bids.len()).to_equal(2)
+        val best = broker_select_best_bid(bids)
+        # reviewer has higher priority (8 vs 5)
+        expect(best.agent_id).to_equal("reviewer")
+
+    it "excludes offline agents":
+        _setup_test_agents()
+        worker_set_status("coder", "offline")
+        val required: [text] = ["code"]
+        val bids = broker_solicit_bids("task-4", required)
+        expect(bids.len()).to_equal(0)

@@ -1,0 +1,95 @@
+# @cover src/lanes/sale.spl 80%
+"""
+# Sale Lane
+
+Checkout writes flow through the ONE shared gate: session -> rbac -> validation
+-> idempotency. This spec pins the accepted path plus each fail-closed reason,
+and the lane's totals (sale total, mark paid, unpaid total).
+"""
+
+use std.spec
+use lanes.sale.{Sale, validate_sale, sale_total, mark_paid, unpaid_total, submit_sale_write}
+use framework.guarded.{Tenant, Actor, Session}
+use std.nogc_sync_mut.enterprise_store.store.{EnterpriseStore, store_open}
+use std.io_runtime.{file_exists, file_delete, dir_create_all}
+
+# Each scenario opens its own durable store: the interpreter backend caches
+# open databases per path in-process, so every it-block gets a fresh path.
+fn fresh_store(name: text) -> EnterpriseStore:
+    dir_create_all("build/test-artifacts")
+    val db = "build/test-artifacts/erp_sale_lane_" + name + ".db"
+    if file_exists(db):
+        file_delete(db)
+    store_open(db)
+
+describe "Sale lane — guarded writes":
+    it "accepts a valid write through the gate":
+        val tenant = Tenant { id: "t1", name: "Demo" }
+        val user = Actor { id: 1, name: "Mina", role: "operator" }
+        val session = Session { token: "sess-1", user_id: 1, tenant_id: "t1", active: true }
+        val s = Sale { id: 1, channel: "online shop", subtotal: 10000, tax: 1000, paid: false, status: "ready", audit_note: "card" }
+        val store = fresh_store("s1")
+        val res = submit_sale_write(session, tenant, user, s, "sale-1", store)
+        expect(res.ok).to_equal(true)
+        expect(res.reason).to_equal("accepted")
+        expect(res.ledger_key).to_equal("sale-1")
+
+    it "denies an inactive session":
+        val tenant = Tenant { id: "t1", name: "Demo" }
+        val user = Actor { id: 1, name: "Mina", role: "operator" }
+        val session = Session { token: "sess-1", user_id: 1, tenant_id: "t1", active: false }
+        val s = Sale { id: 1, channel: "online shop", subtotal: 10000, tax: 1000, paid: false, status: "ready", audit_note: "card" }
+        val store = fresh_store("s2")
+        val res = submit_sale_write(session, tenant, user, s, "sale-1", store)
+        assert_false(res.ok)
+        expect(res.reason).to_equal("invalid-session")
+
+    it "forbids an auditor from writing":
+        val tenant = Tenant { id: "t1", name: "Demo" }
+        val user = Actor { id: 3, name: "Jae", role: "auditor" }
+        val session = Session { token: "sess-3", user_id: 3, tenant_id: "t1", active: true }
+        val s = Sale { id: 1, channel: "online shop", subtotal: 10000, tax: 1000, paid: false, status: "ready", audit_note: "card" }
+        val store = fresh_store("s3")
+        val res = submit_sale_write(session, tenant, user, s, "sale-1", store)
+        assert_false(res.ok)
+        expect(res.reason).to_equal("forbidden")
+
+    it "rejects an invalid record":
+        val tenant = Tenant { id: "t1", name: "Demo" }
+        val user = Actor { id: 1, name: "Mina", role: "operator" }
+        val session = Session { token: "sess-1", user_id: 1, tenant_id: "t1", active: true }
+        val s = Sale { id: 1, channel: "online shop", subtotal: 10000, tax: 1000, paid: false, status: "ready", audit_note: "" }
+        val store = fresh_store("s4")
+        val res = submit_sale_write(session, tenant, user, s, "sale-1", store)
+        assert_false(res.ok)
+        expect(res.reason).to_equal("invalid-record")
+
+    it "rejects a duplicate idempotency key":
+        val tenant = Tenant { id: "t1", name: "Demo" }
+        val user = Actor { id: 1, name: "Mina", role: "operator" }
+        val session = Session { token: "sess-1", user_id: 1, tenant_id: "t1", active: true }
+        val s = Sale { id: 1, channel: "online shop", subtotal: 10000, tax: 1000, paid: false, status: "ready", audit_note: "card" }
+        val store = fresh_store("s5")
+        submit_sale_write(session, tenant, user, s, "sale-1", store)
+        val res = submit_sale_write(session, tenant, user, s, "sale-1", store)
+        assert_false(res.ok)
+        expect(res.reason).to_equal("duplicate-key")
+
+describe "Sale lane — domain operations":
+    it "computes a sale total":
+        val s = Sale { id: 1, channel: "online shop", subtotal: 10000, tax: 1000, paid: false, status: "ready", audit_note: "card" }
+        expect(sale_total(s)).to_equal(11000)
+
+    it "marks a sale paid":
+        val s = Sale { id: 1, channel: "online shop", subtotal: 10000, tax: 1000, paid: false, status: "ready", audit_note: "card" }
+        val settled = mark_paid(s)
+        assert_true(settled.paid)
+        expect(settled.status).to_equal("paid")
+
+    it "sums only unpaid sale totals":
+        val a = Sale { id: 1, channel: "online shop", subtotal: 10000, tax: 1000, paid: true, status: "paid", audit_note: "card" }
+        val b = Sale { id: 2, channel: "restaurant", subtotal: 15000, tax: 1500, paid: false, status: "ready", audit_note: "counter" }
+        var list: [Sale] = []
+        list.push(a)
+        list.push(b)
+        expect(unpaid_total(list)).to_equal(16500)

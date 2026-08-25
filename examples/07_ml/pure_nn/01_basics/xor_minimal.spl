@@ -1,0 +1,75 @@
+#![allow(unnamed_duplicate_typed_args)]
+#!/usr/bin/env simple
+# XOR Problem - Minimal Tensor Demo
+# Demonstrates basic tensor operations with Pure Simple
+#
+# Inline implementation to avoid import issues
+
+class SimpleTensor:
+    data: [f64]
+    shape: [i64]
+
+fn create_tensor(data: [f64], shape: [i64]) -> SimpleTensor:
+    SimpleTensor(data: data, shape: shape)
+
+fn tensor_matmul(a: SimpleTensor, b: SimpleTensor) -> SimpleTensor:
+    # Matrix multiplication for 2D tensors
+    val M = a.shape[0]
+    val K = a.shape[1]
+    val N = b.shape[1]
+    var result: [f64] = []
+    var i = 0
+    while i < M:
+        var j = 0
+        while j < N:
+            var sum = 0.0
+            var k = 0
+            while k < K:
+                sum = sum + a.data[i * K + k] * b.data[k * N + j]
+                k = k + 1
+            result.push(sum)
+            j = j + 1
+        i = i + 1
+    SimpleTensor(data: result, shape: [M, N])
+
+fn tensor_relu(t: SimpleTensor) -> SimpleTensor:
+    var result: [f64] = []
+    for v in t.data:
+        result.push(if v > 0.0: v else: 0.0)
+    SimpleTensor(data: result, shape: t.shape)
+
+fn print_tensor(t: SimpleTensor, name: text):
+    print "{name} shape: [{t.shape[0]}, {t.shape[1]}]"
+    print "  data: {t.data}"
+
+fn main():
+    print "=== Pure Simple Deep Learning - XOR Problem ==="
+    print ""
+
+    # Create XOR input: [[0,0], [0,1], [1,0], [1,1]]
+    val x = create_tensor([0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0], [4, 2])
+    print_tensor(x, "Input X")
+    print ""
+
+    # Create weight matrix
+    val w = create_tensor([0.5, 0.3, -0.2, 0.7], [2, 2])
+    print_tensor(w, "Weight W")
+    print ""
+
+    # Forward pass: y = ReLU(X @ W)
+    val z = tensor_matmul(x, w)
+    print "After matmul (X @ W):"
+    print_tensor(z, "  Z")
+    print ""
+
+    val activated = tensor_relu(z)
+    print "After ReLU:"
+    print_tensor(activated, "  Y")
+    print ""
+
+    print "✓ Pure Simple tensor operations working!"
+    print "✓ XOR forward pass complete"
+    print ""
+    print "Next: See xor_training_example.spl for full training with autograd"
+
+main()

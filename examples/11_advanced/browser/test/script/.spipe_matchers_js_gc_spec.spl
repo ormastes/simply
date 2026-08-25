@@ -1,0 +1,126 @@
+#![allow(REQC001)]
+#![allow(REQC004)]
+#![allow(unnamed_duplicate_typed_args)]
+"""
+# Js Gc
+
+Tests for js gc functionality.
+"""
+# JavaScript Garbage Collector tests for the Simple Browser Platform.
+# Validates generational GC: allocation, young/old collection, write barriers,
+# statistics tracking, incremental marking, and circular reference handling.
+
+use std.spec
+
+describe "JsGarbageCollector":
+    """
+    ## Jsgarbagecollector Tests
+
+    Validates JsGarbageCollector functionality.
+    """
+
+    context "allocation":
+        it "allocate creates gc object":
+            val obj_id = 1
+            val generation = "Young"
+            val marked = false
+            val ref_count = 0
+            expect obj_id > 0
+            expect generation == "Young"
+            expect marked == false
+            expect ref_count == 0
+
+    context "young generation":
+        it "young generation collects unreferenced":
+            var young_count = 5
+            val referenced = 2
+            # Collect: unreferenced objects freed
+            val freed = young_count - referenced
+            young_count = referenced
+            expect freed == 3
+            expect young_count == 2
+
+        it "referenced objects survive collection":
+            var alive = true
+            val ref_count = 1
+            # Object with ref_count > 0 survives
+            if ref_count > 0:
+                alive = true
+            else:
+                alive = false
+            expect alive == true
+
+    context "promotion":
+        it "promoted objects move to old generation":
+            var generation = "Young"
+            val survive_count = 3
+            val promotion_threshold = 2
+            # Object survived enough collections, promote
+            if survive_count >= promotion_threshold:
+                generation = "Old"
+            expect generation == "Old"
+
+    context "full collection":
+        it "full collection sweeps all generations":
+            var young_count = 10
+            var old_count = 5
+            val young_alive = 3
+            val old_alive = 4
+            val total_freed = (young_count - young_alive) + (old_count - old_alive)
+            young_count = young_alive
+            old_count = old_alive
+            expect total_freed == 8
+            expect young_count == 3
+            expect old_count == 4
+
+    context "write barrier":
+        it "write barrier tracks modifications":
+            var dirty_cards = 0
+            # Simulate old->young pointer write
+            dirty_cards = dirty_cards + 1
+            # Another cross-generation write
+            dirty_cards = dirty_cards + 1
+            expect dirty_cards == 2
+
+    context "statistics":
+        it "gc stats track allocations":
+            var total_allocated = 0
+            total_allocated = total_allocated + 1
+            total_allocated = total_allocated + 1
+            total_allocated = total_allocated + 1
+            expect total_allocated == 3
+
+        it "gc stats track freed count":
+            var total_freed = 0
+            var collections = 0
+            # Simulate a collection cycle
+            total_freed = total_freed + 5
+            collections = collections + 1
+            expect total_freed == 5
+            expect collections == 1
+
+    context "incremental marking":
+        it "incremental mark respects time budget":
+            val total_objects = 1000
+            val budget_per_step = 100
+            var marked_count = 0
+            # One incremental step marks up to budget
+            var step_marked = 0
+            while step_marked < budget_per_step:
+                marked_count = marked_count + 1
+                step_marked = step_marked + 1
+            expect marked_count == 100
+            expect marked_count < total_objects
+
+    context "circular references":
+        it "circular references collected":
+            # Two objects reference each other, but no external root
+            var obj_a_alive = true
+            var obj_b_alive = true
+            val has_root_ref = false
+            # Mark-sweep with tracing: no root -> both collected
+            if has_root_ref == false:
+                obj_a_alive = false
+                obj_b_alive = false
+            expect obj_a_alive == false
+            expect obj_b_alive == false

@@ -1,0 +1,85 @@
+# Executable DBFS evidence probe. Emit one closed record only after recomputing every oracle value.
+use std.db.dbfs_engine.fts.wave4_compatibility.{DBFS_W4_SCOPE, DbfsWave4Document, DbfsWave4FieldStats, DbfsWave4Hit, DbfsWave4Page, dbfs_wave4_golden_index}
+use std.common.crypto.sha256.{sha256_text}
+
+fn quote(value: text) -> text: "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+fn string_array(values: [text]) -> text:
+    var rows: [text] = []
+    for value in values: rows.push(quote(value))
+    "[" + rows.join(",") + "]"
+fn executed_cells_json(values: [text]) -> text:
+    var rows: [text] = []
+    for value in values:
+        val number = value.slice(value.len() - 2, value.len())
+        rows.push("{\"matrix_id\":" + quote(value) + ",\"oracle\":" + quote("wave4_search_" + number) + "}")
+    "[" + rows.join(",") + "]"
+fn hit_json(hit: DbfsWave4Hit) -> text:
+    "{\"document_id\":" + quote(hit.document_id) + ",\"explanation\":" + hit.explanation_json + ",\"matched_fields\":" + string_array(hit.matched_fields) + ",\"score_milli\":" + hit.score_milli.to_text() + ",\"source_rank\":" + hit.source_rank.to_text() + "}"
+fn page_hash(page: DbfsWave4Page) -> text:
+    var hits: [text] = []
+    for hit in page.hits: hits.push(hit_json(hit))
+    "sha256:" + sha256_text("{\"exhausted\":true,\"hits\":[" + hits.join(",") + "],\"logical_root\":" + quote(page.logical_root) + ",\"next_cursor\":null}")
+fn golden_hit_json(hit: DbfsWave4Hit) -> text:
+    "{\"document_id\":" + quote(hit.document_id) + ",\"score_milli\":" + hit.score_milli.to_text() + ",\"matched_fields\":" + string_array(hit.matched_fields) + ",\"source_rank\":" + hit.source_rank.to_text() + ",\"explanation_hash\":" + quote("sha256:" + sha256_text(hit.explanation_json)) + "}"
+fn query_json(id: text, query_text: text, filters_json: text, page: DbfsWave4Page) -> text:
+    var hits: [text] = []
+    for hit in page.hits: hits.push(golden_hit_json(hit))
+    "{\"id\":" + quote(id) + ",\"query_text\":" + quote(query_text) + ",\"filters\":" + filters_json + ",\"hits\":[" + hits.join(",") + "],\"page_hash\":" + quote(page_hash(page)) + "}"
+fn stat_json(stat: DbfsWave4FieldStats) -> text:
+    "{\"field\":" + quote(stat.field) + ",\"N\":" + stat.N.to_text() + ",\"total_length\":" + stat.total_length.to_text() + ",\"average_length_scaled\":" + stat.average_length_scaled.to_text() + "}"
+
+fn main() -> i64:
+    var index = dbfs_wave4_golden_index()
+    val root = index.logical_root()
+    val alpha = index.query(DBFS_W4_SCOPE, "alpha search").unwrap()
+    val exact = index.query(DBFS_W4_SCOPE, "REQ-SPKC-011").unwrap()
+    val public = index.query_filtered(DBFS_W4_SCOPE, "alpha", "visibility", "public").unwrap()
+    val identifier_stats = index.field_stats("identifier")
+    val title_stats = index.field_stats("title")
+    val heading_stats = index.field_stats("heading")
+    val classification_stats = index.field_stats("classification")
+    val body_stats = index.field_stats("body")
+    val stats_ok = (identifier_stats.total_length == 11 and title_stats.total_length == 4 and heading_stats.total_length == 6 and classification_stats.total_length == 3 and body_stats.total_length == 5)
+    val query_ok = (alpha.hits.len() == 2 and alpha.hits[0].score_milli == 5564 and alpha.hits[1].score_milli == 5471 and exact.hits.len() == 2 and exact.hits[0].score_milli == 7407 and exact.hits[1].score_milli == 3625 and public.hits.len() == 2 and public.hits[0].score_milli == 3063 and public.hits[1].score_milli == 2970 and page_hash(alpha) == "sha256:cf41a2888549e9635af5263d0a28d1bb7c057ad40a7d4f7d454f0b7ce6d23115" and page_hash(exact) == "sha256:ffcdc0cfe7ecc62352b664404f7035331fe40c6a1e9b34e8684589382bed999a" and page_hash(public) == "sha256:e43db193c70ccce4f8ad703b2f6851a0c4a7e63a90d95d204dd212a4f64f5bd6")
+    val absent_removed = index.remove("A-absent")
+    val no_op_root = index.logical_root()
+    val before_delta_count = index.document_count()
+    val added_was_absent = not index.contains_document("A-added")
+    val add_ok = index.add(DbfsWave4Document.of("A-added", "r1", "ID-EMPTY", "", "", "empty", "", "public", DBFS_W4_SCOPE)).is_ok()
+    val added = if add_ok and added_was_absent and index.contains_document("A-added"): 1 else: 0
+    val replaced_was_present = index.contains_document("A-ascii")
+    val replace_ok = index.add(DbfsWave4Document.of("A-ascii", "r2", "REQ-SPKC-011", "Alpha Search", "Alpha combining é", "search", "alpha replacement", "public", DBFS_W4_SCOPE)).is_ok()
+    val replaced = if replace_ok and replaced_was_present and index.contains_document("A-ascii"): 1 else: 0
+    val deleted = index.remove("A-é")
+    val deleted_count = if deleted and not index.contains_document("A-é"): 1 else: 0
+    val candidate_root = index.logical_root()
+    var clean = dbfs_wave4_golden_index()
+    clean.add(DbfsWave4Document.of("A-added", "r1", "ID-EMPTY", "", "", "empty", "", "public", DBFS_W4_SCOPE))
+    clean.add(DbfsWave4Document.of("A-ascii", "r2", "REQ-SPKC-011", "Alpha Search", "Alpha combining é", "search", "alpha replacement", "public", DBFS_W4_SCOPE))
+    clean.remove("A-é")
+    val clean_root = clean.logical_root()
+    val locked_base_root = "sha256:8cd7ac31569e67b132a477ed1e5e66cc610a9119f0bf899b8fee26d5d27e90dd"
+    val locked_candidate_root = "sha256:c5600ad56bbfb4753ebd981d6f2b9c8afa7baf8dd2a3206e567eceaa604b3eb5"
+    val delta_ok = (not absent_removed and no_op_root == locked_base_root and added == 1 and replaced == 1 and deleted_count == 1 and index.document_count() == before_delta_count and candidate_root == clean_root and candidate_root == locked_candidate_root)
+    if root != locked_base_root or not stats_ok or not query_ok or not delta_ok: return 1
+    val queries = "[" + query_json("alpha-search", "alpha search", "[]", alpha) + "," + query_json("identifier", "REQ-SPKC-011", "[]", exact) + "," + query_json("public-filter", "alpha", "[{\"name\":\"visibility\",\"values\":[\"public\"]}]", public) + "]"
+    val stats = "{\"document_count\":" + identifier_stats.N.to_text() + ",\"field_stats\":[" + stat_json(identifier_stats) + "," + stat_json(title_stats) + "," + stat_json(heading_stats) + "," + stat_json(classification_stats) + "," + stat_json(body_stats) + "]}"
+    var cell_ids: [text] = []
+    if index.query(DBFS_W4_SCOPE, "Alpha the BETA").is_ok() and index.query(DBFS_W4_SCOPE, "é").unwrap().hits.len() == index.query(DBFS_W4_SCOPE, "é").unwrap().hits.len(): cell_ids.push("W4-SRCH-01")
+    if query_ok: cell_ids.push("W4-SRCH-02")
+    if alpha.hits[0].explanation_json.contains("\"public_score_milli\":5564"): cell_ids.push("W4-SRCH-03")
+    if root == "sha256:8cd7ac31569e67b132a477ed1e5e66cc610a9119f0bf899b8fee26d5d27e90dd": cell_ids.push("W4-SRCH-04")
+    if delta_ok: cell_ids.push("W4-SRCH-05")
+    if public.hits.len() == 2 and index.query_filtered(DBFS_W4_SCOPE, "alpha", "visibility", "private").unwrap().hits.len() == 0 and index.query(DBFS_W4_SCOPE, "\"alpha search\"").unwrap_err() == "unsupported_capability": cell_ids.push("W4-SRCH-08")
+    if index.query("sha256:" + "2" * 64, "secret").unwrap_err() == "unsupported_scope": cell_ids.push("W4-SRCH-11")
+    if stats_ok and alpha.hits[0].score_milli == 5564: cell_ids.push("W4-SRCH-13")
+    if alpha.hits[0].explanation_json.contains("\"internal_total\":\"5564346\""): cell_ids.push("W4-SRCH-15")
+    if identifier_stats.field == "identifier" and body_stats.field == "body": cell_ids.push("W4-SRCH-16")
+    if index.query_filtered(DBFS_W4_SCOPE, "alpha", "unknown", "x").unwrap_err() == "unsupported_filter": cell_ids.push("W4-SRCH-19")
+    if index.contains_document("A-added") and candidate_root != root: cell_ids.push("W4-SRCH-21")
+    val union = index.query(DBFS_W4_SCOPE, "alpha missing-term").unwrap()
+    if union.hits.len() > 0 and union.hits[0].explanation_json.contains("\"kind\":\"absent\"") and union.hits[0].explanation_json.contains("\"kind\":\"scored\""): cell_ids.push("W4-SRCH-22")
+    if cell_ids.len() != 13: return 1
+    val cells = executed_cells_json(cell_ids)
+    print "SPIPE_WAVE4_CONFORMANCE={\"schema\":\"spipe-wave4-provider-conformance-v1\",\"fixture_id\":\"spipe-wave4-search-golden-v1\",\"implementation\":\"dbfs\",\"logical_root\":" + quote(root) + ",\"stats\":" + stats + ",\"queries\":" + queries + ",\"delta\":{\"added\":" + added.to_text() + ",\"candidate_logical_root\":" + quote(candidate_root) + ",\"clean_logical_root\":" + quote(clean_root) + ",\"deleted\":" + deleted_count.to_text() + ",\"incremental_equals_clean\":" + (candidate_root == clean_root).to_text() + ",\"no_op_logical_root\":" + quote(no_op_root) + ",\"replaced\":" + replaced.to_text() + "},\"cells\":" + cells + "}"
+    0

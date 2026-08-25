@@ -1,0 +1,134 @@
+# Pure Simple Interpreter Demo
+# Complete pipeline: Source → Lexer → Parser → Evaluator → Result
+
+use std.pure.lexer (lex_source, Token)
+use std.pure.parser (parse, parse_expr)
+use std.pure.evaluator (eval, eval_expr, Value, Environment)
+use std.pure.ast (Module)
+
+fn main():
+    print "═══════════════════════════════════════"
+    print "  Pure Simple Interpreter Demo"
+    print "  Full Pipeline: Lex → Parse → Eval"
+    print "═══════════════════════════════════════"
+    print ""
+
+    demo_expressions()
+    demo_variables()
+    demo_control_flow()
+    demo_functions()
+
+    print ""
+    print "═══════════════════════════════════════"
+    print "  All interpreter demos completed!"
+    print "  Total: 1300+ lines of pure Simple"
+    print "═══════════════════════════════════════"
+
+fn demo_expressions():
+    print "🔢 Expression Evaluation"
+    print "------------------------"
+
+    eval_and_print("2 + 3")
+    eval_and_print("10 - 4")
+    eval_and_print("5 * 6")
+    eval_and_print("20 / 4")
+    eval_and_print("2 + 3 * 4")
+    eval_and_print("(2 + 3) * 4")
+    eval_and_print("10 == 10")
+    eval_and_print("5 < 10")
+    eval_and_print("not false")
+
+    print ""
+
+fn demo_variables():
+    print "📦 Variable Bindings"
+    print "--------------------"
+
+    val source1 = "val x = 42"
+    print "Source: {source1}"
+    eval_module(source1)
+
+    val source2 = "var count = 0"
+    print "Source: {source2}"
+    eval_module(source2)
+
+    print ""
+
+fn demo_control_flow():
+    print "🔀 Control Flow"
+    print "---------------"
+
+    val if_source = "val x = 10\nif x == 10:\n    val result = 100"
+    print "Source: if x == 10: ..."
+    eval_module(if_source)
+
+    val while_source = "var i = 0\nwhile i < 5:\n    i = i + 1"
+    print "Source: while i < 5: ..."
+    eval_module(while_source)
+
+    print ""
+
+fn demo_functions():
+    print "⚡ Function Definitions"
+    print "----------------------"
+
+    val fn_source = "fn square(x) -> i64:\n    x * x"
+    print "Source: fn square(x): x * x"
+    eval_module(fn_source)
+
+    print ""
+
+fn eval_and_print(source: text):
+    print "Evaluating: {source}"
+
+    # Step 1: Lexer
+    val tokens = lex_source(source)
+    print "  Tokens: {tokens.len()} tokens"
+
+    # Step 2: Parser
+    match parse_expr(source):
+        case Ok(expr):
+            print "  Parsed: ✓"
+
+            # Step 3: Evaluator
+            var env = Environment.empty()
+            match eval_expr(expr, env):
+                case Ok(value):
+                    print "  Result: {value_to_string(value)}"
+                case Err(e):
+                    print "  Error: {e.message}"
+        case Err(e):
+            print "  Parse error: {e.message}"
+
+fn eval_module(source: text):
+    # Full pipeline for modules
+    match parse(source):
+        case Ok(module):
+            print "  Parsed: ✓"
+            match eval(module):
+                case Ok(value):
+                    print "  Result: {value_to_string(value)}"
+                case Err(e):
+                    print "  Error: {e.message}"
+        case Err(e):
+            print "  Parse error: {e.message}"
+
+fn value_to_string(v: Value) -> text:
+    match v:
+        case Value.Int(n):
+            "{n}"
+        case Value.Bool(b):
+            if b: "true" else: "false"
+        case Value.String(s):
+            "\"{s}\""
+        case Value.Unit:
+            "()"
+        case Value.List(items):
+            "[...]"
+        case Value.Function(params, body, env):
+            "fn({params.len()} params)"
+        case _:
+            "<?>"
+
+# Run the demo
+main()

@@ -1,0 +1,36 @@
+# T32 CLI — map TRACE32 messages into the shared UI access error taxonomy.
+
+use common.ui.access_cli_grammar.{AccessError}
+
+fn t32_map_access_error(message: text) -> AccessError:
+    val lower = message.to_lower()
+    var code = "source_unavailable"
+    var retryable = true
+    if lower.contains("confirmation") and lower.contains("required"):
+        code = "interaction_required"
+        retryable = false
+    elif lower.contains("required") or lower.contains("invalid") or message.starts_with("T400"):
+        code = "invalid_argument"
+        retryable = false
+    elif lower.contains("not found") or message.starts_with("T4030") or message.starts_with("T4050"):
+        code = "target_not_found"
+        retryable = false
+    elif lower.contains("disabled"):
+        code = "target_disabled"
+        retryable = false
+    elif lower.contains("busy"):
+        code = "target_busy"
+    elif lower.contains("timeout") or lower.contains("timed out"):
+        code = "timeout"
+    elif lower.contains("permission") or lower.contains("denied"):
+        code = "permission_denied"
+        retryable = false
+    elif lower.contains("unsupported") or lower.contains("no capture command") or lower.contains("no open command"):
+        code = "unsupported_action"
+        retryable = false
+    AccessError.detailed(code, message, t32_source_code(message), "", retryable, code == "interaction_required")
+
+fn t32_source_code(message: text) -> text:
+    if message.len() >= 5 and message.starts_with("T4"):
+        return message.slice(0, 5)
+    ""

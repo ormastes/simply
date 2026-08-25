@@ -1,0 +1,34 @@
+use logic_band_geometry_core.*
+
+pub fn _rv32_band_block_state_impl(block: i64, state: i64) -> i64:
+    if _rv32_band_block_valid_impl(block) == 0:
+        return 3
+    state
+
+pub fn _rv32_band_alloc_page_impl(active_blk: i64, active_wp: i64, free_count: i64) -> i64:
+    if free_count <= 0 and (active_blk < 0 or active_wp >= 64):
+        return -1
+    if active_blk < 0:
+        return 0
+    if active_wp < 0:
+        return -1
+    if active_wp > 64:
+        return -1
+    if active_wp == 64:
+        if free_count <= 0:
+            return -1
+        return _rv32_band_first_ppn_impl(active_blk + 1)
+    _rv32_band_first_ppn_impl(active_blk) + active_wp
+
+pub fn _rv32_band_host_can_open_impl(free_count: i64, reserve: i64) -> i32:
+    if free_count <= reserve:
+        return 0
+    1
+
+pub fn _rv32_band_host_writable_pages_impl(active_wp: i64, free_count: i64, reserve: i64) -> i64:
+    var pages: i64 = 0
+    if active_wp >= 0 and active_wp < 64:
+        pages = 64 - active_wp
+    if free_count > reserve:
+        pages = pages + (free_count - reserve) * 64
+    pages

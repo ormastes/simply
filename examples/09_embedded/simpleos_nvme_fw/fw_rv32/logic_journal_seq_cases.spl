@@ -1,0 +1,8 @@
+use logic_journal_core.*
+
+fn rv32_journal_seq_cases_selftest() -> i32:
+    if _rv32_journal_record_seq(1, 3, 512, 1, 2, 3) != 2:
+        return 1
+    if _rv32_journal_record_seq(3, 3, 512, 1, 2, 3) != 0:
+        return 1
+    0

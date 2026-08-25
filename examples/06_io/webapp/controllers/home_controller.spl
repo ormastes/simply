@@ -1,0 +1,10 @@
+use std.web_framework.controller.{ControllerContext, HttpResponseData, ViewData}
+use std.web_framework.template.{render_page}
+
+# @public
+fn action_index(ctx: ControllerContext) -> HttpResponseData:
+    val data = ViewData.new()
+        .set("title", "Welcome to TodoApp")
+        .set("tagline", "A simple todo list built with SimpleWeb")
+        .set("logged_in", ctx.is_authenticated())
+    render_page(ctx, "home/index", data.to_dict())

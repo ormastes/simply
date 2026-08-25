@@ -1,0 +1,141 @@
+"""
+nand_region_check — host-only absolute-oracle checks for
+logic_nand_region_core.spl (wave-3 4-core IPC design contract:
+doc/05_design/hardware/nvme_fw_multicore/fourcore_ipc_index_handle_design.md
+§3 region map).
+
+Deliberately NOT part of the boot-linked import graph (same convention as
+const_drift_check.spl / ipc_ring_check.spl): logic.spl / entry.spl never
+`use nand_region_check`.
+
+Run: bin/simple run examples/09_embedded/simpleos_nvme_fw/fw_rv32/nand_region_check.spl
+Gate: prints "NAND REGION CHECK PASS" and exits 0; exits 1 (with a FAIL line)
+on any failing oracle, so the process rc is meaningful for CI/harness gating.
+"""
+
+extern fn exit(code: i64)
+
+use logic_ipc_layout_core.*
+use logic_nand_region_core.*
+
+# ── region base word arithmetic ───────────────────────────────────────────────
+fn _check_state_idx() -> i32:
+    if nand_state_idx(0) != 256:
+        return 1
+    if nand_state_idx(NUM_PAGES() - 1) != 256 + NUM_PAGES() - 1:
+        return 1
+    0
+
+fn _check_data_idx() -> i32:
+    if nand_data_idx(4095) != 8447:
+        return 1
+    if nand_data_idx(0) != 4352:
+        return 1
+    0
+
+fn _check_ppn_bounds() -> i32:
+    if nand_ppn_valid(4096) != 0:
+        return 1
+    if nand_ppn_valid(4095) != 1:
+        return 1
+    if nand_ppn_valid(-1) != 0:
+        return 1
+    if nand_state_idx(4096) != ipc_null_idx():
+        return 1
+    if nand_data_idx(4096) != ipc_null_idx():
+        return 1
+    if nand_state_idx(-1) != ipc_null_idx():
+        return 1
+    0
+
+fn _check_block_bounds() -> i32:
+    if nand_block_valid(64) != 0:
+        return 1
+    if nand_block_valid(63) != 1:
+        return 1
+    if nand_block_valid(-1) != 0:
+        return 1
+    if nand_block_first_ppn(64) != ipc_null_idx():
+        return 1
+    if nand_block_last_ppn(-1) != ipc_null_idx():
+        return 1
+    0
+
+# ── program-rule verdict ──────────────────────────────────────────────────────
+fn _check_program_on_erased_ok() -> i32:
+    if nand_program_verdict(NAND_STATE_ERASED()) != NAND_PROGRAM_OK():
+        return 1
+    0
+
+fn _check_program_on_programmed_rejected() -> i32:
+    if nand_program_verdict(1) != NAND_PROGRAM_ERR_MEDIA():
+        return 1
+    if nand_program_verdict(42) != NAND_PROGRAM_ERR_MEDIA():
+        return 1
+    0
+
+# ── erase covers whole block (block 3 -> ppns 192..255) ──────────────────────
+fn _check_erase_block_range() -> i32:
+    if nand_block_first_ppn(3) != 192:
+        return 1
+    if nand_block_last_ppn(3) != 255:
+        return 1
+    # block 0 and the last block (63) both cover exactly PAGES_PER_BLOCK pages
+    if nand_block_first_ppn(0) != 0:
+        return 1
+    if nand_block_last_ppn(0) != 63:
+        return 1
+    if nand_block_first_ppn(63) != 4032:
+        return 1
+    if nand_block_last_ppn(63) != 4095:
+        return 1
+    0
+
+# ── read-rule verdict ──────────────────────────────────────────────────────────
+fn _check_read_on_erased_yields_erased_verdict() -> i32:
+    if nand_read_verdict(NAND_STATE_ERASED()) != NAND_READ_ERASED():
+        return 1
+    0
+
+fn _check_read_on_programmed_yields_ok_verdict() -> i32:
+    if nand_read_verdict(1) != NAND_READ_OK():
+        return 1
+    0
+
+fn nand_region_check_selftest() -> i32:
+    if _check_state_idx() != 0:
+        print "  FAIL: nand_state_idx (state_idx(0)==256)"
+        return 1
+    if _check_data_idx() != 0:
+        print "  FAIL: nand_data_idx (data_idx(4095)==8447)"
+        return 1
+    if _check_ppn_bounds() != 0:
+        print "  FAIL: ppn bounds (4096 invalid)"
+        return 1
+    if _check_block_bounds() != 0:
+        print "  FAIL: block bounds"
+        return 1
+    if _check_program_on_erased_ok() != 0:
+        print "  FAIL: program on erased page must be OK"
+        return 1
+    if _check_program_on_programmed_rejected() != 0:
+        print "  FAIL: program-over-program must be rejected"
+        return 1
+    if _check_erase_block_range() != 0:
+        print "  FAIL: erase block range (block 3 -> 192..255)"
+        return 1
+    if _check_read_on_erased_yields_erased_verdict() != 0:
+        print "  FAIL: read on erased page must yield READ_ERASED"
+        return 1
+    if _check_read_on_programmed_yields_ok_verdict() != 0:
+        print "  FAIL: read on programmed page must yield READ_OK"
+        return 1
+    0
+
+fn main():
+    val fail = nand_region_check_selftest()
+    if fail == 0:
+        print "NAND REGION CHECK PASS"
+    else:
+        print "NAND REGION CHECK FAIL"
+        exit(1)

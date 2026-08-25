@@ -1,0 +1,127 @@
+"""
+rel_health — the reliability-engine observability sink (design §7 "rel_health.spl
+— the observability sink"; architecture §5 "Observability"; design §9 lane L2).
+
+Contract: doc/05_design/hardware/nand_recovery/recovery_algorithms_design.md §7
+(implements architecture doc reliability_engine_architecture.md §5). This is the
+durable sink mounted at `RelFtlMount.health` (design §1.4): every other policy
+lane (`rel_ladder`, `rel_vref`, `rel_refresh`, `rel_disturb`, `rel_wear`) and the
+wiring pass (§7 `rel_tick_select`) reads it for triggers; nothing here holds a
+Fil/Ftl handle or actuates anything — pure functions over `RelHealth` (declared
+in rel_types.spl, §1.3), return-the-object on every mutator (design §0
+"Return-the-object").
+
+Pure-policy leaf (design §0 / guide "rel_* implementation wave"): imports ONLY
+nvme_types.* + nd_types.* + rel_types.* — never fil/ftl (the mounts in fil/ftl
+import this module, not the reverse; import-graph law).
+
+Coarse-bucket honesty (architecture §5, task instruction to name the
+distinction): `corrected` fed into `rel_health_note_read` is the coarse
+`FilRead.corrected` bucket (0 clean / 1 corrected / 2+ uncorrectable) — an
+EVENT count, not a per-bit magnitude. `rel_health_rber` therefore reports a
+corrected-EVENT rate (events / reads, scaled to ppm units so it stays an
+i64), not true bit-RBER. On the NandEmu backend (prereq 1b) that bucket
+reflects a modeled per-read bit count; on backends without it, it is an event
+flag only. Callers/specs must not present this as true bit-RBER (architecture
+§5: "Name the distinction in specs — do not present event-rate as true
+bit-RBER").
+
+Cause tags (design §7; owned by this lane — `RelHealth.refresh_cause`'s
+values, per rel_types.spl:140 "constants in L2"): `rel_cause_none` (no
+refresh cause / just erased), `rel_cause_age` (FCR — age-triggered),
+`rel_cause_err` (DEAR — error-trend-triggered), `rel_cause_dist` (STRAW —
+disturb-triggered). `rel_health_mark_cause` records which fired; distinct
+codes so a spec can assert *why* a rewrite happened (architecture §5
+"Refresh cause tags").
+
+Erase-reset discipline (design §7 "Erase-reset discipline"): a block's
+reliability state must not survive a P/E cycle. `rel_health_on_erase` clears
+`corrected_events`, `retry_depth_max`, and `refresh_cause` for exactly the
+erased block — `reads` and `corrected_sum` (the RBER denominator/numerator)
+are DELIBERATELY left alone (not part of the design's erase-reset list; RBER
+is a lifetime-of-block estimate, not a since-last-erase one). Without this
+reset a refreshed-then-recycled block keeps a stale
+`corrected_events >= REL_REFRESH_ERR_EVENTS` and its first corrected read
+would immediately re-fire refresh — a sticky FCR trigger.
+
+Landmines honored (design §0 / guide "Language landmines"):
+- i64-first, no float (rber is scaled-ppm integer division).
+- Return-the-object: every mutator copies `h` into `var out = h` and returns
+  `out`; arrays are value types so the copy is independent of the input.
+- Per-block state is a dense [i64] array of length NUM_BLOCKS, indexed by the
+  raw block index. The public fns take the typed NdBlock newtype at their
+  scalar boundary (harmonized with the sibling rel_* lanes and the guide's
+  TYPED DIMENSIONS LAW) and convert to the flat i64 array index (`blk.idx`)
+  immediately — the array itself stays [i64] because the block is the ARRAY
+  INDEX, a flat i64. (The design §7 pseudocode spells the signatures `blk: i64`;
+  this lane takes the NdBlock and folds to `.idx` at the array boundary so
+  every rel_* fn presents one uniform typed-dimension signature.)
+- Cause/kind codes are fn-returning literals, never module-level collection
+  initializers (freestanding-safe).
+"""
+
+use nvme_types.*
+use nd_types.*
+use rel_types.*
+
+# ── Cause tags (design §7; this lane owns RelHealth.refresh_cause's values) ───
+fn rel_cause_none() -> i64:
+    0              # no refresh cause (default / just erased)
+
+fn rel_cause_age() -> i64:
+    1              # FCR: age-triggered refresh
+
+fn rel_cause_err() -> i64:
+    2              # DEAR: error-trend-triggered refresh
+
+fn rel_cause_dist() -> i64:
+    3              # STRAW: disturb-triggered refresh
+
+# ── Sink fns (design §7 pseudocode, implemented verbatim) ─────────────────────
+
+# Fold one read's outcome into the durable sink: bump the read count, add the
+# coarse corrected bucket into the running sum (RBER numerator), bump the
+# corrected-EVENT counter iff this read needed correction, and track the
+# deepest recovery-ladder rung this block has ever needed.
+fn rel_health_note_read(h: RelHealth, blk: NdBlock, corrected: i64, depth: i64) -> RelHealth:
+    val b: i64 = blk.idx
+    var out = h
+    out.reads[b] = h.reads[b] + 1
+    out.corrected_sum[b] = h.corrected_sum[b] + corrected
+    if corrected >= 1:
+        out.corrected_events[b] = h.corrected_events[b] + 1
+    if depth > h.retry_depth_max[b]:
+        out.retry_depth_max[b] = depth
+    return out
+
+# RBER estimate: corrected-EVENTS / reads, scaled to ppm (x1_000_000) so the
+# result stays an exact i64 ratio with no float. 0 reads -> 0 (no divide-by-
+# zero). This is an event-rate estimator (architecture §5 honesty note above),
+# not a modeled bit-rate unless the NandEmu shadow-word seam (prereq 1b) is the
+# backend feeding `corrected`.
+fn rel_health_rber(h: RelHealth, blk: NdBlock) -> i64:
+    val b: i64 = blk.idx
+    if h.reads[b] == 0:
+        return 0
+    (h.corrected_sum[b] * 1000000) / h.reads[b]
+
+# Record which cause fired the most recent refresh for this block (one of the
+# rel_cause_* tags above), so a spec/observer can assert *why* a rewrite
+# happened.
+fn rel_health_mark_cause(h: RelHealth, blk: NdBlock, cause: i64) -> RelHealth:
+    var out = h
+    out.refresh_cause[blk.idx] = cause
+    return out
+
+# Erase-reset discipline: clear exactly this block's per-cycle reliability
+# state so a recycled block doesn't sticky-refresh on its first corrected
+# read. reads/corrected_sum (the lifetime RBER estimate) are untouched — call
+# from the erase/reclaim path, parallel to rel_vref_decay_on_erase and
+# rel_disturb_clear (design §7 "Erase-reset discipline").
+fn rel_health_on_erase(h: RelHealth, blk: NdBlock) -> RelHealth:
+    val b: i64 = blk.idx
+    var out = h
+    out.corrected_events[b] = 0
+    out.retry_depth_max[b] = 0
+    out.refresh_cause[b] = rel_cause_none()
+    return out

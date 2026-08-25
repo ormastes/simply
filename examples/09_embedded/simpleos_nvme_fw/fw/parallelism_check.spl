@@ -1,0 +1,56 @@
+"""
+parallelism_check — multi-channel scheduler parallelism (gap-closure P2).
+
+Proves the property that justifies the multi-channel gap: a write batch striped across the
+channels completes in `ceil(n / channels)` parallel steps (not `n` serial steps), and an
+unbalanced batch is bounded by its deepest channel. Per-channel serialization (one op per
+channel per step) is asserted by the count.
+
+Run: bin/simple run examples/09_embedded/simpleos_nvme_fw/fw/parallelism_check.spl
+"""
+
+use nvme_types.*
+use fil_scheduler.*
+
+fn main():
+    var fail: i64 = 0
+
+    # 64 sequential blocks striped across 8 channels drain in 8 parallel steps — an 8× speedup
+    # over the 64 steps a single-channel device would take.
+    var s: ChannelSched = channel_sched_new()
+    var b: i64 = 0
+    while b < 64:
+        s.submit(b)
+        b = b + 1
+    val steps: i64 = s.run()
+    fail = fail + expect_eq(steps, 8, "64 striped ops drain in 8 parallel steps")
+    fail = fail + expect_eq(s.completed(), 64, "all 64 ops completed (none dropped)")
+    fail = fail + expect_eq(64 / steps, NUM_CHANNELS, "parallel speedup equals the channel count")
+
+    # Unbalanced: 10 ops on channel 3 + one on channel 1 -> 10 steps (the busy channel dominates).
+    var u: ChannelSched = channel_sched_new()
+    var i: i64 = 0
+    while i < 10:
+        val blk: i64 = 3 + i * 8        # all ≡ 3 mod 8 -> channel 3
+        u.submit(blk)
+        i = i + 1
+    u.submit(1)                          # one op on channel 1
+    val usteps: i64 = u.run()
+    fail = fail + expect_eq(usteps, 10, "unbalanced batch is bounded by the deepest channel")
+    fail = fail + expect_eq(u.completed(), 11, "all 11 ops completed")
+
+    # A single-channel queue deeper than the old fixed 100000-iteration drain guard must still
+    # drain completely (guard is derived from SCHED_COUNTER_MAX, not a magic constant) — this is
+    # the regression case for the fail-open where `run` used to return early with ops still
+    # un-dispatched once one channel's pending count passed the guard's old hardcoded cap.
+    var deep: ChannelSched = channel_sched_new()
+    deep.pending[0] = 100005
+    val deep_steps: i64 = deep.run()
+    fail = fail + expect_eq(deep.total_pending(), 0, "deep single-channel queue drains fully (no fail-open)")
+    fail = fail + expect_eq(deep.completed(), 100005, "deep single-channel queue: all ops completed")
+    fail = fail + expect_eq(deep_steps, 100005, "deep single-channel queue: fully serialized step count")
+
+    if fail == 0:
+        print "PARALLELISM OK"
+    else:
+        print "PARALLELISM FAIL ({fail})"

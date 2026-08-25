@@ -1,0 +1,527 @@
+# LLM Caret Claude CLI Specification (PRIMARY - Intensive Testing)
+#
+# Tests pure functions: build_claude_args, parse_claude_json_response,
+# parse_claude_stream_line. No subprocess calls in unit tests.
+
+# ============================================================================
+# Inline helpers
+# ============================================================================
+
+fn _LB() -> text:
+    "{(123 as char)}"
+
+fn _RB() -> text:
+    "{(125 as char)}"
+
+fn _Q() -> text:
+    "\""
+
+fn _unwrap_idx(opt) -> i64:
+    match opt:
+        Some(i): return i
+        nil: return -1
+
+fn _escape_json(s: text) -> text:
+    var result = ""
+    var i = 0
+    while i < s.len():
+        val ch = s[i]
+        if ch == "\\":
+            result = result + "\\\\"
+        elif ch == "\"":
+            result = result + "\\\""
+        elif ch == "\n":
+            result = result + "\\n"
+        elif ch == "\r":
+            result = result + "\\r"
+        elif ch == "\t":
+            result = result + "\\t"
+        else:
+            result = result + ch
+        i = i + 1
+    result
+
+fn _extract_json_string(json: text, key: text) -> text:
+    val quote = "\""
+    val search = quote + key + quote + ":"
+    val idx = _unwrap_idx(json.index_of(search))
+    if idx < 0:
+        return ""
+    val slen = search.len()
+    val start = idx + slen
+    val after = json.substring(start)
+    val trimmed = after.trim()
+    if trimmed.starts_with(quote):
+        val rest = trimmed.substring(1)
+        var end = 0
+        var escaped = false
+        while end < rest.len():
+            val ch = rest[end]
+            if escaped:
+                escaped = false
+            elif ch == "\\":
+                escaped = true
+            elif ch == "\"":
+                return rest.substring(0, end)
+            end = end + 1
+    ""
+
+fn _extract_json_value(json: text, key: text) -> text:
+    val search = _Q() + key + _Q() + ":"
+    val idx = _unwrap_idx(json.index_of(search))
+    if idx < 0:
+        return "null"
+    val slen = search.len()
+    val start = idx + slen
+    val after = json.substring(start)
+    val trimmed = after.trim()
+    var end = 0
+    while end < trimmed.len():
+        val ch = trimmed[end]
+        if ch == "," or ch == _RB() or ch == "]":
+            break
+        end = end + 1
+    trimmed.substring(0, end).trim()
+
+fn _extract_json_int(json: text, key: text) -> i64:
+    val raw = _extract_json_value(json, key)
+    if raw == "null" or raw == "":
+        return 0
+    int(raw)
+
+fn _extract_json_bool(json: text, key: text) -> bool:
+    val raw = _extract_json_value(json, key)
+    raw == "true"
+
+# ============================================================================
+# Inline structs
+# ============================================================================
+
+struct CliResponse:
+    content: text
+    model: text
+    session_id: text
+    stop_reason: text
+    input_tokens: i64
+    output_tokens: i64
+    error: text
+    is_error: bool
+    raw: text
+
+struct CliStreamEvent:
+    event_type: text
+    content: text
+    session_id: text
+    model: text
+    stop_reason: text
+    input_tokens: i64
+    output_tokens: i64
+
+# ============================================================================
+# Functions under test (inlined)
+# ============================================================================
+
+fn build_claude_args(prompt: text, model: text, output_format: text, system_prompt: text, session_id: text, max_turns: i64, max_tokens: i64, json_schema: text, tools: [text], extra_args: [text], verbose: bool) -> [text]:
+    var args: [text] = []
+    args = args + ["-p", prompt]
+    if output_format != "":
+        args = args + ["--output-format", output_format]
+    else:
+        args = args + ["--output-format", "json"]
+    if model != "":
+        args = args + ["--model", model]
+    if system_prompt != "":
+        args = args + ["--system-prompt", system_prompt]
+    if session_id != "":
+        args = args + ["--resume", session_id]
+    if max_turns > 0:
+        args = args + ["--max-turns", "{max_turns}"]
+    if max_tokens > 0:
+        args = args + ["--max-tokens", "{max_tokens}"]
+    if json_schema != "":
+        args = args + ["--json-schema", json_schema]
+    for tool in tools:
+        args = args + ["--allowedTools", tool]
+    if verbose:
+        args = args + ["--verbose"]
+    for arg in extra_args:
+        if arg != "":
+            args = args + [arg]
+    args
+
+fn parse_claude_json_response(raw: text) -> CliResponse:
+    if raw.trim() == "":
+        return CliResponse(
+            content: "",
+            model: "",
+            session_id: "",
+            stop_reason: "",
+            input_tokens: 0,
+            output_tokens: 0,
+            error: "empty response",
+            is_error: true,
+            raw: ""
+        )
+    val result_text = _extract_json_string(raw, "result")
+    val model_text = _extract_json_string(raw, "model")
+    val session = _extract_json_string(raw, "session_id")
+    val is_err = _extract_json_bool(raw, "is_error")
+    val stop = _extract_json_string(raw, "stop_reason")
+    val in_tok = _extract_json_int(raw, "input_tokens")
+    val out_tok = _extract_json_int(raw, "output_tokens")
+    var final_in_tok = in_tok
+    var final_out_tok = out_tok
+    if in_tok == 0:
+        final_in_tok = _extract_json_int(raw, "input_tokens_used")
+    if out_tok == 0:
+        final_out_tok = _extract_json_int(raw, "output_tokens_used")
+    var error_text = ""
+    if is_err:
+        error_text = result_text
+        if error_text == "":
+            error_text = _extract_json_string(raw, "error")
+    var final_stop = stop
+    if final_stop == "":
+        final_stop = "end_turn"
+    if is_err:
+        final_stop = "error"
+    CliResponse(
+        content: result_text,
+        model: model_text,
+        session_id: session,
+        stop_reason: final_stop,
+        input_tokens: final_in_tok,
+        output_tokens: final_out_tok,
+        error: error_text,
+        is_error: is_err,
+        raw: raw
+    )
+
+fn parse_claude_stream_line(line: text) -> CliStreamEvent:
+    val trimmed = line.trim()
+    if trimmed == "":
+        return CliStreamEvent(
+            event_type: "empty",
+            content: "",
+            session_id: "",
+            model: "",
+            stop_reason: "",
+            input_tokens: 0,
+            output_tokens: 0
+        )
+    val etype = _extract_json_string(trimmed, "type")
+    var content_val = ""
+    var sid = ""
+    var mdl = ""
+    var stop_val = ""
+    var in_tok = 0
+    var out_tok = 0
+    if etype == "content_block_delta":
+        content_val = _extract_json_string(trimmed, "text")
+    elif etype == "message_stop":
+        stop_val = _extract_json_string(trimmed, "stop_reason")
+        if stop_val == "":
+            stop_val = "end_turn"
+    elif etype == "message_start":
+        mdl = _extract_json_string(trimmed, "model")
+        sid = _extract_json_string(trimmed, "session_id")
+    var final_etype = etype
+    if final_etype == "":
+        val has_result = _extract_json_string(trimmed, "result")
+        if has_result != "":
+            final_etype = "result"
+            content_val = has_result
+        else:
+            final_etype = "unknown"
+    CliStreamEvent(
+        event_type: final_etype,
+        content: content_val,
+        session_id: sid,
+        model: mdl,
+        stop_reason: stop_val,
+        input_tokens: in_tok,
+        output_tokens: out_tok
+    )
+
+# Helper to check if arg list contains a specific value
+fn args_contain(args: [text], needle: text) -> bool:
+    for arg in args:
+        if arg == needle:
+            return true
+    false
+
+# Helper to get value after a flag
+fn args_get_flag_value(args: [text], flag: text) -> text:
+    var i = 0
+    while i < args.len() - 1:
+        if args[i] == flag:
+            return args[i + 1]
+        i = i + 1
+    ""
+
+# Helper to build mock JSON response
+fn mock_json(result_val: text, model_val: text, session_val: text) -> text:
+    var r = _LB()
+    r = r + _Q() + "result" + _Q() + ":" + _Q() + _escape_json(result_val) + _Q() + ","
+    r = r + _Q() + "model" + _Q() + ":" + _Q() + model_val + _Q() + ","
+    r = r + _Q() + "session_id" + _Q() + ":" + _Q() + session_val + _Q() + ","
+    r = r + _Q() + "is_error" + _Q() + ":false,"
+    r = r + _Q() + "stop_reason" + _Q() + ":" + _Q() + "end_turn" + _Q() + ","
+    r = r + _Q() + "input_tokens" + _Q() + ":150,"
+    r = r + _Q() + "output_tokens" + _Q() + ":42"
+    r = r + _RB()
+    r
+
+fn mock_error_json(error_val: text) -> text:
+    var r = _LB()
+    r = r + _Q() + "result" + _Q() + ":" + _Q() + _escape_json(error_val) + _Q() + ","
+    r = r + _Q() + "is_error" + _Q() + ":true"
+    r = r + _RB()
+    r
+
+fn mock_stream_line(stype: text, stext: text) -> text:
+    var r = _LB()
+    r = r + _Q() + "type" + _Q() + ":" + _Q() + stype + _Q()
+    if stext != "":
+        r = r + "," + _Q() + "text" + _Q() + ":" + _Q() + _escape_json(stext) + _Q()
+    r = r + _RB()
+    r
+
+# ============================================================================
+# Tests: Arg Building
+# ============================================================================
+
+describe "build_claude_args - minimal":
+    it "includes prompt with -p flag":
+        val args = build_claude_args("Hello", "", "", "", "", 0, 0, "", [], [], false)
+        expect(args_contain(args, "-p")).to_equal(true)
+        expect(args_get_flag_value(args, "-p")).to_equal("Hello")
+
+    it "defaults to json output format":
+        val args = build_claude_args("Hi", "", "", "", "", 0, 0, "", [], [], false)
+        expect(args_get_flag_value(args, "--output-format")).to_equal("json")
+
+    it "has no model flag when empty":
+        val args = build_claude_args("Hi", "", "", "", "", 0, 0, "", [], [], false)
+        expect(args_contain(args, "--model")).to_equal(false)
+
+    it "has no system-prompt flag when empty":
+        val args = build_claude_args("Hi", "", "", "", "", 0, 0, "", [], [], false)
+        expect(args_contain(args, "--system-prompt")).to_equal(false)
+
+    it "has no resume flag when empty":
+        val args = build_claude_args("Hi", "", "", "", "", 0, 0, "", [], [], false)
+        expect(args_contain(args, "--resume")).to_equal(false)
+
+describe "build_claude_args - model":
+    it "includes model flag":
+        val args = build_claude_args("Hi", "claude-opus-4-20250514", "", "", "", 0, 0, "", [], [], false)
+        expect(args_get_flag_value(args, "--model")).to_equal("claude-opus-4-20250514")
+
+    it "supports sonnet model":
+        val args = build_claude_args("Hi", "claude-sonnet-4-20250514", "", "", "", 0, 0, "", [], [], false)
+        expect(args_get_flag_value(args, "--model")).to_equal("claude-sonnet-4-20250514")
+
+describe "build_claude_args - system prompt":
+    it "includes system prompt":
+        val args = build_claude_args("Hi", "", "", "You are a pirate", "", 0, 0, "", [], [], false)
+        expect(args_get_flag_value(args, "--system-prompt")).to_equal("You are a pirate")
+
+describe "build_claude_args - session":
+    it "includes session resume":
+        val args = build_claude_args("Hi", "", "", "", "abc-123", 0, 0, "", [], [], false)
+        expect(args_get_flag_value(args, "--resume")).to_equal("abc-123")
+
+describe "build_claude_args - max turns":
+    it "includes max turns":
+        val args = build_claude_args("Hi", "", "", "", "", 5, 0, "", [], [], false)
+        expect(args_get_flag_value(args, "--max-turns")).to_equal("5")
+
+    it "omits max turns when zero":
+        val args = build_claude_args("Hi", "", "", "", "", 0, 0, "", [], [], false)
+        expect(args_contain(args, "--max-turns")).to_equal(false)
+
+describe "build_claude_args - max tokens":
+    it "includes max tokens":
+        val args = build_claude_args("Hi", "", "", "", "", 0, 4096, "", [], [], false)
+        expect(args_get_flag_value(args, "--max-tokens")).to_equal("4096")
+
+    it "omits max tokens when zero":
+        val args = build_claude_args("Hi", "", "", "", "", 0, 0, "", [], [], false)
+        expect(args_contain(args, "--max-tokens")).to_equal(false)
+
+describe "build_claude_args - streaming":
+    it "uses stream-json format":
+        val args = build_claude_args("Hi", "", "stream-json", "", "", 0, 0, "", [], [], false)
+        expect(args_get_flag_value(args, "--output-format")).to_equal("stream-json")
+
+describe "build_claude_args - json schema":
+    it "includes json schema":
+        val schema = _LB() + _Q() + "type" + _Q() + ":" + _Q() + "object" + _Q() + _RB()
+        val args = build_claude_args("Hi", "", "", "", "", 0, 0, schema, [], [], false)
+        expect(args_get_flag_value(args, "--json-schema")).to_equal(schema)
+
+    it "omits json schema when empty":
+        val args = build_claude_args("Hi", "", "", "", "", 0, 0, "", [], [], false)
+        expect(args_contain(args, "--json-schema")).to_equal(false)
+
+describe "build_claude_args - tools":
+    it "includes single tool":
+        val args = build_claude_args("Hi", "", "", "", "", 0, 0, "", ["Read"], [], false)
+        expect(args_contain(args, "--allowedTools")).to_equal(true)
+        expect(args_get_flag_value(args, "--allowedTools")).to_equal("Read")
+
+    it "includes multiple tools":
+        val args = build_claude_args("Hi", "", "", "", "", 0, 0, "", ["Read", "Write", "Bash"], [], false)
+        # Count --allowedTools occurrences
+        var count = 0
+        for arg in args:
+            if arg == "--allowedTools":
+                count = count + 1
+        expect(count).to_equal(3)
+
+    it "has no tools when empty":
+        val args = build_claude_args("Hi", "", "", "", "", 0, 0, "", [], [], false)
+        expect(args_contain(args, "--allowedTools")).to_equal(false)
+
+describe "build_claude_args - verbose":
+    it "includes verbose flag":
+        val args = build_claude_args("Hi", "", "", "", "", 0, 0, "", [], [], true)
+        expect(args_contain(args, "--verbose")).to_equal(true)
+
+    it "omits verbose when false":
+        val args = build_claude_args("Hi", "", "", "", "", 0, 0, "", [], [], false)
+        expect(args_contain(args, "--verbose")).to_equal(false)
+
+describe "build_claude_args - extra args":
+    it "appends extra args":
+        val args = build_claude_args("Hi", "", "", "", "", 0, 0, "", [], ["--no-cache"], false)
+        expect(args_contain(args, "--no-cache")).to_equal(true)
+
+    it "skips empty extra args":
+        val args = build_claude_args("Hi", "", "", "", "", 0, 0, "", [], ["", "--flag", ""], false)
+        expect(args_contain(args, "--flag")).to_equal(true)
+        expect(args_contain(args, "")).to_equal(false)
+
+describe "build_claude_args - combined":
+    it "builds complete args":
+        val args = build_claude_args("prompt", "claude-opus-4-20250514", "json", "be helpful", "sess-1", 3, 2048, "", ["Read"], ["--no-cache"], true)
+        expect(args_get_flag_value(args, "-p")).to_equal("prompt")
+        expect(args_get_flag_value(args, "--model")).to_equal("claude-opus-4-20250514")
+        expect(args_get_flag_value(args, "--output-format")).to_equal("json")
+        expect(args_get_flag_value(args, "--system-prompt")).to_equal("be helpful")
+        expect(args_get_flag_value(args, "--resume")).to_equal("sess-1")
+        expect(args_get_flag_value(args, "--max-turns")).to_equal("3")
+        expect(args_get_flag_value(args, "--max-tokens")).to_equal("2048")
+        expect(args_contain(args, "--verbose")).to_equal(true)
+        expect(args_contain(args, "--no-cache")).to_equal(true)
+
+# ============================================================================
+# Tests: Response Parsing
+# ============================================================================
+
+describe "parse_claude_json_response - success":
+    it "parses successful response":
+        val json = mock_json("Hello world!", "claude-sonnet-4-20250514", "sess-abc")
+        val resp = parse_claude_json_response(json)
+        expect(resp.content).to_equal("Hello world!")
+        expect(resp.model).to_equal("claude-sonnet-4-20250514")
+        expect(resp.session_id).to_equal("sess-abc")
+        expect(resp.is_error).to_equal(false)
+
+    it "parses token counts":
+        val json = mock_json("Hi", "model", "sess")
+        val resp = parse_claude_json_response(json)
+        expect(resp.input_tokens).to_equal(150)
+        expect(resp.output_tokens).to_equal(42)
+
+    it "parses stop reason":
+        val json = mock_json("Hi", "model", "sess")
+        val resp = parse_claude_json_response(json)
+        expect(resp.stop_reason).to_equal("end_turn")
+
+    it "preserves raw json":
+        val json = mock_json("Hi", "model", "sess")
+        val resp = parse_claude_json_response(json)
+        expect(resp.raw).to_equal(json)
+
+describe "parse_claude_json_response - error":
+    it "parses error response":
+        val json = mock_error_json("Rate limited")
+        val resp = parse_claude_json_response(json)
+        expect(resp.is_error).to_equal(true)
+        expect(resp.error).to_equal("Rate limited")
+        expect(resp.stop_reason).to_equal("error")
+
+    it "handles empty response":
+        val resp = parse_claude_json_response("")
+        expect(resp.is_error).to_equal(true)
+        expect(resp.error).to_equal("empty response")
+
+    it "handles whitespace-only response":
+        val resp = parse_claude_json_response("   ")
+        expect(resp.is_error).to_equal(true)
+        expect(resp.error).to_equal("empty response")
+
+describe "parse_claude_json_response - edge cases":
+    it "handles missing model field":
+        var json = _LB()
+        json = json + _Q() + "result" + _Q() + ":" + _Q() + "Hello" + _Q() + ","
+        json = json + _Q() + "is_error" + _Q() + ":false"
+        json = json + _RB()
+        val resp = parse_claude_json_response(json)
+        expect(resp.content).to_equal("Hello")
+        expect(resp.model).to_equal("")
+
+    it "defaults stop reason to end_turn":
+        var json = _LB()
+        json = json + _Q() + "result" + _Q() + ":" + _Q() + "Done" + _Q() + ","
+        json = json + _Q() + "is_error" + _Q() + ":false"
+        json = json + _RB()
+        val resp = parse_claude_json_response(json)
+        expect(resp.stop_reason).to_equal("end_turn")
+
+    it "handles multiline result content":
+        val json = mock_json("Line 1\\nLine 2", "model", "sess")
+        val resp = parse_claude_json_response(json)
+        expect(resp.content).to_contain("Line 1")
+
+# ============================================================================
+# Tests: Stream Parsing
+# ============================================================================
+
+describe "parse_claude_stream_line":
+    it "parses content_block_delta":
+        val line = mock_stream_line("content_block_delta", "Hello ")
+        val evt = parse_claude_stream_line(line)
+        expect(evt.event_type).to_equal("content_block_delta")
+        expect(evt.content).to_equal("Hello ")
+
+    it "parses message_stop":
+        var line = _LB()
+        line = line + _Q() + "type" + _Q() + ":" + _Q() + "message_stop" + _Q() + ","
+        line = line + _Q() + "stop_reason" + _Q() + ":" + _Q() + "end_turn" + _Q()
+        line = line + _RB()
+        val evt = parse_claude_stream_line(line)
+        expect(evt.event_type).to_equal("message_stop")
+        expect(evt.stop_reason).to_equal("end_turn")
+
+    it "parses message_start with model":
+        var line = _LB()
+        line = line + _Q() + "type" + _Q() + ":" + _Q() + "message_start" + _Q() + ","
+        line = line + _Q() + "model" + _Q() + ":" + _Q() + "claude-sonnet-4-20250514" + _Q()
+        line = line + _RB()
+        val evt = parse_claude_stream_line(line)
+        expect(evt.event_type).to_equal("message_start")
+        expect(evt.model).to_equal("claude-sonnet-4-20250514")
+
+    it "handles empty line":
+        val evt = parse_claude_stream_line("")
+        expect(evt.event_type).to_equal("empty")
+
+    it "handles unknown type":
+        var line = _LB()
+        line = line + _Q() + "data" + _Q() + ":" + _Q() + "something" + _Q()
+        line = line + _RB()
+        val evt = parse_claude_stream_line(line)
+        expect(evt.event_type).to_equal("unknown")

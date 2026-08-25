@@ -1,0 +1,51 @@
+# ARM64 QEMU VirtIO-MMIO NIC live probe.
+
+extern fn serial_println(msg: text)
+extern fn rt_qemu_exit_success()
+extern fn rt_exit(code: i32)
+extern fn rt_arm64_virtio_net_tx_completions() -> i64
+extern fn rt_arm64_virtio_net_rx_frames() -> i64
+
+use os.kernel.boot.mmio.{mmio_disable_test_mode}
+use os.drivers.virtio.virtio_net.{VirtioNetDriver}
+use os.services.netstack.ethernet.{EthAddress, eth_build, eth_parse, ETHERTYPE_ARP}
+use os.services.netstack.arp.{arp_build_request, arp_parse, ARP_REPLY}
+
+fn spl_start():
+    mmio_disable_test_mode()
+    serial_println("[arm64-net-probe] guest-entry")
+    var driver = VirtioNetDriver.new()
+    val initialized = driver.init_arm64_mmio()
+    if initialized.is_err():
+        serial_println("[arm64-net-probe] init:fail reason={initialized.unwrap_err()}")
+        rt_exit(1)
+        return
+    val mac = EthAddress.from_driver_mac(driver.mac_address())
+    serial_println("[arm64-net-probe] init:ok transport=virtio-mmio device=1 mac={mac.to_text()} rxq=8 txq=8")
+
+    val arp = arp_build_request(mac, 0x0A00020Fu32, 0x0A000202u32)
+    val frame = eth_build(EthAddress.broadcast(), mac, ETHERTYPE_ARP, arp)
+    val sent = driver.send_frame(frame.data_ptr().to_u64(), 0, frame.len())
+    if sent.is_err():
+        serial_println("[arm64-net-probe] tx:fail reason={sent.unwrap_err()}")
+        rt_exit(1)
+        return
+    serial_println("[arm64-net-probe] tx:ok completions={rt_arm64_virtio_net_tx_completions()}")
+
+    var recv_buf: [u8] = [0u8; 1514]
+    var polls: u64 = 0
+    while polls < 1000000:
+        val n = driver.recv_frame(recv_buf.data_ptr().to_u64(), recv_buf.len())
+        if n > 0:
+            val parsed_eth = eth_parse(recv_buf.slice(0, n))
+            if parsed_eth.is_ok() and parsed_eth.unwrap().ethertype == ETHERTYPE_ARP:
+                val parsed_arp = arp_parse(parsed_eth.unwrap().payload)
+                if parsed_arp.is_ok() and parsed_arp.unwrap().operation == ARP_REPLY:
+                    serial_println("[arm64-net-probe] rx:ok kind=arp-reply frames={rt_arm64_virtio_net_rx_frames()}")
+                    serial_println("SimpleOsServerExecutionReceiptV1 mode=qemu-arm64-cpu transport=virtio-net device_init=pass tx_completion=pass rx_frame=pass status=pass")
+                    serial_println("TEST PASSED")
+                    rt_qemu_exit_success()
+                    return
+        polls = polls + 1
+    serial_println("[arm64-net-probe] rx:fail reason=bounded-poll-timeout")
+    rt_exit(1)

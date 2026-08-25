@@ -1,0 +1,41 @@
+"""
+thermal_check — thermal throttling under sustained load (gap-closure P7).
+
+Drives the device with sustained heavy load until it throttles and raises a SMART critical
+warning, then cools it down and confirms it recovers — never crashing, the throttle releasing
+when the temperature falls back below the threshold.
+
+Run: bin/simple run examples/09_embedded/simpleos_nvme_fw/fw/thermal_check.spl
+"""
+
+use nvme_types.*
+use power_thermal.*
+
+fn main():
+    var fail: i64 = 0
+    var pt: PowerThermal = power_thermal_new()
+
+    # Sustained extreme load: temperature climbs past the critical threshold.
+    var i: i64 = 0
+    while i < 30:
+        pt.tick(20)
+        i = i + 1
+    fail = fail + expect_eq(pt.is_throttled(), 1, "sustained load engages thermal throttle")
+    fail = fail + expect_eq(pt.critical_warning(), 1, "over-critical temperature raises the SMART warning")
+    var te: i64 = 0
+    if pt.throttle_count() > 0:
+        te = 1
+    fail = fail + expect_eq(te, 1, "throttle engagement recorded (AER-reportable)")
+
+    # Cool down: the device recovers, the throttle releases, no crash.
+    var j: i64 = 0
+    while j < 200:
+        pt.tick(0)
+        j = j + 1
+    fail = fail + expect_eq(pt.is_throttled(), 0, "device recovers and un-throttles when cool")
+    fail = fail + expect_eq(pt.critical_warning(), 0, "critical warning clears once cool")
+
+    if fail == 0:
+        print "THERMAL OK"
+    else:
+        print "THERMAL FAIL ({fail})"

@@ -1,0 +1,46 @@
+# entity/task_request — Task request data structure
+
+struct TaskRequest:
+    id: text
+    content: text
+    required_caps: [text]
+    urgency: i64         # 1-10, higher = more urgent
+    status: text         # "pending", "bidding", "assigned", "running", "completed", "failed"
+    assigned_agent: text
+    result: text
+    error: text
+
+fn task_request(id: text, content: text, required_caps: [text]) -> TaskRequest:
+    TaskRequest(
+        id: id,
+        content: content,
+        required_caps: required_caps,
+        urgency: 5,
+        status: "pending",
+        assigned_agent: "",
+        result: "",
+        error: ""
+    )
+
+fn task_request_urgent(id: text, content: text, required_caps: [text],
+                       urgency: i64) -> TaskRequest:
+    TaskRequest(
+        id: id,
+        content: content,
+        required_caps: required_caps,
+        urgency: urgency,
+        status: "pending",
+        assigned_agent: "",
+        result: "",
+        error: ""
+    )
+
+impl TaskRequest:
+    fn is_pending() -> bool:
+        self.status == "pending"
+
+    fn is_completed() -> bool:
+        self.status == "completed"
+
+    fn to_text() -> text:
+        "Task(" + self.id + ", urgency=" + self.urgency.to_text() + ", " + self.status + ")"

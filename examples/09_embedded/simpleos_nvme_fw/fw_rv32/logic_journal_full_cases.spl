@@ -1,0 +1,8 @@
+use logic_journal_core.*
+
+fn rv32_journal_full_cases_selftest() -> i32:
+    if _rv32_journal_is_full(511, 512) != 0:
+        return 1
+    if _rv32_journal_is_full(512, 512) != 1:
+        return 1
+    0

@@ -1,0 +1,654 @@
+# widget_showcase_metal_gui.spl — GUI widget gallery rendered on the pure-Simple
+# Engine2D Metal GPU lane and presented to an on-screen window.
+#
+# Metal twin of widget_showcase_gui.spl (the CPU-lane canonical widget check app):
+# the same 24 widget types (button/checkbox/switch/text input/dropdown/slider/
+# progress/search/tabs/segmented/list/tree/table/card/chip/tooltip/dialog/
+# scrollbar/avatar/menubar/statusbar) drawn with engine2d primitives, but every
+# draw op is dispatched to the Metal GPU. The app refuses to present a frame
+# that fell back to the software mirror: it requires gpu_frame_complete=true
+# and a full-size read_pixels_gpu_only() download.
+#
+# Launch (window):
+#   SIMPLE_GUI_RUN_SKIP_NUDGE=1 scripts/gui/macos-gui-run.shs examples/06_io/ui/widget_showcase_metal_gui.spl
+# Headless: bin/simple run examples/06_io/ui/widget_showcase_metal_gui.spl
+
+use std.gpu.engine2d.backend_metal.{MetalBackend}
+use std.io.window_winit.{WinitLoop, WinitWindow, WinitInput, winit_loop_new, winit_loop_free, winit_window_new, winit_window_free, winit_present_rgba, winit_poll_input}
+use std.common.image.ppm_decode.{encode_ppm_p6}
+use std.nogc_sync_mut.sffi.io.{file_write_bytes}
+use std.io_runtime.{file_write, file_exists, file_read, getpid, time_now_unix_micros}
+use std.nogc_sync_mut.concurrent.thread.{thread_sleep}
+use common.ui.wm_app_process_contract.{WM_APP_MODE_ENV, WM_BRIDGE_FILE_ENV, WM_FRAME_FILE_ENV, WM_EVENT_FILE_ENV, WM_FRAME_SEQ_FILE_ENV, WM_CLIENT_HOLD_ENV, WIDGET_SHOWCASE_APP_SOURCE, widget_showcase_window_title, wm_app_mode_is_client, wm_widget_showcase_bridge_request_sized_with_backend, wm_fs_bridge_encode, wm_widget_showcase_event_path, wm_widget_showcase_frame_seq_path, wm_fs_app_event_decode}
+
+extern fn rt_env_get(key: text) -> text
+
+fn env_get(key: text) -> text:
+    rt_env_get(key) ?? ""
+
+val W: i32 = 520
+val H: i32 = 660
+
+# Palette
+val BG: u32 = 0xFF14141Cu32
+val CARD: u32 = 0xFF1E1E28u32
+val FG: u32 = 0xFFE6E6F0u32
+val MUTED: u32 = 0xFF8A8A9Au32
+val LINE: u32 = 0xFF34343Eu32
+val ACCENT: u32 = 0xFF3B82F6u32
+val ACCENT_D: u32 = 0xFF1D4ED8u32
+val GREEN: u32 = 0xFF22C55Eu32
+val RED: u32 = 0xFFEF4444u32
+val AMBER: u32 = 0xFFF59E0Bu32
+val WHITE: u32 = 0xFFFFFFFFu32
+val TRACK: u32 = 0xFF2A2A38u32
+
+struct ShowcaseState:
+    button_count: i32
+    button_pressed: bool
+    checkbox_on: bool
+    switch_on: bool
+    slider_value: i32
+    progress_value: i32
+    slider_dragging: bool
+
+fn showcase_state_new() -> ShowcaseState:
+    ShowcaseState(button_count: 0, button_pressed: false, checkbox_on: true, switch_on: true, slider_value: 60, progress_value: 62, slider_dragging: false)
+
+fn clamp_i32(v: i32, lo: i32, hi: i32) -> i32:
+    if v < lo:
+        return lo
+    if v > hi:
+        return hi
+    v
+
+fn hit_rect(px: i32, py: i32, x: i32, y: i32, w: i32, h: i32) -> bool:
+    px >= x and px < x + w and py >= y and py < y + h
+
+fn slider_value_from_x(local_x: i32) -> i32:
+    val slider_x = 268
+    val rel = clamp_i32(local_x - slider_x, 0, 130)
+    rel * 100 / 130
+
+fn showcase_on_pointer(state: ShowcaseState, kind: text, x: i32, y: i32, pressed: bool) -> ShowcaseState:
+    if kind == "tick":
+        return showcase_on_tick(state)
+    var out = state
+    if kind == "down" and pressed and hit_rect(x, y, 12, 56, 60, 18):
+        out.button_pressed = true
+    if kind == "down" and pressed and hit_rect(x, y, 268, 186, 130, 28):
+        out.slider_dragging = true
+        out.slider_value = slider_value_from_x(x)
+    elif kind == "move" and out.slider_dragging:
+        out.slider_value = slider_value_from_x(x)
+    elif kind == "up":
+        if hit_rect(x, y, 12, 56, 60, 18):
+            out.button_count = out.button_count + 1
+        if hit_rect(x, y, 268, 58, 120, 22):
+            out.checkbox_on = not out.checkbox_on
+        if hit_rect(x, y, 12, 124, 78, 18):
+            out.switch_on = not out.switch_on
+        out.button_pressed = false
+        if out.slider_dragging:
+            out.slider_value = slider_value_from_x(x)
+        out.slider_dragging = false
+    out
+
+fn showcase_on_tick(state: ShowcaseState) -> ShowcaseState:
+    var out = state
+    out.progress_value = (out.progress_value + 2) % 101
+    out
+
+fn showcase_state_same(a: ShowcaseState, b: ShowcaseState) -> bool:
+    a.button_count == b.button_count and
+    a.button_pressed == b.button_pressed and
+    a.checkbox_on == b.checkbox_on and
+    a.switch_on == b.switch_on and
+    a.slider_value == b.slider_value and
+    a.progress_value == b.progress_value and
+    a.slider_dragging == b.slider_dragging
+
+fn fill_pixels(pixels: [u32], x: i32, y: i32, w: i32, h: i32, color: u32) -> [u32]:
+    var out = pixels
+    var yy = 0
+    while yy < h:
+        val py = y + yy
+        var xx = 0
+        if py >= 0 and py < H:
+            while xx < w:
+                val px = x + xx
+                if px >= 0 and px < W:
+                    out[py * W + px] = color
+                xx = xx + 1
+        yy = yy + 1
+    out
+
+fn draw_segment_digit(pixels: [u32], digit: i32, x: i32, y: i32, color: u32) -> [u32]:
+    var out = fill_pixels(pixels, x, y, 18, 24, BG)
+    val d = digit % 10
+    val a = d != 1 and d != 4
+    val b = d != 5 and d != 6
+    val c = d != 2
+    val dd = d != 1 and d != 4 and d != 7
+    val e = d == 0 or d == 2 or d == 6 or d == 8
+    val f = d != 1 and d != 2 and d != 3 and d != 7
+    val g = d != 0 and d != 1 and d != 7
+    if a:
+        out = fill_pixels(out, x + 3, y, 12, 3, color)
+    if b:
+        out = fill_pixels(out, x + 15, y + 3, 3, 7, color)
+    if c:
+        out = fill_pixels(out, x + 15, y + 13, 3, 7, color)
+    if dd:
+        out = fill_pixels(out, x + 3, y + 20, 12, 3, color)
+    if e:
+        out = fill_pixels(out, x, y + 13, 3, 7, color)
+    if f:
+        out = fill_pixels(out, x, y + 3, 3, 7, color)
+    if g:
+        out = fill_pixels(out, x + 3, y + 10, 12, 3, color)
+    out
+
+fn patch_showcase_state(base_pixels: [u32], state: ShowcaseState) -> [u32]:
+    var out = base_pixels
+    val button_color = if state.button_count % 2 == 0: ACCENT else: GREEN
+    out = fill_pixels(out, 14, 72, 56, 2, button_color)
+    out = fill_pixels(out, 100, 76, 22, 28, BG)
+    out = draw_segment_digit(out, state.button_count, 102, 78, button_color)
+    val click_meter = (state.button_count % 10) * 8
+    out = fill_pixels(out, 420, H - 11, 84, 6, TRACK)
+    out = fill_pixels(out, 420, H - 11, click_meter, 6, button_color)
+
+    val check_fill = if state.checkbox_on: GREEN else: BG
+    val check_off_fill = if state.checkbox_on: BG else: AMBER
+    out = fill_pixels(out, 271, 61, 7, 7, check_fill)
+    out = fill_pixels(out, 321, 61, 7, 7, check_off_fill)
+
+    val switch_track = if state.switch_on: GREEN else: TRACK
+    val switch_knob_x = if state.switch_on: 34 else: 16
+    out = fill_pixels(out, 13, 126, 32, 12, switch_track)
+    out = fill_pixels(out, 16, 128, 28, 8, switch_track)
+    out = fill_pixels(out, switch_knob_x, 128, 10, 8, WHITE)
+
+    val slider_fill = 130 * state.slider_value / 100
+    out = fill_pixels(out, 268, 196, 130, 4, TRACK)
+    out = fill_pixels(out, 268, 196, slider_fill, 4, ACCENT)
+    out = fill_pixels(out, 268 + slider_fill - 4, 192, 8, 12, WHITE)
+
+    val progress_fill = 130 * state.progress_value / 100
+    out = fill_pixels(out, 12, 258, 130, 10, TRACK)
+    out = fill_pixels(out, 12, 258, progress_fill, 10, ACCENT)
+    out = fill_pixels(out, 0, H - 14, W, 14, CARD)
+    out = fill_pixels(out, 6, H - 11, 6 + state.progress_value, 6, GREEN)
+    out
+
+# section label above each widget cell
+fn label(b: MetalBackend, x: i32, y: i32, name: text):
+    b.draw_text(x, y, name, MUTED, 6)
+
+fn w_button(b: MetalBackend, x: i32, y: i32, state: ShowcaseState):
+    label(b, x, y, "Button")
+    b.draw_rect_filled(x, y + 10, 60, 18, ACCENT)
+    b.draw_rounded_rect(x, y + 10, 60, 18, 5, ACCENT_D)
+    b.draw_text(x + 16, y + 15, "Run", WHITE, 7)
+    b.draw_text(x + 18, y + 33, "Clicks {state.button_count}", MUTED, 6)
+    # secondary (outline)
+    b.draw_rounded_rect_outline(x + 70, y + 10, 60, 18, 5, MUTED, 1)
+    b.draw_text(x + 82, y + 15, "Cancel", FG, 7)
+
+fn w_checkbox(b: MetalBackend, x: i32, y: i32, state: ShowcaseState):
+    label(b, x, y, "Checkbox / Radio")
+    b.draw_rect(x, y + 12, 13, 13, MUTED)
+    if state.checkbox_on:
+        b.draw_rect_filled(x + 3, y + 15, 7, 7, GREEN)
+    b.draw_text(x + 18, y + 14, "On", FG, 7)
+    b.draw_rect(x + 50, y + 12, 13, 13, MUTED)
+    if not state.checkbox_on:
+        b.draw_rect_filled(x + 53, y + 15, 7, 7, AMBER)
+    b.draw_text(x + 68, y + 14, "Off", FG, 7)
+    # radio
+    b.draw_circle(x + 100, y + 18, 7, MUTED)
+    b.draw_circle_filled(x + 100, y + 18, 3, ACCENT)
+    b.draw_circle(x + 124, y + 18, 7, MUTED)
+
+fn w_switch(b: MetalBackend, x: i32, y: i32, state: ShowcaseState):
+    label(b, x, y, "Toggle switch")
+    # on
+    val track = if state.switch_on: GREEN else: TRACK
+    val knob_x = if state.switch_on: x + 26 else: x + 8
+    b.draw_rounded_rect(x, y + 12, 34, 16, 8, track)
+    b.draw_circle_filled(knob_x, y + 20, 6, WHITE)
+    # off
+    b.draw_rounded_rect(x + 44, y + 12, 34, 16, 8, TRACK)
+    b.draw_circle_filled(x + 52, y + 20, 6, MUTED)
+
+fn w_input(b: MetalBackend, x: i32, y: i32):
+    label(b, x, y, "Text input")
+    b.draw_rect(x, y + 11, 150, 18, MUTED)
+    b.draw_text(x + 5, y + 16, "name...", MUTED, 7)
+
+fn w_dropdown(b: MetalBackend, x: i32, y: i32):
+    label(b, x, y, "Dropdown")
+    b.draw_rect(x, y + 11, 130, 18, MUTED)
+    b.draw_text(x + 5, y + 16, "Option A", FG, 7)
+    b.draw_triangle_filled(x + 116, y + 16, x + 124, y + 16, x + 120, y + 22, FG)
+
+fn w_slider(b: MetalBackend, x: i32, y: i32, state: ShowcaseState):
+    label(b, x, y, "Slider")
+    val fill_w = 130 * state.slider_value / 100
+    b.draw_rect_filled(x, y + 18, 130, 4, TRACK)
+    b.draw_rect_filled(x, y + 18, fill_w, 4, ACCENT)
+    b.draw_circle_filled(x + fill_w, y + 20, 6, WHITE)
+    b.draw_text(x + 136, y + 14, "{state.slider_value}%", MUTED, 6)
+
+fn w_progress(b: MetalBackend, x: i32, y: i32, state: ShowcaseState):
+    label(b, x, y, "Progress")
+    val fill_w = 130 * state.progress_value / 100
+    b.draw_rect_filled(x, y + 14, 130, 10, TRACK)
+    b.draw_rect_filled(x, y + 14, fill_w, 10, ACCENT)
+    b.draw_text(x + 136, y + 14, "{state.progress_value}%", MUTED, 6)
+
+fn w_search(b: MetalBackend, x: i32, y: i32):
+    label(b, x, y, "Search bar")
+    b.draw_rounded_rect(x, y + 11, 150, 18, 9, MUTED)
+    b.draw_circle(x + 12, y + 19, 4, MUTED)
+    b.draw_line(x + 15, y + 22, x + 19, y + 26, MUTED, 1)
+    b.draw_text(x + 24, y + 16, "Search...", MUTED, 7)
+
+fn w_tabs(b: MetalBackend, x: i32, y: i32):
+    label(b, x, y, "Tabs")
+    b.draw_text(x + 4, y + 14, "Home", FG, 7)
+    b.draw_text(x + 44, y + 14, "Edit", MUTED, 7)
+    b.draw_text(x + 80, y + 14, "View", MUTED, 7)
+    b.draw_rect_filled(x + 2, y + 26, 32, 2, ACCENT)
+    b.draw_line(x, y + 27, x + 150, y + 27, LINE, 1)
+
+fn w_segmented(b: MetalBackend, x: i32, y: i32):
+    label(b, x, y, "Segmented")
+    b.draw_rounded_rect(x, y + 11, 120, 18, 4, MUTED)
+    b.draw_rect_filled(x + 2, y + 13, 38, 14, ACCENT)
+    b.draw_text(x + 8, y + 16, "Day", WHITE, 6)
+    b.draw_text(x + 50, y + 16, "Week", MUTED, 6)
+    b.draw_text(x + 90, y + 16, "Mo", MUTED, 6)
+
+fn w_list(b: MetalBackend, x: i32, y: i32):
+    label(b, x, y, "List")
+    b.draw_text(x + 2, y + 14, "- First item", FG, 7)
+    b.draw_text(x + 2, y + 26, "- Second item", FG, 7)
+    b.draw_text(x + 2, y + 38, "- Third item", MUTED, 7)
+
+fn w_tree(b: MetalBackend, x: i32, y: i32):
+    label(b, x, y, "Tree")
+    b.draw_triangle_filled(x + 2, y + 12, x + 2, y + 20, x + 8, y + 16, FG)
+    b.draw_text(x + 12, y + 13, "src", FG, 7)
+    b.draw_text(x + 22, y + 26, "main.spl", MUTED, 7)
+    b.draw_text(x + 22, y + 38, "lib.spl", MUTED, 7)
+
+fn w_table(b: MetalBackend, x: i32, y: i32):
+    label(b, x, y, "Table")
+    b.draw_rect_filled(x, y + 11, 150, 12, TRACK)
+    b.draw_text(x + 4, y + 13, "Name", FG, 6)
+    b.draw_text(x + 80, y + 13, "Size", FG, 6)
+    b.draw_text(x + 4, y + 27, "a.spl", MUTED, 6)
+    b.draw_text(x + 80, y + 27, "1.2k", MUTED, 6)
+    b.draw_text(x + 4, y + 39, "b.spl", MUTED, 6)
+    b.draw_text(x + 80, y + 39, "3.4k", MUTED, 6)
+    b.draw_line(x, y + 23, x + 150, y + 23, LINE, 1)
+    b.draw_line(x + 74, y + 11, x + 74, y + 48, LINE, 1)
+
+fn w_card(b: MetalBackend, x: i32, y: i32):
+    label(b, x, y, "Card")
+    b.draw_rect_filled(x + 3, y + 14, 130, 44, 0xFF0C0C12u32)
+    b.draw_rounded_rect(x, y + 11, 130, 44, 6, LINE)
+    b.draw_rect_filled(x + 1, y + 12, 128, 42, CARD)
+    b.draw_text(x + 8, y + 18, "Title", FG, 7)
+    b.draw_text(x + 8, y + 32, "Body text here", MUTED, 6)
+
+fn w_chip(b: MetalBackend, x: i32, y: i32):
+    label(b, x, y, "Badge / Chip")
+    b.draw_rounded_rect(x, y + 12, 40, 14, 7, GREEN)
+    b.draw_text(x + 8, y + 14, "New", WHITE, 6)
+    b.draw_rounded_rect(x + 48, y + 12, 44, 14, 7, AMBER)
+    b.draw_text(x + 55, y + 14, "Beta", 0xFF1A1A1Au32, 6)
+
+fn w_tooltip(b: MetalBackend, x: i32, y: i32):
+    label(b, x, y, "Tooltip")
+    b.draw_rounded_rect(x, y + 12, 88, 18, 4, 0xFF2D2D3Au32)
+    b.draw_text(x + 6, y + 17, "Helpful hint", FG, 6)
+    b.draw_triangle_filled(x + 12, y + 30, x + 22, y + 30, x + 17, y + 35, 0xFF2D2D3Au32)
+
+fn w_dialog(b: MetalBackend, x: i32, y: i32):
+    label(b, x, y, "Dialog / Modal")
+    b.draw_rounded_rect(x, y + 11, 150, 50, 6, LINE)
+    b.draw_rect_filled(x + 1, y + 12, 148, 48, CARD)
+    b.draw_text(x + 8, y + 17, "Delete file?", FG, 7)
+    b.draw_text(x + 8, y + 30, "This cannot be undone.", MUTED, 6)
+    b.draw_rounded_rect(x + 60, y + 42, 36, 14, 4, TRACK)
+    b.draw_text(x + 66, y + 45, "No", FG, 6)
+    b.draw_rect_filled(x + 102, y + 42, 40, 14, RED)
+    b.draw_text(x + 108, y + 45, "Yes", WHITE, 6)
+
+fn w_scrollbar(b: MetalBackend, x: i32, y: i32):
+    label(b, x, y, "Scrollbar")
+    b.draw_rect_filled(x, y + 11, 8, 60, TRACK)
+    b.draw_rounded_rect(x, y + 14, 8, 26, 4, MUTED)
+
+fn w_avatar(b: MetalBackend, x: i32, y: i32):
+    label(b, x, y, "Avatar")
+    b.draw_circle_filled(x + 16, y + 26, 14, ACCENT)
+    b.draw_text(x + 11, y + 22, "JS", WHITE, 7)
+
+fn render_frame(b: MetalBackend, state: ShowcaseState) -> [u32]:
+    b.clear(BG)
+    # menubar
+    b.draw_rect_filled(0, 0, W, 16, CARD)
+    b.draw_text(6, 4, "File  Edit  View  Help", FG, 7)
+    # title
+    b.draw_text(8, 22, "Widget Showcase (Engine2D Metal GPU lane)", FG, 8)
+    b.draw_line(8, 38, W - 8, 38, LINE, 1)
+
+    # two columns
+    val colA = 12
+    val colB = 268
+    var ry = 46
+    val step = 66
+
+    w_button(b, colA, ry, state)
+    w_checkbox(b, colB, ry, state)
+    ry = ry + step
+    w_switch(b, colA, ry, state)
+    w_input(b, colB, ry)
+    ry = ry + step
+    w_dropdown(b, colA, ry)
+    w_slider(b, colB, ry, state)
+    ry = ry + step
+    w_progress(b, colA, ry, state)
+    w_search(b, colB, ry)
+    ry = ry + step
+    w_tabs(b, colA, ry)
+    w_segmented(b, colB, ry)
+    ry = ry + step
+    w_list(b, colA, ry)
+    w_tree(b, colB, ry)
+    ry = ry + step
+    w_table(b, colA, ry)
+    w_card(b, colB, ry)
+    ry = ry + step + 4
+    w_chip(b, colA, ry)
+    w_tooltip(b, colB, ry)
+
+    # dialog spans below (col A), scrollbar + avatar (col B)
+    ry = ry + step
+    w_dialog(b, colA, ry)
+    w_scrollbar(b, colB, ry)
+    w_avatar(b, colB + 30, ry)
+
+    # statusbar
+    b.draw_rect_filled(0, H - 14, W, 14, CARD)
+    b.draw_text(6, H - 11, "Ready clicks={state.button_count} slider={state.slider_value}% progress={state.progress_value}%", MUTED, 6)
+    b.draw_text(W - 60, H - 11, "Ln 1, Col 1", MUTED, 6)
+
+    b.present()
+    # Strict GPU lane: refuse the software mirror. Capture the completeness flag
+    # before shutdown (shutdown resets it) and require the GPU-only download.
+    val frame_complete = b.gpu_frame_complete
+    val pixels = b.read_pixels_gpu_only()
+    if not frame_complete:
+        print "GPU frame incomplete (an op fell back to the software mirror); refusing to present"
+        return []
+    if pixels.len() < W * H:
+        print "GPU readback short ({pixels.len()} of {W * H}); refusing to present"
+        return []
+    print "gpu_frame_complete=true, full GPU readback ({pixels.len()} px)"
+    pixels
+
+fn build_frame(state: ShowcaseState) -> [u32]:
+    var b = MetalBackend.create()
+    if not b.init(W, H):
+        print "Metal backend failed to initialize"
+        return []
+    val pixels = render_frame(b, state)
+    b.shutdown()
+    pixels
+
+fn showcase_ppm_scale() -> i32:
+    val raw = env_get("SHOWCASE_PPM_SCALE") ?? ""
+    if raw == "8":
+        return 8
+    if raw == "4":
+        return 4
+    if raw == "2":
+        return 2
+    1
+
+fn downsample_nearest(src: [u32], src_w: i32, src_h: i32, scale: i32) -> [u32]:
+    if scale <= 1:
+        return src
+    val dst_w = src_w / scale
+    val dst_h = src_h / scale
+    var out: [u32] = []
+    var y = 0
+    while y < dst_h:
+        var x = 0
+        val sy = y * scale
+        while x < dst_w:
+            val sx = x * scale
+            out.push(src[sy * src_w + sx])
+            x = x + 1
+        y = y + 1
+    out
+
+fn pack(src: [u32]) -> [i64]:
+    var out: [i64] = []
+    var i = 0
+    while i < src.len():
+        out.push(src[i].to_i64() & 0xFFFFFF)
+        i = i + 1
+    out
+
+fn showcase_should_close(input: WinitInput) -> bool:
+    if input.close:
+        return true
+    for k in input.keys:
+        if k == 27 or k == 113 or k == 81:
+            return true
+    false
+
+fn wm_env_path_or(default_path: text, key: text) -> text:
+    val raw = env_get(key) ?? ""
+    if raw == "":
+        return default_path
+    raw
+
+fn write_wm_frame(frame_path: text, seq_path: text, seq: i64, frame_w: i32, frame_h: i32, pixels: [u32]) -> bool:
+    val frame_bytes = encode_ppm_p6(frame_w.to_u32(), frame_h.to_u32(), pixels)
+    if frame_bytes.len() == 0 or not file_write_bytes(frame_path, frame_bytes):
+        return false
+    file_write(seq_path, seq.to_text())
+
+fn write_wm_state(state_path: text, state: ShowcaseState, event_seq: i64, frame_seq: i64, frame_scale: i32) -> bool:
+    file_write(state_path,
+        "frame_seq={frame_seq}\n" +
+        "event_seq={event_seq}\n" +
+        "frame_scale={frame_scale}\n" +
+        "button_count={state.button_count}\n" +
+        "checkbox_on={state.checkbox_on}\n" +
+        "switch_on={state.switch_on}\n" +
+        "slider_value={state.slider_value}\n" +
+        "progress_value={state.progress_value}\n")
+
+fn consume_wm_event(event_path: text, last_seq: i64, state: ShowcaseState, coord_scale: i32) -> (ShowcaseState, i64, bool):
+    if event_path == "" or not file_exists(event_path):
+        return (state, last_seq, false)
+    val body = file_read(event_path)
+    if body == "":
+        return (state, last_seq, false)
+    val ev = wm_fs_app_event_decode(body)
+    if ev.seq <= last_seq:
+        return (state, last_seq, false)
+    val scaled_next = showcase_on_pointer(state, ev.kind, ev.x * coord_scale, ev.y * coord_scale, ev.pressed)
+    if coord_scale > 1 and showcase_state_same(scaled_next, state):
+        return (showcase_on_pointer(state, ev.kind, ev.x, ev.y, ev.pressed), ev.seq, true)
+    val next = scaled_next
+    (next, ev.seq, true)
+
+fn run_wm_client() -> i64:
+    val bridge_path = env_get(WM_BRIDGE_FILE_ENV) ?? ""
+    val frame_path = env_get(WM_FRAME_FILE_ENV) ?? ""
+    if bridge_path == "" or frame_path == "":
+        print "[wm-showcase-client] error=missing-bridge-env"
+        return 2
+    val event_path = wm_env_path_or(wm_widget_showcase_event_path(frame_path), WM_EVENT_FILE_ENV)
+    val seq_path = wm_env_path_or(wm_widget_showcase_frame_seq_path(frame_path), WM_FRAME_SEQ_FILE_ENV)
+    val state_path = frame_path + ".state"
+
+    var state = showcase_state_new()
+    var frame_seq = 1
+    val frame_scale = showcase_ppm_scale()
+    val frame_w = W / frame_scale
+    val frame_h = H / frame_scale
+    val base_pixels = build_frame(state)
+    val pixels = patch_showcase_state(base_pixels, state)
+    val wm_pixels = if frame_scale > 1: downsample_nearest(pixels, W, H, frame_scale) else: pixels
+    if wm_pixels.len() < frame_w * frame_h or not write_wm_frame(frame_path, seq_path, frame_seq, frame_w, frame_h, wm_pixels):
+        print "[wm-showcase-client] error=frame-write-failed path={frame_path}"
+        return 1
+    write_wm_state(state_path, state, 0, frame_seq, frame_scale)
+
+    val pid = getpid()
+    val req = wm_widget_showcase_bridge_request_sized_with_backend(pid, frame_path, frame_w + 8, frame_h + 32, "metal")
+    if not file_write(bridge_path, wm_fs_bridge_encode(req)):
+        print "[wm-showcase-client] error=bridge-write-failed path={bridge_path}"
+        return 1
+
+    print "[wm-showcase-client] source={WIDGET_SHOWCASE_APP_SOURCE} pid={pid} bridge={bridge_path} frame={frame_path} event={event_path} seq={seq_path}"
+    if (env_get(WM_CLIENT_HOLD_ENV) ?? "") == "1":
+        var ticks = 0
+        var last_event_seq = 0
+        while ticks < 2000000:
+            val (event_state, event_seq, event_dirty) = consume_wm_event(event_path, last_event_seq, state, frame_scale)
+            if event_dirty:
+                state = event_state
+                last_event_seq = event_seq
+            var dirty = event_dirty
+            if dirty:
+                frame_seq = frame_seq + 1
+                val next_pixels = patch_showcase_state(base_pixels, state)
+                val next_wm_pixels = if frame_scale > 1: downsample_nearest(next_pixels, W, H, frame_scale) else: next_pixels
+                if next_wm_pixels.len() < frame_w * frame_h or not write_wm_frame(frame_path, seq_path, frame_seq, frame_w, frame_h, next_wm_pixels):
+                    print "[wm-showcase-client] error=frame-refresh-failed path={frame_path}"
+                    return 1
+                write_wm_state(state_path, state, last_event_seq, frame_seq, frame_scale)
+                print "[wm-showcase-client] frame seq={frame_seq} event_seq={last_event_seq} clicks={state.button_count} checkbox={state.checkbox_on} switch={state.switch_on} slider={state.slider_value} progress={state.progress_value}"
+            thread_sleep(60)
+            ticks = ticks + 1
+    0
+
+fn apply_native_input(input: WinitInput, mouse_x: i32, mouse_y: i32, state: ShowcaseState) -> (ShowcaseState, i32, i32, bool, bool):
+    var out = state
+    var mx = mouse_x
+    var my = mouse_y
+    var dirty = false
+    var running = true
+    if showcase_should_close(input):
+        running = false
+    if input.mouse_x != 0.0 or input.mouse_y != 0.0:
+        mx = input.mouse_x.to_i32()
+        my = input.mouse_y.to_i32()
+        if out.slider_dragging:
+            out = showcase_on_pointer(out, "move", mx, my, false)
+            dirty = true
+    var ci = 0
+    while ci < input.click_buttons.len():
+        val btn = input.click_buttons[ci]
+        val pressed = input.click_pressed[ci]
+        if btn == 0:
+            var fx = input.click_x[ci].to_i32()
+            var fy = input.click_y[ci].to_i32()
+            if fx == 0 and fy == 0:
+                fx = mx
+                fy = my
+            else:
+                mx = fx
+                my = fy
+            val kind = if pressed: "down" else: "up"
+            out = showcase_on_pointer(out, kind, fx, fy, pressed)
+            dirty = true
+            print "[widget-showcase] input left_button pressed={pressed} x={fx} y={fy} clicks={out.button_count} slider={out.slider_value}"
+        ci = ci + 1
+    (out, mx, my, dirty, running)
+
+fn main() -> i64:
+    print "Widget showcase GUI — render {W}x{H} via Engine2D Metal GPU lane"
+    if wm_app_mode_is_client(env_get(WM_APP_MODE_ENV) ?? ""):
+        return run_wm_client()
+
+    var state = showcase_state_new()
+    val base_pixels = build_frame(state)
+    if base_pixels.len() < W * H:
+        return 1
+    val pixels = patch_showcase_state(base_pixels, state)
+    print "rendered {pixels.len()} px (24 widget types) on Metal GPU"
+
+    # Capture the framebuffer to a P6 PPM (absolute oracle) when SHOWCASE_PPM is set.
+    val ppm_path = env_get("SHOWCASE_PPM") ?? ""
+    if ppm_path != "":
+        val scale = showcase_ppm_scale()
+        val ppm_pixels = downsample_nearest(pixels, W, H, scale)
+        val ppm_w = W / scale
+        val ppm_h = H / scale
+        val bytes = encode_ppm_p6(ppm_w.to_u32(), ppm_h.to_u32(), ppm_pixels)
+        if file_write_bytes(ppm_path, bytes):
+            print "wrote {ppm_path} ({ppm_w}x{ppm_h}, {bytes.len()} bytes)"
+        else:
+            print "failed to write {ppm_path}"
+
+    if (env_get("SIMPLE_GUI") ?? "") != "1":
+        print "No GUI requested (use scripts/gui/macos-gui-run.shs to open a window); headless only."
+        return 0
+
+    val lp = winit_loop_new()
+    if not lp.is_valid:
+        print "No GUI runtime available."
+        return 1
+    val win = winit_window_new(lp, W.to_i64(), H.to_i64(), widget_showcase_window_title("metal"))
+    if not win.is_valid:
+        winit_loop_free(lp)
+        return 1
+
+    var packed = pack(pixels)
+    if packed.len() < W * H:
+        winit_window_free(win)
+        winit_loop_free(lp)
+        return 1
+    var running = true
+    var iters = 0
+    var mouse_x = 0
+    var mouse_y = 0
+    var last_tick = time_now_unix_micros()
+    while running and iters < 2000000:
+        winit_present_rgba(win, W.to_i64(), H.to_i64(), packed)
+        val input = winit_poll_input(lp)
+        val (next_state, next_mx, next_my, input_dirty, next_running) = apply_native_input(input, mouse_x, mouse_y, state)
+        state = next_state
+        mouse_x = next_mx
+        mouse_y = next_my
+        running = next_running
+        var dirty = input_dirty
+        val now = time_now_unix_micros()
+        if now - last_tick >= 500000:
+            state = showcase_on_tick(state)
+            last_tick = now
+            dirty = true
+        if dirty:
+            val next_pixels = patch_showcase_state(base_pixels, state)
+            if next_pixels.len() < W * H:
+                winit_window_free(win)
+                winit_loop_free(lp)
+                return 1
+            packed = pack(next_pixels)
+        thread_sleep(30)
+        iters = iters + 1
+    winit_window_free(win)
+    winit_loop_free(lp)
+    return 0

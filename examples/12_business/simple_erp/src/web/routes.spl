@@ -1,0 +1,65 @@
+# Web Route Layer — pure, testable request routing over the shared
+# guarded-write framework
+#
+# No live server here: `route_table` is the declarative map from HTTP
+# method+path to a lane action, `find_route` resolves a request to one of
+# those routes, and `dispatch` runs the request through the ONE gate every
+# lane already uses (read routes check role_can directly; write routes go
+# through gate_write so session -> rbac -> validation -> idempotency is
+# enforced exactly once, in exactly one place).
+
+use framework.guarded.{Tenant, Actor, Session, WriteResult, gate_write_for, role_can_for, session_valid}
+use framework.registry.{LaneDef, default_lanes}
+use std.nogc_sync_mut.enterprise_store.store.{EnterpriseStore}
+
+struct Route:
+    val method: text
+    val path: text
+    val action: text
+    val requires_write: bool
+
+# The route table DERIVES from the lane registry: one POST write route per
+# registered lane plus the fixed read surfaces. A new business gets its route
+# by registering a LaneDef — this file never changes.
+fn routes_for(lanes: [LaneDef]) -> [Route]:
+    var routes: [Route] = []
+    for l in lanes:
+        routes.push(Route { method: "POST", path: l.write_path, action: l.write_action, requires_write: true })
+    routes.push(Route { method: "GET", path: "/api/audit", action: "audit.read", requires_write: false })
+    routes.push(Route { method: "GET", path: "/api/reports/summary", action: "report.read", requires_write: false })
+    return routes
+
+fn route_table() -> [Route]:
+    return routes_for(default_lanes())
+
+# Sentinel returned by find_route on a miss: an empty action marks "no route".
+fn not_found_route() -> Route:
+    return Route { method: "", path: "", action: "", requires_write: false }
+
+fn find_route_in(routes: [Route], method: text, path: text) -> Route:
+    for route in routes:
+        if route.method == method and route.path == path:
+            return route
+    return not_found_route()
+
+fn find_route(method: text, path: text) -> Route:
+    return find_route_in(route_table(), method, path)
+
+# Route a request through the gate, against the app's lane registry. Unknown
+# routes are denied with reason "not-found". Read routes still require a valid
+# session, then check the actor's role (no idempotency needed for a read).
+# Write routes go through the full framework gate pipeline.
+fn dispatch_for(lanes: [LaneDef], session: Session, tenant: Tenant, user: Actor, method: text, path: text, record_valid: bool, key: text, store: EnterpriseStore) -> WriteResult:
+    val route = find_route_in(routes_for(lanes), method, path)
+    if route.action == "":
+        return WriteResult { ok: false, reason: "not-found", audit_action: "", ledger_key: "" }
+    if not route.requires_write:
+        if !session_valid(session, tenant, user):
+            return WriteResult { ok: false, reason: "invalid-session", audit_action: route.action, ledger_key: "" }
+        if role_can_for(lanes, user.role, route.action):
+            return WriteResult { ok: true, reason: "accepted", audit_action: route.action, ledger_key: "" }
+        return WriteResult { ok: false, reason: "forbidden", audit_action: route.action, ledger_key: "" }
+    return gate_write_for(lanes, store, session, tenant, user, route.action, record_valid, key)
+
+fn dispatch(session: Session, tenant: Tenant, user: Actor, method: text, path: text, record_valid: bool, key: text, store: EnterpriseStore) -> WriteResult:
+    return dispatch_for(default_lanes(), session, tenant, user, method, path, record_valid, key, store)

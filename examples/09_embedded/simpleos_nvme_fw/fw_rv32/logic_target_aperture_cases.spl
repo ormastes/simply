@@ -1,0 +1,14 @@
+use logic_target_core.*
+
+fn rv32_target_aperture_cases_selftest() -> i32:
+    if _rv32_target_valid_apertures(1, 0x00100000, 0xE0001000, 0x43C00000, 0x50000000) != 0:
+        return 1
+    if _rv32_target_valid_apertures(2, 0x00100000, 0xE0001000, 0x43C00000, 0x50000000) != 0:
+        return 1
+    if _rv32_target_valid_apertures(2, 0, 0xE0001000, 0x43C00000, 0x50000000) == 0:
+        return 1
+    if _rv32_target_valid_apertures(2, 0x00100000, 0xE0000000, 0x43C00000, 0x50000000) == 0:
+        return 1
+    if _rv32_target_valid_apertures(99, 0x00100000, 0xE0001000, 0x43C00000, 0x50000000) == 0:
+        return 1
+    0

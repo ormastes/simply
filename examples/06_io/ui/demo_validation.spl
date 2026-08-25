@@ -1,0 +1,143 @@
+#![allow(unnamed_duplicate_typed_args)]
+# Per-Widget Rendering Demo — Input Validation and Widget States
+#
+# Non-interactive demo that builds a form with disabled, readonly,
+# required, and error-state widgets, renders to an 80x24 TUI screen
+# buffer, and verifies the rendered output contains expected markers.
+# Prints PASS/FAIL for each check and returns 0 on all pass.
+
+use common.ui.builder.{column, panel, button, checkbox, text_input, text_field,
+    text_widget, build_tree_with_title, with_height,
+    with_disabled, with_readonly, with_error, with_required}
+use common.ui.widget.{UIState}
+use common.ui.layout.{compute_layout}
+use common.ui.state.{init_state}
+use app.ui.tui.screen.{Screen}
+use app.ui.render.widgets.{render_tui_tree}
+
+fn build_demo_tree() -> UIState:
+    """Build a form tree with validation states."""
+    # Normal input
+    val name_input = with_height(text_input("name_input", "Enter your name"), 1)
+
+    # Required input with "*"
+    val email_input = with_height(with_required(text_input("email_input", "Enter email")), 2)
+
+    # Input with error state
+    val error_input = with_height(with_error(text_input("error_input", "bad@"), "Invalid email format"), 3)
+
+    # Disabled button
+    val submit_btn = with_height(with_disabled(button("submit_btn", "Submit", "submit_form")), 1)
+
+    # Enabled button
+    val cancel_btn = with_height(button("cancel_btn", "Cancel", "cancel_form"), 1)
+
+    # Readonly textfield
+    val sys_id = with_height(with_readonly(text_field("sys_id", "System generated ID: ABC-123", "")), 1)
+
+    # Disabled checkbox
+    val dis_cb = with_height(with_disabled(checkbox("dis_cb", "Agree to Terms", false)), 1)
+
+    # Info text
+    val rules_text = with_height(text_widget("rules_text", "Validation: email must contain @, name is required"), 1)
+
+    val form = panel("form", "Validation Demo Form", [
+        name_input,
+        email_input,
+        error_input,
+        submit_btn,
+        cancel_btn,
+        sys_id,
+        dis_cb,
+        rules_text
+    ])
+
+    val root = column("root", [form])
+    val tree = build_tree_with_title(root, "Validation Demo", "dark")
+    return init_state(tree)
+
+fn check(output: text, needle: text, description: text, failures: i32) -> i32:
+    if output.contains(needle):
+        print "PASS: {description}"
+        return failures
+    else:
+        print "FAIL: {description} (expected '{needle}')"
+        return failures + 1
+
+fn main() -> i64:
+    var failures = 0
+    val width = 80
+    val height = 24
+
+    # Build the widget tree
+    val state = build_demo_tree()
+
+    # Verify tree was built
+    val ids = state.tree.all_widget_ids()
+    if ids.len() > 0:
+        print "PASS: tree built with {ids.len()} widgets"
+    else:
+        print "FAIL: tree has no widgets"
+        failures = failures + 1
+
+    # Compute layout
+    val rects = compute_layout(state.tree.root, 0, 0, width, height - 1)
+    if rects.len() > 0:
+        print "PASS: layout computed with {rects.len()} rects"
+    else:
+        print "FAIL: layout produced no rects"
+        failures = failures + 1
+
+    # Render to screen buffer
+    var screen = Screen.new(width, height - 1)
+    screen = render_tui_tree(screen, state.tree.root, rects, state)
+    val output = screen.render()
+
+    if output.len() > 0:
+        print "PASS: render produced output ({output.len()} chars)"
+    else:
+        print "FAIL: render produced empty output"
+        failures = failures + 1
+
+    # Print the rendered buffer for visual inspection
+    print "--- Rendered Output ---"
+    var row_idx = 0
+    while row_idx < screen.buffer.len():
+        print screen.buffer[row_idx]
+        row_idx = row_idx + 1
+    print "--- End Output ---"
+
+    # Verify form panel title
+    failures = check(output, "Validation Demo Form", "panel title 'Validation Demo Form'", failures)
+
+    # Verify normal input placeholder
+    failures = check(output, "Enter your name", "normal input placeholder", failures)
+
+    # Verify required input placeholder renders
+    failures = check(output, "Enter email", "required input placeholder", failures)
+
+    # Verify error message appears
+    failures = check(output, "Invalid email format", "error message rendered", failures)
+
+    # Verify disabled button label
+    failures = check(output, "Submit", "disabled button label 'Submit'", failures)
+
+    # Verify enabled button label
+    failures = check(output, "Cancel", "enabled button label 'Cancel'", failures)
+
+    # Verify readonly textfield content
+    failures = check(output, "ABC-123", "readonly textfield content", failures)
+
+    # Verify disabled checkbox rendered (unchecked + disabled)
+    failures = check(output, "[ ]", "disabled checkbox marker [ ]", failures)
+
+    # Verify info text
+    failures = check(output, "Validation", "rules text visible", failures)
+
+    # Summary
+    if failures == 0:
+        print "All tests passed."
+        return 0
+    else:
+        print "{failures} test(s) failed."
+        return 1

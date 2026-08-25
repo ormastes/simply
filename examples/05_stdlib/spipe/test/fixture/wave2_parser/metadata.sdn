@@ -1,0 +1,11 @@
+artifact:
+  uid: A-02
+  key: design.search.core
+  aliases:
+    - search-core
+    - bm25
+  features: [search, knowledge]
+parser:
+  id: markdown
+  version: 1
+

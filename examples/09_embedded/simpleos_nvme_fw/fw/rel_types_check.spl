@@ -1,0 +1,175 @@
+"""
+rel_types_check — absolute oracles for the reliability-engine leaf rel_types.spl
+(contract: doc/05_design/hardware/nand_recovery/recovery_algorithms_design.md §1,
+design §9 L1). Known values at known points, not self-comparison.
+
+THIS FILE IS A MODULE SEPARATE FROM rel_types.spl. Every RelAction and every state
+struct below is constructed here, or by a rel_types.spl constructor fn, and read
+back through its fields HERE — so a passing run proves no cross-module struct decay
+(the interpreter tag-decay landmine the architecture §3 / design §9 L1 gate exists
+to catch).
+
+Oracles:
+  1. HEADLINE (design §9 L1 tag-decay gate): construct all SEVEN RelAction verdict
+     kinds via their rel_act_* constant fn + rel_action() in rel_types.spl, pass the
+     result across the module boundary into this file, read .kind AND .arg back, and
+     assert EXACT values. Distinct arg per kind, including a NEGATIVE arg (a signed
+     Vref offset) to prove signed round-trip. If kind or arg decays, THAT is a
+     finding — this oracle fails loudly, it does not paper over.
+  2. kind constants have their design §1.1-documented values (0..6).
+  3. rel_read_obs round-trips code/corrected/offset/depth across the boundary.
+  4. Each per-policy state struct is constructed (dense [i64] arrays length
+     NUM_BLOCKS) and its field defaults read back as 0; RelBlockObs round-trips
+     meaningful scalar values.
+  5. Typed-dimensions law: the NdBlock fields (RelLadderState.blk, RelBlockObs.blk)
+     round-trip — construct with nd_block(5) / nd_block(9), read .idx back through
+     the struct == 5 / 9.
+  6. Mount bundles compose the state structs and their nested fields round-trip.
+
+Run: bin/simple run examples/09_embedded/simpleos_nvme_fw/fw/rel_types_check.spl
+Gate: prints "REL TYPES OK" and exits 0.
+"""
+
+use nvme_types.*
+use nd_types.*
+use rel_types.*
+
+# Loop-built dense zero array (rel_types owns no array constructor; ftl_fill lives in
+# ftl_map.spl which this leaf must not import). Mirrors ftl_fill's build idiom.
+fn zeros(n: i64) -> [i64]:
+    var a: [i64] = []
+    var i: i64 = 0
+    while i < n:
+        a.push(0)
+        i = i + 1
+    a
+
+# Read .kind off a RelAction built in rel_types and handed across the boundary.
+fn kind_of(a: RelAction) -> i64:
+    a.kind
+
+fn arg_of(a: RelAction) -> i64:
+    a.arg
+
+fn main():
+    var fail: i64 = 0
+
+    # ── Oracle 2: kind constants carry their design §1.1 codes ────────────────
+    fail = fail + expect_eq(rel_act_accept(), 0, "rel_act_accept() == 0")
+    fail = fail + expect_eq(rel_act_retry(), 1, "rel_act_retry() == 1")
+    fail = fail + expect_eq(rel_act_calibrate(), 2, "rel_act_calibrate() == 2")
+    fail = fail + expect_eq(rel_act_refresh(), 3, "rel_act_refresh() == 3")
+    fail = fail + expect_eq(rel_act_reclaim(), 4, "rel_act_reclaim() == 4")
+    fail = fail + expect_eq(rel_act_quarantine(), 5, "rel_act_quarantine() == 5")
+    fail = fail + expect_eq(rel_act_uncorrectable(), 6, "rel_act_uncorrectable() == 6")
+
+    # ── Oracle 1: HEADLINE — every verdict round-trips kind AND arg across the ──
+    # module boundary. rel_action() builds the struct in rel_types.spl; kind_of/
+    # arg_of read it back here. Distinct args; retry uses a NEGATIVE signed offset.
+    val acc: RelAction = rel_action(rel_act_accept(), 0)
+    fail = fail + expect_eq(kind_of(acc), 0, "Accept: kind round-trips as 0")
+    fail = fail + expect_eq(arg_of(acc), 0, "Accept: arg round-trips as 0")
+
+    val rty: RelAction = rel_action(rel_act_retry(), -16)
+    fail = fail + expect_eq(kind_of(rty), 1, "RetryAtOffset: kind round-trips as 1")
+    fail = fail + expect_eq(arg_of(rty), -16, "RetryAtOffset: NEGATIVE signed Vref offset -16 round-trips (tag-decay gate)")
+
+    val cal: RelAction = rel_action(rel_act_calibrate(), 5)
+    fail = fail + expect_eq(kind_of(cal), 2, "CalibrateBlock: kind round-trips as 2")
+    fail = fail + expect_eq(arg_of(cal), 5, "CalibrateBlock: block arg 5 round-trips")
+
+    val ref: RelAction = rel_action(rel_act_refresh(), 12)
+    fail = fail + expect_eq(kind_of(ref), 3, "MarkForRefresh: kind round-trips as 3")
+    fail = fail + expect_eq(arg_of(ref), 12, "MarkForRefresh: block arg 12 round-trips")
+
+    val rec: RelAction = rel_action(rel_act_reclaim(), 33)
+    fail = fail + expect_eq(kind_of(rec), 4, "ReclaimNow: kind round-trips as 4")
+    fail = fail + expect_eq(arg_of(rec), 33, "ReclaimNow: block arg 33 round-trips")
+
+    val qua: RelAction = rel_action(rel_act_quarantine(), 57)
+    fail = fail + expect_eq(kind_of(qua), 5, "Quarantine: kind round-trips as 5")
+    fail = fail + expect_eq(arg_of(qua), 57, "Quarantine: block arg 57 round-trips")
+
+    val unc: RelAction = rel_action(rel_act_uncorrectable(), 63)
+    fail = fail + expect_eq(kind_of(unc), 6, "Uncorrectable: kind round-trips as 6")
+    fail = fail + expect_eq(arg_of(unc), 63, "Uncorrectable: block arg 63 round-trips")
+
+    # Distinctness: the seven kinds must be seven distinct codes (no aliasing).
+    var distinct: i64 = 0
+    if rel_act_accept() != rel_act_uncorrectable():
+        distinct = 1
+    fail = fail + expect_eq(distinct, 1, "kind codes are distinct across the verdict set (accept != uncorrectable)")
+
+    # ── Oracle 3: rel_read_obs round-trips its four fields across the boundary ──
+    val obs: RelReadObs = rel_read_obs(NAND_ECC_FAIL, 1, -24, 2)
+    fail = fail + expect_eq(obs.code, NAND_ECC_FAIL, "RelReadObs.code round-trips (NAND_ECC_FAIL)")
+    fail = fail + expect_eq(obs.corrected, 1, "RelReadObs.corrected round-trips (coarse 1)")
+    fail = fail + expect_eq(obs.offset, -24, "RelReadObs.offset round-trips (signed -24)")
+    fail = fail + expect_eq(obs.depth, 2, "RelReadObs.depth round-trips (rung 2)")
+
+    # ── Oracle 4 + 5: state structs — field defaults + NdBlock round-trip ─────
+    # RelLadderState: scalar state, blk is an NdBlock (typed-dims law).
+    val st: RelLadderState = RelLadderState(blk: nd_block(5), depth: 0, table_idx: 0, best_offset: 0, best_corrected: 0, phase: 0)
+    fail = fail + expect_eq(st.blk.idx, 5, "RelLadderState.blk is NdBlock and .idx round-trips == 5 through the struct")
+    fail = fail + expect_eq(st.depth, 0, "RelLadderState.depth default 0")
+    fail = fail + expect_eq(st.table_idx, 0, "RelLadderState.table_idx default 0")
+    fail = fail + expect_eq(st.best_offset, 0, "RelLadderState.best_offset default 0")
+    fail = fail + expect_eq(st.best_corrected, 0, "RelLadderState.best_corrected default 0")
+    fail = fail + expect_eq(st.phase, 0, "RelLadderState.phase default 0 (== rel_phase_seed, constant owned by L4)")
+
+    # RelBlockObs: NdBlock coordinate + meaningful scalar round-trip.
+    val bobs: RelBlockObs = RelBlockObs(blk: nd_block(9), erase_count: 100, rd_disturb: 7, corrected_events: 3, last_prog_seq: 42, cur_seq: 999)
+    fail = fail + expect_eq(bobs.blk.idx, 9, "RelBlockObs.blk is NdBlock and .idx round-trips == 9 through the struct")
+    fail = fail + expect_eq(bobs.erase_count, 100, "RelBlockObs.erase_count round-trips (100)")
+    fail = fail + expect_eq(bobs.rd_disturb, 7, "RelBlockObs.rd_disturb round-trips (7)")
+    fail = fail + expect_eq(bobs.corrected_events, 3, "RelBlockObs.corrected_events round-trips (3)")
+    fail = fail + expect_eq(bobs.last_prog_seq, 42, "RelBlockObs.last_prog_seq round-trips (42)")
+    fail = fail + expect_eq(bobs.cur_seq, 999, "RelBlockObs.cur_seq round-trips (999)")
+
+    # RelVrefCache: three dense [i64] arrays, all length NUM_BLOCKS, default 0.
+    val vc: RelVrefCache = RelVrefCache(offset: zeros(NUM_BLOCKS), valid: zeros(NUM_BLOCKS), gen: zeros(NUM_BLOCKS))
+    fail = fail + expect_eq(vc.offset.len(), NUM_BLOCKS, "RelVrefCache.offset length == NUM_BLOCKS")
+    fail = fail + expect_eq(vc.valid.len(), NUM_BLOCKS, "RelVrefCache.valid length == NUM_BLOCKS")
+    fail = fail + expect_eq(vc.gen.len(), NUM_BLOCKS, "RelVrefCache.gen length == NUM_BLOCKS")
+    fail = fail + expect_eq(vc.offset[7], 0, "RelVrefCache.offset default 0 at block 7")
+    fail = fail + expect_eq(vc.valid[63], 0, "RelVrefCache.valid default 0 at last block")
+
+    # RelRefreshState.
+    val rs: RelRefreshState = RelRefreshState(last_prog_seq: zeros(NUM_BLOCKS), marked: zeros(NUM_BLOCKS))
+    fail = fail + expect_eq(rs.last_prog_seq.len(), NUM_BLOCKS, "RelRefreshState.last_prog_seq length == NUM_BLOCKS")
+    fail = fail + expect_eq(rs.marked[0], 0, "RelRefreshState.marked default 0")
+
+    # RelDisturbState.
+    val ds: RelDisturbState = RelDisturbState(hot_page: zeros(NUM_BLOCKS), hot_count: zeros(NUM_BLOCKS))
+    fail = fail + expect_eq(ds.hot_page.len(), NUM_BLOCKS, "RelDisturbState.hot_page length == NUM_BLOCKS")
+    fail = fail + expect_eq(ds.hot_count[5], 0, "RelDisturbState.hot_count default 0")
+
+    # RelWearState.
+    val ws: RelWearState = RelWearState(last_global_erase: zeros(NUM_BLOCKS))
+    fail = fail + expect_eq(ws.last_global_erase.len(), NUM_BLOCKS, "RelWearState.last_global_erase length == NUM_BLOCKS")
+    fail = fail + expect_eq(ws.last_global_erase[63], 0, "RelWearState.last_global_erase default 0 at last block")
+
+    # RelHealth: five dense [i64] arrays.
+    val h: RelHealth = RelHealth(reads: zeros(NUM_BLOCKS), corrected_sum: zeros(NUM_BLOCKS), corrected_events: zeros(NUM_BLOCKS), retry_depth_max: zeros(NUM_BLOCKS), refresh_cause: zeros(NUM_BLOCKS))
+    fail = fail + expect_eq(h.reads.len(), NUM_BLOCKS, "RelHealth.reads length == NUM_BLOCKS")
+    fail = fail + expect_eq(h.corrected_sum[0], 0, "RelHealth.corrected_sum default 0")
+    fail = fail + expect_eq(h.corrected_events[0], 0, "RelHealth.corrected_events default 0")
+    fail = fail + expect_eq(h.retry_depth_max[0], 0, "RelHealth.retry_depth_max default 0")
+    fail = fail + expect_eq(h.refresh_cause[0], 0, "RelHealth.refresh_cause default 0")
+
+    # ── Oracle 6: mount bundles compose and nested fields round-trip ──────────
+    val fm: RelFilMount = RelFilMount(vref: vc, health: h, ladder: st)
+    fail = fail + expect_eq(fm.ladder.blk.idx, 5, "RelFilMount.ladder.blk.idx nested NdBlock round-trips == 5")
+    fail = fail + expect_eq(fm.vref.valid.len(), NUM_BLOCKS, "RelFilMount.vref nested RelVrefCache composes")
+    fail = fail + expect_eq(fm.health.reads[0], 0, "RelFilMount.health nested RelHealth composes")
+
+    val gm: RelFtlMount = RelFtlMount(refresh: rs, disturb: ds, wear: ws, health: h)
+    fail = fail + expect_eq(gm.refresh.marked[0], 0, "RelFtlMount.refresh nested RelRefreshState composes")
+    fail = fail + expect_eq(gm.disturb.hot_page.len(), NUM_BLOCKS, "RelFtlMount.disturb nested RelDisturbState composes")
+    fail = fail + expect_eq(gm.wear.last_global_erase.len(), NUM_BLOCKS, "RelFtlMount.wear nested RelWearState composes")
+    fail = fail + expect_eq(gm.health.corrected_events[0], 0, "RelFtlMount.health nested durable-sink RelHealth composes")
+
+    if fail == 0:
+        print "REL TYPES OK"
+    else:
+        print "REL TYPES FAIL ({fail})"

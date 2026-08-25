@@ -1,0 +1,198 @@
+# 17. Memory Hierarchy - Global vs Shared Memory
+#
+# Two matrix-multiply kernels: a naive one that reads every operand from
+# global memory, and a tiled one that stages TILE_SIZE x TILE_SIZE blocks of
+# A and B in shared memory so each global load is reused TILE_SIZE times.
+#
+# C/CUDA equivalent (tiled):
+#   __global__ void matmul_tiled(float *a, float *b, float *c, int n) {
+#       __shared__ float tile_a[TILE][TILE];
+#       __shared__ float tile_b[TILE][TILE];
+#       int row = blockIdx.y * TILE + threadIdx.y;
+#       int col = blockIdx.x * TILE + threadIdx.x;
+#       float sum = 0;
+#       for (int t = 0; t < (n + TILE - 1) / TILE; t++) {
+#           tile_a[ty][tx] = (row < n && t*TILE+tx < n) ? a[row*n + t*TILE+tx] : 0;
+#           tile_b[ty][tx] = (t*TILE+ty < n && col < n) ? b[(t*TILE+ty)*n + col] : 0;
+#           __syncthreads();
+#           for (int k = 0; k < TILE; k++) sum += tile_a[ty][k] * tile_b[k][tx];
+#           __syncthreads();
+#       }
+#       if (row < n && col < n) c[row*n + col] = sum;
+#   }
+#
+# Simple mapping: device buffers are `GpuPtr`, element access is
+# `gpu_load_f32` / `gpu_store_f32`, shared memory is a handle from
+# `gpu_shared_array_f32(count)` accessed via `gpu_shared_load_f32` /
+# `gpu_shared_store_f32`, and `gpu_syncthreads()` is `__syncthreads()`.
+
+use std.gpu.*
+
+val TILE_SIZE = 16
+
+# ============================================================================
+# Kernel 1: naive global-memory matmul
+# ============================================================================
+
+@gpu_kernel
+fn matmul_naive(a: GpuPtr, b: GpuPtr, c: GpuPtr, n: i64):
+    val row = gpu_block_id_y() * gpu_block_dim_y() + gpu_local_id_y()
+    val col = gpu_block_id_x() * gpu_block_dim_x() + gpu_local_id_x()
+    if row < n and col < n:
+        var sum = 0.0
+        var k = 0
+        while k < n:
+            sum = sum + gpu_load_f32(a, row * n + k) * gpu_load_f32(b, k * n + col)
+            k = k + 1
+        gpu_store_f32(c, row * n + col, sum)
+
+# ============================================================================
+# Kernel 2: tiled shared-memory matmul
+# ============================================================================
+
+@gpu_kernel
+fn matmul_tiled(a: GpuPtr, b: GpuPtr, c: GpuPtr, n: i64):
+    val tile_a = gpu_shared_array_f32(TILE_SIZE * TILE_SIZE)
+    val tile_b = gpu_shared_array_f32(TILE_SIZE * TILE_SIZE)
+
+    val tx = gpu_local_id_x()
+    val ty = gpu_local_id_y()
+    val row = gpu_block_id_y() * TILE_SIZE + ty
+    val col = gpu_block_id_x() * TILE_SIZE + tx
+
+    var sum = 0.0
+    val num_tiles = (n + TILE_SIZE - 1) / TILE_SIZE
+    var tile = 0
+    while tile < num_tiles:
+        # Stage one tile of A and one tile of B (zero-padded at the edges)
+        val a_col = tile * TILE_SIZE + tx
+        val b_row = tile * TILE_SIZE + ty
+        if row < n and a_col < n:
+            gpu_shared_store_f32(tile_a, ty * TILE_SIZE + tx, gpu_load_f32(a, row * n + a_col))
+        else:
+            gpu_shared_store_f32(tile_a, ty * TILE_SIZE + tx, 0.0)
+        if b_row < n and col < n:
+            gpu_shared_store_f32(tile_b, ty * TILE_SIZE + tx, gpu_load_f32(b, b_row * n + col))
+        else:
+            gpu_shared_store_f32(tile_b, ty * TILE_SIZE + tx, 0.0)
+        gpu_syncthreads()
+
+        # Multiply the two tiles from shared memory
+        var k = 0
+        while k < TILE_SIZE:
+            sum = sum + gpu_shared_load_f32(tile_a, ty * TILE_SIZE + k) * gpu_shared_load_f32(tile_b, k * TILE_SIZE + tx)
+            k = k + 1
+        gpu_syncthreads()
+        tile = tile + 1
+
+    if row < n and col < n:
+        gpu_store_f32(c, row * n + col, sum)
+
+# ============================================================================
+# Host helpers (pure - also used by spec.spl)
+# ============================================================================
+
+fn create_matrix(rows: i64, cols: i64, fill_value: f32) -> [f32]:
+    [for i in 0..(rows * cols): fill_value]
+
+fn create_identity(n: i64) -> [f32]:
+    var data = create_matrix(n, n, 0.0)
+    var row = 0
+    while row < n:
+        data[row * n + row] = 1.0
+        row = row + 1
+    data
+
+fn matmul_cpu(a: [f32], b: [f32], n: i64) -> [f32]:
+    var c = create_matrix(n, n, 0.0)
+    var i = 0
+    while i < n:
+        var j = 0
+        while j < n:
+            var sum = 0.0
+            var k = 0
+            while k < n:
+                sum = sum + a[i * n + k] * b[k * n + j]
+                k = k + 1
+            c[i * n + j] = sum
+            j = j + 1
+        i = i + 1
+    c
+
+fn tiles_for(n: i64) -> i64:
+    (n + TILE_SIZE - 1) / TILE_SIZE
+
+fn count_mismatches(actual: [f32], expected: [f32], tol: f32) -> i64:
+    var errors = 0
+    var i = 0
+    while i < expected.len():
+        val diff = actual[i] - expected[i]
+        if diff > tol or diff < 0.0 - tol:
+            errors = errors + 1
+        i = i + 1
+    errors
+
+# ============================================================================
+# Host drivers
+# ============================================================================
+
+fn run_matmul(a_host: [f32], b_host: [f32], n: i64, tiled: bool) -> Result<[f32], GpuError>:
+    val bytes = n * n * 4
+    val a_dev = gpu_alloc(bytes)?
+    val b_dev = gpu_alloc(bytes)?
+    val c_dev = gpu_alloc(bytes)?
+    gpu_upload_f32(a_dev, a_host)?
+    gpu_upload_f32(b_dev, b_host)?
+
+    val g = tiles_for(n)
+    if tiled:
+        matmul_tiled<<<grid: (g, g, 1), block: (TILE_SIZE, TILE_SIZE, 1)>>>(a_dev, b_dev, c_dev, n)
+    else:
+        matmul_naive<<<grid: (g, g, 1), block: (TILE_SIZE, TILE_SIZE, 1)>>>(a_dev, b_dev, c_dev, n)
+    gpu_sync()?
+
+    val result = gpu_download_f32(c_dev, n * n)?
+    gpu_free(a_dev)?
+    gpu_free(b_dev)?
+    gpu_free(c_dev)?
+    Ok(result)
+
+fn run_naive(a_host: [f32], b_host: [f32], n: i64) -> Result<[f32], GpuError>:
+    run_matmul(a_host, b_host, n, false)
+
+fn run_tiled(a_host: [f32], b_host: [f32], n: i64) -> Result<[f32], GpuError>:
+    run_matmul(a_host, b_host, n, true)
+
+fn run() -> Result<(), GpuError>:
+    val n = 64
+    gpu_init()?
+    gpu_set_device(0)?
+
+    val a_host = create_matrix(n, n, 2.0)
+    val identity = create_identity(n)
+    val expected = matmul_cpu(a_host, identity, n)
+
+    print "Running naive matrix multiply ({n}x{n}, {tiles_for(n)}x{tiles_for(n)} blocks of {TILE_SIZE}x{TILE_SIZE})..."
+    val result_naive = run_naive(a_host, identity, n)?
+    print "Naive: done"
+
+    print "Running tiled matrix multiply ({n}x{n})..."
+    val result_tiled = run_tiled(a_host, identity, n)?
+    print "Tiled: done"
+
+    val errors_naive = count_mismatches(result_naive, expected, 0.001)
+    val errors_tiled = count_mismatches(result_tiled, expected, 0.001)
+    print "Naive errors: {errors_naive}"
+    print "Tiled errors: {errors_tiled}"
+    if errors_naive == 0 and errors_tiled == 0:
+        print "Both variants produce correct results!"
+    else:
+        print "ERROR: results mismatch"
+    Ok(())
+
+fn main():
+    match run():
+        case Ok(_):
+            print "=== Done ==="
+        case Err(e):
+            print "GPU error: {e.to_text()}"

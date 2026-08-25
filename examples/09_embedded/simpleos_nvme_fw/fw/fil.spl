@@ -1,0 +1,374 @@
+"""
+fil — Flash Interface Layer.
+
+Composes the flash-memory controller (fil_fmc) with ECC (fil_ecc) and the bad-block table
+(fil_badblock) into a single page-level interface for the FTL: ECC-verified reads, and
+program/erase that retire a block (bad-block table + NAND state) on media failure. The flash is
+driven through the FMC register handshake (load command → issue → read result latches), exactly
+as a real firmware programs its flash controller; the NAND chips hang off the controller. This
+layer stays media-agnostic.
+"""
+
+use nvme_types.*
+use nd_types.*
+use rel_types.*         # RelVrefCache / RelReadObs / RelAction / RelLadderState (pure leaf)
+use rel_vref.*          # 7-entry retry table + ROR-lite calibration cache (pure leaf)
+use rel_ladder.*        # hard-decision recovery-ladder state machine (pure leaf)
+use fil_fmc.*           # Fmc — flash-memory-controller register driver (owns the NAND device)
+use fil_ecc.*
+use fil_badblock.*
+
+# Result of an ECC-verified read. `code` is NAND_OK / NAND_ECC_FIXED / NAND_ECC_FAIL.
+# `corrected` is an ADDITIVE field: the coarse ECC decode outcome the reliability
+# engine observes to notice correction events — 0 = clean, 1 = a bit error was
+# corrected, 2 = uncorrectable. Existing callers keep checking `code`; `corrected`
+# is derived from `code` via fil_corrected_of, so its 0/1/2 semantic is stable even
+# if the NAND_* constant values change.
+struct FilRead:
+    data: i64
+    lba:  i64
+    seq:  i64
+    code: i64
+    corrected: i64
+
+# Map an ECC decode result code to the coarse reliability-observable outcome:
+# clean (0), corrected (1), uncorrectable (2). This is the surface rel_health /
+# rel_ladder read (arch doc §3 prereq 1, §5) — it does not depend on the numeric
+# NAND_* enum values.
+fn fil_corrected_of(code: i64) -> i64:
+    if code == NAND_ECC_FIXED:
+        return 1
+    if code == NAND_ECC_FAIL:
+        return 2
+    0
+
+# Result of a recovery-ladder-driven read (the L8 FIL-mount adapter output, design
+# §2 `fil_read_with_ladder`). `ok` = 1 when the ladder recovered good data (clean
+# first read OR a Vref-retry that decoded), 0 when the ladder exhausted the retry
+# table (Uncorrectable → the FTL caller escalates to RAIN/Quarantine). `data` carries
+# the last sensed payload either way, so a caller that ignores `ok` sees exactly the
+# offset-0 read the pre-L8 firmware returned (behaviour-preserving on backends without
+# a Vref actuator, where every retry re-senses identically). `depth` is the retry
+# rung count (0 = clean) and `corrected` the coarse ECC bucket at the winning sense —
+# both fold into the durable RelFtlMount.health at the FTL read site (design §1.4).
+struct RelReadResult:
+    data:      i64
+    lba:       i64   # recovered OOB logical-block tag (for a reclaim/relocation remap)
+    seq:       i64   # recovered OOB sequence tag
+    depth:     i64
+    corrected: i64
+    ok:        i64
+
+fn rel_read_result_ok(data: i64, lba: i64, seq: i64, depth: i64, corrected: i64) -> RelReadResult:
+    RelReadResult(data: data, lba: lba, seq: seq, depth: depth, corrected: corrected, ok: 1)
+
+fn rel_read_result_fail(data: i64, lba: i64, seq: i64, depth: i64) -> RelReadResult:
+    RelReadResult(data: data, lba: lba, seq: seq, depth: depth, corrected: 2, ok: 0)
+
+# Zero-initialised per-block Vref calibration cache (design §3 RelVrefCache). Built
+# here with the plain struct-literal constructor because rel_types.spl (L1) owns the
+# shape but deliberately provides no per-policy *_new (its module-boundary law); the
+# rel_vref lane's mutators return-the-object over this cache. `g` avoids the reserved
+# `gen` identifier for the local while keeping the struct's `gen` field name.
+fn fil_rel_vref_new() -> RelVrefCache:
+    var offset: [i64] = []
+    var valid:  [i64] = []
+    var g:      [i64] = []
+    var i: i64 = 0
+    while i < NUM_BLOCKS:
+        offset.push(0)
+        valid.push(0)
+        g.push(0)
+        i = i + 1
+    RelVrefCache(offset: offset, valid: valid, gen: g)
+
+struct Fil:
+    fmc: Fmc
+    bbt: BadBlockTable
+    rel_vref: RelVrefCache   # ROR-lite per-block calibrated Vref offset (L8 FIL mount, design §1.4/§3)
+
+fn fil_new() -> Fil:
+    Fil(fmc: fmc_new(), bbt: bbt_new(), rel_vref: fil_rel_vref_new())
+
+# Opt-in: a FIL whose flash media is the Vt-physics NeChip emulator (fil_nand_emu)
+# instead of the behavioural NandDevice. Drop-in — the same ECC-verified
+# program/read/erase seam — but reads reflect real threshold-voltage drift, so an
+# aged/worn page can surface a genuine ECC failure the FTL then observes. The
+# default fil_new() is unchanged; this backend is selected only by ftl_new_emu.
+fn fil_new_emu() -> Fil:
+    Fil(fmc: fmc_new_emu(), bbt: bbt_new(), rel_vref: fil_rel_vref_new())
+
+impl Fil:
+    # Program one page (data + OOB {lba, seq}). Retires the block on program failure.
+    # Returns NAND_OK, NAND_BAD_BLOCK (target already retired), or NAND_PROG_FAIL.
+    me program(ppn: i64, lba: i64, seq: i64, data: i64) -> i64:
+        if not ppn_in_range(ppn):
+            return NAND_BAD_BLOCK
+        val blk: i64 = ppn_block(ppn)
+        val bad: bool = me.bbt.is_bad(blk)
+        if bad:
+            return NAND_BAD_BLOCK
+        me.fmc.load(fmc_cmd(FMC_OP_PROGRAM, ppn, lba, seq, data))
+        me.fmc.issue()
+        val res: FmcResult = me.fmc.out()
+        me.fmc.ack()
+        if res.code == NAND_PROG_FAIL:
+            me.bbt.mark_bad(blk)
+            me.fmc.set_bad(blk)
+            return NAND_PROG_FAIL
+        res.code
+
+    # Read one page and verify against the ECC stored in NAND OOB at program time.
+    me read(ppn: i64) -> FilRead:
+        if not ppn_in_range(ppn):
+            return FilRead(data: 0, lba: UNMAP, seq: 0, code: NAND_ECC_FAIL, corrected: fil_corrected_of(NAND_ECC_FAIL))
+        me.fmc.load(fmc_cmd(FMC_OP_READ, ppn, 0, 0, 0))
+        me.fmc.issue()
+        val res: FmcResult = me.fmc.out()
+        me.fmc.ack()
+        val dec: EccDecode = ecc_decode(res.data, res.lba, res.seq, res.ecc, res.err)
+        FilRead(data: dec.data, lba: res.lba, seq: res.seq, code: dec.code, corrected: fil_corrected_of(dec.code))
+
+    # Read one page at a shifted read reference (read-retry primitive for the
+    # reliability retry ladder). The Vref actuator is chip-global (vref = 128 +
+    # offset) and lives only on the Vt-physics emulator backend: there the offset is
+    # applied for this one sense and the PRIOR reference restored before returning
+    # (set→read→restore is atomic, in NandEmu.read_at_vref). On the default
+    # behavioural NandDevice backend there is no threshold-voltage model and hence no
+    # Vref actuator, so this returns exactly the same bytes a plain read() would —
+    # NOT a faked shifted sense. `corrected` is populated identically to read().
+    me read_at_vref(ppn: i64, offset: i64) -> FilRead:
+        if not ppn_in_range(ppn):
+            return FilRead(data: 0, lba: UNMAP, seq: 0, code: NAND_ECC_FAIL, corrected: fil_corrected_of(NAND_ECC_FAIL))
+        val res: FmcResult = me.fmc.read_at_vref(ppn, offset)
+        val dec: EccDecode = ecc_decode(res.data, res.lba, res.seq, res.ecc, res.err)
+        FilRead(data: dec.data, lba: res.lba, seq: res.seq, code: dec.code, corrected: fil_corrected_of(dec.code))
+
+    # ── L8 FIL mount adapter: recovery-ladder-driven read (design §2) ─────────
+    # Owns the Fil handle and the retry loop; the rel_ladder / rel_vref policy
+    # leaves stay pure. On the first NAND_ECC_FAIL the ladder is entered: it senses
+    # the block's cached ROR seed first (rel_vref_lookup), then walks the fixed
+    # 7-entry Vref retry table, re-sensing via read_at_vref and feeding each coarse
+    # outcome back, until a sense decodes (→ CalibrateBlock, the winning offset is
+    # persisted into me.rel_vref) or the table exhausts (→ Uncorrectable). The
+    # chip-GLOBAL Vref knob is restored to 0 before returning so a subsequent plain
+    # read is unshifted (design §2, architecture ecc_fail_ladder diagram).
+    #
+    # Backend honesty: on the default NandDevice backend read_at_vref == a plain
+    # read and emu_set_vref_offset is inert, so every retry re-senses identically —
+    # a genuine FAIL exhausts the table and returns rel_read_result_fail carrying the
+    # SAME offset-0 payload the pre-L8 read returned (no behaviour change beyond the
+    # bounded retry attempts). Only the Vt-physics emu backend actually recovers a
+    # retention-drifted page. A clean first read (code != FAIL) Accepts immediately
+    # with depth 0 and exactly one sense — unchanged from a plain read().
+    #
+    # needed_retry is derivable by the caller as (result.depth > 0): design seam #1
+    # landed FilRead.corrected but not retry_depth, so the ladder's own depth counter
+    # is the needed_retry source threaded up to the FTL rel_refresh feed (per the
+    # coordinator cross-review resolution — no FilRead field added).
+    me read_with_ladder(ppn: i64, blk: NdBlock) -> RelReadResult:
+        var rd: FilRead = me.read(ppn)                       # hard read at offset 0 (seam #1: rd.corrected)
+        var st: RelLadderState = rel_ladder_state_new(blk)
+        var obs: RelReadObs = rel_read_obs(rd.code, rd.corrected, 0, 0)
+        var guard: i64 = 0
+        # Bounded: the ladder is 1 seed + 7 table rungs; 16 is a defensive cap so a
+        # future state-machine bug can never spin the firmware read path.
+        while guard < 16:
+            guard = guard + 1
+            val stp: RelLadderStep = rel_ladder_step(st, obs, rel_vref_lookup(me.rel_vref, blk))
+            st = stp.state
+            val a: RelAction = stp.action
+            if a.kind == rel_act_accept():
+                me.emu_set_vref_offset(0)                     # restore the global knob
+                return rel_read_result_ok(rd.data, rd.lba, rd.seq, st.depth, obs.corrected)
+            if a.kind == rel_act_calibrate():
+                me.rel_vref = rel_vref_calibrate(me.rel_vref, blk, st.best_offset)   # persist winner (ROR)
+                me.emu_set_vref_offset(0)
+                return rel_read_result_ok(rd.data, rd.lba, rd.seq, st.depth, obs.corrected)
+            if a.kind == rel_act_retry():
+                me.emu_set_vref_offset(a.arg)                 # chip-global vref = 128 + a.arg
+                rd  = me.read_at_vref(ppn, a.arg)             # seam #2: non-terminal shifted sense
+                obs = rel_read_obs(rd.code, rd.corrected, a.arg, st.depth)
+            else:
+                # rel_act_uncorrectable: table exhausted. Carry the last payload so a
+                # caller ignoring `ok` matches the pre-L8 offset-0 return exactly.
+                me.emu_set_vref_offset(0)
+                return rel_read_result_fail(rd.data, rd.lba, rd.seq, st.depth)
+        me.emu_set_vref_offset(0)
+        rel_read_result_fail(rd.data, rd.lba, rd.seq, st.depth)
+
+    # Erase-reset (design §7): a recycled block must not reuse a stale retention
+    # calibration — void this block's ROR offset. Called from the FTL erase/reclaim
+    # path, parallel to rel_disturb_clear / rel_health_on_erase / rel_wear_on_erase.
+    me decay_vref_on_erase(blk: NdBlock):
+        me.rel_vref = rel_vref_decay_on_erase(me.rel_vref, blk)
+
+    # Observability: the persisted ROR offset for a block (0 = uncalibrated), so a
+    # test can assert a second read hits the calibrated seed at depth <= 1 (design §3).
+    me calibrated_offset(blk: i64) -> i64:
+        rel_vref_lookup(me.rel_vref, nd_block(blk))
+
+    # Event-driven spare substitution (design §7 / architecture §4 A7): draw one
+    # over-provision spare (blocks 56..63) to backfill a retired data-region block.
+    # Returns the spare index, or UNMAP when the pool is exhausted.
+    me alloc_spare() -> i64:
+        me.bbt.alloc_spare()
+
+    me spare_cursor() -> i64:
+        me.bbt.spare_next
+
+    # Erase one block. Retires the block on erase failure.
+    me erase(blk: i64) -> i64:
+        if not block_in_range(blk):
+            return NAND_BAD_BLOCK
+        val bad: bool = me.bbt.is_bad(blk)
+        if bad:
+            return NAND_BAD_BLOCK
+        me.fmc.load(fmc_cmd(FMC_OP_ERASE, blk, 0, 0, 0))
+        me.fmc.issue()
+        val res: FmcResult = me.fmc.out()
+        me.fmc.ack()
+        if res.code == NAND_ERASE_FAIL:
+            me.bbt.mark_bad(blk)
+            me.fmc.set_bad(blk)
+            return NAND_ERASE_FAIL
+        res.code
+
+    me erase_count(blk: i64) -> i64:
+        if not block_in_range(blk):
+            return 0
+        me.fmc.erase_count(blk)
+
+    me block_bad(blk: i64) -> bool:
+        me.bbt.is_bad(blk)
+
+    # True iff the block still holds at least one physically-programmed page (its OOB
+    # carries a live tag). NAND erase is whole-block and pages fill sequentially from
+    # page 0, so page 0's OOB is authoritative: lba == UNMAP ⟺ the block is erased.
+    # Recovery uses this to tell a genuinely-erased FREE block from a fully-stale-but-
+    # unerased one (which must NOT be reused as free — erase-before-program NAND rejects it).
+    me block_programmed(blk: i64) -> bool:
+        if not block_in_range(blk):
+            return false
+        val head: FilRead = me.read(block_first_ppn(blk))
+        head.lba != UNMAP
+
+    me bad_count(self) -> i64:
+        me.bbt.count_bad()
+
+    # ── test hooks (forwarded through the controller to the simulated NAND) ──
+    me inject_prog_fail(blk: i64):
+        if not block_in_range(blk):
+            return
+        me.fmc.inject_prog_fail(blk)
+
+    me inject_erase_fail(blk: i64):
+        if not block_in_range(blk):
+            return
+        me.fmc.inject_erase_fail(blk)
+
+    me inject_read_bitflip(ppn: i64, n: i64):
+        if not ppn_in_range(ppn):
+            return
+        me.fmc.inject_read_bitflip(ppn, n)
+
+    me corrupt_page_data(ppn: i64, data: i64):
+        if not ppn_in_range(ppn):
+            return
+        me.fmc.corrupt_page_data(ppn, data)
+
+    # ── Emu-backend test API (retention / wear). No-op unless built via
+    #    fil_new_emu; forwards through the controller to the Vt-physics media. ──
+    me emu_advance_time_s(seconds: f64):
+        me.fmc.emu_advance_time_s(seconds)
+
+    me emu_set_block_wear(blk: i64, pe_cycles: i64):
+        if not block_in_range(blk):
+            return
+        me.fmc.emu_set_block_wear(blk, pe_cycles)
+
+    me emu_set_vref_offset(offset: i64):
+        me.fmc.emu_set_vref_offset(offset)
+
+    # Soft-observability re-export (arch doc §3 prereq 3, §5): surface the NeChip's
+    # per-page stored-Vt histogram and read margin through the FIL seam so a
+    # reliability spec can validate against the Vt oracle. `ppn` is a firmware page
+    # number (folded into the S1 window like read). Empty / 0 on the default
+    # NandDevice backend, which has no threshold-voltage model.
+    me emu_vt_histogram(ppn: i64) -> [i64]:
+        me.fmc.emu_vt_histogram(ppn)
+
+    me emu_read_margin(ppn: i64) -> i64:
+        me.fmc.emu_read_margin(ppn)
+
+# ── Self-test ─────────────────────────────────────────────────────────────────
+
+fn fil_selftest() -> i64:
+    var fail: i64 = 0
+    var fil: Fil = fil_new()
+
+    val ppn: i64 = block_first_ppn(2) + 3   # block 2, page 3
+
+    # program + ECC-clean read round-trips data and OOB (first-param *8 guard via ppn index)
+    val pc: i64 = fil.program(ppn, 42, 7, 0xAB)
+    fail = fail + expect_eq(pc, NAND_OK, "program returns NAND_OK")
+    val r0: FilRead = fil.read(ppn)
+    fail = fail + expect_eq(r0.data, 0xAB, "read data round-trips")
+    fail = fail + expect_eq(r0.lba, 42, "read lba round-trips")
+    fail = fail + expect_eq(r0.seq, 7, "read seq round-trips")
+    fail = fail + expect_eq(r0.code, NAND_OK, "read code NAND_OK (0 flips)")
+
+    # 1 bit flip -> corrected; 2 -> uncorrectable
+    fil.inject_read_bitflip(ppn, 1)
+    val r1: FilRead = fil.read(ppn)
+    fail = fail + expect_eq(r1.code, NAND_ECC_FIXED, "1 flip -> ECC_FIXED")
+    fail = fail + expect_eq(r1.data, 0xAB, "data still good after correction")
+    fil.inject_read_bitflip(ppn, 2)
+    val r2: FilRead = fil.read(ppn)
+    fail = fail + expect_eq(r2.code, NAND_ECC_FAIL, "2 flips -> ECC_FAIL")
+    fil.inject_read_bitflip(ppn, 0)
+    fil.corrupt_page_data(ppn, 0xAA)
+    val rf: FilRead = fil.read(ppn)
+    fail = fail + expect_eq(rf.code, NAND_ECC_FIXED, "silent single-bit payload corruption -> ECC_FIXED")
+    fail = fail + expect_eq(rf.data, 0xAB, "silent single-bit payload corruption corrected")
+    fil.corrupt_page_data(ppn, 0xA8)
+    val rc: FilRead = fil.read(ppn)
+    fail = fail + expect_eq(rc.code, NAND_ECC_FAIL, "silent double-bit payload corruption -> ECC_FAIL")
+
+    # erase clears the page OOB and bumps the erase count
+    val ec0: i64 = fil.erase_count(2)
+    fail = fail + expect_eq(ec0, 0, "erase_count before erase")
+    val er: i64 = fil.erase(2)
+    fail = fail + expect_eq(er, NAND_OK, "erase returns NAND_OK")
+    val r3: FilRead = fil.read(ppn)
+    fail = fail + expect_eq(r3.lba, UNMAP, "OOB cleared after erase")
+    val ec1: i64 = fil.erase_count(2)
+    fail = fail + expect_eq(ec1, 1, "erase_count after erase")
+
+    # program failure retires the block; further programs hit NAND_BAD_BLOCK
+    fil.inject_prog_fail(5)
+    val ppn5: i64 = block_first_ppn(5)
+    val pf: i64 = fil.program(ppn5, 1, 1, 1)
+    fail = fail + expect_eq(pf, NAND_PROG_FAIL, "injected program failure")
+    var bb: i64 = 0
+    if fil.block_bad(5):
+        bb = 1
+    fail = fail + expect_eq(bb, 1, "block 5 retired after prog fail")
+    val pf2: i64 = fil.program(ppn5 + 1, 1, 1, 1)
+    fail = fail + expect_eq(pf2, NAND_BAD_BLOCK, "program to retired block -> BAD_BLOCK")
+    fail = fail + expect_eq(fil.bad_count(), 1, "bad_count == 1")
+
+    # erase failure also retires
+    fil.inject_erase_fail(6)
+    val efl: i64 = fil.erase(6)
+    fail = fail + expect_eq(efl, NAND_ERASE_FAIL, "injected erase failure")
+    var bb6: i64 = 0
+    if fil.block_bad(6):
+        bb6 = 1
+    fail = fail + expect_eq(bb6, 1, "block 6 retired after erase fail")
+    fail = fail + expect_eq(fil.program(NUM_PAGES, 1, 1, 1), NAND_BAD_BLOCK, "FIL out-of-range program fails closed")
+    fail = fail + expect_eq(fil.read(NUM_PAGES).code, NAND_ECC_FAIL, "FIL out-of-range read fails closed")
+    fail = fail + expect_eq(fil.erase(NUM_BLOCKS), NAND_BAD_BLOCK, "FIL out-of-range erase fails closed")
+    fail = fail + expect_eq(fil.erase_count(NUM_BLOCKS), 0, "FIL out-of-range erase count is inert")
+
+    fail

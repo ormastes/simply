@@ -1,0 +1,265 @@
+@allow(unnamed_duplicate_typed_args)
+# mcpgdb MCP — session and workspace state
+
+extern fn rt_env_cwd() -> text
+
+use std.io_runtime.{file_exists, read_file, write_file}
+
+class DebugSession:
+    session_id: text
+    backend: text
+    state: text
+    workspace_root: text
+    process_pid: text
+    input_path: text
+    output_path: text
+    error_path: text
+    session_dir: text
+    prompt: text
+    remote_host: text
+    remote_port: text
+    current_thread: text
+    current_frame: text
+    bootstrap_monitor: text
+
+class WorkspaceState:
+    root: text
+    compile_commands_dir: text
+    clangd_binary: text
+    clangd_pid: text
+    clangd_input_path: text
+    clangd_output_path: text
+    clangd_error_path: text
+    clangd_dir: text
+    clangd_request_seq: i64
+    clangd_output_offset: i64
+
+var MCPGDB_SESSIONS: [DebugSession] = []
+var MCPGDB_CURRENT_SESSION = ""
+var MCPGDB_NEXT_SESSION_ID = 1
+var MCPGDB_WORKSPACE = WorkspaceState(
+    root: "",
+    compile_commands_dir: "",
+    clangd_binary: "",
+    clangd_pid: "",
+    clangd_input_path: "",
+    clangd_output_path: "",
+    clangd_error_path: "",
+    clangd_dir: "",
+    clangd_request_seq: 1,
+    clangd_output_offset: 0
+)
+var MCPGDB_OPEN_FILES: [text] = []
+
+fn next_session_id() -> text:
+    val id = "dbg_" + str(MCPGDB_NEXT_SESSION_ID)
+    MCPGDB_NEXT_SESSION_ID = MCPGDB_NEXT_SESSION_ID + 1
+    id
+
+fn set_current_session(session_id: text):
+    MCPGDB_CURRENT_SESSION = session_id
+
+fn find_session_index(session_id: text) -> i64:
+    var idx = 0
+    while idx < MCPGDB_SESSIONS.len():
+        if MCPGDB_SESSIONS[idx].session_id == session_id:
+            return idx
+        idx = idx + 1
+    -1
+
+fn current_or_named_session(session_id: text) -> DebugSession?:
+    var target = session_id
+    if target == "":
+        target = MCPGDB_CURRENT_SESSION
+    if target == "":
+        return nil
+    val idx = find_session_index(target)
+    if idx < 0:
+        return nil
+    Some(MCPGDB_SESSIONS[idx])
+
+fn put_session(session: DebugSession):
+    val idx = find_session_index(session.session_id)
+    if idx >= 0:
+        MCPGDB_SESSIONS[idx] = session
+        return
+    MCPGDB_SESSIONS.push(session)
+
+fn remove_session(session_id: text):
+    var kept: [DebugSession] = []
+    for session in MCPGDB_SESSIONS:
+        if session.session_id != session_id:
+            kept.push(session)
+    MCPGDB_SESSIONS = kept
+    if MCPGDB_CURRENT_SESSION == session_id:
+        MCPGDB_CURRENT_SESSION = ""
+
+fn session_ids() -> [text]:
+    var result: [text] = []
+    for session in MCPGDB_SESSIONS:
+        result.push(session.session_id)
+    result
+
+fn session_count() -> i64:
+    MCPGDB_SESSIONS.len()
+
+fn reset_state():
+    MCPGDB_SESSIONS = []
+    MCPGDB_CURRENT_SESSION = ""
+    MCPGDB_NEXT_SESSION_ID = 1
+    MCPGDB_WORKSPACE = WorkspaceState(
+        root: "",
+        compile_commands_dir: "",
+        clangd_binary: "",
+        clangd_pid: "",
+        clangd_input_path: "",
+        clangd_output_path: "",
+        clangd_error_path: "",
+        clangd_dir: "",
+        clangd_request_seq: 1,
+        clangd_output_offset: 0
+    )
+    MCPGDB_OPEN_FILES = []
+
+fn sanitize_state_segment(value: text) -> text:
+    if value == "":
+        return "workspace"
+    var out = ""
+    var i = 0
+    while i < value.len():
+        val ch = value.substring(i, i + 1)
+        if (ch >= "a" and ch <= "z") or (ch >= "A" and ch <= "Z") or (ch >= "0" and ch <= "9") or ch == "." or ch == "-" or ch == "_":
+            out = out + ch
+        else:
+            out = out + "_"
+        i = i + 1
+    if out == "":
+        return "workspace"
+    out
+
+fn persisted_state_path() -> text:
+    "/tmp/mcpgdb_state_" + sanitize_state_segment(rt_env_cwd()) + ".txt"
+
+fn encode_state_value(value: text) -> text:
+    var out = value
+    out = out.replace("%", "%25")
+    out = out.replace("|", "%7C")
+    out = out.replace("\n", "%0A")
+    out = out.replace("\r", "%0D")
+    out = out.replace("\t", "%09")
+    out
+
+fn decode_state_value(value: text) -> text:
+    var out = value
+    out = out.replace("%09", "\t")
+    out = out.replace("%0D", "\r")
+    out = out.replace("%0A", "\n")
+    out = out.replace("%7C", "|")
+    out = out.replace("%25", "%")
+    out
+
+fn session_record(session: DebugSession) -> text:
+    "SESSION|" + [
+        encode_state_value(session.session_id),
+        encode_state_value(session.backend),
+        encode_state_value(session.state),
+        encode_state_value(session.workspace_root),
+        encode_state_value(session.process_pid),
+        encode_state_value(session.input_path),
+        encode_state_value(session.output_path),
+        encode_state_value(session.error_path),
+        encode_state_value(session.session_dir),
+        encode_state_value(session.prompt),
+        encode_state_value(session.remote_host),
+        encode_state_value(session.remote_port),
+        encode_state_value(session.current_thread),
+        encode_state_value(session.current_frame),
+        encode_state_value(session.bootstrap_monitor)
+    ].join("|")
+
+fn workspace_record() -> text:
+    "WORKSPACE|" + [
+        encode_state_value(MCPGDB_WORKSPACE.root),
+        encode_state_value(MCPGDB_WORKSPACE.compile_commands_dir),
+        encode_state_value(MCPGDB_WORKSPACE.clangd_binary),
+        encode_state_value(MCPGDB_WORKSPACE.clangd_pid),
+        encode_state_value(MCPGDB_WORKSPACE.clangd_input_path),
+        encode_state_value(MCPGDB_WORKSPACE.clangd_output_path),
+        encode_state_value(MCPGDB_WORKSPACE.clangd_error_path),
+        encode_state_value(MCPGDB_WORKSPACE.clangd_dir),
+        str(MCPGDB_WORKSPACE.clangd_request_seq),
+        str(MCPGDB_WORKSPACE.clangd_output_offset)
+    ].join("|")
+
+fn save_persisted_state():
+    var lines: [text] = []
+    lines.push("META|" + encode_state_value(MCPGDB_CURRENT_SESSION) + "|" + str(MCPGDB_NEXT_SESSION_ID))
+    lines.push(workspace_record())
+    for open_path in MCPGDB_OPEN_FILES:
+        lines.push("OPEN|" + encode_state_value(open_path))
+    for session in MCPGDB_SESSIONS:
+        lines.push(session_record(session))
+    val payload = lines.join("\n") + "\n"
+    write_file(persisted_state_path(), payload)
+
+fn load_workspace(parts: [text]):
+    if parts.len() < 11:
+        return
+    MCPGDB_WORKSPACE = WorkspaceState(
+        root: decode_state_value(parts[1]),
+        compile_commands_dir: decode_state_value(parts[2]),
+        clangd_binary: decode_state_value(parts[3]),
+        clangd_pid: decode_state_value(parts[4]),
+        clangd_input_path: decode_state_value(parts[5]),
+        clangd_output_path: decode_state_value(parts[6]),
+        clangd_error_path: decode_state_value(parts[7]),
+        clangd_dir: decode_state_value(parts[8]),
+        clangd_request_seq: int(parts[9]) ?? 1,
+        clangd_output_offset: int(parts[10]) ?? 0
+    )
+
+fn load_session(parts: [text]):
+    if parts.len() < 16:
+        return
+    MCPGDB_SESSIONS.push(DebugSession(
+        session_id: decode_state_value(parts[1]),
+        backend: decode_state_value(parts[2]),
+        state: decode_state_value(parts[3]),
+        workspace_root: decode_state_value(parts[4]),
+        process_pid: decode_state_value(parts[5]),
+        input_path: decode_state_value(parts[6]),
+        output_path: decode_state_value(parts[7]),
+        error_path: decode_state_value(parts[8]),
+        session_dir: decode_state_value(parts[9]),
+        prompt: decode_state_value(parts[10]),
+        remote_host: decode_state_value(parts[11]),
+        remote_port: decode_state_value(parts[12]),
+        current_thread: decode_state_value(parts[13]),
+        current_frame: decode_state_value(parts[14]),
+        bootstrap_monitor: decode_state_value(parts[15])
+    ))
+
+fn load_persisted_state():
+    reset_state()
+    val path = persisted_state_path()
+    if not file_exists(path):
+        return
+    val raw = read_file(path) ?? ""
+    if raw == "":
+        return
+    for line in raw.split("\n"):
+        if line == "":
+            continue
+        val parts = line.split("|")
+        if parts.len() == 0:
+            continue
+        val kind = parts[0]
+        if kind == "META" and parts.len() >= 3:
+            MCPGDB_CURRENT_SESSION = decode_state_value(parts[1])
+            MCPGDB_NEXT_SESSION_ID = int(parts[2]) ?? 1
+        elif kind == "WORKSPACE":
+            load_workspace(parts)
+        elif kind == "OPEN" and parts.len() >= 2:
+            MCPGDB_OPEN_FILES.push(decode_state_value(parts[1]))
+        elif kind == "SESSION":
+            load_session(parts)

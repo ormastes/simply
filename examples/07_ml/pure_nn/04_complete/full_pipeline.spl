@@ -1,0 +1,20 @@
+#!/usr/bin/env simple
+# Complete deep-learning pipeline overview - runtime compatible.
+
+fn main():
+    print "=== Pure Simple Deep Learning - Complete Demonstration ==="
+    print ""
+    print "Pipeline stages:"
+    print "1. Prepare tensors and labels"
+    print "2. Run forward pass"
+    print "3. Compute loss"
+    print "4. Estimate or backpropagate gradients"
+    print "5. Apply optimizer step"
+    print "6. Evaluate predictions"
+    print ""
+    print "Runnable detailed demos:"
+    print "- examples/07_ml/pure_nn/runtime_compatible/full_pipeline_runtime.spl"
+    print "- examples/07_ml/pure_nn/runtime_compatible/xor_training_runtime.spl"
+    print "- examples/07_ml/pure_nn/runtime_compatible/minibatch_sgd_runtime.spl"
+
+main()

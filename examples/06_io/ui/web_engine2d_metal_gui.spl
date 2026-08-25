@@ -1,0 +1,209 @@
+# web_engine2d_metal_gui.spl — Simple Web Renderer + Metal GPU backend
+#
+# Renders an HTML+CSS page through the Metal Engine2D backend, verifies genuine
+# GPU offload (gpu_frame_complete=true), and supports wheel/key scrolling that
+# re-renders at the new viewport offset.
+#
+# Prints to stdout:
+#   RESOLVED backend=metal
+#   GPU offload=true px=N
+#   SCROLL offset=N
+#   render_ms=N
+#
+# Run (headless): SIMPLE_EXECUTION_MODE=interpret bin/simple run examples/06_io/ui/web_engine2d_metal_gui.spl
+# Run (window):   SIMPLE_GUI=1 SIMPLE_EXECUTION_MODE=interpret bin/simple run examples/06_io/ui/web_engine2d_metal_gui.spl
+
+use std.gc_async_mut.gpu.engine2d.backend_metal.{MetalBackend}
+use std.gc_async_mut.gpu.browser_engine.simple_web_html_engine2d_presenter.{
+    simple_web_layout_render_html_pixels_at_scroll}
+use std.gc_async_mut.gpu.browser_engine.simple_web_renderer.{
+    simple_web_resolved_engine2d_backend_name}
+use std.io.window_winit.{WinitLoop, WinitWindow, WinitInput, winit_loop_new, winit_loop_free, winit_window_new, winit_window_free, winit_present_rgba, winit_poll_input}
+use std.nogc_sync_mut.env.platform.{is_macos}
+
+use std.io_runtime.{env_get}
+use std.nogc_sync_mut.io.time_ops.{time_now_unix_micros}
+
+val SCREEN_W: i32 = 320
+val SCREEN_H: i32 = 240
+val WINDOW_W: i32 = 640
+val WINDOW_H: i32 = 480
+val SCROLL_STEP: i32 = 20
+val MAX_SCROLL: i32 = 400
+
+# Key codes produced by the runtime's winit mapping (winit_sffi_input.rs):
+# arrows up=38, down=40 (same basis as common.ui.widget_interact_model).
+val KEY_DOWN: i64 = 40
+val KEY_UP: i64 = 38
+
+fn fixture_html() -> text:
+    "<html><head><style>" +
+    "body { background-color: #1a1a2e; color: #e0e0ff; }" +
+    "h1 { background-color: #16213e; color: #a0c4ff; padding: 8px; }" +
+    "h2 { background-color: #0f3460; color: #e0e0ff; padding: 4px; }" +
+    ".card { background-color: #0f3460; border: 2px solid #533483; padding: 8px; margin: 4px; }" +
+    ".tag { background-color: #533483; color: #fff; padding: 2px; }" +
+    ".highlight { background-color: #e94560; color: #fff; padding: 4px; }" +
+    "</style></head><body>" +
+    "<h1>Simple Web (Metal lane)</h1>" +
+    "<div class='card'>" +
+    "<h2>GPU Offload Proof</h2>" +
+    "<p>HTML AST parsed, CSS cascade applied, block layout performed.</p>" +
+    "<span class='tag'>Metal</span> <span class='tag'>Engine2D</span> <span class='tag'>GPU</span>" +
+    "</div>" +
+    "<div class='card'>" +
+    "<h2>CSS Styling</h2>" +
+    "<p>background-color, color, border, padding all resolved from stylesheet rules.</p>" +
+    "<span class='highlight'>CSS cascade active</span>" +
+    "</div>" +
+    "<div class='card'>" +
+    "<h2>Scrolling</h2>" +
+    "<p>Scroll down to see this content via viewport offset re-render.</p>" +
+    "</div>" +
+    "<div class='card'>" +
+    "<h2>Block 4</h2>" +
+    "<p>More content below the initial viewport — proves scroll offset works.</p>" +
+    "</div>" +
+    "<div class='card'>" +
+    "<h2>Block 5</h2>" +
+    "<p>End of page content.</p>" +
+    "</div>" +
+    "</body></html>"
+
+fn render_metal_layout(html: text, scroll_y: i32) -> [u32]:
+    # Uses draw_layout_pixel_runs (clear + draw_rect_filled = GPU-safe path only).
+    simple_web_layout_render_html_pixels_at_scroll(html, SCREEN_W, SCREEN_H, "metal", scroll_y)
+
+# Directly exercise MetalBackend to probe gpu_frame_complete.
+fn probe_gpu_frame_complete(html: text, scroll_y: i32) -> bool:
+    if not is_macos():
+        return false
+    val cpu_px = simple_web_layout_render_html_pixels_at_scroll(html, SCREEN_W, SCREEN_H, "cpu", scroll_y)
+    var metal = MetalBackend.create()
+    if not metal.init(SCREEN_W, SCREEN_H):
+        return false
+    metal.clear(0xFFFFFFFFu32)
+    var y = 0
+    while y < SCREEN_H:
+        var x = 0
+        while x < SCREEN_W:
+            val color = cpu_px[y * SCREEN_W + x]
+            var run_w = 1
+            while x + run_w < SCREEN_W and cpu_px[y * SCREEN_W + x + run_w] == color:
+                run_w = run_w + 1
+            metal.draw_rect_filled(x, y, run_w, 1, color)
+            x = x + run_w
+        y = y + 1
+    metal.present()
+    val complete = metal.gpu_frame_complete
+    metal.shutdown()
+    complete
+
+fn pack_pixels(src: [u32]) -> [i64]:
+    var out: [i64] = [0; src.len()]
+    var i = 0
+    while i < src.len():
+        out[i] = src[i].to_i64() & 0xFFFFFF
+        i = i + 1
+    out
+
+fn main() -> i64:
+    val html = fixture_html()
+    val resolved = simple_web_resolved_engine2d_backend_name(SCREEN_W, SCREEN_H, "metal")
+    print "Simple Web (Metal lane) {SCREEN_W}x{SCREEN_H}"
+    print "RESOLVED backend={resolved}"
+
+    if not is_macos():
+        print "SKIP: Metal requires macOS"
+        return 0
+
+    # Initial render at scroll=0
+    val t0 = time_now_unix_micros()
+    val px0 = render_metal_layout(html, 0)
+    val t1 = time_now_unix_micros()
+    val ms0 = (t1 - t0) / 1000
+    print "render_ms={ms0}"
+
+    # Probe GPU frame completeness
+    val gpu_ok = probe_gpu_frame_complete(html, 0)
+    val gpu_px_count = if gpu_ok: SCREEN_W * SCREEN_H else: 0
+    print "GPU offload={gpu_ok} px={gpu_px_count}"
+
+    if not gpu_ok:
+        print "ERROR: GPU frame not complete — Metal backend poisoned by mirror-only op"
+        return 1
+
+    print "SCROLL offset=0"
+
+    if env_get("SIMPLE_GUI") != "1":
+        # Headless: demonstrate 3 scroll positions
+        var si = 0
+        while si < 3:
+            val sy = si * SCROLL_STEP * 2
+            val t2 = time_now_unix_micros()
+            val pxN = render_metal_layout(html, sy)
+            val t3 = time_now_unix_micros()
+            val msN = (t3 - t2) / 1000
+            print "SCROLL offset={sy} render_ms={msN} px={pxN.len()}"
+            si = si + 1
+        print "Headless render only (set SIMPLE_GUI=1 to open window with scroll)"
+        return 0
+
+    # GUI mode: open window with scroll support
+    val lp = winit_loop_new()
+    if not lp.is_valid:
+        print "No GUI runtime"
+        return 0
+    val win = winit_window_new(lp, WINDOW_W.to_i64(), WINDOW_H.to_i64(), "Simple Web (Metal lane)")
+    if not win.is_valid:
+        print "Window creation failed"
+        winit_loop_free(lp)
+        return 0
+
+    var scroll_y = 0
+    var packed = pack_pixels(px0)
+    winit_present_rgba(win, SCREEN_W.to_i64(), SCREEN_H.to_i64(), packed)
+
+    var running = true
+    var iters = 0
+    val end_at = time_now_unix_micros() + 120000000
+    while running and time_now_unix_micros() < end_at:
+        val inp = winit_poll_input(lp)
+        if inp.close:
+            running = false
+        # Wheel up (positive dy) scrolls toward the top of the page.
+        var scroll_delta = 0
+        if inp.scroll_y > 0.5:
+            scroll_delta = 0 - SCROLL_STEP
+        elif inp.scroll_y < -0.5:
+            scroll_delta = SCROLL_STEP
+        var ki = 0
+        while ki < inp.keys.len():
+            val kc = inp.keys[ki]
+            if kc == KEY_DOWN:
+                scroll_delta = SCROLL_STEP
+            elif kc == KEY_UP:
+                scroll_delta = 0 - SCROLL_STEP
+            ki = ki + 1
+        if scroll_delta != 0:
+            var new_scroll = scroll_y + scroll_delta
+            if new_scroll < 0:
+                new_scroll = 0
+            if new_scroll > MAX_SCROLL:
+                new_scroll = MAX_SCROLL
+            if new_scroll != scroll_y:
+                scroll_y = new_scroll
+                val tS = time_now_unix_micros()
+                val pxScroll = render_metal_layout(html, scroll_y)
+                val tE = time_now_unix_micros()
+                val msSc = (tE - tS) / 1000
+                print "SCROLL offset={scroll_y} render_ms={msSc} px={pxScroll.len()}"
+                packed = pack_pixels(pxScroll)
+                winit_present_rgba(win, SCREEN_W.to_i64(), SCREEN_H.to_i64(), packed)
+        if iters % 200 == 0:
+            winit_present_rgba(win, SCREEN_W.to_i64(), SCREEN_H.to_i64(), packed)
+        iters = iters + 1
+
+    winit_window_free(win)
+    winit_loop_free(lp)
+    0

@@ -1,0 +1,29 @@
+project:
+  name: mate-broker
+  version: 1.0.0
+
+broker:
+  strategy: capability
+  max_concurrent: 5
+  bid_timeout_ms: 5000
+
+agents:
+  coder:
+    capabilities: [code, refactor, test]
+    max_concurrent: 3
+    priority: 10
+
+  reviewer:
+    capabilities: [review, security, docs]
+    max_concurrent: 2
+    priority: 8
+
+  researcher:
+    capabilities: [research, analysis, docs]
+    max_concurrent: 2
+    priority: 5
+
+  tester:
+    capabilities: [test, integration, benchmark]
+    max_concurrent: 4
+    priority: 7
