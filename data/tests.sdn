@@ -1,0 +1,73 @@
+# simply test lists — id|kind|path
+# kind: unit (feature gate) | system (usability gate) | bench (performance gate)
+#       | planned (future-impl planned() spec)
+# Paths are in ormastes/simple unless prefixed "repo:". A directory means every
+# *_spec.spl beneath it. See doc/plan/completion_criteria.md.
+I01|unit|test/01_unit/language
+I01|unit|test/01_unit/core
+I02|unit|test/01_unit/compiler
+I02|system|test/02_integration/compiler
+I02|bench|doc/10_metrics/startup/cross_language_compute_compile_benchmark_2026-08-18.md
+I03|unit|test/01_unit/runtime
+I03|unit|test/01_unit/memleak
+I04|unit|test/01_unit/std
+I04|unit|test/01_unit/lib
+I05|unit|test/01_unit/sffi
+I05|unit|test/01_unit/ffi_gen
+I06|unit|test/01_unit/app
+I07|unit|test/01_unit/test_runner
+I07|unit|test/01_unit/app/test_runner_group_json_spec.spl
+I07|unit|test/01_unit/spec
+I08|unit|test/01_unit/tools
+I08|planned|IDE workbench end-to-end workflow spec
+I09|planned|forge/CI hosted-service conformance suite
+I10|unit|test/01_unit/rtl
+I10|unit|test/01_unit/riscv64_fpga
+I10|unit|test/01_unit/hardware
+I11|unit|test/01_unit/os
+I11|unit|test/01_unit/kernel_standalone
+I12|unit|test/01_unit/baremetal
+I13|unit|test/01_unit/hal
+I13|unit|test/01_unit/fs_driver
+I14|unit|test/01_unit/nvfs
+I14|unit|test/01_unit/dbfs
+I15|unit|test/01_unit/net
+I16|planned|unified IAM/secrets/supply-chain suite
+I17|unit|test/01_unit/debug
+I18|unit|test/02_integration/database
+I19|planned|streaming/warehouse/analytics platform suite
+I20|planned|durable workflow/event engine suite
+I21|planned|consensus/membership cluster substrate suite
+I22|planned|OCI-conformant container control-plane suite
+I23|unit|test/01_unit/io
+I24|unit|test/01_unit/browser
+I24|unit|test/01_unit/browser_engine
+I24|unit|test/01_unit/js
+I25|unit|test/01_unit/ui
+I26|unit|test/01_unit/gpu
+I27|planned|media codec/container/pipeline suite
+I28|planned|Office coauthoring/format-fidelity suite (see A01)
+I29|planned|universal application kernel suite (identity/money/workflow)
+I30|unit|test/01_unit/jit
+I30|planned|repo:simple_deeplearning_study training conformance
+I31|planned|BLAS/LAPACK/ODE numeric conformance suite
+I32|planned|multiphysics/FMI co-simulation suite
+I33|planned|control/navigation/robotics suite
+I34|planned|CAD/EDA/PLM suite
+I35|planned|PLC/SCADA/MES deterministic-scan suite
+I36|planned|GIS/projection/terrain suite
+I37|planned|mail/calendar/chat federation suite
+I38|planned|universal control-plane resource-graph suite
+A01|planned|repo:simple-ide Office vertical-slice workflow
+A02|planned|repo:simple-erp CRM→quote→order→ledger vertical slice
+A03|planned|repo:simple-restaurant order/fulfillment slice
+A07|planned|repo:simple-payment settlement slice
+A10|unit|test/01_unit/app
+A10|system|test/03_system/e2e
+A11|planned|ITSM/SOC/fleet management slice
+A13|planned|game/XR interactive slice
+A15|unit|test/01_unit/rtl
+A21|planned|avionics/FMS/GNC slice (board-runnable per board rule)
+A23|planned|repo:simple-os CubeSat command→telemetry slice
+A30|planned|scientific workflow slice
+A31|unit|test/01_unit/check

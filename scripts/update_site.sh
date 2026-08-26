@@ -66,10 +66,27 @@ AVG=$(awk -F'|' '/^#/||NF<9{next}{t+=$7;n++}END{printf "%.0f", t/n}' data/regist
 } > "$TMP/head.html"
 
 # ---- Registry sections -------------------------------------------------
+# First pass reads data/tests.sdn (id|kind|path) into per-id test-list
+# summaries ("2 unit · 1 planned"); second pass renders the registry, showing
+# that summary in the tests column (falling back to the row's sspec field).
 awk -F'|' '
+FNR == NR {
+  if ($0 ~ /^#/ || NF < 3) next
+  cnt[$1 "|" $2]++
+  if (!(($1) in ids)) ids[$1] = 1
+  next
+}
 /^#/ || NF < 9 { next }
 {
   id=$1; g=$2; name=$3; f=$4; u=$5; p=$6; d=$7; st=$8; sp=$9
+  if (id in ids) {
+    sp = ""
+    split("unit system bench planned", kinds, " ")
+    for (k = 1; k <= 4; k++) {
+      key = id "|" kinds[k]
+      if (key in cnt) sp = sp (sp == "" ? "" : " · ") cnt[key] " " kinds[k]
+    }
+  }
   if (!(g in seen)) { seen[g]=1; order[ng++]=g }
   n[g]++
   rows[g] = rows[g] sprintf("<tr><td class=id>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td class=done><b>%s%%</b></td><td><span class=\"st st-%s\">%s</span></td><td class=sspec>%s</td></tr>\n", id, name, f, u, p, d, st, st, sp)
@@ -80,11 +97,11 @@ END {
     g=order[i]
     printf "<section class=card><h2>%s <span class=pct>%.0f%%</span></h2>", g, gsum[g]/n[g]
     printf "<div class=bar><div style=\"width:%.0f%%\"></div></div>", gsum[g]/n[g]
-    printf "<div class=tblwrap><table><tr><th>id</th><th>capability</th><th>F</th><th>U</th><th>P</th><th>done</th><th>status</th><th>sspec</th></tr>%s</table></div></section>", rows[g]
+    printf "<div class=tblwrap><table><tr><th>id</th><th>capability</th><th>F</th><th>U</th><th>P</th><th>done</th><th>status</th><th>tests</th></tr>%s</table></div></section>", rows[g]
   }
-  printf "<footer>Generated %s by scripts/update_site.sh from data/registry.sdn. Scores are repo-audit estimates (±10pt); the test panel above (when present) is produced by SSpec runs.</footer>", strftime("%Y-%m-%d")
+  printf "<footer>Generated %s by scripts/update_site.sh from data/registry.sdn + data/tests.sdn. Scores are repo-audit estimates (±10pt); the test panel above (when present) is produced by SSpec runs. Criteria: doc/plan/completion_criteria.md.</footer>", strftime("%Y-%m-%d")
   printf "</body></html>"
-}' data/registry.sdn > "$TMP/body.html"
+}' data/tests.sdn data/registry.sdn > "$TMP/body.html"
 
 cat "$TMP/head.html" "$TMP/panel.html" "$TMP/body.html" > docs/index.html
 echo "PASS — docs/index.html regenerated from $COUNT registry rows$( [ -f data/test_results.json ] && echo ' + test panel' )"
