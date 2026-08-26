@@ -94,8 +94,17 @@ project exposes a standardized dashboard the simply site can link or aggregate.
 
 ## New features this design needs from Simple (tracked as registry rows)
 
-1. Future-impl SSpec tests (declare-now, implement-later specs that report as
-   `planned`, not `failed`).
-2. `simple test --json` status export consumable by the dashboard generator.
-3. Feature grouping + done-percentage emission from the SSpec runner itself
-   (so the dashboard is *produced by* tests, not hand audit).
+All three landed in ormastes/simple on 2026-08-26 (`db45479c256`):
+
+1. Future-impl SSpec tests — `planned(name, reason)` marker reports as
+   pending, never failed.
+2. `simple test --json` status export: totals now include
+   `total_skipped`/`total_pending`, per-file `skipped`/`pending`.
+3. Runner-emitted grouping: a `groups` array (per-directory
+   passed/failed/skipped/pending + `done_pct`) in the same JSON.
+
+The dashboard consumes it via `data/test_results.json`: when present,
+`update_site.sh` renders a "Test status" panel (totals + per-group done bars)
+above the registry; when absent the panel is skipped. The daily workflow
+refreshes the file automatically once a `simple` binary is installable in CI;
+until then it can be produced locally and committed.

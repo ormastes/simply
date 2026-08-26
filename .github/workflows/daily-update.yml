@@ -12,6 +12,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Refresh test results (when a simple binary is available)
+        # `simple test --json` emits totals + per-group done_pct consumed by
+        # the dashboard's test panel. No released binary is installable in CI
+        # yet, so this refreshes only if `simple` is on PATH; otherwise the
+        # committed data/test_results.json (if any) is used as-is.
+        run: |
+          if command -v simple >/dev/null 2>&1; then
+            simple test --json 2>/dev/null | grep '^{' | tail -1 > data/test_results.json || rm -f data/test_results.json
+          fi
       - name: Regenerate site
         run: sh scripts/update_site.sh
       - name: Commit if changed
