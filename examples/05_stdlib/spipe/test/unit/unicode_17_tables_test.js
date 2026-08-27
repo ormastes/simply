@@ -19,7 +19,12 @@ const manifestPath = join(fixture, "unicode_17_0_0_manifest.json");
 const sourceDir = resolve(root, "examples/05_stdlib/spipe/tools/unicode/ucd/17.0.0");
 const generator = resolve(root, "examples/05_stdlib/spipe/tools/unicode/generate_unicode_tables.mjs");
 const sha = (bytes) => createHash("sha256").update(bytes).digest("hex");
-const cpText = (values) => String.fromCodePoint(...values);
+const cpText = (values) => {
+  let text = "";
+  for (let start = 0; start < values.length; start += 4096)
+    text += String.fromCodePoint(...values.slice(start, start + 4096));
+  return text;
+};
 
 const rangeContains = (ranges, cp) => {
   let lo = 0, hi = ranges.length - 1;
@@ -156,6 +161,10 @@ test("table-driven NFC passes the complete UCD 17 normalization corpus", () => {
     assert.equal(nfc(c4), c4, `NFC(c4) at case ${cases}`);
     assert.equal(nfc(c5), c4, `NFC(c5) at case ${cases}`);
     assert.equal(unicodeNormalizeNfc(c1), c2, `generated NFC(c1) at case ${cases}`);
+    assert.equal(unicodeNormalizeNfc(c2), c2, `generated NFC(c2) at case ${cases}`);
+    assert.equal(unicodeNormalizeNfc(c3), c2, `generated NFC(c3) at case ${cases}`);
+    assert.equal(unicodeNormalizeNfc(c4), c4, `generated NFC(c4) at case ${cases}`);
+    assert.equal(unicodeNormalizeNfc(c5), c4, `generated NFC(c5) at case ${cases}`);
     cases++;
   }
   assert.ok(cases > 19000, `expected complete corpus, got ${cases}`);
@@ -185,4 +194,48 @@ test("generated adapter API matches the independent table harness", () => {
     assert.equal(unicodeCanonicalCombiningClass(cp), ccc(cp));
   }
   assert.throws(() => unicodeNormalizeNfc("\uD800"), /Unicode scalar/);
+});
+
+test("every Unicode scalar matches the independent table harness", { timeout: 120_000 }, () => {
+  const moduli = [1_000_000_007, 1_000_000_009], hashes = [17, 17];
+  const fold = (value) => {
+    for (let index = 0; index < hashes.length; index++)
+      hashes[index] = (hashes[index] * 65_599 + value + 1) % moduli[index];
+  };
+  for (let cp = 0; cp <= 0x10FFFF; cp++) {
+    if (cp >= 0xD800 && cp <= 0xDFFF) continue;
+    const value = cpText([cp]);
+    const expectedBits = (rangeContains(ALPHABETIC_RANGES, cp) ? 1 : 0) |
+      (rangeContains(DECIMAL_NUMBER_RANGES, cp) ? 2 : 0) |
+      (rangeContains(MARK_RANGES, cp) ? 4 : 0) |
+      ((cp === 0x5F || rangeContains(ALPHABETIC_RANGES, cp) || rangeContains(DECIMAL_NUMBER_RANGES, cp) || rangeContains(MARK_RANGES, cp)) ? 8 : 0);
+    const actualBits = (unicodeIsAlphabetic(cp) ? 1 : 0) |
+      (unicodeIsDecimalNumber(cp) ? 2 : 0) |
+      (unicodeIsMark(cp) ? 4 : 0) |
+      (unicodeIsTokenCodePoint(cp) ? 8 : 0);
+    if (actualBits !== expectedBits) assert.fail(`property mismatch at U+${cp.toString(16).toUpperCase()}`);
+    if (unicodeCanonicalCombiningClass(cp) !== ccc(cp)) assert.fail(`CCC mismatch at U+${cp.toString(16).toUpperCase()}`);
+    const normalized = unicodeNormalizeNfc(value), lowered = unicodeDefaultLowercase(value);
+    if (normalized !== nfc(value)) assert.fail(`NFC mismatch at U+${cp.toString(16).toUpperCase()}`);
+    if (lowered !== defaultLower(value)) assert.fail(`lowercase mismatch at U+${cp.toString(16).toUpperCase()}`);
+    const normalizedValues = [...normalized].map((char) => char.codePointAt(0));
+    const loweredValues = [...lowered].map((char) => char.codePointAt(0));
+    fold(cp);
+    fold(actualBits);
+    fold(unicodeCanonicalCombiningClass(cp));
+    fold(normalizedValues.length);
+    for (const normalizedCp of normalizedValues) fold(normalizedCp);
+    fold(0x110000);
+    fold(loweredValues.length);
+    for (const loweredCp of loweredValues) fold(loweredCp);
+    fold(0x110001);
+  }
+  assert.deepEqual(hashes, [566_308_199, 235_371_174]);
+});
+
+test("one-mebibyte inputs use bounded conversion and linear context passes", { timeout: 120_000 }, () => {
+  const upper = "A".repeat(1024 * 1024);
+  assert.equal(Buffer.byteLength(upper), 1024 * 1024);
+  assert.equal(unicodeNormalizeNfc(upper), upper);
+  assert.equal(unicodeDefaultLowercase(upper), "a".repeat(1024 * 1024));
 });

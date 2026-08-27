@@ -23,15 +23,15 @@
    - Feature name and description
    - Key files added/modified
    - Test results summary
-4. Commit all changes: `jj commit -m "<type>(<scope>): <description>"`
-5. Push to remote and trigger PR creation + review:
+4. Commit only files owned by the isolated feature session.
+5. Push the owned work branch and trigger protected integration review:
    ```
-   jj bookmark set main -r @-
-   jj git push --bookmark main
+   jj git push --bookmark <work-branch>
 
    # See "CLI Flags (3-Level Review wiring)" below for $TARGET / $REVIEW_LEVEL detection.
    /repo_and_pull_req push --target=$TARGET --level=$REVIEW_LEVEL
    ```
+   Never move a protected branch or release tag from an authoring session.
 6. Generate completion report at `doc/09_report/<feature>_complete_<date>.md`:
    - Feature summary (from Phase 1 intake)
    - Architecture decisions (from Phase 3)

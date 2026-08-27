@@ -6,4 +6,3 @@ pub fn add_document(doc: SearchDocument):
 // @implements REQ-SPKC-012
 fn rank_document(query: text, doc: SearchDocument):
     return doc
-

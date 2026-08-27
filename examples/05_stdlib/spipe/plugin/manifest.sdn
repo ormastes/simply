@@ -1,9 +1,24 @@
 plugin:
   name: spipe
-  version: 0.1.0
+  version: 0.2.0
   description: Reusable SPipe feature-development process module
   cli: cli/spipe.js
   mcp: mcp/server.js
   setup:
     unix: scripts/setup-spipe-links.shs
     windows: scripts/setup-spipe-links.ps1
+  schemas:
+    vcs_policy: spipe-vcs/3
+    session: spipe-session/1
+    release: spipe-release/1
+    candidate: spipe-candidate/1
+  capabilities:
+    isolated_sessions: true
+    reviewed_beta_backports: true
+    immutable_release_candidates: true
+    promote_without_rebuild: true
+    operational_release_planning: true
+    main_fix_discovery_planning: true
+    release_first_forward_port_validation: true
+    scoped_self_review_guidance: true
+    external_release_mutation: false

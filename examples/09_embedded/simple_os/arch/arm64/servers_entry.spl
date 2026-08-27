@@ -8,6 +8,7 @@ use os.kernel.boot.mmio.{mmio_disable_test_mode}
 use os.services.vfs.arm_fs_exec_vfs.{arm_fs_exec_vfs_boot_init, arm_fs_exec_read_file_bytes}
 use os.services.vfs.vfs_boot_state.{g_mount_table}
 use os.kernel.loader.arm64_authenticated_media_fixture.{arm64_authenticated_media_execute_server_v1}
+use os.kernel.loader.authenticated_fs_exec_submission_service_v1.{authenticated_fs_exec_user_install_canonical_vfs_owner_v1}
 use os.kernel.scheduler.scheduler_types.{Scheduler}
 use os.services.netstack.netstack_init.{net_boot_init_arm64_mmio}
 use os.kernel.arch.arm64.cpu.{wfe}
@@ -56,6 +57,8 @@ fn stop_after_injected_power_cut(code: i64):
         wfe()
 
 fn spl_start():
+    # DBD is reachable only inside /SERVERS.ELF after its current TCB consumes
+    # ABI 116; this kernel entry must never bind or advertise DBD directly.
     mmio_disable_test_mode()
     val crash_code = simpleos_server_crash_seam_code()
     fat32_replace_fault_injection_clear()
@@ -69,6 +72,10 @@ fn spl_start():
         if fat32_replace_fault_injection_triggered():
             stop_after_injected_power_cut(crash_code)
         serial_println("[arm64-servers] filesystem mount=fail")
+        rt_exit(1)
+        return
+    if not authenticated_fs_exec_user_install_canonical_vfs_owner_v1():
+        serial_println("[arm64-servers] filesystem-exec VFS owner install=fail")
         rt_exit(1)
         return
 

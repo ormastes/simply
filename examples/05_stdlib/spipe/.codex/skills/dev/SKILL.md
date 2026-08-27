@@ -19,3 +19,9 @@ refactor, verification, and ship handoff:
 ## Dispatch
 
 Follow the current SPipe dev entrypoint in `.codex/skills/sp_dev/SKILL.md`.
+
+Preserve its protected-PR handoff: GitHub forbids author `APPROVED` reviews;
+`SPipe Self Review Admission` is a required status check, not provider or
+independent approval. Log the exact rejection/invalidation reason and follow
+its scoped remediation without reusing stale status or weakening release
+authority.

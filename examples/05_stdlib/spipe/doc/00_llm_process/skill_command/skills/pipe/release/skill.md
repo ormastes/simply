@@ -1,151 +1,29 @@
-<!-- llm-process-gen: managed source=pipe_release_skill source_sha256=8101a3f942cf7248127ec5931807a5fd55425fb7bfb11ea1aedfaa70a7a6551b content_sha256=861814efcb71cb4d3344e56009aaefefe93af4452886d06d8ca671c9faff85da -->
-# Release Skill
+<!-- generated-from: doc/00_llm_process/skill_command/command/release.md -->
+# Protected Software Release
 
-Perform a version bump and release of the Simple Language compiler.
+Release contract: isolated-session; reviewed-beta-backport; immutable-candidate; promote-without-rebuild; protected-ref-guard; non-destructive-release-identity.
 
-## Usage
+Use the canonical semantic source at `doc/00_llm_process/skill_command/command/release.md`.
 
-```
-/release              # patch bump (default): 0.9.2 → 0.9.3
-/release patch        # same as above
-/release third        # same as above
-/release minor        # minor bump: 0.9.2 → 0.10.0
-/release second       # same as above
-/release major        # major bump: 0.9.2 → 1.0.0
-/release first        # same as above
-/release 1.0.0        # set exact version
-```
+Start one isolated release branch/worktree, read `release/version.sdn`, and require verified evidence. Beta maintenance accepts only explicit reviewed bug-fix backports with exact provenance and renewed post-application evidence. Create an immutable candidate, build once, and promote exact admitted artifacts through one signed annotated exact tag after approval.
 
-## Procedure
+Never update protected refs directly, rebuild during promotion, select fixes automatically, push all tags, delete/move/reuse a published tag, or use fallback artifacts. Rollback redeploys a prior admitted release; corrections get a new version.
 
-Given argument: `$ARGUMENTS`
+## Normalized contract clauses
 
-Prerequisite: `/verify` must show `STATUS: PASS`. SPipe/manual evidence,
-lower-model sidecar review, and workflow/tooling/evidence/spec/verification
-contract docs must already be complete from verify. Release must not create or
-update SPipe specs, repair generated-manual quality, accept sidecar-review gaps,
-or repair stale `doc/07_guide`, `doc/06_spec`, `.codex/skills`,
-`.agents/skills`, `.claude/skills`, `.claude/agents/spipe`, or
-`.gemini/commands` instructions. Before proceeding, confirm
-`find doc/06_spec -name '*_spec.spl' | wc -l` returns `0`.
-
-### Step 1 — Determine new version
-
-1. Read current version from `simple.sdn` (field `project.version`, line 6)
-2. Parse argument:
-   - Empty, `patch`, or `third` → increment patch (Z+1)
-   - `minor` or `second` → increment minor (Y+1), reset patch to 0
-   - `major` or `first` → increment major (X+1), reset minor and patch to 0
-   - Pattern `X.Y.Z` (digits.digits.digits) → use as-is
-   - Anything else → error, show usage
-3. Print: `Version bump: {old} → {new}`
-
-### Step 2 — Update all version locations
-
-Update these 4 files with the new version:
-
-| File | What to change |
-|------|---------------|
-| `simple.sdn` | `version: X.Y.Z` (line 6) |
-| `VERSION` | Entire file content: `X.Y.Z\n` |
-| `src/app/cli/main.spl` | Hardcoded fallback string `"X.Y.Z"` in `get_version()` |
-| `src/app/cli/bootstrap_main.spl` | Hardcoded string `"X.Y.Z"` in `bootstrap_version()` |
-
-### Step 3 — Update CHANGELOG
-
-Insert a new section at the top of `CHANGELOG.md` (after the `# Changelog` header and description line):
-
-```markdown
-## [X.Y.Z] - YYYY-MM-DD
-
-### Added
-
-### Fixed
-
-### Changed
-```
-
-Use today's date. Keep existing entries below.
-
-### Step 4 — Commit
-
-```bash
-jj commit -m "chore: release vX.Y.Z"
-```
-
-### Step 5 — Tag
-
-```bash
-git tag -a vX.Y.Z -m "Release vX.Y.Z"
-```
-
-### Step 6 — Ask before push
-
-Show the user what will happen and ask for confirmation before running:
-
-```bash
-jj bookmark set main -r @- && jj git push --bookmark main
-git push origin vX.Y.Z
-```
-
-Do NOT push without explicit user approval.
-
----
-
-## Release Types
-
-| Type | Format | Example |
-|------|--------|---------|
-| Stable | `vX.Y.Z` | `v1.0.0` |
-| RC | `vX.Y.Z-rc.N` | `v1.0.0-rc.1` |
-| Beta | `vX.Y.Z-beta.N` | `v1.0.0-beta.1` |
-| Alpha | `vX.Y.Z-alpha.N` | `v1.0.0-alpha.1` |
-
-## Pre-Release Checklist
-
-- [ ] `bin/simple test` passing
-- [ ] `bin/simple lint <changed .spl files>` clean
-- [ ] `bin/simple todo-scan` — no critical TODOs
-- [ ] Local bootstrap build works (3-stage)
-- [ ] No orphan jj commits (`jj log` shows clean history)
-
-## GitHub Actions Release Pipeline
-
-Triggered by: git tag `v*.*.*` push or `workflow_dispatch` (manual).
-
-| Job | What | Platforms |
-|-----|------|-----------|
-| `check-version` | Detect version from `simple.sdn` | ubuntu |
-| `llvm-cross` | LLVM cross-compilation prep | reusable workflow |
-| `build-bootstrap` | Build per-platform packages | 13 platforms |
-| `build-full` | Full source+binary package | ubuntu |
-| `create-release` | GitHub Release with assets | ubuntu |
-| `publish-ghcr` | Publish to GHCR via ORAS | ubuntu |
-
-## Post-Release
-
-```bash
-# Monitor
-gh run list --workflow=release.yml --limit 3
-gh run watch <run-id>
-# Verify
-gh release view vX.Y.Z
-```
-
-## Apply Release Binary Locally
-
-```bash
-gh release download vX.Y.Z --pattern "*-darwin-arm64.spk" --dir /tmp
-cd /tmp && tar xzf simple-bootstrap-*-darwin-arm64.spk
-cp simple-bootstrap-*/bin/simple ~/simple/bin/release/aarch64-apple-darwin-macho/simple
-chmod +x ~/simple/bin/release/aarch64-apple-darwin-macho/simple
-bin/simple --version
-```
-
-## Rollback
-
-```bash
-gh release delete vX.Y.Z --yes
-git tag -d vX.Y.Z
-git push origin :refs/tags/vX.Y.Z
-```
+- One isolated release session owns one work branch and one non-main worktree.
+- `release/version.sdn` is the sole version authority and all other version locations are checked projections.
+- Beta maintenance admits only caller-selected reviewed bug-fix commits with exact provenance and renewed result-revision evidence.
+- Bootstrap periodically performs read-only main-to-release convergence discovery and never selects or cherry-picks fixes automatically.
+- An approved release-first emergency fix requires an exact reviewed forward-port receipt to main.
+- Main remains the independent development trunk and never tracks or becomes a release branch.
+- Protected refs change only through exact-revision compare-and-swap integration authority.
+- Each changed source policy support or toolchain identity creates a new immutable candidate attempt.
+- Build and qualify the exact candidate once and reject required failures or fallback artifacts.
+- Promotion reuses admitted artifacts without rebuilding and pushes exactly one signed annotated tag.
+- Release admission requires focused failures to reach zero followed by one clean whole-suite confirmation.
+- Withdrawal preserves published tags assets and history and corrections use a new version.
+- Protected PR self review uses a required status check because GitHub forbids an author APPROVED review and never claims provider approval.
+- Ordinary code and text are eligible by default absent an operator deny or constrain record with code, text, file, directory_files, and directory_recursive scopes.
+- Push, retarget, base, diff, ruleset, policy, or expiry invalidation requires a fresh exact-head review and a new self-review admission dispatch.
+- Rejection remediation follows the exact reason without broadening protected integration, candidate, release, signing, or publication authority.

@@ -992,7 +992,7 @@ fn _nand_ram_selftest() -> i32:
     _emit_nand_stage(8)
     0
 
-fn nvme_fw_rv32_selftest() -> i64:
+pub fn nvme_fw_rv32_selftest() -> i64:
     _emit_begin()
     val raw_fail = nvme_fw_rv32_logic_selftest()
     val nand_ram_fail = _nand_ram_selftest()
@@ -1005,10 +1005,6 @@ fn nvme_fw_rv32_selftest() -> i64:
         _emit_fail_mask(fail)
         _emit_fail()
     fail
-
-@export("C", name: "rt_rv32_boot_optional_nvme_fw_selftest")
-fn rt_rv32_boot_optional_nvme_fw_selftest() -> i64:
-    nvme_fw_rv32_selftest()
 
 fn main() -> i64:
     nvme_fw_rv32_selftest()

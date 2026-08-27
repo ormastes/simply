@@ -79,7 +79,7 @@ suite is green (gate
 Scope note (explicit): "full NVMe SSD fw" here = the host-runnable simulation (run-green).
 P9 — bare-metal **rv32** scalar firmware floor: `fw_rv32/entry.spl` is written as an array-free scalar
 re-expression of the RAIN reconstruct, SECDED ECC floor, fixed scheduler, fixed power/thermal model, fixed map cache, fixed band allocator, fixed journal ring, fixed HIL command/queue, fixed queue-phase handling, fixed io-opcode-read-zero-trim-flush handling, fixed admin/format/fw-log handling, fixed reactor handling, fixed policy/target handling, fixed DRAM/durability handling, fixed wear/scrub handling, fixed media-retire handling, fixed power-cycle handling, fixed backpressure/abort handling, fixed feature-guard handling, and fixed namespace-guard handling, `bin/simple check`-clean, host-verified, and wired through
-the rv32 boot hook (`rt_rv32_boot_optional_nvme_fw_selftest`). As of 2026-07-25,
+the stable Pure-Simple rv32 HAL provider. As of 2026-07-25,
 the direct rv32 QEMU smoke prints `RV32 NVME FW BEGIN` and
 `ALL RV32 NVME FW CHECKS PASS`; internal rv32 counters use bounded no-alloc caps
 while host simulation owns full-width counter stress. The full 22-module no-alloc firmware

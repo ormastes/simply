@@ -15,4 +15,9 @@ Pipeline:
 8. ship: VCS sync or release handoff when requested
 
 Follow `.claude/skills/sstack.md` as the canonical procedure.
+
+Preserve SPipe protected-PR guidance: GitHub forbids author APPROVED reviews;
+SPipe Self Review Admission is a required status check, not provider or
+independent approval. Log exact rejection/invalidation reasons and follow
+scoped remediation without reusing stale status or weakening release authority.
 """

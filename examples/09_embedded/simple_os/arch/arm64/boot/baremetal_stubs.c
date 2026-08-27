@@ -1347,6 +1347,7 @@ extern int64_t spl_handle_file_read(uint64_t, uint64_t, uint64_t, uint64_t, uint
 extern int64_t spl_handle_file_write(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) __attribute__((weak));
 extern int64_t spl_handle_file_close(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) __attribute__((weak));
 extern int64_t spl_handle_file_sync(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) __attribute__((weak));
+extern int64_t spl_handle_server_startup_evidence_consume_v1(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) __attribute__((weak));
 extern int64_t spl_shim_file_capability_check(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) __attribute__((weak));
 extern int64_t spl_arm64_net_socket_direct(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) __attribute__((weak));
 extern int64_t spl_arm64_net_bind_direct(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) __attribute__((weak));
@@ -1439,6 +1440,10 @@ int64_t userlib__syscall_raw__syscall(uint64_t id, uint64_t a0, uint64_t a1,
         case 74: return arm64_dispatch_net_shim(74, spl_arm64_net_accept_direct, spl_handle_net_accept, a0, a1, a2, a3, a4);
         case 75: return arm64_dispatch_net_shim(75, spl_arm64_net_send_direct, spl_handle_net_send_to, a0, a1, a2, a3, a4);
         case 76: return arm64_dispatch_net_shim(76, spl_arm64_net_recv_direct, spl_handle_net_recv_from, a0, a1, a2, a3, a4);
+        case 116:
+            return arm64_dispatch_optional_shim(
+                spl_handle_server_startup_evidence_consume_v1,
+                0, 0, 0, 0, 0);
         default:
             return -38; /* ENOSYS */
     }

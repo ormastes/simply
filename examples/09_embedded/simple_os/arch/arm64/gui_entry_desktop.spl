@@ -14,7 +14,8 @@ use os.kernel.arch.arm64.console.{uart_data_ready, uart_init, uart_read_char, ua
 use os.gui.input_event.{WmAction}
 use os.gui.shortcut.{uart_char_to_action}
 use os.kernel.arch.arm64.virtio_input.{
-    arm64_virtio_input_init
+    arm64_virtio_input_init,
+    arm64_virtio_input_poll
 }
 use os.kernel.arch.arm64.simd_receipt.{arm64_engine2d_simd_scalar_parity}
 use os.drivers.input.ps2_keyboard.{Key, KeyEvent}
@@ -44,20 +45,35 @@ use os.compositor.engine2d_baremetal_core.{
     baremetal_simd_fill_tail_pixels
 }
 use os.compositor.engine2d_wm_frame_executor.{Engine2dWmFrameExecutor}
+use os.compositor.baremetal_wm_present_owner.{
+    WM_PRESENT_ARCH_AARCH64,
+    BaremetalWmScanoutIdentityV1,
+    BaremetalWmPresentOwnerV1
+}
 use os.compositor.simpleos_wm_theme_bootstrap.{install_generated_simpleos_wm_theme, apply_simpleos_css_theme_override}
 use os.desktop.shell.{DesktopShell}
 use os.desktop.font_bootstrap.{simpleos_desktop_register_selected_fonts_from_vfs}
 use os.services.vfs.vfs_init.{vfs_boot_init_virtio_fat32, g_vfs_read_file_text}
+use os.services.launcher.launcher_path_helpers.{launcher_path_exists}
+use os.services.wm.arm64_production_wm_producer.{Arm64ProductionWmProducer}
 use os.kernel.ipc.host_gpu_ivshmem_map.{
     map_qemu_host_gpu_ivshmem_bar2,
     qemu_host_gpu_ivshmem_window_base
 }
-use os.kernel.boot.monotonic_hardware.{boot_monotonic_now_us, boot_monotonic_prepare}
+use os.kernel.boot.monotonic_hardware.{
+    boot_monotonic_deadline_us,
+    boot_monotonic_now_us,
+    boot_monotonic_prepare
+}
+use os.userlib.process.{yield_}
 use common.gpu.simpleos_host_gpu_protocol.{
     SIMPLEOS_HOST_GPU_BACKEND_METAL,
     SIMPLEOS_HOST_GPU_BACKEND_VULKAN,
     SIMPLEOS_HOST_GPU_ISA_AARCH64
 }
+
+val ARM64_WM_BOOT_BINARY_PATH: text = "/sys/apps/browser_demo.smf"
+val ARM64_WM_PUBLICATION_BUDGET_US: i64 = 2000000
 
 fn arm64_wm_action_from_virtio_key(event: KeyEvent) -> WmAction:
     """Map shared evdev-translated key presses onto existing WM actions.
@@ -140,12 +156,13 @@ pub fn gui_entry_desktop_start(file_backed_ram_tail_base: u64, preferred_backend
         return
 
     val ramfb_scratch = (framebuffer_address + framebuffer_size).to_u64()
-    if not arm64_ramfb_setup(
+    val ramfb_configured = arm64_ramfb_setup(
         framebuffer_address.to_u64(),
         ARM64_RAMFB_WIDTH,
         ARM64_RAMFB_HEIGHT,
         ramfb_scratch
-    ):
+    )
+    if not ramfb_configured:
         uart_writeln("[desktop-gui-arm64] ramfb unavailable; rendering remains local")
 
     var framebuffer = FramebufferDriver.from_scanout_raw(
@@ -155,6 +172,17 @@ pub fn gui_entry_desktop_start(file_backed_ram_tail_base: u64, preferred_backend
         (screen_width * 4).to_u32(),
         32u32
     )
+    # RAMFB is a singleton boot output.  The scalar id is an opaque adapter
+    # handle, never its framebuffer address or dereference authority.
+    val wm_scanout_identity = BaremetalWmScanoutIdentityV1(
+        architecture: WM_PRESENT_ARCH_AARCH64,
+        scanout_id: 1u64,
+        width: ARM64_RAMFB_WIDTH,
+        height: ARM64_RAMFB_HEIGHT,
+        stride: ARM64_RAMFB_WIDTH * 4u32,
+        bpp: 32u32
+    )
+    var wm_present_owner = BaremetalWmPresentOwnerV1.create(wm_scanout_identity)
     val vfs_mounted = vfs_boot_init_virtio_fat32()
     val theme_css = if vfs_mounted:
         g_vfs_read_file_text("/THEME.CSS")
@@ -172,9 +200,11 @@ pub fn gui_entry_desktop_start(file_backed_ram_tail_base: u64, preferred_backend
         uart_writeln("[desktop-gui-arm64] font unavailable fallback=bitmap")
     var engine = create_fb_engine_sized(framebuffer, screen_width, screen_height)
     val compositor_backend = Engine2dCompositorBackend.create(engine)
-    var input_backend = Arm64VirtioInputBackend.create(
+    var input_backend = Arm64VirtioInputBackend.create_with_poller(
         screen_width.to_i64(),
-        screen_height.to_i64()
+        screen_height.to_i64(),
+        arm64_virtio_input_poll,
+        false
     )
     # The C MMIO owner has already discovered both producer devices before
     # this backend is handed to the canonical compositor ingress.  A failed
@@ -188,25 +218,16 @@ pub fn gui_entry_desktop_start(file_backed_ram_tail_base: u64, preferred_backend
         screen_height
     )
 
-    val terminal_id = compositor.compositor_materialize_process_surface_scalar(
-        "Terminal", 60, 60, 420, 260, 0, "terminal",
-        "<pre>simple$ uname -m\naarch64\nsimple$ simple check\nAll checks passed\nsimple$</pre>"
-    )
-    val editor_id = compositor.compositor_materialize_process_surface_scalar(
-        "Editor", 300, 160, 480, 300, 0, "editor",
-        "<pre>fn main():\n    val x = 42\n    print x\n\n# Comment\nfn square(n):\n    n * n</pre>"
-    )
-    val finder_id = compositor.compositor_materialize_process_surface_scalar(
-        "Finder", 540, 300, 360, 240, 0, "finder",
-        "<h2>Favorites</h2><p>Desktop</p><p>Documents</p><p>Downloads</p><h3>Project</h3><p>Photos</p>"
-    )
-    if terminal_id <= 0 or editor_id <= 0 or finder_id <= 0:
-        uart_writeln("[desktop-gui-arm64] fatal reason=surface-materialization")
-        return
-    compositor.focus_window(editor_id.to_i32())
-
     var shell = DesktopShell.new(compositor)
     shell.init_baremetal()
+
+    if not vfs_mounted or not launcher_path_exists(ARM64_WM_BOOT_BINARY_PATH):
+        uart_writeln("[desktop-gui-arm64] fatal reason=wm-filesystem-app-unavailable path={ARM64_WM_BOOT_BINARY_PATH}")
+        return
+    var wm_producer = Arm64ProductionWmProducer.launch(ARM64_WM_BOOT_BINARY_PATH, [])
+    if wm_producer.process_id == 0u64 or wm_producer.verdict().failed:
+        uart_writeln("[desktop-gui-arm64] fatal reason=wm-process-launch")
+        return
 
     boot_monotonic_prepare()
     val mapped_slot = map_qemu_host_gpu_ivshmem_bar2()
@@ -227,17 +248,62 @@ pub fn gui_entry_desktop_start(file_backed_ram_tail_base: u64, preferred_backend
             backend_required
         )
 
-    val first_revision = shell.render_baremetal_first_frame(wm_frame_executor)
-    if first_revision <= 0:
-        uart_writeln("[desktop-gui-arm64] fatal reason=first-frame")
+    val publication_started_us = boot_monotonic_now_us()
+    val publication_deadline_us = boot_monotonic_deadline_us(
+        publication_started_us,
+        ARM64_WM_PUBLICATION_BUDGET_US
+    )
+    if publication_deadline_us <= 0:
+        uart_writeln("[desktop-gui-arm64] fatal reason=wm-publication-deadline")
         return
+    var publication_attempts: i64 = 0
+    var publication_now_us = publication_started_us
+    yield_()
+    val _initial_publication = wm_producer.pump_one_published_action(shell)
+    publication_attempts = publication_attempts + 1
+    var published_snapshot = wm_producer.snapshot_published_scene(shell)
+    publication_now_us = boot_monotonic_now_us()
+    while not published_snapshot.ready_to_present and not wm_producer.verdict().failed and publication_now_us > 0 and publication_now_us <= publication_deadline_us:
+        yield_()
+        val _pumped = wm_producer.pump_one_published_action(shell)
+        publication_attempts = publication_attempts + 1
+        published_snapshot = wm_producer.snapshot_published_scene(shell)
+        publication_now_us = boot_monotonic_now_us()
+    if (wm_producer.process_id == 0u64 or
+        published_snapshot.owned_scene.process_id != wm_producer.process_id or
+        published_snapshot.owned_scene.process_surface_count <= 0 or
+        not published_snapshot.ready_to_present):
+        uart_writeln("[desktop-gui-arm64] fatal reason=wm-process-surface-publication pid={wm_producer.process_id} attempts={publication_attempts} detail={published_snapshot.reason}")
+        return
+    var animation_surface_id: i32 = 0
+    for surface in shell.compositor.surfaces:
+        if animation_surface_id == 0 and surface.process_id > 0 and surface.process_id.to_u64() == wm_producer.process_id:
+            animation_surface_id = surface.id
+    if animation_surface_id <= 0:
+        uart_writeln("[desktop-gui-arm64] fatal reason=wm-process-surface-id pid={wm_producer.process_id}")
+        return
+    val wm_result = wm_producer.present_snapshot(wm_frame_executor, published_snapshot)
+    if wm_result.failed or not wm_result.ready or wm_result.process_id == 0u64:
+        uart_writeln("[desktop-gui-arm64] fatal reason=first-frame-owner-receipt pid={wm_result.process_id} detail={wm_result.reason}")
+        return
+    val first_revision = wm_result.first_present_revision
     var ramfb_frame_id: i64 = 1
-    if not arm64_emit_ramfb_visual_commit(
+    val first_platform_presented = arm64_emit_ramfb_visual_commit(
         0,
         framebuffer_address.to_u64(),
         first_revision,
         ramfb_frame_id
-    ):
+    )
+    val first_present_receipt = wm_present_owner.commit_present(
+        wm_scanout_identity,
+        first_revision.to_u64(),
+        ramfb_frame_id.to_u64(),
+        # RAMFB is configured once for this boot. Output generation is the
+        # scanout lifecycle epoch, not the independently advancing frame id.
+        1u64,
+        ramfb_configured and first_platform_presented
+    )
+    if not first_present_receipt.accepted:
         uart_writeln("[desktop-gui-arm64] fatal reason=first-frame-ramfb-receipt")
         return
     val simd_enabled = baremetal_simd_fill_enabled()
@@ -265,10 +331,30 @@ pub fn gui_entry_desktop_start(file_backed_ram_tail_base: u64, preferred_backend
     var observed_pointer_sequence: i64 = 0
     var showcase_animation_tick: i64 = 0
     var showcase_animation_next_us = boot_monotonic_now_us() + 16667
+    var last_published_scene_revision = published_snapshot.owned_scene.scene_revision
+    var last_published_taskbar_revision = published_snapshot.render_inputs.taskbar_revision
+    var publication_progress_count: i64 = publication_attempts
     while running:
+        val _publication_progress = wm_producer.pump_one_published_action(shell)
+        if _publication_progress:
+            publication_progress_count = publication_progress_count + 1
+        val live_snapshot = wm_producer.snapshot_published_scene(shell)
+        val live_verdict = wm_producer.verdict()
+        if (live_verdict.failed or
+            live_verdict.process_id == 0u64 or
+            live_snapshot.owned_scene.process_id != live_verdict.process_id or
+            live_snapshot.owned_scene.process_surface_count <= 0 or
+            not live_snapshot.ready_to_present):
+            uart_writeln("[desktop-gui-arm64] fatal reason=wm-process-liveness pid={live_verdict.process_id} detail={live_snapshot.reason}")
+            running = false
+            continue
+        val publication_changed = (
+            live_snapshot.owned_scene.scene_revision != last_published_scene_revision or
+            live_snapshot.render_inputs.taskbar_revision != last_published_taskbar_revision
+        )
         var input_compositor = shell.compositor
         var action = WmAction.None
-        var changed = false
+        var changed = publication_changed
         var pointer_event_pending = false
         var pointer_sequence: i64 = 0
         var pointer_x: i32 = 0
@@ -405,7 +491,7 @@ pub fn gui_entry_desktop_start(file_backed_ram_tail_base: u64, preferred_backend
         if backend_required and preferred_backend_code == SIMPLEOS_HOST_GPU_BACKEND_VULKAN and showcase_animation_tick < 20 and not pointer_event_pending and not key_event_pending and animation_now_us >= showcase_animation_next_us:
             showcase_animation_tick = showcase_animation_tick + 1
             showcase_animation_next_us = animation_now_us + 16667
-            input_compositor.move_window(editor_id.to_i32(), (300 + showcase_animation_tick).to_i32(), 160)
+            input_compositor.move_window(animation_surface_id, (300 + showcase_animation_tick).to_i32(), 160)
             changed = true
             animation_event_pending = true
 
@@ -431,31 +517,68 @@ pub fn gui_entry_desktop_start(file_backed_ram_tail_base: u64, preferred_backend
             else:
                 uart_writeln("[backend2d-event-receipt] backend=simpleos-qemu-arm64 event_backend=pl011-uart event_count={event_count}")
             var rendered_revision: i64 = 0
+            var rendered_scene_revision: i64 = 0
+            var rendered_taskbar_revision: i64 = 0
             if pointer_event_pending and key_event_pending:
                 uart_writeln("[desktop-gui-arm64] fatal reason=multi-input-frame-attribution")
                 running = false
             else:
-                rendered_revision = shell.render_baremetal_frame(wm_frame_executor)
+                # Refresh after committing the local compositor copy.  Using
+                # live_snapshot here would overwrite an input mutation with a
+                # scene captured before that mutation.
+                val frame_snapshot = wm_producer.snapshot_published_scene(shell)
+                if (not frame_snapshot.ready_to_present or
+                    frame_snapshot.owned_scene.process_id != wm_producer.process_id or
+                    frame_snapshot.owned_scene.process_surface_count <= 0):
+                    uart_writeln("[desktop-gui-arm64] fatal reason=changed-frame-owner-snapshot detail={frame_snapshot.reason}")
+                    running = false
+                else:
+                    rendered_revision = wm_frame_executor.render(
+                        frame_snapshot.owned_scene.scene,
+                        frame_snapshot.render_inputs.taskbar,
+                        frame_snapshot.render_inputs.content_frames,
+                        frame_snapshot.owned_scene.scene_revision,
+                        frame_snapshot.render_inputs.taskbar_revision,
+                        frame_snapshot.render_inputs.clock_label
+                    )
+                    if rendered_revision > 0:
+                        rendered_scene_revision = frame_snapshot.owned_scene.scene_revision
+                        rendered_taskbar_revision = frame_snapshot.render_inputs.taskbar_revision
             if rendered_revision > 0:
                 ramfb_frame_id = ramfb_frame_id + 1
                 val frame_input_sequence = if key_event_pending:
                     key_sequence
                 else:
                     pointer_sequence
-                if not arm64_emit_ramfb_visual_commit(
+                val platform_presented = arm64_emit_ramfb_visual_commit(
                     frame_input_sequence,
                     framebuffer_address.to_u64(),
                     rendered_revision,
                     ramfb_frame_id
-                ):
+                )
+                val present_receipt = wm_present_owner.commit_present(
+                    wm_scanout_identity,
+                    rendered_revision.to_u64(),
+                    ramfb_frame_id.to_u64(),
+                    1u64,
+                    ramfb_configured and platform_presented
+                )
+                if not present_receipt.accepted:
                     uart_writeln("[desktop-gui-arm64] fatal reason=changed-frame-ramfb-receipt")
                     running = false
+                    # Never publish input/frame correlation for a platform or
+                    # owner rejection from this iteration.
+                    continue
+                last_published_scene_revision = rendered_scene_revision
+                last_published_taskbar_revision = rendered_taskbar_revision
+                if publication_changed and not pointer_event_pending and not key_event_pending and not animation_event_pending:
+                    uart_writeln("[wm-publication-frame] progress_count={publication_progress_count} scene_revision={last_published_scene_revision} taskbar_revision={last_published_taskbar_revision} frame_id={ramfb_frame_id}")
             if rendered_revision > 0 and pointer_event_pending:
                 uart_writeln("[wm-pointer-frame] input_seq={pointer_sequence} rendered_revision={rendered_revision} frame_id={ramfb_frame_id}")
             if rendered_revision > 0 and key_event_pending:
                 uart_writeln("[wm-key-frame] input_seq={key_sequence} rendered_revision={rendered_revision} frame_id={ramfb_frame_id}")
             if rendered_revision > 0 and animation_event_pending:
-                uart_writeln("[showcase-animation-frame] source=guest-monotonic tick={showcase_animation_tick} scene_revision={rendered_revision} frame_id={ramfb_frame_id} editor_x={300 + showcase_animation_tick}")
+                uart_writeln("[showcase-animation-frame] source=guest-monotonic tick={showcase_animation_tick} scene_revision={rendered_revision} frame_id={ramfb_frame_id} window_x={300 + showcase_animation_tick}")
             if rendered_revision <= 0:
                 uart_writeln("[desktop-gui-arm64] fatal reason=changed-frame")
                 running = false

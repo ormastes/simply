@@ -7,6 +7,7 @@ extern fn rt_riscv_nvfs_probe() -> i64
 
 use os.services.vfs.vfs_boot_init.{vfs_boot_init_riscv64_virtio_fat32, g_mount_table}
 use os.kernel.loader.riscv64_authenticated_media_fixture.{riscv64_authenticated_media_execute_server_v1}
+use os.kernel.loader.authenticated_fs_exec_submission_service_v1.{authenticated_fs_exec_user_install_canonical_vfs_owner_v1}
 use os.kernel.scheduler.scheduler_types.{Scheduler}
 
 fn reject(reason: text):
@@ -15,9 +16,14 @@ fn reject(reason: text):
     rt_qemu_exit_failure()
 
 fn spl_start():
+    # DBD is reachable only inside /SERVERS.ELF after its current TCB consumes
+    # ABI 116; this kernel entry must never bind or advertise DBD directly.
     serial_println("=== SimpleOS RV64 filesystem servers boot ===")
     if rt_riscv_nvfs_probe() != 1 or not vfs_boot_init_riscv64_virtio_fat32():
         reject("filesystem mount=fail")
+        return
+    if not authenticated_fs_exec_user_install_canonical_vfs_owner_v1():
+        reject("filesystem-exec VFS owner install=fail")
         return
     serial_println("[riscv64-servers] executable read=ok path=/SERVERS.ELF")
     val rc = riscv64_authenticated_media_execute_server_v1(Scheduler.new(), g_mount_table)

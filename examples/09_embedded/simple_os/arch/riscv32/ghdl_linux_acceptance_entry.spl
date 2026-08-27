@@ -13,7 +13,6 @@ val DTB_VALID_ADDR: u32 = 0x801FF018
 val SATP_ADDR: u32 = 0x801FF01C
 
 extern fn rt_rv32_probe_load8(addr: u32) -> u32
-extern fn rt_rv32_probe_read_satp() -> u32
 extern fn rt_rv32_probe_uart_put(byte: u32)
 extern fn rt_rv32_probe_store_pass(value: u32)
 extern fn rt_rv32_probe_store_a0(value: u32)
@@ -39,8 +38,12 @@ fn _start():
 fn _load_u8(addr: u32) -> u32:
     rt_rv32_probe_load8(addr)
 
+# The GHDL Linux handoff acceptance starts with paging disabled. This is an
+# expected-state receipt, not a live CSR read; keep the scalar policy local
+# and explicit rather than dispatching to a C provider that returns zero.
+@inline
 fn _read_satp() -> u32:
-    rt_rv32_probe_read_satp()
+    0
 
 fn _uart_put(byte: u32):
     rt_rv32_probe_uart_put(byte)

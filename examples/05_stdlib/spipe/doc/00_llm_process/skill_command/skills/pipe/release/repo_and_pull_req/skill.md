@@ -1,91 +1,27 @@
-<!-- llm-process-gen: managed source=pipe_release_repo_and_pull_req_skill source_sha256=b0d8ff77e62a1f146b0cb5f61c09a80186698ae2321053ec11daaaa8f3ce8c45 content_sha256=b0d8ff77e62a1f146b0cb5f61c09a80186698ae2321053ec11daaaa8f3ce8c45 -->
----
-name: repo_and_pull_req
-description: GitHub and Jira/Confluence integration — setup, push, wiki, and autonomous PR review. Routes to sub-skills in git/ and jira/ directories.
----
+<!-- generated-from: doc/00_llm_process/skill_command/command/release.md -->
+# Protected Software Release
 
-# Repo & Pull Request Skill — Dispatcher
+Use the canonical semantic source at `doc/00_llm_process/skill_command/command/release.md`.
 
-Unified skill for GitHub and Jira/Confluence operations: setup, push, wiki, and PR review.
+Start one isolated release branch/worktree, read `release/version.sdn`, and require verified evidence. Beta maintenance accepts only explicit reviewed bug-fix backports with exact provenance and renewed post-application evidence. Create an immutable candidate, build once, and promote exact admitted artifacts through one signed annotated exact tag after approval.
 
-## Usage
+Never update protected refs directly, rebuild during promotion, select fixes automatically, push all tags, delete/move/reuse a published tag, or use fallback artifacts. Rollback redeploys a prior admitted release; corrections get a new version.
 
-```
-/repo_and_pull_req <command> [platform] [args]
-```
+## Normalized contract clauses
 
-## Commands
-
-| Command | Example | Description |
-|---------|---------|-------------|
-| `setup gh` | `/repo_and_pull_req setup gh` | Install and configure gh CLI |
-| `setup jira` | `/repo_and_pull_req setup jira` | Install and configure jira-cli + Atlassian account |
-| `push` | `/repo_and_pull_req push` | Push code as PR + create Jira issue |
-| `wiki gh` | `/repo_and_pull_req wiki gh` | Create/update GitHub wiki page |
-| `wiki jira` | `/repo_and_pull_req wiki jira` | Create/update Confluence page |
-| `wiki` | `/repo_and_pull_req wiki` | Update both wikis |
-| `review <pr#>` | `/repo_and_pull_req review 42` | Single-pass PR review |
-| `review loop <pr#>` | `/repo_and_pull_req review loop 42` | Start hourly review loop |
-| `review stop <pr#>` | `/repo_and_pull_req review stop 42` | Stop review loop |
-
-## Dispatch Logic
-
-Argument: `$ARGUMENTS`
-
-### Parse
-
-Split `$ARGUMENTS` into tokens:
-1. First token = command (`setup`, `push`, `wiki`, `review`)
-2. Second token = platform or sub-command (`gh`, `jira`, `loop`, `stop`, `<pr#>`)
-3. Remaining = extra arguments
-
-### Route
-
-**`setup gh`:**
-Read `tools/claude-plugin/repo-and-pull-req/skills/git/gh_setup.md` and follow procedure.
-
-**`setup jira`:**
-Read `tools/claude-plugin/repo-and-pull-req/skills/jira/jira_setup.md` and follow procedure.
-
-**`push`:**
-1. Pre-check: `gh auth status` — if fails, redirect to `setup gh`
-2. Read and follow `tools/claude-plugin/repo-and-pull-req/skills/git/gh_push.md`
-3. If Jira configured (`bin/jira auth status` succeeds):
-   Also read and follow `tools/claude-plugin/repo-and-pull-req/skills/jira/jira_push.md`
-
-**`wiki gh`:**
-Read `tools/claude-plugin/repo-and-pull-req/skills/git/gh_wiki.md` and follow procedure.
-
-**`wiki jira`:**
-Read `tools/claude-plugin/repo-and-pull-req/skills/jira/jira_wiki.md` and follow procedure.
-
-**`wiki`** (no platform specified):
-Run `wiki gh`. If Jira configured (`bin/jira auth status` succeeds), also run `wiki jira`.
-
-**`review <pr#>`:**
-1. Read and follow `tools/claude-plugin/repo-and-pull-req/skills/git/gh_pull_req_review.md`
-2. If Jira configured, also follow `tools/claude-plugin/repo-and-pull-req/skills/jira/jira_pull_req_review.md`
-
-**`review loop <pr#>`:**
-Start scheduled hourly review:
-```
-/schedule 1h /repo_and_pull_req review <pr#>
-```
-
-**`review stop <pr#>`:**
-Cancel the scheduled review for this PR number.
-
-## Prerequisite Checks
-
-Before any non-setup command:
-- For gh commands: `gh auth status` — redirect to `setup gh` if fails
-- For jira commands: `bin/jira auth status` — redirect to `setup jira` if fails
-- For push: verify committed changes exist (`jj st`)
-
-## Integration
-
-| Skill | When Used |
-|-------|-----------|
-| `/sync` | File count guards during push and rebase |
-| `/release` | Suggested after merge for version bump |
-| `/sstack` | State file used for richer PR descriptions |
+- One isolated release session owns one work branch and one non-main worktree.
+- `release/version.sdn` is the sole version authority and all other version locations are checked projections.
+- Beta maintenance admits only caller-selected reviewed bug-fix commits with exact provenance and renewed result-revision evidence.
+- Bootstrap periodically performs read-only main-to-release convergence discovery and never selects or cherry-picks fixes automatically.
+- An approved release-first emergency fix requires an exact reviewed forward-port receipt to main.
+- Main remains the independent development trunk and never tracks or becomes a release branch.
+- Protected refs change only through exact-revision compare-and-swap integration authority.
+- Each changed source policy support or toolchain identity creates a new immutable candidate attempt.
+- Build and qualify the exact candidate once and reject required failures or fallback artifacts.
+- Promotion reuses admitted artifacts without rebuilding and pushes exactly one signed annotated tag.
+- Release admission requires focused failures to reach zero followed by one clean whole-suite confirmation.
+- Withdrawal preserves published tags assets and history and corrections use a new version.
+- Protected PR self review uses a required status check because GitHub forbids an author APPROVED review and never claims provider approval.
+- Ordinary code and text are eligible by default absent an operator deny or constrain record with code, text, file, directory_files, and directory_recursive scopes.
+- Push, retarget, base, diff, ruleset, policy, or expiry invalidation requires a fresh exact-head review and a new self-review admission dispatch.
+- Rejection remediation follows the exact reason without broadening protected integration, candidate, release, signing, or publication authority.

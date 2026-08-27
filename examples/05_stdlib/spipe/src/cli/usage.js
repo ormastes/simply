@@ -10,6 +10,20 @@ Commands:
                        Create or update host .spipe/doc link.
   doctor [host]        Check module files and host link status.
   skill                Print the SPipe skill guide.
+  release-guide        Print the protected software-release operator guide.
+  release-capabilities Print release/session/candidate schemas and capabilities.
+  release-session-plan <json>
+                       Validate and plan an isolated release session.
+  release-beta-backport-plan <json>
+                       Validate one reviewed, caller-selected beta bug-fix backport.
+  release-candidate-plan <json>
+                       Validate an immutable build-once candidate plan.
+  release-promotion-plan <json>
+                       Validate exact promote-without-rebuild inputs.
+  release-main-fix-discovery-plan <json>
+                       Check a read-only main snapshot for reviewed bug-fix candidates.
+  release-forward-port-plan <json>
+                       Validate an isolated forward-port for a release-first fix.
   fine-tune-guide      Print the LLM fine-tune process guide.
   fine-tune-model-guide
                        Print the LLM base-model research guide.

@@ -10,7 +10,6 @@ extern fn rt_riscv_native_gui_process_render() -> i64
 extern fn rt_riscv_harden_canary_value() -> i64
 extern fn rt_riscv_fs_exec_probe() -> i64
 extern fn rt_riscv_fs_exec_run() -> i64
-extern fn rt_riscv_fs_legacy_exec_disabled() -> i64
 extern fn rt_riscv_fs_list_apps() -> i64
 extern fn rt_riscv_fs_exec_malformed_selftest() -> i64
 extern fn rt_riscv_fs_exec_privilege_selftest() -> i64
@@ -21,6 +20,8 @@ extern fn rt_riscv_fs_last_trap_sepc() -> i64
 extern fn rt_riscv_fs_last_trap_stval() -> i64
 use os.services.vfs.vfs_boot_init.{vfs_boot_init_riscv64_virtio_fat32, g_mount_table}
 use os.kernel.loader.riscv64_authenticated_media_fixture.{riscv64_authenticated_media_acceptance_v1}
+use os.kernel.loader.riscv64_authenticated_media_policy.{rv64_legacy_fs_exec_disabled_v1}
+use os.kernel.loader.authenticated_fs_exec_submission_service_v1.{authenticated_fs_exec_user_install_canonical_vfs_owner_v1}
 use os.kernel.scheduler.scheduler_types.{Scheduler}
 
 fn spl_start():
@@ -91,13 +92,14 @@ fn spl_start():
     # `/FSEXEC.ELF` is writable boot media and has no canonical loader-issued
     # authority token.  Keep its parser/isolation checks as structural evidence,
     # but never enter it from the production boot path.
-    if not rt_riscv_fs_legacy_exec_disabled():
+    if not rv64_legacy_fs_exec_disabled_v1():
         serial_println("[riscv-fs-exec] unauthenticated legacy execution enabled")
         serial_println("TEST FAILED")
         rt_qemu_exit_failure()
         return
     serial_println("RV64_LEGACY_FSEXEC_DISABLED reason=missing-loader-authority-token")
     if not vfs_boot_init_riscv64_virtio_fat32() or
+       not authenticated_fs_exec_user_install_canonical_vfs_owner_v1() or
        not riscv64_authenticated_media_acceptance_v1(Scheduler.new(), g_mount_table):
         serial_println("[riscv-auth-exec] canonical loader fixture failed")
         serial_println("TEST FAILED")

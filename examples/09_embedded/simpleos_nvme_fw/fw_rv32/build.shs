@@ -36,7 +36,10 @@ OBJ="build/test-artifacts/nvme_fw_rv32.o"
 START_OBJ="build/test-artifacts/nvme_fw_rv32_start.o"
 START_ASM="build/test-artifacts/nvme_fw_rv32_start.S"
 BOOT="src/os/kernel/arch/riscv32/boot.spl"
+OPTIONAL_FIRMWARE_PROVIDER="src/os/kernel/arch/riscv32/optional_firmware_provider.spl"
+FIRMWARE_ENTRY="examples/09_embedded/simpleos_nvme_fw/fw_rv32/entry.spl"
 ENTRY_DIR="build/os/generated"
+OPTIONAL_FIRMWARE_OVERRIDE="$ENTRY_DIR/os/kernel/arch/riscv32/optional_firmware_provider.spl"
 ENTRY="$ENTRY_DIR/nvme_fw_boot_root.spl"
 DIRECT_ENTRY="$ENTRY_DIR/nvme_fw_direct_entry.spl"
 BOOT_STUB_LINK="$ENTRY_DIR/boot"
@@ -79,8 +82,11 @@ SMP_NAMES_NEW="$LOG_DIR/nvme_fw_rv32_smp_names_new.txt"
 SMP_NAMES_DUP="$LOG_DIR/nvme_fw_rv32_smp_names_dup.txt"
 SMP_TMP_APPEND="$LOG_DIR/nvme_fw_rv32_smp_append_tmp.spl"
 
-if ! grep -q "rt_rv32_boot_optional_nvme_fw_selftest" "$BOOT"; then
-  echo "NVME_RV32_BOOT_NOT_WIRED: add rt_rv32_boot_optional_nvme_fw_selftest() to $BOOT before building $OUT"
+if ! grep -q "hal_rv32_boot_optional_nvme_fw_selftest()" "$BOOT" \
+    || ! grep -q "pub fn hal_rv32_boot_optional_nvme_fw_selftest() -> i64:" "$OPTIONAL_FIRMWARE_PROVIDER" \
+    || ! grep -q '^[[:space:]]\{4\}0$' "$OPTIONAL_FIRMWARE_PROVIDER" \
+    || ! grep -q "pub fn nvme_fw_rv32_selftest() -> i64:" "$FIRMWARE_ENTRY"; then
+  echo "NVME_RV32_BOOT_NOT_WIRED: restore boot -> stable Pure-Simple HAL -> firmware provider override chain before building $OUT"
   exit 2
 fi
 
@@ -128,7 +134,8 @@ if [ "$SMP_MODE" = "1" ]; then
   # error, and it protects future edits to any of the appended files.
   : >"$SMP_NAMES_SEEN"
   smp_check_collisions() {
-    grep -oE '^(fn|val) [A-Za-z_][A-Za-z0-9_]*' "$2" | awk '{print $2}' | sort -u >"$SMP_NAMES_NEW"
+    grep -oE '^(pub )?(fn|val) [A-Za-z_][A-Za-z0-9_]*' "$2" \
+      | sed -E 's/^(pub )?(fn|val) //' | sort -u >"$SMP_NAMES_NEW"
     comm -12 "$SMP_NAMES_SEEN" "$SMP_NAMES_NEW" >"$SMP_NAMES_DUP"
     if [ -s "$SMP_NAMES_DUP" ]; then
       echo "NVME_RV32_SMP_FLATTEN_COLLISION source=$1 names=$(tr '\n' ',' <"$SMP_NAMES_DUP")" >&2
@@ -156,15 +163,12 @@ if [ "$SMP_MODE" = "1" ]; then
     examples/09_embedded/simpleos_nvme_fw/fw_rv32/logic.spl >>"$SMP_DIRECT_ENTRY"
   cat >>"$SMP_DIRECT_ENTRY" <<'EOF_SMP_BASE_FOOTER'
 
-@export("C", name: "rt_rv32_boot_optional_nvme_fw_selftest")
-fn rt_rv32_boot_optional_nvme_fw_selftest() -> i64:
-    nvme_fw_rv32_logic_selftest()
-
 fn main() -> i64:
     nvme_fw_rv32_logic_selftest()
 EOF_SMP_BASE_FOOTER
   printf '\n' >>"$SMP_DIRECT_ENTRY"
-  grep -oE '^(fn|val) [A-Za-z_][A-Za-z0-9_]*' "$SMP_DIRECT_ENTRY" | awk '{print $2}' | sort -u >"$SMP_NAMES_SEEN"
+  grep -oE '^(pub )?(fn|val) [A-Za-z_][A-Za-z0-9_]*' "$SMP_DIRECT_ENTRY" \
+    | sed -E 's/^(pub )?(fn|val) //' | sort -u >"$SMP_NAMES_SEEN"
 
   # NOTE (found + verified during L6-fix via the collision guard itself,
   # 2026-07-19): the wave-3 IPC/pool/fourcore/coro pure-logic core files
@@ -184,12 +188,9 @@ EOF_SMP_BASE_FOOTER
   #    the raw nvme_fw_rv32_logic_selftest() instead, since its own _start
   #    asm prints the PASS banner itself. Pull in only what entry_smp.spl
   #    needs (nvme_fw_rv32_selftest + its private _emit_* helpers) via an
-  #    awk paragraph filter; entry.spl's `_uart_put`, `main`, and
-  #    `rt_rv32_boot_optional_nvme_fw_selftest` paragraphs are dropped here
-  #    because they duplicate definitions already present (entry_smp.spl
-  #    defines its own `_uart_put`; the base footer above already defines
-  #    `main` and `rt_rv32_boot_optional_nvme_fw_selftest`) -- real
-  #    collisions found+fixed during L6-fix, confirmed by the same
+  #    awk paragraph filter; entry.spl's `_uart_put` and `main` paragraphs are
+  #    dropped because entry_smp owns `_uart_put` and the base footer owns
+  #    `main` -- real collisions found+fixed during L6-fix, confirmed by the same
   #    collision-guard grep run on every other appended file.
   # NOTE: each `if` test is kept on its own statement (not chained with a
   # multi-line `&&` pattern) -- gawk does not auto-continue a bare top-level
@@ -201,7 +202,6 @@ EOF_SMP_BASE_FOOTER
          if ($0 ~ /^extern fn rt_riscv_uart_put/) keep = 0
          if ($0 ~ /^use logic\./) keep = 0
          if ($0 ~ /^fn _uart_put\(/) keep = 0
-         if ($0 ~ /^@export\("C", name: "rt_rv32_boot_optional_nvme_fw_selftest"\)/) keep = 0
          if ($0 ~ /^fn main\(\)/) keep = 0
          if (keep == 1) print
        }' examples/09_embedded/simpleos_nvme_fw/fw_rv32/entry.spl \
@@ -411,6 +411,13 @@ if [ "$OS_BOOT_BUILD" = "1" ]; then
   done
   sed '/^[[:space:]]*#/d; /^[[:space:]]*$/d' \
     examples/09_embedded/simpleos_nvme_fw/fw_rv32/entry.spl >"$ENTRY_DIR/entry.spl"
+  mkdir -p "$(dirname "$OPTIONAL_FIRMWARE_OVERRIDE")"
+  cat >"$OPTIONAL_FIRMWARE_OVERRIDE" <<'EOF_OPTIONAL_FIRMWARE_OVERRIDE'
+use entry.{nvme_fw_rv32_selftest}
+
+pub fn hal_rv32_boot_optional_nvme_fw_selftest() -> i64:
+    nvme_fw_rv32_selftest()
+EOF_OPTIONAL_FIRMWARE_OVERRIDE
 else
   for logic_src in examples/09_embedded/simpleos_nvme_fw/fw_rv32/logic*.spl; do
     case "$(basename "$logic_src")" in
@@ -482,7 +489,6 @@ if [ "$OS_BOOT_BUILD" = "1" ]; then
   ln -s "$PWD/src/os/kernel/arch/riscv32/boot" "$BOOT_STUB_LINK"
   cat >"$ENTRY" <<'EOF_ENTRY'
 use os.kernel.arch.riscv32.boot.{boot_main}
-use entry.{rt_rv32_boot_optional_nvme_fw_selftest}
 
 fn main() -> i64:
     0
@@ -548,7 +554,7 @@ service_loop:
     call    nvme_fw_rv32_service_once
     j       service_loop
 #else
-    call    rt_rv32_boot_optional_nvme_fw_selftest
+    call    nvme_fw_direct_entry__nvme_fw_rv32_selftest
     bnez    a0, fail
     lui     t0, 0x10000
 .macro putc byte

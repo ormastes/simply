@@ -7,6 +7,9 @@ Set `SIMPLE_STEAMWORKS_LIB_PATH` to a real `libsteam_api.so` or
 `steam_api64.dll`, then build this bridge and point Simple at it with
 `SIMPLE_STEAM_BRIDGE_PATH`.
 
+The two `simple_steam_bridge_*` health exports use the C `bool` ABI. They must
+not be replaced with integer-returning predicates.
+
 ```bash
 mkdir -p build/os/game/steam
 cc -shared -fPIC examples/os/game/steam_bridge_real/simple_steam_bridge_real.c \

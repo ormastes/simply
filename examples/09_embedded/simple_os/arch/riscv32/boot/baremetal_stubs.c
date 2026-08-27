@@ -355,11 +355,6 @@ RuntimeValue rt_rv32_probe_load8(RuntimeValue addr)
     return (RuntimeValue)(uintptr_t)(*(volatile uint8_t *)(uintptr_t)addr);
 }
 
-RuntimeValue rt_rv32_probe_read_satp(void)
-{
-    return 0;
-}
-
 RuntimeValue rt_rv32_probe_uart_put(RuntimeValue byte)
 {
     uart_putc((char)(uint8_t)(uintptr_t)byte);

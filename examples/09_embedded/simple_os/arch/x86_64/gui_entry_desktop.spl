@@ -43,6 +43,12 @@ use os.drivers.input.ps2_mouse.{Ps2Mouse, MouseState}
 use os.compositor.compositor.{Compositor}
 use os.compositor.compositor_engine2d.{Engine2dCompositorBackend}
 use os.compositor.engine2d_wm_frame_executor.{Engine2dWmFrameExecutor}
+use os.compositor.baremetal_wm_present_owner.{
+    WM_PRESENT_ARCH_X86_64,
+    BaremetalWmScanoutIdentityV1,
+    BaremetalWmPresentOwnerV1
+}
+use os.compositor.legacy_ps2_input_gate.{legacy_ps2_input_ready}
 use os.compositor.input_backend.{Ps2InputBackend}
 use os.compositor.engine2d_display.{create_fb_engine_sized}
 use os.compositor.engine2d_baremetal_core.{
@@ -422,6 +428,17 @@ fn spl_start():
     rt_gui_set_fb(scanout.address, scanout.width.to_u64())
     _vram_mapping_probe(scanout.address as i64, vmm_kernel_pml4_phys() as i64)
     var fb = FramebufferDriver.from_scanout_raw(scanout.address, scanout.width, scanout.height, scanout.stride, framebuffer_bpp)
+    # Generation one identifies the sole boot scanout without retaining or
+    # publishing its MMIO address in the presentation owner.
+    val wm_scanout_identity = BaremetalWmScanoutIdentityV1(
+        architecture: WM_PRESENT_ARCH_X86_64,
+        scanout_id: scanout.generation,
+        width: scanout.width,
+        height: scanout.height,
+        stride: scanout.stride,
+        bpp: framebuffer_bpp
+    )
+    var wm_present_owner = BaremetalWmPresentOwnerV1.create(wm_scanout_identity)
     val screen_width = scanout.width.to_i32()
     val screen_height = scanout.height.to_i32()
     var engine = create_fb_engine_sized(fb, screen_width, screen_height)
@@ -590,6 +607,17 @@ fn spl_start():
         serial_println("[production-readiness-failed] reason=simple2d-or-simple-web-frame-invalid")
         port_outb(0xF4, 1)
         return
+    val first_present_receipt = wm_present_owner.commit_present(
+        wm_scanout_identity,
+        first_frame_revision.to_u64(),
+        1u64,
+        scanout.generation,
+        true
+    )
+    if not first_present_receipt.accepted:
+        serial_println("[production-readiness-failed] reason=wm-present-owner-first-frame")
+        port_outb(0xF4, 1)
+        return
     val simd_enabled = baremetal_simd_fill_enabled()
     val simd_hits = baremetal_simd_fill_hits()
     val simd_chunks = baremetal_simd_fill_chunks()
@@ -625,5 +653,8 @@ fn spl_start():
     serial_println("[desktop-gui] desktop-ready")
     serial_println("[production-readiness] wm=live simple_gui=object-tree simple_web=content-frame renderer=engine2d process_owned_surfaces={owned_surface_count} scanout_generation={scanout.generation}")
 
+    # Inject the x86-only capability. Common/ARM/RV entry closures do not
+    # import this provider and therefore contain no i8042 call edge.
+    shell.install_legacy_baremetal_readiness(legacy_ps2_input_ready)
     shell.run_baremetal(wm_frame_executor)
     serial_println("[desktop-gui] shell exited")

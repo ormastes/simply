@@ -12,7 +12,7 @@
 | Commit (snapshot) | `jj commit -m "message"` | `git add -A && git commit -m "message"` |
 | Describe working copy | `jj describe -m "message"` | `git commit --amend -m "message"` (before push) |
 | View history | `jj log` | `git log --oneline -20` |
-| Push to remote | `jj bookmark set main -r @- && jj git push --bookmark main` | `git push origin main` |
+| Push owned branch | `jj git push --bookmark <work-branch>` | `git push --force-with-lease origin <work-branch>` |
 | Fetch from remote | `jj git fetch` | `git fetch` |
 | Rebase on latest | `jj rebase -d main@origin` | `git rebase origin/main` |
 | Show change | `jj show <change_id>` | `git show <commit>` |
@@ -32,7 +32,7 @@
 ## Standard Workflow
 
 ```bash
-# 1. Make code changes (auto-tracked by jj)
+# 1. Work in the session's unique worktree and work branch
 
 # 2. Check what changed
 jj st
@@ -41,9 +41,9 @@ jj diff
 # 3. Commit
 jj commit -m "feat: add new feature"
 
-# 4. Push
-jj bookmark set main -r @-
-jj git push --bookmark main
+# 4. Push the owned branch and submit for protected integration
+jj git push --bookmark <work-branch>
+/repo_and_pull_req push --target=main --level=normal
 ```
 
 ## Sync Workflow (Pull/Rebase/Push with Safety)
@@ -63,24 +63,21 @@ jj rebase -d main@origin
 NEW_COUNT=$(git ls-files | wc -l | tr -d ' ')
 echo "Before: $FILE_COUNT, After: $NEW_COUNT"
 
-# 4. Push
-jj bookmark set main -r @-
-jj git push --bookmark main
+# 4. Push only the session-owned work branch
+jj git push --bookmark <work-branch>
 ```
 
 ## Orphan Prevention
 
-- **NEVER** leave commits detached from main
-- If orphans found: cherrypick onto main with `jj new main` + `jj restore --from <id>`
-- Or rebase: `jj rebase -r <id> -d main`
+- **NEVER** leave commits detached from their owned work branch
+- Recover orphans into a new isolated session branch
+- Rebase private work onto `main@origin`; never rebase protected refs
 
 ## Worktree Sync
 
-If on a workspace, switch to main, sync, switch back:
-1. `cd` to main repo
-2. Run sync workflow
-3. `cd` back to worktree
-4. `jj workspace update-stale`
+Stay in the isolated session worktree. Fetch, rebase the private branch onto the
+exact target, rerun affected checks, and push only that owned branch. The main
+worktree is read-only.
 
 ## Fixing Past Changes
 
@@ -102,9 +99,10 @@ jj split -r <change_id>
 
 ## Rules
 
-- NO branches - work directly on main
+- One session has one unique work branch and one unique worktree
+- Never author in the main worktree or directly update a protected ref
 - LINEAR history - squash if needed
-- NO orphan commits - everything on main
+- NO orphan commits - everything belongs to an owned work branch
 - FILE COUNT GUARD - check before/after every rebase
 - Use jj as primary VCS (git commands available for tags, gh CLI)
 

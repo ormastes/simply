@@ -10,11 +10,16 @@
 
 use os.kernel.arch.hal.{hal_console_init, hal_console_writeln,
     hal_disable_interrupts, hal_parse_boot_info, hal_halt_loop}
+use os.kernel.arch.arm32.topology.{arm32_publish_boot_mpidr_topology_v1}
 
 fn spl_start():
     hal_disable_interrupts()
     hal_console_init()
     hal_console_writeln("SimpleOS arm32 starting...")
+
+    # Seal firmware CPU identity before boot parsing can reach CPU-indexed
+    # scheduler, interrupt, or per-CPU state.
+    val _topology_ready = arm32_publish_boot_mpidr_topology_v1()
 
     val _boot_info = hal_parse_boot_info()
     hal_console_writeln("[arm32] boot-info:ok")

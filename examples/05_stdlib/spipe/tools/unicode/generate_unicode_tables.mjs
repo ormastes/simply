@@ -5,7 +5,9 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const VERSION = "17.0.0";
-const GENERATOR_VERSION = 1;
+const GENERATOR_VERSION = 2;
+const CANONICAL_CLASS_COUNT = 256;
+const CODE_POINT_TEXT_CHUNK = 4096;
 const SOURCE_NAMES = [
   "UnicodeData.txt", "DerivedCoreProperties.txt", "PropList.txt",
   "SpecialCasing.txt", "CaseFolding.txt", "CompositionExclusions.txt",
@@ -95,6 +97,7 @@ function compact(value) {
 }
 
 const JS_RUNTIME = String.raw`
+const CODE_POINT_TEXT_CHUNK = ${CODE_POINT_TEXT_CHUNK};
 function rangeContains(ranges, cp) {
   if (!Number.isInteger(cp) || cp < 0 || cp > 0x10ffff) return false;
   let lo = 0, hi = ranges.length - 1;
@@ -150,6 +153,50 @@ function composePair(a, b) {
   }
   return undefined;
 }
+function canonicalOrder(values) {
+  const ordered = [];
+  const heads = new Int32Array(${CANONICAL_CLASS_COUNT});
+  const tails = new Int32Array(${CANONICAL_CLASS_COUNT});
+  const next = new Int32Array(values.length);
+  heads.fill(-1);
+  tails.fill(-1);
+  next.fill(-1);
+  let pending = false;
+  const flush = () => {
+    for (let cls = 1; cls < ${CANONICAL_CLASS_COUNT}; cls++) {
+      let index = heads[cls];
+      while (index >= 0) {
+        ordered.push(values[index]);
+        index = next[index];
+      }
+      heads[cls] = -1;
+      tails[cls] = -1;
+    }
+  };
+  for (let index = 0; index < values.length; index++) {
+    const cp = values[index], cls = unicodeCanonicalCombiningClass(cp);
+    if (cls === 0) {
+      if (pending) {
+        flush();
+        pending = false;
+      }
+      ordered.push(cp);
+    } else {
+      if (heads[cls] < 0) heads[cls] = index;
+      else next[tails[cls]] = index;
+      tails[cls] = index;
+      pending = true;
+    }
+  }
+  if (pending) flush();
+  return ordered;
+}
+function codePointsToText(values) {
+  let text = "";
+  for (let start = 0; start < values.length; start += CODE_POINT_TEXT_CHUNK)
+    text += String.fromCodePoint(...values.slice(start, start + CODE_POINT_TEXT_CHUNK));
+  return text;
+}
 export function unicodeNormalizeNfc(text) {
   const values = [];
   for (const char of text) {
@@ -157,44 +204,43 @@ export function unicodeNormalizeNfc(text) {
     if (cp >= 0xd800 && cp <= 0xdfff) throw new TypeError("input must contain only Unicode scalar values");
     decomposeOne(cp, values);
   }
-  for (let i = 1; i < values.length; i++) {
-    const cls = unicodeCanonicalCombiningClass(values[i]);
-    if (!cls) continue;
-    let j = i;
-    while (j > 0 && unicodeCanonicalCombiningClass(values[j - 1]) > cls) { [values[j - 1], values[j]] = [values[j], values[j - 1]]; j--; }
-  }
-  if (!values.length) return "";
-  const output = [values[0]];
+  const ordered = canonicalOrder(values);
+  if (!ordered.length) return "";
+  const output = [ordered[0]];
   let starterIndex = 0, starter = output[0], lastClass = 0;
-  for (let i = 1; i < values.length; i++) {
-    const cp = values[i], cls = unicodeCanonicalCombiningClass(cp), composite = composePair(starter, cp);
+  for (let i = 1; i < ordered.length; i++) {
+    const cp = ordered[i], cls = unicodeCanonicalCombiningClass(cp), composite = composePair(starter, cp);
     if (composite !== undefined && (lastClass < cls || lastClass === 0)) output[starterIndex] = starter = composite;
     else { if (cls === 0) { starterIndex = output.length; starter = cp; } output.push(cp); lastClass = cls; }
   }
-  return String.fromCodePoint(...output);
+  return codePointsToText(output);
 }
-function isFinalSigma(values, index) {
-  let before = false;
-  for (let i = index - 1; i >= 0; i--) {
-    if (rangeContains(CASE_IGNORABLE_RANGES, values[i])) continue;
-    before = rangeContains(CASED_RANGES, values[i]); break;
+function finalSigmaContexts(values) {
+  const before = new Uint8Array(values.length), after = new Uint8Array(values.length);
+  let nearestIsCased = false;
+  for (let index = 0; index < values.length; index++) {
+    before[index] = nearestIsCased ? 1 : 0;
+    if (!rangeContains(CASE_IGNORABLE_RANGES, values[index]))
+      nearestIsCased = rangeContains(CASED_RANGES, values[index]);
   }
-  if (!before) return false;
-  for (let i = index + 1; i < values.length; i++) {
-    if (rangeContains(CASE_IGNORABLE_RANGES, values[i])) continue;
-    return !rangeContains(CASED_RANGES, values[i]);
+  nearestIsCased = false;
+  for (let index = values.length - 1; index >= 0; index--) {
+    after[index] = nearestIsCased ? 1 : 0;
+    if (!rangeContains(CASE_IGNORABLE_RANGES, values[index]))
+      nearestIsCased = rangeContains(CASED_RANGES, values[index]);
   }
-  return true;
+  return { before, after };
 }
 export function unicodeDefaultLowercase(text) {
   const values = [...unicodeNormalizeNfc(text)].map((char) => char.codePointAt(0)), output = [];
+  const finalSigma = finalSigmaContexts(values);
   for (let i = 0; i < values.length; i++) {
     const entry = lowercase.get(values[i]);
     if (!entry) output.push(values[i]);
-    else if (entry.condition === "Final_Sigma" && isFinalSigma(values, i)) output.push(...entry.conditionalMapping);
+    else if (entry.condition === "Final_Sigma" && finalSigma.before[i] === 1 && finalSigma.after[i] === 0) output.push(...entry.conditionalMapping);
     else output.push(...entry.mapping);
   }
-  return unicodeNormalizeNfc(String.fromCodePoint(...output));
+  return unicodeNormalizeNfc(codePointsToText(output));
 }
 `;
 
@@ -314,6 +360,51 @@ fn _unicode_compose_pair(first: i64, second: i64) -> i64:
         else: return _unicode_composition_data[offset + 2]
     -1
 
+fn _unicode_canonical_order(values: [i64]) -> [i64]:
+    var heads: [i64] = [${Array(CANONICAL_CLASS_COUNT).fill(-1).join(", ")}]
+    var tails: [i64] = [${Array(CANONICAL_CLASS_COUNT).fill(-1).join(", ")}]
+    var next_links: [i64] = []
+    var reserve_index: i64 = 0
+    while reserve_index < values.len():
+        next_links.push(-1)
+        reserve_index = reserve_index + 1
+    var ordered: [i64] = []
+    var pending = false
+    var value_index: i64 = 0
+    while value_index < values.len():
+        val cp = values[value_index]
+        val cls = unicode_canonical_combining_class(cp)
+        if cls == 0:
+            if pending:
+                var flush_class: i64 = 1
+                while flush_class < ${CANONICAL_CLASS_COUNT}:
+                    var link = heads[flush_class]
+                    while link >= 0:
+                        ordered.push(values[link])
+                        link = next_links[link]
+                    heads[flush_class] = -1
+                    tails[flush_class] = -1
+                    flush_class = flush_class + 1
+                pending = false
+            ordered.push(cp)
+        else:
+            if heads[cls] < 0:
+                heads[cls] = value_index
+            else:
+                next_links[tails[cls]] = value_index
+            tails[cls] = value_index
+            pending = true
+        value_index = value_index + 1
+    if pending:
+        var final_flush_class: i64 = 1
+        while final_flush_class < ${CANONICAL_CLASS_COUNT}:
+            var final_link = heads[final_flush_class]
+            while final_link >= 0:
+                ordered.push(values[final_link])
+                final_link = next_links[final_link]
+            final_flush_class = final_flush_class + 1
+    ordered
+
 fn unicode_normalize_nfc(input: text) -> text:
     val input_codepoints = text_codepoints(input)
     var values: [i64] = []
@@ -325,25 +416,15 @@ fn unicode_normalize_nfc(input: text) -> text:
             values.push(expanded[expanded_index])
             expanded_index = expanded_index + 1
         input_index = input_index + 1
-    var order_index: i64 = 1
-    while order_index < values.len():
-        val cls = unicode_canonical_combining_class(values[order_index])
-        var move_index = order_index
-        if cls != 0:
-            while move_index > 0 and unicode_canonical_combining_class(values[move_index - 1]) > cls:
-                val previous = values[move_index - 1]
-                values[move_index - 1] = values[move_index]
-                values[move_index] = previous
-                move_index = move_index - 1
-        order_index = order_index + 1
-    if values.len() == 0: return ""
-    var output: [i64] = [values[0]]
+    val ordered = _unicode_canonical_order(values)
+    if ordered.len() == 0: return ""
+    var output: [i64] = [ordered[0]]
     var starter_index: i64 = 0
-    var starter = values[0]
+    var starter = ordered[0]
     var last_class: i64 = 0
     var index: i64 = 1
-    while index < values.len():
-        val cp = values[index]
+    while index < ordered.len():
+        val cp = ordered[index]
         val cls = unicode_canonical_combining_class(cp)
         val composite = _unicode_compose_pair(starter, cp)
         if composite >= 0 and (last_class < cls or last_class == 0):
@@ -358,25 +439,30 @@ fn unicode_normalize_nfc(input: text) -> text:
         index = index + 1
     text_from_codepoints(output)
 
-fn _unicode_is_final_sigma(values: [i64], index: i64) -> bool:
-    var before = false
-    var cursor = index - 1
-    while cursor >= 0:
-        if not _unicode_range_contains(_unicode_case_ignorable_ranges, values[cursor]):
-            before = _unicode_range_contains(_unicode_cased_ranges, values[cursor])
-            break
-        cursor = cursor - 1
-    if not before: return false
-    cursor = index + 1
-    while cursor < values.len():
-        if not _unicode_range_contains(_unicode_case_ignorable_ranges, values[cursor]):
-            return not _unicode_range_contains(_unicode_cased_ranges, values[cursor])
-        cursor = cursor + 1
-    true
-
 fn unicode_default_lowercase(input: text) -> text:
     val values = text_codepoints(unicode_normalize_nfc(input))
     var output: [i64] = []
+    var final_sigma_before: [i64] = []
+    var nearest_is_cased = false
+    var context_index: i64 = 0
+    while context_index < values.len():
+        if nearest_is_cased: final_sigma_before.push(1)
+        else: final_sigma_before.push(0)
+        if not _unicode_range_contains(_unicode_case_ignorable_ranges, values[context_index]):
+            nearest_is_cased = _unicode_range_contains(_unicode_cased_ranges, values[context_index])
+        context_index = context_index + 1
+    var final_sigma_after: [i64] = []
+    context_index = 0
+    while context_index < values.len():
+        final_sigma_after.push(0)
+        context_index = context_index + 1
+    nearest_is_cased = false
+    context_index = values.len() - 1
+    while context_index >= 0:
+        if nearest_is_cased: final_sigma_after[context_index] = 1
+        if not _unicode_range_contains(_unicode_case_ignorable_ranges, values[context_index]):
+            nearest_is_cased = _unicode_range_contains(_unicode_cased_ranges, values[context_index])
+        context_index = context_index - 1
     var value_index: i64 = 0
     while value_index < values.len():
         val cp = values[value_index]
@@ -386,7 +472,8 @@ fn unicode_default_lowercase(input: text) -> text:
         else:
             var start = _unicode_lowercase_offsets[table_index]
             var finish = _unicode_lowercase_offsets[table_index + 1]
-            if _unicode_lowercase_conditions[table_index] == 1 and _unicode_is_final_sigma(values, value_index):
+            if (_unicode_lowercase_conditions[table_index] == 1 and
+                final_sigma_before[value_index] == 1 and final_sigma_after[value_index] == 0):
                 start = _unicode_lowercase_conditional_offsets[table_index]
                 finish = _unicode_lowercase_conditional_offsets[table_index + 1]
                 var conditional_index = start

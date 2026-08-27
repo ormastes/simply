@@ -130,6 +130,16 @@ void *rt_alloc(spl_i64 size) {
     return (void *)next;
 }
 
+/* Codegen emits rt_struct_alloc for struct literals (e.g. the pmm module
+ * initializer). The hosted implementation (src/runtime/runtime_memory.c:491)
+ * is rt_alloc plus a registration table that exists ONLY to answer
+ * rt_struct_receiver_valid; this freestanding runtime defines no such check,
+ * so the table would be dead weight and the wrapper is the whole contract.
+ * Non-zeroed, matching hosted rt_alloc (malloc): codegen writes every field. */
+void *rt_struct_alloc(spl_i64 size) {
+    return rt_alloc(size);
+}
+
 void rt_free(void *ptr) {
     (void)ptr;
 }
@@ -2281,6 +2291,17 @@ static volatile limine_request_t g_limine_kernel_addr_request = {
     0, 0
 };
 
+/* SMP response is architecture-specific.  On aarch64 it carries the BSP
+ * MPIDR and an array of limine_smp_info pointers.  Pure Simple owns all
+ * validation, ordering, and publication; this boundary only preserves the
+ * request bytes and returns Limine's response pointer. */
+__attribute__((used, aligned(8)))
+static volatile limine_request_t g_limine_smp_request = {
+    { LIMINE_COMMON_MAGIC_0, LIMINE_COMMON_MAGIC_1,
+      0x95a67b819a1b857eULL, 0xa0b61b723b6a73e0ULL },
+    0, 0
+};
+
 spl_u64 rt_limine_memmap_response(void) {
     return (spl_u64)g_limine_memmap_request.response;
 }
@@ -2299,6 +2320,10 @@ spl_u64 rt_limine_hhdm_response(void) {
 
 spl_u64 rt_limine_kernel_addr_response(void) {
     return (spl_u64)g_limine_kernel_addr_request.response;
+}
+
+spl_u64 rt_limine_smp_response(void) {
+    return (spl_u64)g_limine_smp_request.response;
 }
 
 /* ===========================================================================

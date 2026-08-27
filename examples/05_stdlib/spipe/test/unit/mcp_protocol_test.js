@@ -19,10 +19,27 @@ test("initialize preserves protocol and request id", () => {
 
 test("tools remain ordered and contain the compatibility surface", () => {
   const reply = route({ jsonrpc: "2.0", id: 1, method: "tools/list" });
-  assert.deepEqual(reply.result.tools.map(({ name }) => name), [
+  const listedTools = reply.result.tools;
+  assert.deepEqual(listedTools.map(({ name }) => name), [
     "spipe_info", "spipe_experts", "spipe_read_doc", "spipe_fine_tune_guide",
-    "spipe_fine_tune_model_guide", "spipe_fine_tune_template"
+    "spipe_fine_tune_model_guide", "spipe_fine_tune_template",
+    "spipe_release_guide", "spipe_release_capabilities",
+    "spipe_release_session_plan", "spipe_release_beta_backport_plan",
+    "spipe_release_candidate_plan", "spipe_release_promotion_plan",
+    "spipe_release_main_fix_discovery_plan", "spipe_release_forward_port_plan"
   ]);
+  for (const name of [
+    "spipe_release_session_plan", "spipe_release_beta_backport_plan",
+    "spipe_release_candidate_plan", "spipe_release_promotion_plan",
+    "spipe_release_main_fix_discovery_plan", "spipe_release_forward_port_plan"
+  ]) {
+    const tool = listedTools.find((candidate) => candidate.name === name);
+    assert.ok(tool, `missing release planner ${name}`);
+    assert.equal(tool.inputSchema.type, "object");
+    assert.equal(tool.inputSchema.additionalProperties, false);
+    assert.deepEqual([...tool.inputSchema.required].sort(), Object.keys(tool.inputSchema.properties).sort());
+    assert.match(tool.description, /plan|validate|check/i);
+  }
 });
 
 test("resource list and read preserve spipe skill", () => {
@@ -46,7 +63,7 @@ test("recognized legacy messages without ids still produce id-less responses", (
   assert.equal(output.length, 3);
   assert.equal(Object.hasOwn(output[0], "id"), false);
   assert.equal(output[0].result.protocolVersion, "2024-11-05");
-  assert.equal(output[1].result.tools.length, 6);
+  assert.equal(output[1].result.tools.length, 14);
   assert.deepEqual(output[2].result.resources.map(({ uri }) => uri), ["spipe://skill"]);
 });
 

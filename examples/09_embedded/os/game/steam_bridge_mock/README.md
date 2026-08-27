@@ -6,9 +6,9 @@ Steam SFFI path. It exports the twenty Steamworks symbol names required by
 `simple_steam_bridge_is_mock` and `simple_steam_bridge_real_backend_ready`.
 
 It is not Valve Steamworks, not a Steam client, and not a DRM/auth backend. Its
-purpose is to prove that a compiled Simple program can load a bridge with
-`spl_dlopen`, resolve the required symbols with `spl_dlsym`, and reject the
-fixture as `real_steam_backend=false`.
+purpose is to prove that a compiled Simple program can load a bridge through
+the checked loader/resolver ABI, call its health predicates through the typed
+C `bool` thunk, and reject the fixture as `real_steam_backend=false`.
 
 Build and run:
 

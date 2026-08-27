@@ -18,10 +18,22 @@ use os.compositor.arm64_virtio_input_backend.{Arm64VirtioInputBackend}
 use os.compositor.compositor_engine2d.{Engine2dCompositorBackend}
 use os.compositor.engine2d_display.{create_fb_engine_sized}
 use os.compositor.engine2d_wm_frame_executor.{Engine2dWmFrameExecutor}
+use os.compositor.baremetal_wm_present_owner.{
+    WM_PRESENT_ARCH_RISCV64,
+    BaremetalWmScanoutIdentityV1,
+    BaremetalWmPresentOwnerV1
+}
 use os.compositor.simpleos_wm_theme_bootstrap.{install_generated_simpleos_wm_theme, apply_simpleos_css_theme_override}
 use os.desktop.shell.{DesktopShell}
 use os.desktop.font_bootstrap.{simpleos_desktop_register_selected_fonts_from_vfs}
 use os.services.vfs.vfs_init.{vfs_boot_init_riscv64_virtio_fat32, g_vfs_read_file_text}
+use os.services.launcher.launcher_path_helpers.{launcher_path_exists}
+use os.services.wm.rv64_production_wm_producer.{Rv64ProductionWmProducer}
+use os.userlib.process.{yield_}
+use os.rv64_wm_boot_resources.{
+    RV64_WM_BOOT_BINARY_PATH,
+    rv64_wm_snapshot_facts_ready
+}
 use os.kernel.arch.riscv64.console.{serial_init, serial_read_byte}
 use os.gui.input_event.{WmAction}
 use os.gui.shortcut.{uart_char_to_action}
@@ -87,6 +99,17 @@ fn boot_main(hart_id: u64, dtb_addr: u64):
     serial_println("[desktop-gui-riscv64] scanout-ready width={width} height={height} stride={pitch}")
     val screen_w = width.to_i64()
     val screen_h = height.to_i64()
+    # The platform display capsule owns one primary scanout per boot.  This
+    # opaque scalar handle does not expose its framebuffer address.
+    val wm_scanout_identity = BaremetalWmScanoutIdentityV1(
+        architecture: WM_PRESENT_ARCH_RISCV64,
+        scanout_id: 1u64,
+        width: width,
+        height: height,
+        stride: pitch,
+        bpp: bpp
+    )
+    var wm_present_owner = BaremetalWmPresentOwnerV1.create(wm_scanout_identity)
 
     val vfs_mounted = vfs_boot_init_riscv64_virtio_fat32()
     if not vfs_mounted:
@@ -112,26 +135,6 @@ fn boot_main(hart_id: u64, dtb_addr: u64):
         compositor_backend, input_backend, width.to_i32(), height.to_i32()
     )
 
-    val terminal_id = compositor.compositor_materialize_process_surface_scalar(
-        "Terminal", (screen_w / 20).to_i32(), (screen_h / 8).to_i32(),
-        (screen_w * 9 / 20).to_i32(), (screen_h * 2 / 5).to_i32(),
-        0, "terminal", "<pre>simple$ uname -m\nriscv64\nsimple$ simple check\nAll checks passed\nsimple$</pre>"
-    )
-    val editor_id = compositor.compositor_materialize_process_surface_scalar(
-        "Editor", (screen_w * 7 / 20).to_i32(), (screen_h / 4).to_i32(),
-        (screen_w / 2).to_i32(), (screen_h / 2).to_i32(),
-        0, "editor", "<pre>fn main():\n    val x = 42\n    print x\n\n# Comment\nfn square(n):\n    n * n</pre>"
-    )
-    val finder_id = compositor.compositor_materialize_process_surface_scalar(
-        "Finder", (screen_w * 3 / 5).to_i32(), (screen_h * 3 / 5).to_i32(),
-        (screen_w * 7 / 20).to_i32(), (screen_h * 3 / 10).to_i32(),
-        0, "finder", "<h2>Favorites</h2><p>Desktop</p><p>Documents</p><p>Downloads</p><h3>Project</h3><p>Photos</p>"
-    )
-    if terminal_id <= 0 or editor_id <= 0 or finder_id <= 0:
-        serial_println("[desktop-gui-riscv64] fatal reason=surface-materialization")
-        return
-    compositor.focus_window(editor_id.to_i32())
-
     var shell = DesktopShell.new(compositor)
     shell.init_baremetal()
 
@@ -154,9 +157,46 @@ fn boot_main(hart_id: u64, dtb_addr: u64):
             false
         )
 
-    val revision = shell.render_baremetal_first_frame(executor)
-    if revision <= 0:
-        serial_println("[desktop-gui-riscv64] fatal reason=first-frame")
+    # Desktop readiness comes only from an admitted filesystem executable that
+    # publishes a WM surface. PID-zero demo windows are not production evidence.
+    if not launcher_path_exists(RV64_WM_BOOT_BINARY_PATH):
+        serial_println("[desktop-gui-riscv64] fatal reason=wm-app-missing path=" + RV64_WM_BOOT_BINARY_PATH)
+        return
+    var wm_producer = Rv64ProductionWmProducer.launch(RV64_WM_BOOT_BINARY_PATH, [])
+    if wm_producer.process_id == 0u64 or wm_producer.verdict().failed:
+        serial_println("[desktop-gui-riscv64] fatal reason=wm-app-launch")
+        return
+    var wm_process_frame_ready = false
+    var revision: i64 = 0
+    var wm_last_scene_revision: i64 = 0
+    var wm_last_taskbar_revision: i64 = 0
+    val wm_publication_deadline_us = boot_monotonic_now_us() + 2000000
+    while (not wm_process_frame_ready and
+        boot_monotonic_now_us() < wm_publication_deadline_us):
+        val _pumped = wm_producer.pump_one_published_action(shell)
+        val snapshot = wm_producer.snapshot_published_scene(shell)
+        val snapshot_ready = rv64_wm_snapshot_facts_ready(
+            wm_producer.process_id,
+            snapshot.owned_scene.process_id,
+            snapshot.owned_scene.process_surface_count,
+            snapshot.ready_to_present,
+            snapshot.render_inputs.consistent,
+            snapshot.render_inputs.content_frames.len(),
+            snapshot.render_inputs.taskbar_revision
+        )
+        if snapshot_ready:
+            val wm_verdict = wm_producer.present_snapshot(executor, snapshot)
+            if wm_verdict.ready and not wm_verdict.failed:
+                revision = wm_verdict.first_present_revision
+                wm_last_scene_revision = snapshot.owned_scene.scene_revision
+                wm_last_taskbar_revision = snapshot.render_inputs.taskbar_revision
+                wm_process_frame_ready = true
+        if not wm_process_frame_ready:
+            # Let the launched application run and publish rather than spinning
+            # on the compositor queue in the boot owner.
+            yield_()
+    if not wm_process_frame_ready or revision <= 0:
+        serial_println("[desktop-gui-riscv64] fatal reason=pid-owned-surface-publication")
         return
     if not riscv64_display_present():
         serial_println("[desktop-gui-riscv64] fatal reason=scanout-present")
@@ -165,6 +205,17 @@ fn boot_main(hart_id: u64, dtb_addr: u64):
     val display_generation = riscv64_display_generation()
     if display_generation <= 0:
         serial_println("[desktop-gui-riscv64] fatal reason=scanout-generation")
+        return
+    var wm_frame_id: u64 = 1u64
+    val first_present_receipt = wm_present_owner.commit_present(
+        wm_scanout_identity,
+        revision.to_u64(),
+        wm_frame_id,
+        display_generation.to_u64(),
+        true
+    )
+    if not first_present_receipt.accepted:
+        serial_println("[desktop-gui-riscv64] fatal reason=present-owner-first-frame")
         return
     serial_println("[desktop-gui-riscv64] scanout-present address={address} width={width} height={height} stride={pitch} bpp={bpp} format=bgra8888 generation={display_generation} scene_revision={revision}")
     serial_println("[desktop-gui-riscv64] present-ok revision={revision}")
@@ -184,7 +235,6 @@ fn boot_main(hart_id: u64, dtb_addr: u64):
     var observed_key_sequence: i64 = 0
     var observed_pointer_sequence: i64 = 0
     while running:
-        var input_compositor = shell.compositor
         var action = WmAction.None
         var action_name = "none"
         var changed = false
@@ -198,6 +248,32 @@ fn boot_main(hart_id: u64, dtb_addr: u64):
         var pointer_y: i32 = 0
         var pointer_button_code: i32 = 0
         var pointer_kind_code: i32 = 0
+
+        # Keep remote application publication interleaved with input. A new
+        # compositor revision is rendered by the shared frame path below.
+        val _publication_pumped = wm_producer.pump_one_published_action(shell)
+        val publication_snapshot = wm_producer.snapshot_published_scene(shell)
+        val publication_ready = rv64_wm_snapshot_facts_ready(
+            wm_producer.process_id,
+            publication_snapshot.owned_scene.process_id,
+            publication_snapshot.owned_scene.process_surface_count,
+            publication_snapshot.ready_to_present,
+            publication_snapshot.render_inputs.consistent,
+            publication_snapshot.render_inputs.content_frames.len(),
+            publication_snapshot.render_inputs.taskbar_revision
+        )
+        if not publication_ready:
+            serial_println("[desktop-gui-riscv64] fatal reason=pid-owned-surface-lost")
+            running = false
+            continue
+        if (publication_snapshot.owned_scene.scene_revision != wm_last_scene_revision or
+            publication_snapshot.render_inputs.taskbar_revision != wm_last_taskbar_revision):
+            wm_last_scene_revision = publication_snapshot.owned_scene.scene_revision
+            wm_last_taskbar_revision = publication_snapshot.render_inputs.taskbar_revision
+            changed = true
+
+        # Copy only after publication has committed its compositor mutation.
+        var input_compositor = shell.compositor
 
         if virtio_input_enabled:
             input_compositor.handle_input()
@@ -228,8 +304,12 @@ fn boot_main(hart_id: u64, dtb_addr: u64):
         else:
             val input_byte = serial_read_byte()
             if input_byte < 0:
-                continue
-            action = uart_char_to_action(input_byte.to_u64())
+                # A publication may already have changed the compositor this
+                # turn; do not skip its frame merely because UART is idle.
+                if not changed:
+                    continue
+            else:
+                action = uart_char_to_action(input_byte.to_u64())
 
         match action:
             case WmAction.CycleFocus:
@@ -288,7 +368,35 @@ fn boot_main(hart_id: u64, dtb_addr: u64):
                 if shell.last_wm_loop_marker.contains("handled=true"):
                     pointer_handled = "true"
                 serial_println("[wm-pointer-state] input_seq={pointer_sequence} window={pointer_window_id} marker={shell.last_wm_loop_marker} handled={pointer_handled}")
-            val rendered_revision = shell.render_baremetal_frame(executor)
+            # Refresh after committing the input-mutated compositor. Render the
+            # producer snapshot directly so its correlated content frames are
+            # not dropped by the generic baremetal shell wrapper.
+            val changed_snapshot = wm_producer.snapshot_published_scene(shell)
+            val changed_snapshot_ready = rv64_wm_snapshot_facts_ready(
+                wm_producer.process_id,
+                changed_snapshot.owned_scene.process_id,
+                changed_snapshot.owned_scene.process_surface_count,
+                changed_snapshot.ready_to_present,
+                changed_snapshot.render_inputs.consistent,
+                changed_snapshot.render_inputs.content_frames.len(),
+                changed_snapshot.render_inputs.taskbar_revision
+            )
+            var rendered_revision: i64 = 0
+            if not changed_snapshot_ready:
+                serial_println("[desktop-gui-riscv64] fatal reason=changed-frame-owner-snapshot detail=" + changed_snapshot.reason)
+                running = false
+            else:
+                rendered_revision = executor.render(
+                    changed_snapshot.owned_scene.scene,
+                    changed_snapshot.render_inputs.taskbar,
+                    changed_snapshot.render_inputs.content_frames,
+                    changed_snapshot.owned_scene.scene_revision,
+                    changed_snapshot.render_inputs.taskbar_revision,
+                    changed_snapshot.render_inputs.clock_label
+                )
+                if rendered_revision > 0:
+                    wm_last_scene_revision = changed_snapshot.owned_scene.scene_revision
+                    wm_last_taskbar_revision = changed_snapshot.render_inputs.taskbar_revision
             if rendered_revision <= 0:
                 serial_println("[desktop-gui-riscv64] fatal reason=changed-frame")
                 running = false
@@ -297,6 +405,22 @@ fn boot_main(hart_id: u64, dtb_addr: u64):
                 running = false
             else:
                 val changed_generation = riscv64_display_generation()
+                if changed_generation <= 0:
+                    serial_println("[desktop-gui-riscv64] fatal reason=changed-scanout-generation")
+                    running = false
+                    continue
+                wm_frame_id = wm_frame_id + 1u64
+                val present_receipt = wm_present_owner.commit_present(
+                    wm_scanout_identity,
+                    rendered_revision.to_u64(),
+                    wm_frame_id,
+                    changed_generation.to_u64(),
+                    true
+                )
+                if not present_receipt.accepted:
+                    serial_println("[desktop-gui-riscv64] fatal reason=present-owner-changed-frame")
+                    running = false
+                    continue
                 serial_println("[desktop-gui-riscv64] scanout-present address={address} width={width} height={height} stride={pitch} bpp={bpp} format=bgra8888 generation={changed_generation} scene_revision={rendered_revision}")
                 if key_event_pending and changed:
                     serial_println("[wm-frame] input_seq={key_sequence} generation={changed_generation}")

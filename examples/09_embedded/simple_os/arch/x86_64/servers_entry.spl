@@ -16,8 +16,8 @@
 use build.os.generated.ssh_live_build_marker.{ssh_live_build_marker}
 use os.apps.sshd.sshd.{SshDaemon}
 use os.kernel.boot.http_baremetal.{http_bind_baremetal, http_accept_and_handle_once}
-use os.apps.dbd.dbd.{DbdServer, DBD_PORT, dbd_bind, dbd_accept_and_handle_once}
 use os.services.vfs.vfs_boot_init.{vfs_boot_init_production, g_root_fat32, g_adapter}
+use os.kernel.loader.authenticated_fs_exec_submission_service_v1.{authenticated_fs_exec_user_install_canonical_vfs_owner_v1}
 use os.services.fat32.shared_fat32_driver.{SharedFat32Driver as Fat32Core}
 
 extern fn serial_println(msg: text)
@@ -60,6 +60,8 @@ fn _start():
     serial_println("[boot] vfs_boot_init_production ok={storage_ok}")
     if storage_ok:
         _servers_ensure_generic_root_fat32()
+        if not authenticated_fs_exec_user_install_canonical_vfs_owner_v1():
+            serial_println("[boot] filesystem-exec VFS owner unavailable; syscall launch remains closed")
     else:
         serial_println("[boot] storage unavailable; dbd/http file routes degrade to ERR/404")
 
@@ -94,18 +96,13 @@ fn _start():
     else:
         serial_println("[http] serving on 0.0.0.0:8080")
 
-    var dbd_server = DbdServer.new()
-    dbd_server.replay_log()
-    val dbd_listener = dbd_bind(DBD_PORT)
-    if dbd_listener < 0:
-        serial_println("[FATAL] dbd bind failed rc={dbd_listener}")
-    else:
-        serial_println("[dbd] serving on 0.0.0.0:5433")
+    # This kernel-local legacy entry has no filesystem-launched current TCB
+    # and therefore cannot consume ABI 116. Keep DBD absent rather than
+    # bypassing DbdServer through a free bind helper or advertising readiness.
+    serial_println("[dbd] startup blocked reason=filesystem-launch-evidence-required")
 
     serial_println("[servers] round-robin loop start")
     while true:
         daemon.accept_and_handle_once()
         if http_listener >= 0:
             http_accept_and_handle_once(http_listener)
-        if dbd_listener >= 0:
-            dbd_accept_and_handle_once(dbd_listener, dbd_server)

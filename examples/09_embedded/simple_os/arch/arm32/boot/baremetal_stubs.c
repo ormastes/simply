@@ -109,6 +109,32 @@ RuntimeValue arm32_harden_print_canary(void)
 #define TRUE_VALUE     ENCODE_INT(1)
 #define FALSE_VALUE    ENCODE_INT(0)
 
+extern uint32_t rt_arm32_boot_dtb_physical_storage;
+
+RuntimeValue rt_arm32_boot_dtb_low16(void)
+{
+    return ENCODE_INT(rt_arm32_boot_dtb_physical_storage & 0xffffU);
+}
+
+RuntimeValue rt_arm32_boot_dtb_high16(void)
+{
+    return ENCODE_INT(rt_arm32_boot_dtb_physical_storage >> 16);
+}
+
+RuntimeValue rt_arm32_mrc_mpidr_low16(void)
+{
+    uint32_t mpidr;
+    __asm__ volatile("mrc p15, 0, %0, c0, c0, 5" : "=r"(mpidr));
+    return ENCODE_INT(mpidr & 0xffffU);
+}
+
+RuntimeValue rt_arm32_mrc_mpidr_high16(void)
+{
+    uint32_t mpidr;
+    __asm__ volatile("mrc p15, 0, %0, c0, c0, 5" : "=r"(mpidr));
+    return ENCODE_INT(mpidr >> 16);
+}
+
 typedef struct {
     uint32_t type;
     uint32_t size;
@@ -1199,10 +1225,16 @@ RuntimeValue rt_memory_barrier(void)
 
 static void arm32_clean_dcache_range(uint32_t addr, uint32_t size)
 {
+    if (size == 0U) return;
+    /* A DMA ownership range may not wrap the ARM32 physical address space.
+     * Fail-stop instead of silently maintaining an unrelated low range and
+     * then allowing device submission to continue. */
+    if ((size - 1U) > (UINT32_MAX - addr)) __builtin_trap();
     uint32_t line = addr & ~31U;
-    uint32_t end = (addr + size + 31U) & ~31U;
-    while (line < end) {
+    uint32_t last = (addr + size - 1U) & ~31U;
+    for (;;) {
         __asm__ volatile("mcr p15, 0, %0, c7, c10, 1" :: "r"(line) : "memory");
+        if (line == last) break;
         line += 32U;
     }
     __asm__ volatile("dsb sy" ::: "memory");
@@ -1210,10 +1242,13 @@ static void arm32_clean_dcache_range(uint32_t addr, uint32_t size)
 
 static void arm32_invalidate_dcache_range(uint32_t addr, uint32_t size)
 {
+    if (size == 0U) return;
+    if ((size - 1U) > (UINT32_MAX - addr)) __builtin_trap();
     uint32_t line = addr & ~31U;
-    uint32_t end = (addr + size + 31U) & ~31U;
-    while (line < end) {
+    uint32_t last = (addr + size - 1U) & ~31U;
+    for (;;) {
         __asm__ volatile("mcr p15, 0, %0, c7, c6, 1" :: "r"(line) : "memory");
+        if (line == last) break;
         line += 32U;
     }
     __asm__ volatile("dsb sy" ::: "memory");
@@ -1236,6 +1271,21 @@ static void write_le32_volatile(volatile uint8_t *p, uint32_t v)
 static uint32_t arm32_scalar_arg(RuntimeValue v)
 {
     return IS_INT(v) ? (uint32_t)DECODE_INT(v) : (uint32_t)v;
+}
+
+/* Shared Pure-Simple DMA cache-maintenance boundary.  Keep the CP15
+ * implementation in this architecture owner; drivers pass only a bounded
+ * address range and never duplicate cache-line assumptions. */
+RuntimeValue rt_arm32_dcache_clean_range(RuntimeValue addr, RuntimeValue size)
+{
+    arm32_clean_dcache_range(arm32_scalar_arg(addr), arm32_scalar_arg(size));
+    return NIL_VALUE;
+}
+
+RuntimeValue rt_arm32_dcache_invalidate_range(RuntimeValue addr, RuntimeValue size)
+{
+    arm32_invalidate_dcache_range(arm32_scalar_arg(addr), arm32_scalar_arg(size));
+    return NIL_VALUE;
 }
 
 RuntimeValue rt_virtq_desc_write(RuntimeValue base, RuntimeValue index, RuntimeValue addr_lo,

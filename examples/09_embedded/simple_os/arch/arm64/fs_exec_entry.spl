@@ -14,6 +14,7 @@ use os.kernel.loader.arm64_fs_exec_spawn.{
     arm64_fs_exec_spawn, arm64_fs_exec_spawn_ring3,
     arm64_fs_exec_load_and_launch_hello_world
 }
+use os.kernel.loader.authenticated_fs_exec_submission_service_v1.{authenticated_fs_exec_user_install_canonical_vfs_owner_v1}
 
 # Freestanding module-var init never runs, so `_mmio_test_mode` reads
 # garbage-true; force hardware MMIO before the VFS/loader touch the device.
@@ -38,6 +39,11 @@ fn spl_start():
 
     if not arm_fs_exec_vfs_boot_init():
         serial_println("[arm-fs-exec] vfs:fail")
+        serial_println("TEST FAILED")
+        rt_qemu_exit_success()
+        return
+    if not authenticated_fs_exec_user_install_canonical_vfs_owner_v1():
+        serial_println("[arm-fs-exec] filesystem-exec VFS owner:fail")
         serial_println("TEST FAILED")
         rt_qemu_exit_success()
         return

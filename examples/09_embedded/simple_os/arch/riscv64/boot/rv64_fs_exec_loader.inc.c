@@ -347,8 +347,3 @@ RuntimeValue rt_riscv_fs_exec_run(void)
      * and content generation. */
     return (RuntimeValue)-13;
 }
-
-RuntimeValue rt_riscv_fs_legacy_exec_disabled(void)
-{
-    return 1;
-}

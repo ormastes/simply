@@ -1,114 +1,29 @@
-<!-- llm-process-gen: managed source=codex_release_skill source_sha256=3d68961d63bc7661657f37fcf006fd8ba9990dfa5e64bcde7f06662736755a7d content_sha256=5768dc8cf053a260fc589004b44f7b1af24bd0bc4278317abde464b108b89ae1 -->
----
-name: release
-description: "Codex release skill. Version bump (major/minor/patch/exact), CHANGELOG update, commit, tag, push (ask before push). Prerequisite: verify PASS."
----
+<!-- generated-from: doc/00_llm_process/skill_command/command/release.md -->
+# Protected Software Release
 
-# Release — Codex Version Bump and Tag
+Release contract: isolated-session; reviewed-beta-backport; immutable-candidate; promote-without-rebuild; protected-ref-guard; non-destructive-release-identity.
 
-**Cooperative Phase:** Release (after verification passes)
-**Self-sufficient.** Can be run by any LLM independently.
+Use the canonical semantic source at `doc/00_llm_process/skill_command/command/release.md`.
 
-## Tools
+Start one isolated release branch/worktree, read `release/version.sdn`, and require verified evidence. Beta maintenance accepts only explicit reviewed bug-fix backports with exact provenance and renewed post-application evidence. Create an immutable candidate, build once, and promote exact admitted artifacts through one signed annotated exact tag after approval.
 
-- **Simple MCP** — read/write project files
+Never update protected refs directly, rebuild during promotion, select fixes automatically, push all tags, delete/move/reuse a published tag, or use fallback artifacts. Rollback redeploys a prior admitted release; corrections get a new version.
 
-## Usage
+## Normalized contract clauses
 
-- No args or `patch`/`third`: bump patch (0.9.3 -> 0.9.4)
-- `minor`/`second`: bump minor (0.9.3 -> 0.10.0)
-- `major`/`first`: bump major (0.9.3 -> 1.0.0)
-- `X.Y.Z`: set exact version
-
-## Prerequisite
-
-Run `verify` skill first — must show **STATUS: PASS**.
-
-Do NOT proceed with release if verification has any FAIL items.
-SPipe/manual evidence, lower-model sidecar review, and workflow/tooling/
-evidence/spec/verification contract docs must already be complete from verify.
-Release must not create or update SPipe specs, repair generated-manual quality,
-accept sidecar-review gaps, or repair stale `doc/07_guide`, `doc/06_spec`,
-`.codex/skills`, `.agents/skills`, `.claude/skills`, `.claude/agents/spipe`,
-or `.gemini/commands` instructions. Before proceeding, confirm
-`find doc/06_spec -name '*_spec.spl' | wc -l` returns `0`.
-
-## Steps
-
-### 1. Read Current Version
-Read from `simple.sdn` (field `project.version`).
-
-### 2. Calculate New Version
-Apply bump rule (major/minor/patch) or use exact version.
-
-### 3. Update All Version Locations
-
-| File | Field/Pattern |
-|------|---------------|
-| `simple.sdn` | `version: X.Y.Z` |
-| `VERSION` | Entire file content |
-| `src/app/cli/main.spl` | Hardcoded fallback in `get_version()` |
-| `src/app/cli/bootstrap_main.spl` | Hardcoded in `bootstrap_version()` |
-
-### 4. Update CHANGELOG
-
-Add new section to `CHANGELOG.md`:
-
-```markdown
-## [X.Y.Z] - YYYY-MM-DD
-
-### Added
-- <new features>
-
-### Changed
-- <modifications>
-
-### Fixed
-- <bug fixes>
-```
-
-Populate from recent commits since last release tag.
-
-### 5. Commit
-
-```bash
-jj commit -m "chore: release vX.Y.Z"
-```
-
-Or if jj unavailable:
-```bash
-git add -A && git commit -m "chore: release vX.Y.Z"
-```
-
-### 6. Tag
-
-```bash
-git tag -a vX.Y.Z -m "Release vX.Y.Z"
-```
-
-### 7. Push (ASK FIRST)
-
-**Do NOT push without user approval.**
-
-Ask: **"Ready to push vX.Y.Z to remote? (y/n)"**
-
-If approved:
-```bash
-jj bookmark set main -r @- && jj git push --bookmark main
-git push --tags
-```
-
-## Artifacts Produced
-
-| Artifact | Path |
-|----------|------|
-| Updated version | `simple.sdn`, `VERSION`, `src/app/cli/main.spl`, `src/app/cli/bootstrap_main.spl` |
-| Changelog | `CHANGELOG.md` |
-| Git tag | `vX.Y.Z` |
-
-## Rules
-
-- NEVER release without verify PASS
-- NEVER push without user approval
-- NEVER skip version locations — all 4 files must be updated
-- All code in `.spl` — no Python, no Bash
+- One isolated release session owns one work branch and one non-main worktree.
+- `release/version.sdn` is the sole version authority and all other version locations are checked projections.
+- Beta maintenance admits only caller-selected reviewed bug-fix commits with exact provenance and renewed result-revision evidence.
+- Bootstrap periodically performs read-only main-to-release convergence discovery and never selects or cherry-picks fixes automatically.
+- An approved release-first emergency fix requires an exact reviewed forward-port receipt to main.
+- Main remains the independent development trunk and never tracks or becomes a release branch.
+- Protected refs change only through exact-revision compare-and-swap integration authority.
+- Each changed source policy support or toolchain identity creates a new immutable candidate attempt.
+- Build and qualify the exact candidate once and reject required failures or fallback artifacts.
+- Promotion reuses admitted artifacts without rebuilding and pushes exactly one signed annotated tag.
+- Release admission requires focused failures to reach zero followed by one clean whole-suite confirmation.
+- Withdrawal preserves published tags assets and history and corrections use a new version.
+- Protected PR self review uses a required status check because GitHub forbids an author APPROVED review and never claims provider approval.
+- Ordinary code and text are eligible by default absent an operator deny or constrain record with code, text, file, directory_files, and directory_recursive scopes.
+- Push, retarget, base, diff, ruleset, policy, or expiry invalidation requires a fresh exact-head review and a new self-review admission dispatch.
+- Rejection remediation follows the exact reason without broadening protected integration, candidate, release, signing, or publication authority.

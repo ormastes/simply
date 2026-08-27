@@ -1,7 +1,8 @@
 #include <stdint.h>
+#include <stdbool.h>
 
-int32_t simple_steam_bridge_is_mock(void) { return 1; }
-int32_t simple_steam_bridge_real_backend_ready(void) { return 0; }
+bool simple_steam_bridge_is_mock(void) { return true; }
+bool simple_steam_bridge_real_backend_ready(void) { return false; }
 
 int32_t SteamAPI_Init(void) { return 1; }
 void SteamAPI_Shutdown(void) {}

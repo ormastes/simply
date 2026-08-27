@@ -17,11 +17,19 @@ doc/00_llm_process/project_expert/subproject_links.example.sdn
 doc/00_llm_process/domain_expert
 doc/00_llm_process/tool_expert
 .claude/skills/spipe.md
+.claude/skills/software-release.md
+.claude/skills/release.md
+.claude/skills/sync.md
 .claude/templates/spipe_template.spl
 .codex/skills/dev/SKILL.md
 .codex/skills/sp_dev/SKILL.md
+.codex/skills/software-release/SKILL.md
+.codex/skills/release/SKILL.md
+.codex/skills/sync/SKILL.md
 .gemini/commands/dev.toml
 .gemini/commands/sp_dev.toml
+.gemini/commands/release.toml
+.gemini/commands/sync.toml
 package.json
 cli/spipe.js
 mcp/server.js
@@ -29,6 +37,9 @@ schema/artifact.schema.sdn
 src/core/knowledge_compiler.js
 plugin/.codex-plugin/plugin.json
 plugin/manifest.sdn
+plugin/skills/software-release/SKILL.md
+plugin/skills/release/SKILL.md
+plugin/skills/sync/SKILL.md
 plugin
 mcp
 cli
@@ -60,6 +71,13 @@ node cli/spipe.js experts >/dev/null
 node cli/spipe.js fine-tune-guide >/dev/null
 node cli/spipe.js fine-tune-model-guide >/dev/null
 node cli/spipe.js fine-tune-template >/dev/null
+node cli/spipe.js release-guide >/dev/null
+node cli/spipe.js release-capabilities | grep -q "capability.immutable_release_candidates=true"
+node cli/spipe.js release-capabilities | grep -q "capability.scoped_self_review_guidance=true"
+node cli/spipe.js release-capabilities | grep -q "capability.external_release_mutation=false"
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"spipe_release_capabilities","arguments":{}}}' | node mcp/server.js | grep -q "immutable_release_candidates=true"
+printf '%s\n' '{"jsonrpc":"2.0","id":4,"method":"tools/list","params":{}}' | node mcp/server.js | grep -q "spipe_release_main_fix_discovery_plan"
+node --test test/unit/release_policy_test.js
 
 tmp_link_host="$(mktemp -d)"
 tmp_host="$(mktemp -d)"

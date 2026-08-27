@@ -6,4 +6,14 @@ This command is equivalent to /dev and /sstack, using the SPipe-prefixed
 command name for clearer namespacing.
 
 Follow `.claude/skills/sstack.md` as the canonical procedure.
+
+For protected PR self-review, GitHub forbids author APPROVED reviews.
+SPipe Self Review Admission is a required status check, not provider/independent
+approval. Ordinary code/text is default allow absent external deny/constrain;
+scopes are code, text, exact file, immediate directory_files, and recursive
+directory_recursive. Log the exact reason and use scoped remediation: fresh
+exact-head review+dispatch for drift/expiry, policy-owner/independent route for
+deny, smaller diff/new constraint for scope rejection, and removal/credential
+rotation for unsafe material. Never reuse stale status or weaken release
+authority.
 """

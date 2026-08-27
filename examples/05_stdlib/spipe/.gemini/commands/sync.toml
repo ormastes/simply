@@ -1,0 +1,4 @@
+description = "Sync only the current isolated session branch; never move protected refs directly."
+prompt = """
+Read doc/00_llm_process/skill_command/skills/gemini/sync/skill.md completely and follow it. Verify session branch/worktree ownership, fetch the declared target, rebase only when policy permits, renew affected evidence, and push only the owned work ref with lease/CAS. Never mutate or rebase a protected ref, candidate, recovery ref, or tag.
+"""

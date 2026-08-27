@@ -1,24 +1,30 @@
 {
   "name": "spipe",
-  "version": "0.1.0",
-  "description": "SPipe commands, experts, CLI, and MCP server for reusable feature-development process.",
-  "skills": [
-    "../.claude/skills/spipe.md",
-    "../.claude/skills/spipe_loop.md",
-    "../.claude/skills/sstack.md",
-    "../.claude/skills/dev.md",
-    "../.claude/skills/sp_dev.md",
-    "../.codex/skills/dev/SKILL.md",
-    "../.codex/skills/sp_dev/SKILL.md"
-  ],
-  "commands": [
-    "../.gemini/commands/dev.toml",
-    "../.gemini/commands/sp_dev.toml"
-  ],
+  "version": "0.2.0",
+  "description": "SPipe guarded release planning, process guidance, and MCP tools.",
+  "author": {
+    "name": "Simple Project"
+  },
+  "license": "MIT",
+  "skills": "./skills/",
   "mcpServers": {
     "spipe": {
       "command": "node",
-      "args": ["mcp/server.js"]
+      "args": ["../mcp/server.js"]
     }
+  },
+  "interface": {
+    "displayName": "SPipe",
+    "shortDescription": "Guarded software-release planning and process tools",
+    "longDescription": "Plan isolated release sessions, beta convergence, immutable candidates, exact promotion, and scoped self-review remediation without granting repository mutation authority.",
+    "developerName": "Simple Project",
+    "category": "Developer Tools",
+    "capabilities": ["Read", "Planning"],
+    "defaultPrompt": [
+      "Plan an isolated beta release.",
+      "Check reviewed fixes for beta backporting.",
+      "Validate an immutable candidate promotion.",
+      "Explain SPipe self-review status and remediate a rejection."
+    ]
   }
 }

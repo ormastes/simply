@@ -31,13 +31,13 @@ bin/simple test --only-slow              # Slow tests only
 
 ## Release Process
 
-1. Update version in `simple.sdn`
-2. Update `CHANGELOG.md`
-3. Commit: `jj commit -m "chore: Release vX.Y.Z"`
-4. Tag: `git tag -a vX.Y.Z -m "Release vX.Y.Z"` (use git for tags)
-5. Push: `jj bookmark set main -r @- && jj git push --bookmark main && git push origin vX.Y.Z`
-6. Monitor GitHub Actions
-7. Verify: `gh release view vX.Y.Z`
+1. Start an isolated release work branch and worktree from the fetched target.
+2. Update the canonical version authority and verify every projection.
+3. Admit beta bug fixes only as reviewed, exact-provenance backports.
+4. Integrate through the protected authority and freeze one immutable candidate.
+5. Build and qualify once; required paths may not use fallback artifacts.
+6. Promote exact admitted artifacts and create only the exact signed tag.
+7. Withdraw or supersede failures without rewriting published identity.
 
 ## Version Types
 

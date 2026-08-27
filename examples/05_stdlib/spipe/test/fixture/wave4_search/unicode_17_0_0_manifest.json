@@ -11,9 +11,9 @@
     "file": "examples/05_stdlib/spipe/tools/unicode/UNICODE-LICENSE.txt"
   },
   "generator": {
-    "version": 1,
+    "version": 2,
     "file": "examples/05_stdlib/spipe/tools/unicode/generate_unicode_tables.mjs",
-    "sha256": "22732b052cc89aac98847873f72120bc10ab2582e1146dd4cc1aadab6cc580f8",
+    "sha256": "4a377beee60d35d5da8fe495128abaac47d5f078a2cc6a6bf306d25a4295a338",
     "command": "node examples/05_stdlib/spipe/tools/unicode/generate_unicode_tables.mjs"
   },
   "sources": [
@@ -56,13 +56,13 @@
   "generated": [
     {
       "file": "examples/05_stdlib/spipe/src/search/generated/unicode_17_0_0.js",
-      "sha256": "439e75817775eb1250e28ffb6028f19fce03bef5a6cbe0aefe96023a414336cd",
-      "bytes": 129002
+      "sha256": "e625a3ab2ec0091a1e86c40048dc3ad483d7b181197b8dc97541e74266c176b6",
+      "bytes": 130277
     },
     {
       "file": "src/lib/common/search/generated/unicode_17_0_0.spl",
-      "sha256": "85f86cf09a78027c70fe2668db25b27e8a321e10fb0fbed8cc6a5b5f96680c4e",
-      "bytes": 116205
+      "sha256": "6f656fea28081ba65a237427f852206d1f4415df6de8b2c5ee648985de8e128f",
+      "bytes": 119824
     }
   ],
   "contracts": {

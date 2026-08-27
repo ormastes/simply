@@ -493,16 +493,6 @@ static RuntimeValue simpleos_expose_runtime_value(RuntimeValue v)
     return IS_INT(v) ? (RuntimeValue)DECODE_INT(v) : v;
 }
 
-RuntimeValue rt_x86_ap_trampoline_vector(void)
-{
-    return (RuntimeValue)SIMPLEOS_AP_TRAMPOLINE_VECTOR;
-}
-
-RuntimeValue rt_x86_ap_trampoline_phys(void)
-{
-    return (RuntimeValue)SIMPLEOS_AP_TRAMPOLINE_PHYS;
-}
-
 RuntimeValue rt_x86_prepare_ap_startup(RuntimeValue cpu_id_rv, RuntimeValue vector_rv)
 {
     uint32_t cpu_id = (uint32_t)cpu_id_rv;
@@ -15752,7 +15742,11 @@ S2(rt_result_unwrap_or)
 
 S1(rt_weak_ref)
 S1(rt_weak_deref)
-S1(rt_closure_new)
+/* rt_closure_new is supplied by the selected runtime bundle. A fatal S1 stub
+ * here is a strong definition and silently shadows the real allocator while
+ * the other closure accessors remain real, yielding an ABI-incoherent guest.
+ * Leave the symbol unresolved so no-stub linking fails closed when the runtime
+ * bundle is missing. */
 S2(rt_closure_call)
 S1(rt_closure_bind)
 

@@ -1,52 +1,13 @@
-<!-- llm-process-gen: managed source=codex_sync_skill source_sha256=c7843bc7156c20b4d7e01acc2603b91e6662b1147c2275a6e0841ccfa82253a1 content_sha256=c7843bc7156c20b4d7e01acc2603b91e6662b1147c2275a6e0841ccfa82253a1 -->
----
-name: sync
-description: "Pull, rebase, and push with file-count safety checks. Worktree-aware jj sync. Use when syncing the repository."
----
+<!-- generated-from: isolated session sync policy -->
+# Isolated Session Sync
 
-# Sync Skill — Pull/Rebase/Push with Safety Checks
+Sync only the current session-owned `work/*` branch from its declared protected target.
 
-## Rules
-1. **NO BRANCHES** — work directly on `main`
-2. **NO ORPHAN COMMITS** — never leave detached
-3. **LINEAR HISTORY** — rebase, never merge
-4. **FILE COUNT GUARD** — check file count before/after rebase; abort if unexpected reduction
+1. Verify the current path is the session's linked worktree and the branch/workspace owner matches the session manifest.
+2. Fetch the target and record its exact SHA.
+3. Rebase only a private work branch. A submitted branch requires renewed review and evidence. Protected refs, candidates, recovery refs, and tags are never rebased.
+4. Resolve policy/config conflicts semantically; regenerate projections instead of selecting one side blindly.
+5. Run affected gates, update the session manifest, and push only the owned work ref with lease/compare-and-swap.
+6. Submit through the integration authority. This skill never moves `main`, `release/*`, a candidate ref, or a release tag.
 
-## Workflow
-
-```bash
-# 0. Pre-check: record baseline
-FILE_COUNT_BEFORE=$(git ls-files | wc -l | tr -d ' ')
-
-# 1. Commit local changes (if any)
-jj commit -m "<type>: <msg>"
-
-# 2. Fetch remote
-jj git fetch
-
-# 3. Rebase onto latest remote
-jj rebase -d main@origin
-
-# 4. Post-rebase file count check
-FILE_COUNT_AFTER=$(git ls-files | wc -l | tr -d ' ')
-if [ "$FILE_COUNT_AFTER" -lt "$FILE_COUNT_BEFORE" ]; then
-  echo "WARNING: File count reduced ($FILE_COUNT_BEFORE -> $FILE_COUNT_AFTER)"
-  jj diff --stat
-  echo "Restore with: jj op restore <op_id>"
-  echo "Stopping before bookmark/push. Continue manually only after human review."
-  exit 1
-fi
-
-# 5. Push
-jj bookmark set main -r @-
-jj git push --bookmark main
-```
-
-## Worktree Sync
-If on a jj workspace (not default), discover the workspace paths with
-`jj workspace list`, move to the default workspace path first, sync there,
-then return to the original workspace path and run `jj workspace update-stale`.
-
-## Safety
-- If file count drops unexpectedly, show `jj diff --stat`, exit before bookmark/push, and require explicit human continuation outside the script block
-- Restore with: `jj op restore <op_id>` if rebase went wrong
+Reject main-worktree mutation, stale target SHA, branch/workspace ownership mismatch, unconditional force, and broad ref pushes.

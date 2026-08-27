@@ -18,6 +18,7 @@ use os.kernel.memory.vmm_address_space.{vmm_map_nvme_bar_high}
 use os.x86_64_fs_exec_provider_status.{x86_64_fs_exec_provider_blocked_marker}
 use os.services.vfs.vfs_boot_init.{vfs_boot_init, g_mount_table}
 use os.kernel.loader.x86_64_authenticated_media_fixture.{x86_64_authenticated_media_execute_v1}
+use os.kernel.loader.authenticated_fs_exec_submission_service_v1.{authenticated_fs_exec_user_install_canonical_vfs_owner_v1}
 use os.kernel.scheduler.scheduler_types.{Scheduler}
 
 fn fail(reason: text):
@@ -59,6 +60,9 @@ fn spl_start():
 
     if not vfs_boot_init():
         fail("[fs-program] canonical MountTable bind failed")
+        return
+    if not authenticated_fs_exec_user_install_canonical_vfs_owner_v1():
+        fail("[fs-program] filesystem-exec VFS owner install failed")
         return
 
     serial_println("FS_PROGRAM_BEGIN path=/FSEXEC.ELF arch=x86_64")
