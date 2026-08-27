@@ -36,15 +36,34 @@ ts() {
   echo "${t:-0}"
 }
 
+# For the registry, only the HAND-AUTHORED identity columns count. This script
+# rewrites columns 7-9 on every run, so a plain "registry newer than results"
+# test would go stale the instant the generator itself ran — self-defeating.
+# Walk registry history newest-first for the last commit that changed cols 1-6.
+idcols() { grep -v '^#' | cut -d'|' -f1-6 | md5sum; }
+registry_identity_ts() {
+  git log --format=%H -- data/registry.sdn 2>/dev/null | while read -r c; do
+    a=$(git show "$c:data/registry.sdn" 2>/dev/null | idcols)
+    b=$(git show "$c^:data/registry.sdn" 2>/dev/null | idcols)
+    if [ "$a" != "$b" ]; then git log -1 --format=%ct "$c"; break; fi
+  done | head -1
+}
+
 if [ ! -f data/test_results.json ]; then
   echo "data/test_results.json is missing — no capability status can be earned from evidence." >> "$TMP/warn"
   : > "$TMP/results.json"
   RESULTS=$TMP/results.json
 else
   RESULTS=data/test_results.json
-  TR=$(ts data/test_results.json); RG=$(ts data/registry.sdn); TS=$(ts data/tests.sdn)
-  [ "$TR" -lt "$RG" ] && echo "data/test_results.json is OLDER than data/registry.sdn — the numbers below predate the current capability list." >> "$TMP/warn"
-  [ "$TR" -lt "$TS" ] && echo "data/test_results.json is OLDER than data/tests.sdn — the numbers below predate the current test mapping." >> "$TMP/warn"
+  TR=$(ts data/test_results.json)
+  RG=$(registry_identity_ts); [ -n "$RG" ] || RG=$(ts data/registry.sdn)
+  TS=$(ts data/tests.sdn)
+  if [ "$TR" -lt "$RG" ]; then
+    echo "data/test_results.json is OLDER than the hand-authored columns of data/registry.sdn — the numbers below predate the current capability list." >> "$TMP/warn"
+  fi
+  if [ "$TR" -lt "$TS" ]; then
+    echo "data/test_results.json is OLDER than data/tests.sdn — the numbers below predate the current test mapping." >> "$TMP/warn"
+  fi
 fi
 
 DATE=$(date -u +%Y-%m-%d)

@@ -52,8 +52,12 @@ stale. `scripts/update_site.sh` still renders the page, but prints a STALE
 banner on it and exits 1, when any of these hold:
 
 - `data/test_results.json` is missing;
-- it is older than `data/registry.sdn` or `data/tests.sdn` (git commit time,
-  falling back to mtime outside a checkout — a CI clone flattens mtimes);
+- it is older than `data/tests.sdn`, or older than the last commit that changed
+  the **hand-authored** columns 1-6 of `data/registry.sdn` (git commit time,
+  falling back to mtime outside a checkout — a CI clone flattens mtimes).
+  Comparing against the whole registry file would be self-defeating: the
+  generator rewrites columns 7-9 itself, so every run would declare its own
+  fresh results stale;
 - a `unit`/`system` mapping matches no spec file, split into two causes: the
   run **did** cover that test tree (broken or renamed mapping) or it **never
   executed** that tree (coverage gap in the run).
