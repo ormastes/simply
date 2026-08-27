@@ -18,15 +18,48 @@ unit tests alone never earns a high score.
 
 | status | earned by |
 |---|---|
+| `unproven` | `data/tests.sdn` maps the row to no spec file present in the test run. The dashboard shows **no evidence**, never a percentage — deliberately distinct from `0%`, which means tests ran and failed |
 | `declared` | Row exists; criteria written; tests may be `planned()` markers only |
 | `source_present` | Implementation source exists; no verifying suite yet |
 | `unit_verified` | The row's unit-test list is green in `test --json` |
 | `system_verified` | Unit list green AND at least one end-to-end workflow spec green |
 | `usable` | system_verified AND the usability gate's workflow is documented and reproducible by a newcomer |
 
-Statuses flip from test evidence, not by hand: the daily job reads
-`data/test_results.json` (native `simple test --json` output) and a row whose
-test list has failures cannot hold `unit_verified` or better.
+Statuses flip from test evidence, not by hand. `scripts/update_site.sh` reads
+`data/test_results.json` (verbatim `simple test --json` output), resolves each
+row's `tests.sdn` paths against `files[]` (exact match, or prefix match for a
+directory mapping, deduplicated per row), and computes:
+
+- **F** = unit pass-rate = `passed / (passed + failed)` over the row's `unit`
+  entries. **U** = the same over `system` entries, **P** over `bench` entries.
+  Pending and skipped are outside every denominator, so `planned()` markers can
+  never drag a score down.
+- `done = 55F + 25U + 20P`, **renormalized over the gates that actually have
+  evidence** — a gate with a zero denominator is unmeasured, not zero.
+- Status: no evidence at all → `unproven`; only `planned` entries resolved, or
+  any unit failure → `source_present`; unit green → `unit_verified`; unit and
+  system both green → `system_verified`. `usable` is **never auto-awarded** —
+  "reproducible by a newcomer" is not something a test run can evidence.
+
+Columns 7-9 of `data/registry.sdn` (`done|status|sspec`) are **generated**: the
+script rewrites them in place, so the file can never disagree with the page.
+Columns 1-6 (`id|group|name|F|U|P`) stay hand-authored.
+
+## Staleness (the generator exits non-zero)
+
+A dashboard that quietly shows old numbers is worse than one that admits it is
+stale. `scripts/update_site.sh` still renders the page, but prints a STALE
+banner on it and exits 1, when any of these hold:
+
+- `data/test_results.json` is missing;
+- it is older than `data/registry.sdn` or `data/tests.sdn` (git commit time,
+  falling back to mtime outside a checkout — a CI clone flattens mtimes);
+- a `unit`/`system` mapping matches no spec file, split into two causes: the
+  run **did** cover that test tree (broken or renamed mapping) or it **never
+  executed** that tree (coverage gap in the run).
+
+`.github/workflows/daily-update.yml` commits the rendered page either way and
+then fails the job on that exit code. It never synthesises results.
 
 ## Test lists (`data/tests.sdn`)
 

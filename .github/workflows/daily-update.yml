@@ -3,7 +3,12 @@ on:
   schedule:
     - cron: "17 3 * * *"
   push:
-    paths: [data/registry.sdn, scripts/update_site.sh, docs/glass.css]
+    paths:
+      - data/registry.sdn
+      - data/tests.sdn
+      - data/test_results.json
+      - scripts/update_site.sh
+      - docs/glass.css
   workflow_dispatch:
 permissions:
   contents: write
@@ -12,21 +17,43 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # scripts/update_site.sh reads commit times for its freshness check
       - name: Refresh test results (when a simple binary is available)
-        # `simple test --json` emits totals + per-group done_pct consumed by
-        # the dashboard's test panel. No released binary is installable in CI
-        # yet, so this refreshes only if `simple` is on PATH; otherwise the
-        # committed data/test_results.json (if any) is used as-is.
+        # `simple test --json` is the ONLY source of the dashboard's numbers.
+        # No released binary is installable in CI yet, so this refreshes only
+        # when `simple` is on PATH; otherwise the committed
+        # data/test_results.json is used as-is and the generator decides
+        # whether it is still fresh. Nothing here ever synthesises results.
         run: |
           if command -v simple >/dev/null 2>&1; then
-            simple test --json 2>/dev/null | grep '^{' | tail -1 > data/test_results.json || rm -f data/test_results.json
+            simple test --json > "$RUNNER_TEMP/results.json" 2>/dev/null || true
+            if [ -s "$RUNNER_TEMP/results.json" ] && head -c1 "$RUNNER_TEMP/results.json" | grep -q '{'; then
+              cp "$RUNNER_TEMP/results.json" data/test_results.json
+            fi
           fi
       - name: Regenerate site
-        run: sh scripts/update_site.sh
+        id: gen
+        # The generator always writes docs/index.html — including the STALE
+        # banner state — and exits non-zero when the evidence cannot be
+        # trusted. The page is committed either way; the job then fails so a
+        # stale dashboard is loud instead of quiet.
+        run: |
+          set +e
+          sh scripts/update_site.sh
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
       - name: Commit if changed
         run: |
           git config user.name "simply-bot"
           git config user.email "ormastespq@gmail.com"
-          git add docs/index.html
-          git diff --cached --quiet || git commit -m "chore(site): daily regenerate"
+          git add docs/index.html docs/glass.css data/registry.sdn data/test_results.json
+          git diff --cached --quiet || git commit -m "chore(site): daily regenerate from test evidence"
           git push
+      - name: Fail if the generator reported stale or refused
+        run: |
+          rc="${{ steps.gen.outputs.rc }}"
+          if [ "$rc" != "0" ]; then
+            echo "::error::scripts/update_site.sh exited $rc — the dashboard is published but its evidence is stale or the generator refused to run. See the STALE section on docs/index.html."
+            exit "$rc"
+          fi
+          echo "generator fresh (rc=0)"

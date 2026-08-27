@@ -89,3 +89,24 @@ td.sspec { color: var(--muted); font-family: ui-monospace, monospace; font-size:
 .st-source_present { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
 .st-declared { background: rgba(127, 127, 127, 0.15); color: var(--muted); }
 footer { max-width: 72rem; margin: 2rem auto 0; color: var(--muted); font-size: 0.85rem; text-align: center; }
+
+/* --- derived-evidence rendering (scripts/update_site.sh) --- */
+.st-unproven { background: rgba(127, 127, 127, 0.15); color: var(--muted); border: 1px dashed var(--muted); }
+.noev { color: var(--muted); font-style: italic; }
+td.ct { font-family: ui-monospace, monospace; font-size: 0.8rem; white-space: nowrap; }
+td.ct .p { color: var(--ok); }
+td.ct .f { color: var(--bad, #c2334d); }
+td.ct .e { color: var(--muted); }
+.ev { margin: 0.1rem 0; }
+.ev .cnt { color: var(--muted); }
+.k { display: inline-block; min-width: 3.6rem; padding: 0 0.35rem; margin-right: 0.3rem;
+     border-radius: 4px; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.03em;
+     background: rgba(127, 127, 127, 0.15); color: var(--muted); }
+.k-unit { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent); }
+.k-system { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
+.k-planned { background: rgba(127, 127, 127, 0.15); color: var(--muted); }
+.nolink { color: var(--muted); }
+.card.stale { border-color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, var(--card)); }
+.card.stale h2 { color: var(--warn); }
+.card.stale ul { margin: 0.4rem 0 0; padding-left: 1.2rem; font-size: 0.85rem; }
+h2 small { color: var(--muted); font-weight: 400; }
