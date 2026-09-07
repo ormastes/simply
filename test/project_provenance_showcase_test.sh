@@ -15,6 +15,7 @@ simple_binary_sha256=11111111111111111111111111111111111111111111111111111111111
 simple_version_sha256=2222222222222222222222222222222222222222222222222222222222222222
 tree=clean
 test_result=verified
+failure_phase=none
 test_command=simple test test/03_system/project_proof
 test_exit=0
 test_output_sha256=0f5c408234c85a2ca5db0ef87b9ddcd7d5907e2cf1cec9fa7d9ca35e2dbaaaa1
@@ -42,7 +43,7 @@ sh "$work/scripts/project_proof.sh" >/dev/null
 grep -q 'simple.*st-unverified' "$work/docs/projects.html"
 mv "$proof.absent" "$proof"
 
-cp "$valid" "$proof"; sed -i 's/test_result=verified/test_result=failed/; s/test_exit=0/test_exit=7/' "$proof"
+cp "$valid" "$proof"; sed -i 's/test_result=verified/test_result=failed/; s/failure_phase=none/failure_phase=project-test/; s/test_exit=0/test_exit=7/' "$proof"
 sh "$work/scripts/project_proof.sh" >/dev/null
 grep -q 'simple.*st-failed' "$work/docs/projects.html"
 

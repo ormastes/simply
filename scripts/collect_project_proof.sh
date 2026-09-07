@@ -61,14 +61,19 @@ set +e
 "$simple_binary" --version >"$tmp/simple-version.log" 2>&1
 simple_probe_exit=$?
 set -e
-[ "$simple_probe_exit" -eq 0 ] || { echo "FAIL: pinned Simple executable failed --version with exit $simple_probe_exit" >&2; exit 1; }
 if command -v sha256sum >/dev/null 2>&1; then simple_binary_digest=$(sha256sum "$simple_binary" | awk '{print $1}'); simple_version_digest=$(sha256sum "$tmp/simple-version.log" | awk '{print $1}'); else simple_binary_digest=$(shasum -a 256 "$simple_binary" | awk '{print $1}'); simple_version_digest=$(shasum -a 256 "$tmp/simple-version.log" | awk '{print $1}'); fi
-set +e
 simple_tag=$(sed -n 's/^tag=//p' "$root/data/simple_release.sdn"); simple_commit=$(sed -n 's/^commit=//p' "$root/data/simple_release.sdn")
 [ "$(grep -c '^tag=' "$root/data/simple_release.sdn")" -eq 1 ] && [ "$(grep -c '^commit=' "$root/data/simple_release.sdn")" -eq 1 ] && [ "$simple_tag" = v1.0.1-beta.1 ] && printf '%s' "$simple_commit" | grep -Eq '^[0-9a-f]{40}$' || { echo "FAIL: invalid pinned Simple release" >&2; exit 2; }
-(cd "$checkout" && SIMPLE_PROOF_TAG=$simple_tag SIMPLE_PROOF_COMMIT=$simple_commit "$@") >"$tmp/test.log" 2>&1
-test_exit=$?
-set -e
+failure_phase=none
+if [ "$simple_probe_exit" -ne 0 ]; then
+  cp "$tmp/simple-version.log" "$tmp/test.log"; test_exit=$simple_probe_exit; failure_phase=simple-version
+else
+  set +e
+  (cd "$checkout" && SIMPLE_PROOF_TAG=$simple_tag SIMPLE_PROOF_COMMIT=$simple_commit "$@") >"$tmp/test.log" 2>&1
+  test_exit=$?
+  set -e
+  [ "$test_exit" -eq 0 ] || failure_phase=project-test
+fi
 [ -z "$(git -C "$checkout" status --porcelain=v1 --untracked-files=all)" ] || { echo "FAIL: proof command dirtied the project checkout; receipt not written" >&2; exit 1; }
 if command -v sha256sum >/dev/null 2>&1; then digest=$(sha256sum "$tmp/test.log" | awk '{print $1}'); else digest=$(shasum -a 256 "$tmp/test.log" | awk '{print $1}'); fi
 [ -z "$log_output" ] || { mkdir -p "$(dirname "$log_output")"; cp "$tmp/test.log" "$log_output"; }
@@ -87,13 +92,16 @@ mkdir -p "$(dirname "$output")"
   echo simple_version_sha256="$simple_version_digest"
   echo tree=clean
   echo test_result="$result"
+  echo failure_phase="$failure_phase"
   echo test_command="$command_text"
   echo test_exit="$test_exit"
   echo test_output_sha256="$digest"
   echo sspec_paths="$specs"
   echo sspec_review=basic-static
   date -u '+checked_at=%Y-%m-%dT%H:%M:%SZ'
-  if [ "$result" = verified ]; then echo follow_up=manual-semantic-review; else echo follow_up=repair-test-failure; fi
+  if [ "$result" = verified ]; then echo follow_up=manual-semantic-review
+  elif [ "$failure_phase" = simple-version ]; then echo follow_up=beta-runtime-blocker-ormastes-simple-497
+  else echo follow_up=repair-test-failure; fi
 } > "$tmp/receipt"
 mv "$tmp/receipt" "$output"
 echo "PROOF: project=$id state=$result commit=$commit simple=$simple_tag@$simple_commit receipt=$output"

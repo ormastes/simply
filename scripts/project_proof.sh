@@ -27,7 +27,7 @@ bad=0
     if [ -f "$proof" ]; then
       project=$(one "$proof" project 2>/dev/null || true); prepo=$(one "$proof" repository 2>/dev/null || true); pbranch=$(one "$proof" branch 2>/dev/null || true)
       schema=$(one "$proof" schema 2>/dev/null || true); sha=$(one "$proof" commit 2>/dev/null || true); stag=$(one "$proof" simple_tag 2>/dev/null || true); ssha=$(one "$proof" simple_commit 2>/dev/null || true); sbinary=$(one "$proof" simple_binary_sha256 2>/dev/null || true); sversion=$(one "$proof" simple_version_sha256 2>/dev/null || true)
-      tree=$(one "$proof" tree 2>/dev/null || true); result=$(one "$proof" test_result 2>/dev/null || true); command=$(one "$proof" test_command 2>/dev/null || true); exit_code=$(one "$proof" test_exit 2>/dev/null || true); digest=$(one "$proof" test_output_sha256 2>/dev/null || true); specs=$(one "$proof" sspec_paths 2>/dev/null || true); review=$(one "$proof" sspec_review 2>/dev/null || true); checked=$(one "$proof" checked_at 2>/dev/null || true); follow=$(one "$proof" follow_up 2>/dev/null || true)
+      tree=$(one "$proof" tree 2>/dev/null || true); result=$(one "$proof" test_result 2>/dev/null || true); phase=$(one "$proof" failure_phase 2>/dev/null || true); command=$(one "$proof" test_command 2>/dev/null || true); exit_code=$(one "$proof" test_exit 2>/dev/null || true); digest=$(one "$proof" test_output_sha256 2>/dev/null || true); specs=$(one "$proof" sspec_paths 2>/dev/null || true); review=$(one "$proof" sspec_review 2>/dev/null || true); checked=$(one "$proof" checked_at 2>/dev/null || true); follow=$(one "$proof" follow_up 2>/dev/null || true)
       tag_count=$(grep -c '^project_tag=' "$proof" || true); tag_commit_count=$(grep -c '^project_tag_commit=' "$proof" || true); tag_ok=0; project_tag=none
       if [ "$tag_count" -eq 0 ] && [ "$tag_commit_count" -eq 0 ]; then tag_ok=1
       elif [ "$tag_count" -eq 1 ] && [ "$tag_commit_count" -eq 1 ]; then
@@ -41,8 +41,8 @@ bad=0
       if [ "$schema" = project-proof-v1 ] && [ "$project" = "$id" ] && [ "$prepo" = "$repo" ] && [ "$pbranch" = "$branch" ] && printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$' && [ "$stag" = "$release_tag" ] && [ "$ssha" = "$release_commit" ] && printf '%s' "$sbinary" | grep -Eq '^[0-9a-f]{64}$' && printf '%s' "$sversion" | grep -Eq '^[0-9a-f]{64}$' && [ "$tag_ok" -eq 1 ]; then identity_ok=1; fi
       evidence_ok=0
       if [ "$identity_ok" -eq 1 ] && [ "$tree" = clean ] && printf '%s' "$digest" | grep -Eq '^[0-9a-f]{64}$' && [ "$specs_ok" -eq 1 ] && [ -n "$specs" ] && [ "$review" = basic-static ] && safe_text "$command" && safe_text "$specs" && printf '%s' "$checked" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' && safe_text "$follow"; then evidence_ok=1; fi
-      if [ "$evidence_ok" -eq 1 ] && [ "$result" = verified ] && [ "$exit_code" = 0 ]; then state=verified
-      elif [ "$evidence_ok" -eq 1 ] && [ "$result" = failed ] && printf '%s' "$exit_code" | grep -Eq '^[1-9][0-9]*$'; then state=failed
+      if [ "$evidence_ok" -eq 1 ] && [ "$result" = verified ] && [ "$exit_code" = 0 ] && [ "$phase" = none ]; then state=verified
+      elif [ "$evidence_ok" -eq 1 ] && [ "$result" = failed ] && { [ "$phase" = simple-version ] || [ "$phase" = project-test ]; } && printf '%s' "$exit_code" | grep -Eq '^[1-9][0-9]*$'; then state=failed
       else state=failed; bad=1; command='—'; checked='—'; follow='repair receipt or test'; fi
       if [ "$identity_ok" -eq 1 ]; then
         commit="<a href=\"$repo/commit/$sha\"><code>$sha</code></a>"
