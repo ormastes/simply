@@ -7,7 +7,12 @@ on:
       - data/registry.sdn
       - data/tests.sdn
       - data/test_results.json
+      - data/projects.sdn
+      - data/project_proofs/**
+      - data/simple_release.sdn
       - scripts/update_site.sh
+      - scripts/project_proof.sh
+      - scripts/check_worktree_clean.sh
       - docs/glass.css
   workflow_dispatch:
 permissions:
@@ -39,6 +44,7 @@ jobs:
         # trusted. The page is committed either way; the job then fails so a
         # stale dashboard is loud instead of quiet.
         run: |
+          sh scripts/check_worktree_clean.sh
           set +e
           sh scripts/update_site.sh
           echo "rc=$?" >> "$GITHUB_OUTPUT"

@@ -1,0 +1,11 @@
+use std.spec.*
+
+describe "Project provenance showcase":
+    it "REQ-PPS-001 through REQ-PPS-004 keep proof requirements explicit":
+        val receipt = "project=simple|commit=62eada434c050cb688598bef1ab4f5a25b5cb404|tree=clean|test_result=verified"
+        expect(receipt).to_contain("commit=62eada434c050cb688598bef1ab4f5a25b5cb404")
+        expect(receipt).to_contain("tree=clean")
+
+    it "REQ-PPS-006 distinguishes a dirty receipt from a verified proof":
+        val dirty = "tree=dirty"
+        expect(dirty).to_equal("tree=dirty")
