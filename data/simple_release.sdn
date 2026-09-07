@@ -1,0 +1,5 @@
+# Immutable Simple compatibility baseline. Do not substitute main.
+repository=https://github.com/ormastes/simple
+tag=v1.0.1-beta.1
+commit=62eada434c050cb688598bef1ab4f5a25b5cb404
+channel=beta

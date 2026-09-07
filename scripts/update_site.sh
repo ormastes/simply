@@ -223,7 +223,7 @@ END {
     printf "<div class=big>%d%%<span> composite over the %d row(s) with evidence</span></div>", int(compsum / proven + 0.5), proven
   else
     printf "<div class=big>—<span> no row has test evidence</span></div>"
-  printf "<p class=links><a href=\"https://github.com/ormastes/simply/blob/main/doc/plan/implementation_map.md\">implementation map</a> · <a href=\"https://github.com/ormastes/simply/blob/main/doc/plan/completion_criteria.md\">completion criteria</a> · <a href=\"https://github.com/ormastes/simply/tree/main/examples\">examples</a></p></header>"
+  printf "<p class=links><a href=\"https://github.com/ormastes/simply/blob/main/doc/plan/implementation_map.md\">implementation map</a> · <a href=\"https://github.com/ormastes/simply/blob/main/doc/plan/completion_criteria.md\">completion criteria</a> · <a href=\"projects.html\">project proofs</a> · <a href=\"https://github.com/ormastes/simply/tree/main/examples\">examples</a></p></header>"
 
   # --- staleness banner ---
   nw = 0
@@ -295,6 +295,7 @@ END {
 
 mv "$TMP/index.html" docs/index.html
 mv "$TMP/registry.sdn" data/registry.sdn
+sh scripts/project_proof.sh
 
 STALE=0
 if [ -s "$TMP/warn" ] || [ -s "$TMP/warn.derived" ]; then STALE=1; fi

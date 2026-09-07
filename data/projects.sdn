@@ -1,0 +1,22 @@
+# id|repository|branch|capabilities
+simple|https://github.com/ormastes/simple|main|I01,I02,I03,I04,I06,I07,I08,A10
+simple-os|https://github.com/ormastes/simple-os|main|I11,I12,I13,A23
+simple-erp|https://github.com/ormastes/simple-erp|main|A02
+simple-ubs|https://github.com/ormastes/simple-ubs|main|I29
+simple-ide|https://github.com/ormastes/simple-ide|main|I08,A01
+simple-browser|https://github.com/ormastes/simple-browser|main|I24
+simple-baremetal|https://github.com/ormastes/simple-baremetal|main|I12,I13
+simple-qemu|https://github.com/ormastes/simple-qemu|main|I11,I12
+simple-riscv|https://github.com/ormastes/simple-riscv|main|I10,I13
+simple_cuda_example|https://github.com/ormastes/simple_cuda_example|main|I10,I26,I30
+simple-restaurant|https://github.com/ormastes/simple-restaurant|main|A03
+simple-payment|https://github.com/ormastes/simple-payment|main|A07
+simple-spostgre|https://github.com/ormastes/simple-spostgre|main|I18
+simple-llm-cli-tools|https://github.com/ormastes/simple-llm-cli-tools|main|I08,I30
+simple_deeplearning_study|https://github.com/ormastes/simple_deeplearning_study|main|I30
+simple_game|https://github.com/ormastes/simple_game|main|A13
+simple.nvim|https://github.com/ormastes/simple.nvim|main|I08
+simple_obsidian_tools|https://github.com/ormastes/simple_obsidian_tools|main|I08
+simple_cmake_tutorial|https://github.com/ormastes/simple_cmake_tutorial|main|I06
+simple-mllvm-qemu-rtl|https://github.com/ormastes/simple-mllvm-qemu-rtl|main|I10,I12
+svllm|https://github.com/ormastes/svllm|main|I30
