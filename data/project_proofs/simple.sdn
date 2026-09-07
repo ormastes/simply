@@ -1,0 +1,19 @@
+schema=project-proof-v1
+project=simple
+repository=https://github.com/ormastes/simple
+branch=main
+commit=da48c00098e843a0465ba36a5850e664685f6c6c
+simple_tag=v1.0.1-beta.1
+simple_commit=62eada434c050cb688598bef1ab4f5a25b5cb404
+simple_binary_sha256=7fc570189e1d689c8c99988981a4766b0a42ba9a70dc97571c71d2a75c46823b
+simple_version_sha256=26d422b0a44e4f756144e1c3fde97aaeb3b0e308dc74279a303e17249c0bfa25
+tree=clean
+test_result=failed
+failure_phase=simple-version
+test_command=simple test test/01_unit/app/ffi_gen/module_gen_spec.spl --mode=interpreter
+test_exit=139
+test_output_sha256=26d422b0a44e4f756144e1c3fde97aaeb3b0e308dc74279a303e17249c0bfa25
+sspec_paths=test/01_unit/app/ffi_gen/module_gen_spec.spl
+sspec_review=basic-static
+checked_at=2026-09-07T11:59:11Z
+follow_up=https://github.com/ormastes/simple/issues/497

@@ -53,7 +53,7 @@ if sh "$root/scripts/collect_project_proof.sh" simple "$project" test/system/pro
 grep -q '^test_result=failed$' "$receipt"
 grep -q '^test_exit=139$' "$receipt"
 grep -q '^failure_phase=simple-version$' "$receipt"
-grep -q '^follow_up=beta-runtime-blocker-ormastes-simple-497$' "$receipt"
+grep -q '^follow_up=https://github.com/ormastes/simple/issues/497$' "$receipt"
 
 printf '%s\n' dirty > "$project/untracked"
 if sh "$root/scripts/collect_project_proof.sh" simple "$project" test/system/proof_spec.spl --output "$tmp/dirty.sdn" -- simple test test/system/proof_spec.spl >/dev/null 2>&1; then echo 'expected dirty checkout rejection' >&2; exit 1; fi
