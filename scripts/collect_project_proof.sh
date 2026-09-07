@@ -100,7 +100,7 @@ mkdir -p "$(dirname "$output")"
   echo sspec_review=basic-static
   date -u '+checked_at=%Y-%m-%dT%H:%M:%SZ'
   if [ "$result" = verified ]; then echo follow_up=manual-semantic-review
-  elif [ "$failure_phase" = simple-version ]; then echo follow_up=beta-runtime-blocker-ormastes-simple-497
+  elif [ "$failure_phase" = simple-version ]; then echo follow_up=https://github.com/ormastes/simple/issues/497
   else echo follow_up=repair-test-failure; fi
 } > "$tmp/receipt"
 mv "$tmp/receipt" "$output"

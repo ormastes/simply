@@ -55,7 +55,9 @@ bad=0
         IFS=$old_ifs
       fi
     fi
-    printf '<tr><td><a href="%s">%s</a><br><small>%s</small></td><td>%s</td><td>%s</td><td><span class="st st-%s">%s</span></td><td>%s</td><td>%s</td><td>%s</td></tr>\n' "$repo" "$id" "$caps" "$branch" "$commit" "$state" "$state" "$evidence" "$checked" "$follow"
+    follow_display=$follow
+    case "$follow" in https://github.com/*) follow_display="<a href=\"$follow\">upstream blocker</a>";; esac
+    printf '<tr><td><a href="%s">%s</a><br><small>%s</small></td><td>%s</td><td>%s</td><td><span class="st st-%s">%s</span></td><td>%s</td><td>%s</td><td>%s</td></tr>\n' "$repo" "$id" "$caps" "$branch" "$commit" "$state" "$state" "$evidence" "$checked" "$follow_display"
   done < "$catalog"
   printf '%s\n' '</table></div><footer>A project becomes verified only through a clean checkout, a pinned commit, the pinned Simple beta tag/commit, and an explicit successful test receipt. This page never queries GitHub or runs projects.</footer></section><p><a href="index.html">Capability dashboard</a></p></body></html>'
 } > "$output"
