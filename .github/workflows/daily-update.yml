@@ -32,6 +32,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0   # scripts/update_site.sh reads commit times for its freshness check
+      - name: Verify pristine checkout before maintenance
+        run: sh scripts/check_worktree_clean.sh
       - name: Refresh test results (when a simple binary is available)
         # `simple test --json` is the ONLY source of the dashboard's numbers.
         # The pinned beta currently has no downloadable release assets, so this
@@ -57,7 +59,6 @@ jobs:
         # trusted. The page is committed either way; the job then fails so a
         # stale dashboard is loud instead of quiet.
         run: |
-          sh scripts/check_worktree_clean.sh
           set +e
           sh scripts/update_site.sh
           echo "rc=$?" >> "$GITHUB_OUTPUT"
