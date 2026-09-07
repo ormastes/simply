@@ -5,10 +5,10 @@
 `simply` is an offline evidence aggregator, never a live project runner.
 
 ```
-project catalog + project_proofs/*.sdn + simulator fixtures
+project catalog + project_proofs/*.sdn + materialized simulator fixtures
                          │
                          ▼
-             verify_project_proofs.sh
+                project_proof.sh
                     │             │
             nonzero reject   projects.html
 ```
@@ -22,9 +22,12 @@ upgrades a missing or malformed receipt.
 
 `data/projects.sdn` is the full organization catalog. Receipts are independent
 files so projects can update their evidence without changing the catalog.
-`data/project_proofs/fixtures` is a deterministic simulator corpus for every
-accept/reject state. Live GitHub collection is a separate maintenance command
-and is prohibited in page generation.
+`test/project_provenance_showcase_test.sh` materializes a deterministic
+simulator corpus for every accept/reject state. Live checkout collection is a
+separate maintenance command, `scripts/collect_project_proof.sh`, and is
+prohibited in page generation. The manual `project-proof` workflow resolves
+the target from the catalog, checks out the pinned beta toolchain, retains the
+test log as an artifact, and never commits a receipt automatically.
 
 The strict root guard rejects all tracked and untracked changes for an evidence
 run. Its pre-commit mode permits the staged index (otherwise commits cannot be
