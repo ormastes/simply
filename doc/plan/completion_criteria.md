@@ -52,8 +52,8 @@ stale. `scripts/update_site.sh` still renders the page, but prints a STALE
 banner on it and exits 1, when any of these hold:
 
 - `data/test_results.json` is missing;
-- it is older than `data/tests.sdn`, or older than the last commit that changed
-  the **hand-authored** columns 1-6 of `data/registry.sdn` (git commit time,
+- it is older than the last commit that changed the **hand-authored** columns
+  1-6 of `data/registry.sdn` (git commit time,
   falling back to mtime outside a checkout — a CI clone flattens mtimes).
   Comparing against the whole registry file would be self-defeating: the
   generator rewrites columns 7-9 itself, so every run would declare its own
@@ -61,6 +61,11 @@ banner on it and exits 1, when any of these hold:
 - a `unit`/`system` mapping matches no spec file, split into two causes: the
   run **did** cover that test tree (broken or renamed mapping) or it **never
   executed** that tree (coverage gap in the run).
+
+Changing a mapping does not become stale merely because its commit is newer
+than the result file. Exact path resolution is the validity check: a scored
+mapping must match the snapshot or generation fails. An `available` mapping
+explicitly earns no score and records an omitted-suite follow-up.
 
 `.github/workflows/daily-update.yml` commits the rendered page either way and
 then fails the job on that exit code. It never synthesises results.
@@ -71,8 +76,10 @@ then fails the job on that exit code. It never synthesises results.
 ormastes/simple (or a sibling repo, prefixed `repo:`).
 
 - `kind` = `unit` (feature gate), `system` (usability gate), `bench`
-  (performance gate), or `planned` (a future-impl `planned()` spec — declared
-  now, implemented later; reports as pending, never failed).
+  (performance gate), `available` (the suite exists at the pinned Simple beta
+  revision but was not executed by the current result snapshot and earns no
+  score), or `planned` (a future-impl `planned()` spec — declared now,
+  implemented later; reports as pending, never failed).
 - A row with only `planned` entries can be at most `source_present`.
 - Directory paths mean "every `*_spec.spl` beneath".
 

@@ -104,6 +104,7 @@ td.ct .e { color: var(--muted); }
      background: rgba(127, 127, 127, 0.15); color: var(--muted); }
 .k-unit { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent); }
 .k-system { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
+.k-available { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
 .k-planned { background: rgba(127, 127, 127, 0.15); color: var(--muted); }
 .nolink { color: var(--muted); }
 .card.stale { border-color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, var(--card)); }
