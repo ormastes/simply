@@ -12,7 +12,13 @@ on:
       - data/simple_release.sdn
       - scripts/update_site.sh
       - scripts/project_proof.sh
+      - scripts/collect_project_proof.sh
       - scripts/check_worktree_clean.sh
+      - test/project_provenance_showcase_test.sh
+      - test/collect_project_proof_test.sh
+      - test/worktree_clean_guard_test.sh
+      - test/03_system/project_proof/project_provenance_showcase_spec.spl
+      - .github/workflows/daily-update.yml
       - docs/glass.css
   workflow_dispatch:
 permissions:
@@ -63,3 +69,34 @@ jobs:
             exit "$rc"
           fi
           echo "generator fresh (rc=0)"
+  proof-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: simply
+      - uses: actions/checkout@v4
+        with:
+          repository: ormastes/simple
+          ref: v1.0.1-beta.1
+          path: simple-beta
+      - name: Prove portable project-proof behavior
+        working-directory: simply
+        run: |
+          sh test/project_provenance_showcase_test.sh
+          sh test/collect_project_proof_test.sh
+          sh test/worktree_clean_guard_test.sh
+      - name: Attempt exact-beta executable SSpec
+        id: beta_sspec
+        continue-on-error: true
+        working-directory: simple-beta
+        run: |
+          test "$(git rev-parse HEAD)" = 62eada434c050cb688598bef1ab4f5a25b5cb404
+          bin/simple_native --version
+          SIMPLE_LIB=src bin/simple_native test "$GITHUB_WORKSPACE/simply/test/03_system/project_proof/project_provenance_showcase_spec.spl" --mode=interpreter
+      - name: Record beta runtime blocker
+        if: steps.beta_sspec.outcome != 'success'
+        run: |
+          echo "::warning::Exact-beta SSpec is blocked by ormastes/simple#497; portable behavior gates passed, but this is not beta runtime proof."
+          echo "### Beta SSpec blocked" >> "$GITHUB_STEP_SUMMARY"
+          echo "The exact v1.0.1-beta.1 Linux artifact fails before SSpec execution. See https://github.com/ormastes/simple/issues/497." >> "$GITHUB_STEP_SUMMARY"

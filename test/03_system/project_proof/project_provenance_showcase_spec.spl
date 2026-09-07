@@ -1,11 +1,22 @@
 use std.spec.*
+use std.io_runtime.{process_run}
 
 describe "Project provenance showcase":
-    it "REQ-PPS-001 through REQ-PPS-004 keep proof requirements explicit":
-        val receipt = "project=simple|commit=62eada434c050cb688598bef1ab4f5a25b5cb404|tree=clean|test_result=verified"
-        expect(receipt).to_contain("commit=62eada434c050cb688598bef1ab4f5a25b5cb404")
-        expect(receipt).to_contain("tree=clean")
+    it "REQ-PPS-001 through REQ-PPS-005 fail closed across every receipt state":
+        val (out, err, code) = process_run("sh", ["-c", "if [ -f test/project_provenance_showcase_test.sh ]; then sh test/project_provenance_showcase_test.sh; else sh ../simply/test/project_provenance_showcase_test.sh; fi"])
+        expect(code).to_equal(0)
+        expect(out).to_contain("verified, failed, absent, malformed, dirty")
+        expect(out).to_contain("beta-mismatch, and project-tag states")
+        expect(err).to_equal("")
 
-    it "REQ-PPS-006 distinguishes a dirty receipt from a verified proof":
-        val dirty = "tree=dirty"
-        expect(dirty).to_equal("tree=dirty")
+    it "REQ-PPS-001 and REQ-PPS-007 bind live maintenance evidence to immutable revisions":
+        val (out, err, code) = process_run("sh", ["-c", "if [ -f test/collect_project_proof_test.sh ]; then sh test/collect_project_proof_test.sh; else sh ../simply/test/collect_project_proof_test.sh; fi"])
+        expect(code).to_equal(0)
+        expect(out).to_contain("identity, tag, SSpec review, result, digest, and clean tree")
+        expect(err).to_equal("")
+
+    it "REQ-PPS-006 rejects dirty roots while permitting a staged pre-commit index":
+        val (out, err, code) = process_run("sh", ["-c", "if [ -f test/worktree_clean_guard_test.sh ]; then sh test/worktree_clean_guard_test.sh; else sh ../simply/test/worktree_clean_guard_test.sh; fi"])
+        expect(code).to_equal(0)
+        expect(out).to_contain("staged, unstaged, and untracked changes")
+        expect(err).to_equal("")

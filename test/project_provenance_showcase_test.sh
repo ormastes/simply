@@ -11,30 +11,49 @@ branch=main
 commit=62eada434c050cb688598bef1ab4f5a25b5cb404
 simple_tag=v1.0.1-beta.1
 simple_commit=62eada434c050cb688598bef1ab4f5a25b5cb404
+simple_binary_sha256=1111111111111111111111111111111111111111111111111111111111111111
+simple_version_sha256=2222222222222222222222222222222222222222222222222222222222222222
 tree=clean
 test_result=verified
 test_command=simple test test/03_system/project_proof
 test_exit=0
 test_output_sha256=0f5c408234c85a2ca5db0ef87b9ddcd7d5907e2cf1cec9fa7d9ca35e2dbaaaa1
 sspec_paths=test/03_system/project_proof/project_provenance_showcase_spec.spl
+sspec_review=basic-static
 checked_at=2026-09-07T00:00:00Z
-follow_up=none
+follow_up=manual-semantic-review
 EOF
 work=$(mktemp -d); trap 'rm -rf "$tmp" "$work"' EXIT
 cp -R "$root/scripts" "$work/"
 mkdir -p "$work/docs"
 cp "$root/docs/glass.css" "$work/docs/"
 mv "$tmp/data" "$work/data"
+proof="$work/data/project_proofs/simple.sdn"; valid="$work/valid.sdn"; cp "$proof" "$valid"
+reject() {
+  if sh "$work/scripts/project_proof.sh" >/dev/null 2>&1; then echo "expected $1 rejection" >&2; exit 1; fi
+  grep -q 'st-failed' "$work/docs/projects.html"
+}
+
 sh "$work/scripts/project_proof.sh" >/dev/null
-grep -q 'st-verified' "$work/docs/projects.html"
-sed -i 's/tree=clean/tree=dirty/' "$work/data/project_proofs/simple.sdn"
-if sh "$work/scripts/project_proof.sh" >/dev/null 2>&1; then echo 'expected dirty receipt rejection' >&2; exit 1; fi
-grep -q 'st-failed' "$work/docs/projects.html"
-sed -i 's/tree=dirty/tree=clean/' "$work/data/project_proofs/simple.sdn"
-printf '%s\n' 'tree=clean' >> "$work/data/project_proofs/simple.sdn"
-if sh "$work/scripts/project_proof.sh" >/dev/null 2>&1; then echo 'expected duplicate-key rejection' >&2; exit 1; fi
-grep -q 'invalid receipt' "$work/docs/projects.html"
-sed -i '$d' "$work/data/project_proofs/simple.sdn"
-sed -i 's#test_command=.*#test_command=<script>#' "$work/data/project_proofs/simple.sdn"
-if sh "$work/scripts/project_proof.sh" >/dev/null 2>&1; then echo 'expected unsafe-field rejection' >&2; exit 1; fi
-echo 'PASS: project provenance simulator rejects dirty, duplicate, and unsafe receipts'
+grep -q 'simple.*st-verified' "$work/docs/projects.html"
+
+mv "$proof" "$proof.absent"
+sh "$work/scripts/project_proof.sh" >/dev/null
+grep -q 'simple.*st-unverified' "$work/docs/projects.html"
+mv "$proof.absent" "$proof"
+
+cp "$valid" "$proof"; sed -i 's/test_result=verified/test_result=failed/; s/test_exit=0/test_exit=7/' "$proof"
+sh "$work/scripts/project_proof.sh" >/dev/null
+grep -q 'simple.*st-failed' "$work/docs/projects.html"
+
+cp "$valid" "$proof"; sed -i 's/tree=clean/tree=dirty/' "$proof"; reject dirty
+cp "$valid" "$proof"; sed -i '/^schema=/d' "$proof"; reject malformed
+cp "$valid" "$proof"; sed -i 's/simple_commit=./simple_commit=f/' "$proof"; reject beta-mismatch
+cp "$valid" "$proof"; printf '%s\n' 'tree=clean' >> "$proof"; reject duplicate-key
+cp "$valid" "$proof"; sed -i 's#test_command=.*#test_command=<script>#' "$proof"; reject unsafe-field
+cp "$valid" "$proof"; printf '%s\n' 'project_tag=v1.0.0' 'project_tag_commit=1111111111111111111111111111111111111111' >> "$proof"; reject tag-mismatch
+cp "$valid" "$proof"; printf '%s\n' 'project_tag=v1.0.1-beta.1' 'project_tag_commit=62eada434c050cb688598bef1ab4f5a25b5cb404' >> "$proof"
+sh "$work/scripts/project_proof.sh" >/dev/null
+grep -q 'tag v1.0.1-beta.1' "$work/docs/projects.html"
+
+echo 'PASS: simulator covers verified, failed, absent, malformed, dirty, unsafe, duplicate, beta-mismatch, and project-tag states'

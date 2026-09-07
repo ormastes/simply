@@ -28,3 +28,19 @@ checkout. See design.md "Recursion prevention".
 Run `sh scripts/project_proof.sh` to regenerate the project page and
 `sh scripts/check_worktree_clean.sh` before recording evidence. Install the
 pre-commit guard with `sh scripts/install_hooks.sh`.
+
+To create a receipt from a clean sibling checkout, run:
+
+```sh
+sh scripts/collect_project_proof.sh PROJECT CHECKOUT test/path/proof_spec.spl -- simple test test/path/proof_spec.spl
+```
+
+The `project-proof` workflow exposes the same maintenance operation as a
+manual GitHub Actions run. It resolves repository identity from the catalog,
+uses the exact pinned beta checkout, uploads the receipt and raw test log, and
+fails when the project test or anti-placeholder SSpec review fails.
+
+The exact beta Linux artifact currently crashes before it can execute SSpec;
+[Simple issue #497](https://github.com/ormastes/simple/issues/497) tracks that
+release blocker. CI runs the portable behavior gates and attempts the beta
+SSpec, but labels the latter blocked rather than presenting it as proof.

@@ -1,0 +1,94 @@
+name: project-proof
+on:
+  workflow_dispatch:
+    inputs:
+      project_id:
+        description: Catalog project id
+        required: true
+        type: string
+      sspec_paths:
+        description: Comma-separated project SSpec paths
+        required: true
+        type: string
+      proof_command:
+        description: Whitespace-separated command tokens, for example simple test test/system/proof_spec.spl
+        required: true
+        type: string
+      project_tag:
+        description: Optional project tag resolving to the checked commit
+        required: false
+        type: string
+permissions:
+  contents: read
+jobs:
+  prove:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: simply
+      - name: Resolve catalog identity
+        id: project
+        working-directory: simply
+        env:
+          PROJECT_ID: ${{ inputs.project_id }}
+        run: |
+          line=$(awk -F'|' -v id="$PROJECT_ID" '$1 == id { print }' data/projects.sdn)
+          [ "$(printf '%s\n' "$line" | grep -c .)" -eq 1 ]
+          repo=$(printf '%s\n' "$line" | cut -d'|' -f2 | sed 's#^https://github.com/##')
+          branch=$(printf '%s\n' "$line" | cut -d'|' -f3)
+          printf 'repository=%s\nbranch=%s\n' "$repo" "$branch" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.project.outputs.repository }}
+          ref: ${{ steps.project.outputs.branch }}
+          path: project
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: ormastes/simple
+          ref: v1.0.1-beta.1
+          path: simple-beta
+      - name: Verify pinned Simple revision
+        run: |
+          test "$(git -C simple-beta rev-parse HEAD)" = 62eada434c050cb688598bef1ab4f5a25b5cb404
+          simple-beta/bin/simple_native --version
+      - name: Collect immutable proof
+        id: collect
+        continue-on-error: true
+        working-directory: simply
+        env:
+          PROJECT_ID: ${{ inputs.project_id }}
+          SSPEC_PATHS: ${{ inputs.sspec_paths }}
+          PROOF_COMMAND: ${{ inputs.proof_command }}
+          PROJECT_TAG: ${{ inputs.project_tag }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/proof-bin" build/project-proof
+          ln -s "$GITHUB_WORKSPACE/simple-beta/bin/simple_native" "$RUNNER_TEMP/proof-bin/simple"
+          export PATH="$RUNNER_TEMP/proof-bin:$PATH"
+          set -f
+          set -- $PROOF_COMMAND
+          set +f
+          if [ -n "$PROJECT_TAG" ]; then
+            sh scripts/collect_project_proof.sh "$PROJECT_ID" "$GITHUB_WORKSPACE/project" "$SSPEC_PATHS" --tag "$PROJECT_TAG" --log "build/project-proof/$PROJECT_ID.log" -- "$@"
+          else
+            sh scripts/collect_project_proof.sh "$PROJECT_ID" "$GITHUB_WORKSPACE/project" "$SSPEC_PATHS" --log "build/project-proof/$PROJECT_ID.log" -- "$@"
+          fi
+      - name: Render proof page
+        if: always()
+        working-directory: simply
+        run: sh scripts/project_proof.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: project-proof-${{ inputs.project_id }}
+          path: |
+            simply/data/project_proofs/${{ inputs.project_id }}.sdn
+            simply/build/project-proof/${{ inputs.project_id }}.log
+            simply/docs/projects.html
+          if-no-files-found: warn
+      - name: Enforce project result
+        if: always()
+        env:
+          COLLECT_OUTCOME: ${{ steps.collect.outcome }}
+        run: test "$COLLECT_OUTCOME" = success
