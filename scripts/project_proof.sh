@@ -8,7 +8,10 @@ release="$root/data/simple_release.sdn"
 output="$root/docs/projects.html"
 case "${1:-render}" in render) ;; *) echo "usage: $0 [render]" >&2; exit 2;; esac
 field() { sed -n "s/^$2=//p" "$1"; }
-one() { v=$(field "$1" "$2"); [ "$(printf '%s\n' "$v" | wc -l)" -eq 1 ] && [ -n "$v" ] && printf '%s' "$v"; }
+# Command substitution discards trailing newlines, so count the source lines
+# directly: duplicated keys must invalidate a receipt.
+one() { [ "$(grep -c "^$2=" "$1" || true)" -eq 1 ] && field "$1" "$2"; }
+safe_text() { printf '%s' "$1" | grep -Eq '^[[:alnum:]_./:=,@+ -]+$'; }
 release_tag=$(one "$release" tag); release_commit=$(one "$release" commit)
 [ "$release_tag" = v1.0.1-beta.1 ] && printf '%s' "$release_commit" | grep -Eq '^[0-9a-f]{40}$' || exit 2
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
@@ -23,9 +26,9 @@ bad=0
     proof="$receipts/$id.sdn"; state=unverified; commit='—'; command='—'; checked='—'; follow='receipt required'
     if [ -f "$proof" ]; then
       project=$(one "$proof" project 2>/dev/null || true); prepo=$(one "$proof" repository 2>/dev/null || true); pbranch=$(one "$proof" branch 2>/dev/null || true)
-      sha=$(one "$proof" commit 2>/dev/null || true); stag=$(one "$proof" simple_tag 2>/dev/null || true); ssha=$(one "$proof" simple_commit 2>/dev/null || true)
-      tree=$(one "$proof" tree 2>/dev/null || true); result=$(one "$proof" test_result 2>/dev/null || true); command=$(one "$proof" test_command 2>/dev/null || true); checked=$(one "$proof" checked_at 2>/dev/null || true); follow=$(one "$proof" follow_up 2>/dev/null || true)
-      if [ "$project" = "$id" ] && [ "$prepo" = "$repo" ] && [ "$pbranch" = "$branch" ] && printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$' && [ "$stag" = "$release_tag" ] && [ "$ssha" = "$release_commit" ] && [ "$tree" = clean ] && [ "$result" = verified ] && [ -n "$command" ] && [ -n "$checked" ]; then
+      schema=$(one "$proof" schema 2>/dev/null || true); sha=$(one "$proof" commit 2>/dev/null || true); stag=$(one "$proof" simple_tag 2>/dev/null || true); ssha=$(one "$proof" simple_commit 2>/dev/null || true)
+      tree=$(one "$proof" tree 2>/dev/null || true); result=$(one "$proof" test_result 2>/dev/null || true); command=$(one "$proof" test_command 2>/dev/null || true); exit_code=$(one "$proof" test_exit 2>/dev/null || true); digest=$(one "$proof" test_output_sha256 2>/dev/null || true); specs=$(one "$proof" sspec_paths 2>/dev/null || true); checked=$(one "$proof" checked_at 2>/dev/null || true); follow=$(one "$proof" follow_up 2>/dev/null || true)
+      if [ "$schema" = project-proof-v1 ] && [ "$project" = "$id" ] && [ "$prepo" = "$repo" ] && [ "$pbranch" = "$branch" ] && printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$' && [ "$stag" = "$release_tag" ] && [ "$ssha" = "$release_commit" ] && [ "$tree" = clean ] && [ "$result" = verified ] && [ "$exit_code" = 0 ] && printf '%s' "$digest" | grep -Eq '^[0-9a-f]{64}$' && printf '%s' "$specs" | grep -Eq '^test/.+_spec\.spl$' && safe_text "$command" && safe_text "$specs" && safe_text "$checked" && safe_text "$follow"; then
         state=verified; commit="<a href=\"$repo/commit/$sha\"><code>$sha</code></a>"
       else state=failed; bad=1; commit='invalid receipt'; command='—'; checked='—'; follow='repair receipt or test'; fi
     fi
