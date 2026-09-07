@@ -57,18 +57,16 @@ else
   RESULTS=data/test_results.json
   TR=$(ts data/test_results.json)
   RG=$(registry_identity_ts); [ -n "$RG" ] || RG=$(ts data/registry.sdn)
-  TS=$(ts data/tests.sdn)
   if [ "$TR" -lt "$RG" ]; then
     echo "data/test_results.json is OLDER than the hand-authored columns of data/registry.sdn — the numbers below predate the current capability list." >> "$TMP/warn"
-  fi
-  if [ "$TR" -lt "$TS" ]; then
-    echo "data/test_results.json is OLDER than data/tests.sdn — the numbers below predate the current test mapping." >> "$TMP/warn"
   fi
 fi
 
 DATE=$(date -u +%Y-%m-%d)
 RESULTS_DATE=$( [ -s "$RESULTS" ] && git log -1 --format=%cs -- data/test_results.json 2>/dev/null || true )
 [ -n "${RESULTS_DATE:-}" ] || RESULTS_DATE="unknown"
+SIMPLE_TAG=$(sed -n 's/^tag=//p' data/simple_release.sdn)
+[ "$(grep -c '^tag=' data/simple_release.sdn)" -eq 1 ] && [ -n "$SIMPLE_TAG" ] || { echo "invalid Simple release tag" >&2; exit 2; }
 
 # ---- Derivation + render ------------------------------------------------
 # Pass 1  test_results.json : pretty-printed; a line-based state machine reads
@@ -76,7 +74,7 @@ RESULTS_DATE=$( [ -s "$RESULTS" ] && git log -1 --format=%cs -- data/test_result
 # Pass 2  tests.sdn         : id|kind|path mappings.
 # Pass 3  registry.sdn      : identity columns (id|group|name|F|U|P) are the
 #         hand-authored source of truth; done/status are recomputed.
-awk -v DATE="$DATE" -v RDATE="$RESULTS_DATE" \
+awk -v DATE="$DATE" -v RDATE="$RESULTS_DATE" -v STAG="$SIMPLE_TAG" \
     -v REGOUT="$TMP/registry.sdn" -v WARNOUT="$TMP/warn.derived" '
 function sval(  s) {
   if (match($0, /: *"[^"]*"/)) { s = substr($0, RSTART, RLENGTH); sub(/^: *"/, "", s); sub(/"$/, "", s); return s }
@@ -90,7 +88,7 @@ function esc(s) { gsub(/&/, "\\&amp;", s); gsub(/</, "\\&lt;", s); gsub(/>/, "\\
 function pct(a, b) { return (a + b) > 0 ? 100.0 * a / (a + b) : -1 }
 function link(p,  u) {
   if (p !~ /^test\//) return "<span class=nolink>" esc(p) "</span>"
-  u = "https://github.com/ormastes/simple/" (p ~ /\.spl$/ ? "blob" : "tree") "/main/" p
+  u = "https://github.com/ormastes/simple/" (p ~ /\.spl$/ ? "blob" : "tree") "/" STAG "/" p
   return "<a href=\"" u "\">" esc(p) "</a>"
 }
 
@@ -122,6 +120,10 @@ FILENAME ~ /tests\.sdn$/ {
   if ($0 ~ /^#/ || $0 ~ /^[ \t]*$/) next
   n = split($0, a, "|")
   if (n < 3) next
+  if (a[2] !~ /^(unit|system|bench|available|planned)$/) {
+    print "invalid evidence kind for " a[1] ": " a[2] >> WARNOUT
+    next
+  }
   nt++; tid[nt] = a[1]; tkind[nt] = a[2]; tpath[nt] = a[3]
   next
 }
@@ -218,7 +220,7 @@ END {
   print "<meta name=viewport content=\"width=device-width,initial-scale=1\">"
   print "<title>simply — whole-earth software in Simple</title>"
   print "<link rel=stylesheet href=glass.css></head><body>"
-  printf "<header class=hero><h1>simply</h1><p>Whole-earth software, implemented in the <a href=\"https://github.com/ormastes/simple\">Simple</a> language. One capability registry, %d rows — every percentage below is <b>earned from test evidence</b>, never hand-typed.</p>", nr
+  printf "<header class=hero><h1>simply</h1><p>Whole-earth software targeting the <a href=\"https://github.com/ormastes/simple/tree/%s\">Simple %s beta baseline</a>. One capability registry, %d rows — every percentage below comes from the last-known test snapshot, never hand-typed. Compatibility with the beta is claimed only by the separate project proofs.</p>", STAG, STAG, nr
   if (proven > 0)
     printf "<div class=big>%d%%<span> composite over the %d row(s) with evidence</span></div>", int(compsum / proven + 0.5), proven
   else
@@ -239,7 +241,7 @@ END {
 
   # --- evidence summary ---
   printf "<section class=card><h2>Evidence coverage <span class=pct>%d proven / %d unproven</span></h2>", proven, unproven
-  printf "<footer>A row is <b>unproven</b> when data/tests.sdn maps it to no spec file that appears in the test run — it shows <i>no evidence</i>, never a percentage. <b>0%%</b> means the opposite: tests ran and failed. Gates per completion_criteria.md: F = unit pass-rate, U = system pass-rate, P = bench pass-rate, done = 55F+25U+20P renormalized over the gates that are actually measured (pending and skipped are outside every denominator, so <code>planned()</code> markers can never drag a score down). Test data: <code>data/test_results.json</code> (%s).</footer></section>", esc(RDATE)
+  printf "<footer>A row is <b>unproven</b> when data/tests.sdn maps it to no spec file that appears in the test run — it shows <i>no evidence</i>, never a percentage. <b>available</b> identifies a real beta suite absent from this unit-only snapshot; it earns nothing. <b>0%%</b> means tests ran and failed. Gates per completion_criteria.md: F = unit pass-rate, U = system pass-rate, P = bench pass-rate, done = 55F+25U+20P renormalized over the gates that are actually measured. Test data: <code>data/test_results.json</code> (%s).</footer></section>", esc(RDATE)
 
   # --- test panel from groups[] ---
   if (ng > 0) {

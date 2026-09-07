@@ -26,8 +26,8 @@ jobs:
           fetch-depth: 0   # scripts/update_site.sh reads commit times for its freshness check
       - name: Refresh test results (when a simple binary is available)
         # `simple test --json` is the ONLY source of the dashboard's numbers.
-        # No released binary is installable in CI yet, so this refreshes only
-        # when `simple` is on PATH; otherwise the committed
+        # The pinned beta currently has no downloadable release assets, so this
+        # refreshes only when `simple` is explicitly on PATH; otherwise the committed
         # data/test_results.json is used as-is and the generator decides
         # whether it is still fresh. Nothing here ever synthesises results.
         run: |
