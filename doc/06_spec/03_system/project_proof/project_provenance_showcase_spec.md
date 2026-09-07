@@ -4,7 +4,8 @@ Source: `test/03_system/project_proof/project_provenance_showcase_spec.spl`.
 
 The executable SSpec launches three portable simulators. Together they prove
 all receipt states, canonical checkout/tag binding, anti-placeholder SSpec
-review, output digests, and strict/pre-commit dirty-root behavior.
+review, output digests, immutable non-proof observations, private-metadata
+withholding, and strict/pre-commit dirty-root behavior.
 The exact beta execution is currently blocked before SSpec parsing by
 [`ormastes/simple#497`](https://github.com/ormastes/simple/issues/497); the
 portable runs below do not masquerade as beta-runtime evidence.

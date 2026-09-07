@@ -8,12 +8,14 @@ on:
       - data/tests.sdn
       - data/test_results.json
       - data/projects.sdn
+      - data/project_observations.sdn
       - data/project_proofs/**
       - data/simple_release.sdn
       - scripts/update_site.sh
       - scripts/project_proof.sh
       - scripts/collect_project_proof.sh
       - scripts/check_worktree_clean.sh
+      - scripts/update_project_observations.sh
       - test/project_provenance_showcase_test.sh
       - test/collect_project_proof_test.sh
       - test/worktree_clean_guard_test.sh
@@ -43,6 +45,11 @@ jobs:
               cp "$RUNNER_TEMP/results.json" data/test_results.json
             fi
           fi
+      - name: Refresh public project observations
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: sh scripts/update_project_observations.sh
       - name: Regenerate site
         id: gen
         # The generator always writes docs/index.html — including the STALE
@@ -58,7 +65,7 @@ jobs:
         run: |
           git config user.name "simply-bot"
           git config user.email "ormastespq@gmail.com"
-          git add docs/index.html docs/glass.css data/registry.sdn data/test_results.json
+          git add docs/index.html docs/projects.html docs/glass.css data/registry.sdn data/test_results.json data/project_observations.sdn
           git diff --cached --quiet || git commit -m "chore(site): daily regenerate from test evidence"
           git push
       - name: Fail if the generator reported stale or refused

@@ -25,6 +25,11 @@ repository, branch, project commit, Simple beta reference, proof state, test
 command, timestamp, and follow-up. Commit and tag links use immutable GitHub
 URLs. Unavailable receipts produce a truthful unverified row.
 
+Every catalog row also has one observation record containing branch, public
+head commit, optional deliberately selected tag and resolved commit,
+visibility, and observation time. Public revisions link immutably but confer
+no proof state. Private rows expose neither commit nor tag metadata.
+
 ## Test approach
 
 The POSIX test exercises materialized simulator fixtures: verified, failed,

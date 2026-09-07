@@ -44,3 +44,8 @@ The exact beta Linux artifact currently crashes before it can execute SSpec;
 [Simple issue #497](https://github.com/ormastes/simple/issues/497) tracks that
 release blocker. CI runs the portable behavior gates and attempts the beta
 SSpec, but labels the latter blocked rather than presenting it as proof.
+
+`data/project_observations.sdn` records each public project’s last-observed
+default-branch commit and deliberately selected tag. These links are labeled
+“observed, not proof.” The daily workflow refreshes them with
+`scripts/update_project_observations.sh`; private commit metadata is withheld.
