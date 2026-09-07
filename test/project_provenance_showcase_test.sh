@@ -41,6 +41,8 @@ grep -q 'simple.*st-verified' "$work/docs/projects.html"
 mv "$proof" "$proof.absent"
 sh "$work/scripts/project_proof.sh" >/dev/null
 grep -q 'simple.*st-unverified' "$work/docs/projects.html"
+grep -q 'observed, not proof' "$work/docs/projects.html"
+grep -q 'private revision withheld' "$work/docs/projects.html"
 mv "$proof.absent" "$proof"
 
 cp "$valid" "$proof"; sed -i 's/test_result=verified/test_result=failed/; s/failure_phase=none/failure_phase=project-test/; s/test_exit=0/test_exit=7/' "$proof"
@@ -57,4 +59,10 @@ cp "$valid" "$proof"; printf '%s\n' 'project_tag=v1.0.1-beta.1' 'project_tag_com
 sh "$work/scripts/project_proof.sh" >/dev/null
 grep -q 'tag v1.0.1-beta.1' "$work/docs/projects.html"
 
-echo 'PASS: simulator covers verified, failed, absent, malformed, dirty, unsafe, duplicate, beta-mismatch, and project-tag states'
+cp "$work/data/project_observations.sdn" "$work/observations.valid"
+duplicate_observation=$(grep '^simple|' "$work/data/project_observations.sdn")
+printf '%s\n' "$duplicate_observation" >> "$work/data/project_observations.sdn"
+reject duplicate-observation
+mv "$work/observations.valid" "$work/data/project_observations.sdn"
+
+echo 'PASS: simulator covers proof states, immutable observations, private metadata, and malformed evidence'

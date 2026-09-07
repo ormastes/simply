@@ -22,6 +22,11 @@ upgrades a missing or malformed receipt.
 
 `data/projects.sdn` is the full organization catalog. Receipts are independent
 files so projects can update their evidence without changing the catalog.
+`data/project_observations.sdn` is a maintenance-time snapshot of public branch
+heads and deliberately admitted tags. The renderer validates it offline and
+labels every such revision “observed, not proof”; private revision metadata is
+withheld. `scripts/update_project_observations.sh` compares the live public
+repository set to the catalog before refreshing the snapshot.
 `test/project_provenance_showcase_test.sh` materializes a deterministic
 simulator corpus for every accept/reject state. Live checkout collection is a
 separate maintenance command, `scripts/collect_project_proof.sh`, and is

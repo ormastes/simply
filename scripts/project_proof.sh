@@ -4,6 +4,7 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 catalog="$root/data/projects.sdn"
 receipts="$root/data/project_proofs"
+observations="$root/data/project_observations.sdn"
 release="$root/data/simple_release.sdn"
 output="$root/docs/projects.html"
 case "${1:-render}" in render) ;; *) echo "usage: $0 [render]" >&2; exit 2;; esac
@@ -18,13 +19,33 @@ tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 bad=0
 {
   printf '%s\n' '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>simply — Project proofs</title><link rel="stylesheet" href="glass.css"></head><body>'
-  printf '%s\n' '<header class="hero"><h1>Simple project propagation</h1><p>Immutable, offline proof receipts. Missing or invalid evidence is never a working claim.</p>'
+  printf '%s\n' '<header class="hero"><h1>Simple project propagation</h1><p>Immutable, offline proof receipts. Last-observed revisions aid discovery but never count as working evidence.</p>'
   printf '<p>Compatibility baseline: <a href="%s/tree/%s">%s</a> (<a href="%s/commit/%s"><code>%s</code></a>, beta).</p></header>' "$release_repo" "$release_tag" "$release_tag" "$release_repo" "$release_commit" "$release_commit"
   printf '%s\n' '<section class="card"><h2>Advertised projects</h2><div class="tblwrap"><table><tr><th>project</th><th>branch</th><th>project revision</th><th>proof</th><th>SSpec / test</th><th>last known</th><th>follow-up</th></tr>'
   while IFS='|' read -r id repo branch caps; do
     case "$id" in ''|'#'*) continue;; esac
-    proof="$receipts/$id.sdn"; state=unverified; commit='—'; evidence='—'; command='—'; checked='—'; follow='receipt required'
-    if [ -f "$proof" ]; then
+    proof="$receipts/$id.sdn"; state=unverified; commit='—'; evidence='—'; command='—'; checked='—'; follow='receipt required'; visibility=unknown; observation_ok=0
+    observation=$(awk -F'|' -v id="$id" '$1 == id { print }' "$observations")
+    if [ "$(printf '%s\n' "$observation" | grep -c .)" -ne 1 ]; then
+      state=failed; bad=1; follow='repair observation snapshot'
+    else
+      IFS='|' read -r oid obranch ocommit otag otag_commit visibility observed_at <<EOF
+$observation
+EOF
+      if [ "$oid" = "$id" ] && [ "$obranch" = "$branch" ] && printf '%s' "$observed_at" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'; then
+        if [ "$visibility" = private ] && [ "$ocommit" = private ] && [ "$otag" = none ] && [ "$otag_commit" = none ]; then observation_ok=1; commit='private revision withheld'
+        elif [ "$visibility" = public ] && printf '%s' "$ocommit" | grep -Eq '^[0-9a-f]{40}$'; then
+          observation_ok=1; commit="<a href=\"$repo/commit/$ocommit\"><code>$ocommit</code></a><br><small>observed, not proof</small>"
+          if [ "$otag" != none ]; then
+            if safe_text "$otag" && printf '%s' "$otag_commit" | grep -Eq '^[0-9a-f]{40}$'; then commit="$commit<br><small><a href=\"$repo/tree/$otag\">$otag</a> at <a href=\"$repo/commit/$otag_commit\">$otag_commit</a></small>"
+            else observation_ok=0; fi
+          elif [ "$otag_commit" != none ]; then observation_ok=0; fi
+        fi
+      fi
+      if [ "$observation_ok" -eq 1 ]; then checked="$observed_at (observation)"
+      else state=failed; bad=1; commit='invalid observation'; checked='—'; follow='repair observation snapshot'; fi
+    fi
+    if [ -f "$proof" ] && [ "${observation_ok:-0}" -eq 1 ]; then
       project=$(one "$proof" project 2>/dev/null || true); prepo=$(one "$proof" repository 2>/dev/null || true); pbranch=$(one "$proof" branch 2>/dev/null || true)
       schema=$(one "$proof" schema 2>/dev/null || true); sha=$(one "$proof" commit 2>/dev/null || true); stag=$(one "$proof" simple_tag 2>/dev/null || true); ssha=$(one "$proof" simple_commit 2>/dev/null || true); sbinary=$(one "$proof" simple_binary_sha256 2>/dev/null || true); sversion=$(one "$proof" simple_version_sha256 2>/dev/null || true)
       tree=$(one "$proof" tree 2>/dev/null || true); result=$(one "$proof" test_result 2>/dev/null || true); phase=$(one "$proof" failure_phase 2>/dev/null || true); command=$(one "$proof" test_command 2>/dev/null || true); exit_code=$(one "$proof" test_exit 2>/dev/null || true); digest=$(one "$proof" test_output_sha256 2>/dev/null || true); specs=$(one "$proof" sspec_paths 2>/dev/null || true); review=$(one "$proof" sspec_review 2>/dev/null || true); checked=$(one "$proof" checked_at 2>/dev/null || true); follow=$(one "$proof" follow_up 2>/dev/null || true)
@@ -57,9 +78,9 @@ bad=0
     fi
     follow_display=$follow
     case "$follow" in https://github.com/*) follow_display="<a href=\"$follow\">upstream blocker</a>";; esac
-    printf '<tr><td><a href="%s">%s</a><br><small>%s</small></td><td>%s</td><td>%s</td><td><span class="st st-%s">%s</span></td><td>%s</td><td>%s</td><td>%s</td></tr>\n' "$repo" "$id" "$caps" "$branch" "$commit" "$state" "$state" "$evidence" "$checked" "$follow_display"
+    printf '<tr><td><a href="%s">%s</a><br><small>%s · %s</small></td><td>%s</td><td>%s</td><td><span class="st st-%s">%s</span></td><td>%s</td><td>%s</td><td>%s</td></tr>\n' "$repo" "$id" "$caps" "$visibility" "$branch" "$commit" "$state" "$state" "$evidence" "$checked" "$follow_display"
   done < "$catalog"
-  printf '%s\n' '</table></div><footer>A project becomes verified only through a clean checkout, a pinned commit, the pinned Simple beta tag/commit, and an explicit successful test receipt. This page never queries GitHub or runs projects.</footer></section><p><a href="index.html">Capability dashboard</a></p></body></html>'
+  printf '%s\n' '</table></div><footer>A project becomes verified only through a clean checkout, a pinned commit, the pinned Simple beta tag/commit, and an explicit successful test receipt. Observations are maintenance-time discovery metadata only. This page never queries GitHub or runs projects.</footer></section><p><a href="index.html">Capability dashboard</a></p></body></html>'
 } > "$output"
 if [ "$bad" -ne 0 ]; then echo 'FAIL: one or more project receipts were invalid; page renders no verified claim for them' >&2; exit 1; fi
 echo "PASS: rendered $output"
