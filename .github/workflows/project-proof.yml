@@ -50,9 +50,7 @@ jobs:
           ref: v1.0.1-beta.1
           path: simple-beta
       - name: Verify pinned Simple revision
-        run: |
-          test "$(git -C simple-beta rev-parse HEAD)" = 62eada434c050cb688598bef1ab4f5a25b5cb404
-          simple-beta/bin/simple_native --version
+        run: test "$(git -C simple-beta rev-parse HEAD)" = 62eada434c050cb688598bef1ab4f5a25b5cb404
       - name: Collect immutable proof
         id: collect
         continue-on-error: true

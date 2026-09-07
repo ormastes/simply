@@ -43,6 +43,17 @@ EOF
 if sh "$root/scripts/collect_project_proof.sh" simple "$project" test/system/proof_spec.spl --output "$receipt" -- simple test test/system/proof_spec.spl >/dev/null 2>&1; then echo 'expected failing command status' >&2; exit 1; fi
 grep -q '^test_result=failed$' "$receipt"
 grep -q '^test_exit=1$' "$receipt"
+grep -q '^failure_phase=project-test$' "$receipt"
+
+cat > "$tmp/bin/simple" <<'EOF'
+#!/bin/sh
+exit 139
+EOF
+if sh "$root/scripts/collect_project_proof.sh" simple "$project" test/system/proof_spec.spl --output "$receipt" -- simple test test/system/proof_spec.spl >/dev/null 2>&1; then echo 'expected Simple preflight failure' >&2; exit 1; fi
+grep -q '^test_result=failed$' "$receipt"
+grep -q '^test_exit=139$' "$receipt"
+grep -q '^failure_phase=simple-version$' "$receipt"
+grep -q '^follow_up=beta-runtime-blocker-ormastes-simple-497$' "$receipt"
 
 printf '%s\n' dirty > "$project/untracked"
 if sh "$root/scripts/collect_project_proof.sh" simple "$project" test/system/proof_spec.spl --output "$tmp/dirty.sdn" -- simple test test/system/proof_spec.spl >/dev/null 2>&1; then echo 'expected dirty checkout rejection' >&2; exit 1; fi
