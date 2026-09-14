@@ -74,12 +74,20 @@ EOF
       IFS=$old_ifs
       identity_ok=0
       if [ "$schema" = project-proof-v1 ] && [ "$project" = "$id" ] && [ "$prepo" = "$repo" ] && [ "$pbranch" = "$branch" ] && printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$' && [ "$stag" = "$release_tag" ] && [ "$ssha" = "$release_commit" ] && printf '%s' "$sbinary" | grep -Eq '^[0-9a-f]{64}$' && printf '%s' "$sversion" | grep -Eq '^[0-9a-f]{64}$' && [ "$tag_ok" -eq 1 ]; then identity_ok=1; fi
-      evidence_ok=0
-      freshness_ok=0
-      if checked_epoch=$(iso_epoch "$checked") && valid_until_epoch=$(iso_epoch "$valid_until") && [ "$checked_epoch" -le "$now_epoch" ] && [ "$valid_until_epoch" -gt "$now_epoch" ] && [ "$valid_until_epoch" -gt "$checked_epoch" ]; then freshness_ok=1; fi
-      if [ "$identity_ok" -eq 1 ] && [ "$tree" = clean ] && printf '%s' "$digest" | grep -Eq '^[0-9a-f]{64}$' && [ "$specs_ok" -eq 1 ] && [ -n "$specs" ] && [ "$review" = basic-static ] && safe_text "$command" && safe_text "$specs" && [ "$freshness_ok" -eq 1 ] && safe_text "$follow"; then evidence_ok=1; fi
+      evidence_core_ok=0; result_core_ok=0; evidence_ok=0
+      timestamp_core_ok=0; freshness_ok=0
+      if checked_epoch=$(iso_epoch "$checked") && valid_until_epoch=$(iso_epoch "$valid_until") && [ "$checked_epoch" -le "$now_epoch" ] && [ "$valid_until_epoch" -gt "$checked_epoch" ]; then
+        timestamp_core_ok=1
+        [ "$valid_until_epoch" -gt "$now_epoch" ] && freshness_ok=1
+      fi
+      if [ "$identity_ok" -eq 1 ] && [ "$tree" = clean ] && printf '%s' "$digest" | grep -Eq '^[0-9a-f]{64}$' && [ "$specs_ok" -eq 1 ] && [ -n "$specs" ] && [ "$review" = basic-static ] && safe_text "$command" && safe_text "$specs" && safe_text "$follow"; then evidence_core_ok=1; fi
+      if [ "$result" = verified ] && [ "$exit_code" = 0 ] && [ "$phase" = none ]; then result_core_ok=1
+      elif [ "$result" = failed ] && { [ "$phase" = simple-version ] || [ "$phase" = project-test ]; } && printf '%s' "$exit_code" | grep -Eq '^[1-9][0-9]*$'; then result_core_ok=1; fi
+      if [ "$evidence_core_ok" -eq 1 ] && [ "$result_core_ok" -eq 1 ] && [ "$freshness_ok" -eq 1 ]; then evidence_ok=1; fi
       if [ "$evidence_ok" -eq 1 ] && [ "$result" = verified ] && [ "$exit_code" = 0 ] && [ "$phase" = none ]; then state=verified
       elif [ "$evidence_ok" -eq 1 ] && [ "$result" = failed ] && { [ "$phase" = simple-version ] || [ "$phase" = project-test ]; } && printf '%s' "$exit_code" | grep -Eq '^[1-9][0-9]*$'; then state=failed
+      elif [ "$evidence_core_ok" -eq 1 ] && [ "$result_core_ok" -eq 1 ] && [ "$timestamp_core_ok" -eq 1 ] && [ "$freshness_ok" -eq 0 ]; then
+        state=failed; rejected=1; command='—'; checked="$checked (expired $valid_until)"
       else state=failed; rejected=1; command='—'; checked='—'; follow='repair receipt or test'; fi
       if [ "$identity_ok" -eq 1 ]; then
         commit="<a href=\"$repo/commit/$sha\"><code>$sha</code></a>"

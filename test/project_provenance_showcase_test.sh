@@ -57,10 +57,16 @@ cp "$valid" "$proof"; sed -i '/^schema=/d' "$proof"; reject malformed
 cp "$valid" "$proof"; sed -i 's/simple_commit=./simple_commit=f/' "$proof"; reject beta-mismatch
 cp "$valid" "$proof"; printf '%s\n' 'tree=clean' >> "$proof"; reject duplicate-key
 cp "$valid" "$proof"; sed -i 's#test_command=.*#test_command=<script>#' "$proof"; reject unsafe-field
-cp "$valid" "$proof"; sed -i 's/valid_until=.*/valid_until=2026-09-06T00:00:00Z/' "$proof"; reject expired
+cp "$valid" "$proof"; sed -i 's/valid_until=.*/valid_until=2026-09-07T11:00:00Z/' "$proof"; reject expired
+grep -q 'expired 2026-09-07T11:00:00Z' "$work/docs/projects.html"
+grep -q 'manual-semantic-review' "$work/docs/projects.html"
+cp "$valid" "$proof"; sed -i 's/valid_until=.*/valid_until=2026-09-07T11:00:00Z/; s/test_exit=0/test_exit=7/' "$proof"; reject expired-inconsistent-result
+grep -q 'repair receipt or test' "$work/docs/projects.html"; ! grep -q 'manual-semantic-review' "$work/docs/projects.html"
 cp "$valid" "$proof"; sed -i 's/valid_until=.*/valid_until=2026-09-07T12:00:00Z/' "$proof"; reject boundary
 cp "$valid" "$proof"; sed -i 's/valid_until=.*/valid_until=2026-02-30T00:00:00Z/' "$proof"; reject malformed-expiry
+grep -q 'repair receipt or test' "$work/docs/projects.html"; ! grep -q 'expired 2026-02-30' "$work/docs/projects.html"
 cp "$valid" "$proof"; sed -i 's/checked_at=.*/checked_at=2026-09-08T00:00:00Z/' "$proof"; reject future-check
+grep -q 'repair receipt or test' "$work/docs/projects.html"; ! grep -q 'manual-semantic-review' "$work/docs/projects.html"
 cp "$valid" "$proof.real"; rm "$proof"; ln -s "$proof.real" "$proof"; reject symlink; rm "$proof"; mv "$proof.real" "$proof"
 cp "$valid" "$proof"; printf '%s\n' 'project_tag=v1.0.0' 'project_tag_commit=1111111111111111111111111111111111111111' >> "$proof"; reject tag-mismatch
 cp "$valid" "$proof"; printf '%s\n' 'project_tag=v1.0.1-beta.1' 'project_tag_commit=62eada434c050cb688598bef1ab4f5a25b5cb404' >> "$proof"

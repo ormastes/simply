@@ -28,6 +28,9 @@ The renderer returns `0` when all evidence is accepted, `3` when it safely
 renders one or more rejected receipts without a verified claim, and a fatal
 status for structural catalog/observation or rendering errors.
 `scripts/update_site.sh` accepts only `0` and the safe-degraded `3` status.
+For an otherwise valid expired receipt, the row retains its validated
+follow-up/TODO and shows the explicit expiry deadline, while suppressing the
+stale command as evidence and remaining `failed`.
 
 ## Page
 
