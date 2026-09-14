@@ -297,7 +297,13 @@ END {
 
 mv "$TMP/index.html" docs/index.html
 mv "$TMP/registry.sdn" data/registry.sdn
-sh scripts/project_proof.sh
+proof_status=0
+sh scripts/project_proof.sh || proof_status=$?
+case "$proof_status" in
+  0) ;;
+  3) echo "NOTICE: project page rendered with rejected proof evidence; no verified claim was published" >&2;;
+  *) echo "FAIL: project proof page could not be rendered safely" >&2; exit 2;;
+esac
 
 STALE=0
 if [ -s "$TMP/warn" ] || [ -s "$TMP/warn.derived" ]; then STALE=1; fi

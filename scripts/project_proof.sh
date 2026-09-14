@@ -27,7 +27,8 @@ release_repo=$(one "$release" repository); release_tag=$(one "$release" tag); re
 proof_now=${PROOF_NOW:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}
 now_epoch=$(iso_epoch "$proof_now") || { echo "FAIL: invalid PROOF_NOW: $proof_now" >&2; exit 2; }
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
-bad=0
+fatal=0
+rejected=0
 {
   printf '%s\n' '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>simply — Project proofs</title><link rel="stylesheet" href="glass.css"></head><body>'
   printf '%s\n' '<header class="hero"><h1>Simple project propagation</h1><p>Immutable, offline proof receipts. Last-observed revisions aid discovery but never count as working evidence.</p>'
@@ -38,7 +39,7 @@ bad=0
     proof="$receipts/$id.sdn"; state=unverified; commit='—'; evidence='—'; command='—'; checked='—'; follow='receipt required'; visibility=unknown; observation_ok=0
     observation=$(awk -F'|' -v id="$id" '$1 == id { print }' "$observations")
     if [ "$(printf '%s\n' "$observation" | grep -c .)" -ne 1 ]; then
-      state=failed; bad=1; follow='repair observation snapshot'
+      state=failed; fatal=1; follow='repair observation snapshot'
     else
       IFS='|' read -r oid obranch ocommit otag otag_commit visibility observed_at <<EOF
 $observation
@@ -54,10 +55,10 @@ EOF
         fi
       fi
       if [ "$observation_ok" -eq 1 ]; then checked="$observed_at (observation)"
-      else state=failed; bad=1; commit='invalid observation'; checked='—'; follow='repair observation snapshot'; fi
+      else state=failed; fatal=1; commit='invalid observation'; checked='—'; follow='repair observation snapshot'; fi
     fi
     if [ -L "$proof" ] && [ "${observation_ok:-0}" -eq 1 ]; then
-      state=failed; bad=1; commit='invalid receipt'; follow='receipt must be a regular file'
+      state=failed; rejected=1; commit='invalid receipt'; follow='receipt must be a regular file'
     elif [ -f "$proof" ] && [ "${observation_ok:-0}" -eq 1 ]; then
       project=$(one "$proof" project 2>/dev/null || true); prepo=$(one "$proof" repository 2>/dev/null || true); pbranch=$(one "$proof" branch 2>/dev/null || true)
       schema=$(one "$proof" schema 2>/dev/null || true); sha=$(one "$proof" commit 2>/dev/null || true); stag=$(one "$proof" simple_tag 2>/dev/null || true); ssha=$(one "$proof" simple_commit 2>/dev/null || true); sbinary=$(one "$proof" simple_binary_sha256 2>/dev/null || true); sversion=$(one "$proof" simple_version_sha256 2>/dev/null || true)
@@ -79,7 +80,7 @@ EOF
       if [ "$identity_ok" -eq 1 ] && [ "$tree" = clean ] && printf '%s' "$digest" | grep -Eq '^[0-9a-f]{64}$' && [ "$specs_ok" -eq 1 ] && [ -n "$specs" ] && [ "$review" = basic-static ] && safe_text "$command" && safe_text "$specs" && [ "$freshness_ok" -eq 1 ] && safe_text "$follow"; then evidence_ok=1; fi
       if [ "$evidence_ok" -eq 1 ] && [ "$result" = verified ] && [ "$exit_code" = 0 ] && [ "$phase" = none ]; then state=verified
       elif [ "$evidence_ok" -eq 1 ] && [ "$result" = failed ] && { [ "$phase" = simple-version ] || [ "$phase" = project-test ]; } && printf '%s' "$exit_code" | grep -Eq '^[1-9][0-9]*$'; then state=failed
-      else state=failed; bad=1; command='—'; checked='—'; follow='repair receipt or test'; fi
+      else state=failed; rejected=1; command='—'; checked='—'; follow='repair receipt or test'; fi
       if [ "$identity_ok" -eq 1 ]; then
         commit="<a href=\"$repo/commit/$sha\"><code>$sha</code></a>"
         [ "$project_tag" = none ] || commit="$commit<br><small>tag $project_tag</small>"
@@ -97,5 +98,6 @@ EOF
   done < "$catalog"
   printf '%s\n' '</table></div><footer>A project becomes verified only through a clean checkout, a pinned commit, the pinned Simple beta tag/commit, and an explicit successful test receipt. Observations are maintenance-time discovery metadata only. This page never queries GitHub or runs projects.</footer></section><p><a href="index.html">Capability dashboard</a></p></body></html>'
 } > "$output"
-if [ "$bad" -ne 0 ]; then echo 'FAIL: one or more project receipts were invalid; page renders no verified claim for them' >&2; exit 1; fi
+if [ "$fatal" -ne 0 ]; then echo 'FAIL: project catalog or observation data is structurally invalid' >&2; exit 1; fi
+if [ "$rejected" -ne 0 ]; then echo 'REJECTED: page rendered, but one or more receipts were not accepted as proof' >&2; exit 3; fi
 echo "PASS: rendered $output"

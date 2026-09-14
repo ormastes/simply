@@ -30,6 +30,12 @@ heads and deliberately admitted tags. The renderer validates it offline and
 labels every such revision “observed, not proof”; private revision metadata is
 withheld. `scripts/update_project_observations.sh` compares the live public
 repository set to the catalog before refreshing the snapshot.
+
+Renderer status separates proof rejection from page integrity. Status `3`
+means the page was produced but at least one receipt was rejected, so the site
+generator may publish the explicit failed/unverified state. Status `1` or any
+other unexpected renderer failure means catalog, observation, or output
+integrity is unsafe and publication stops.
 `test/project_provenance_showcase_test.sh` materializes a deterministic
 simulator corpus for every accept/reject state. Live checkout collection is a
 separate maintenance command, `scripts/collect_project_proof.sh`, and is

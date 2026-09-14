@@ -33,7 +33,8 @@ cp "$root/docs/glass.css" "$work/docs/"
 mv "$tmp/data" "$work/data"
 proof="$work/data/project_proofs/simple.sdn"; valid="$work/valid.sdn"; cp "$proof" "$valid"
 reject() {
-  if sh "$work/scripts/project_proof.sh" >/dev/null 2>&1; then echo "expected $1 rejection" >&2; exit 1; fi
+  set +e; sh "$work/scripts/project_proof.sh" >/dev/null 2>&1; status=$?; set -e
+  [ "$status" -eq 3 ] || { echo "expected $1 evidence rejection status 3, got $status" >&2; exit 1; }
   grep -q 'st-failed' "$work/docs/projects.html"
 }
 
@@ -69,7 +70,9 @@ grep -q 'tag v1.0.1-beta.1' "$work/docs/projects.html"
 cp "$work/data/project_observations.sdn" "$work/observations.valid"
 duplicate_observation=$(grep '^simple|' "$work/data/project_observations.sdn")
 printf '%s\n' "$duplicate_observation" >> "$work/data/project_observations.sdn"
-reject duplicate-observation
+set +e; sh "$work/scripts/project_proof.sh" >/dev/null 2>&1; status=$?; set -e
+[ "$status" -eq 1 ] || { echo "expected structural observation failure status 1, got $status" >&2; exit 1; }
+grep -q 'st-failed' "$work/docs/projects.html"
 mv "$work/observations.valid" "$work/data/project_observations.sdn"
 
 echo 'PASS: simulator covers proof states, immutable observations, private metadata, and malformed evidence'

@@ -24,6 +24,11 @@ deadline boundary fail closed. The collector/workflow chooses the explicit
 validity window; the renderer never guesses one from receipt age. A receipt
 path must be a regular file and symlinks are rejected.
 
+The renderer returns `0` when all evidence is accepted, `3` when it safely
+renders one or more rejected receipts without a verified claim, and a fatal
+status for structural catalog/observation or rendering errors.
+`scripts/update_site.sh` accepts only `0` and the safe-degraded `3` status.
+
 ## Page
 
 `docs/projects.html` contains one row per `data/projects.sdn` project: project,

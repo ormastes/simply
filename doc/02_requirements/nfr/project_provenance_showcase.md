@@ -5,7 +5,9 @@
 - **NFR-PPS-001:** Proof acceptance is fail-closed. Missing, malformed, dirty,
   stale, expired, future-dated, symlinked, or tag/commit-inconsistent evidence
   is rendered only as `unverified` or `failed`. The deadline comparison is
-  deterministic and strict: `checked_at <= PROOF_NOW < valid_until`.
+  deterministic and strict: `checked_at <= PROOF_NOW < valid_until`. A safely
+  rendered page with rejected evidence returns status `3`; structural catalog,
+  observation, or rendering failures remain fatal.
 - **NFR-PPS-002:** Page generation is deterministic and offline: it consumes
   tracked receipts and simulator fixtures, not live GitHub state.
 - **NFR-PPS-003:** Every accepted reference is immutable: canonical repository
