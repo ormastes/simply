@@ -32,13 +32,25 @@ pre-commit guard with `sh scripts/install_hooks.sh`.
 To create a receipt from a clean sibling checkout, run:
 
 ```sh
-sh scripts/collect_project_proof.sh PROJECT CHECKOUT test/path/proof_spec.spl -- simple test test/path/proof_spec.spl
+valid_until=$(date -u -d '+7 days' '+%Y-%m-%dT%H:%M:%SZ')
+sh scripts/collect_project_proof.sh PROJECT PROJECT_CHECKOUT test/path/proof_spec.spl \
+  --simple-checkout SIMPLE_BETA_CHECKOUT --valid-until "$valid_until" \
+  --output /tmp/PROJECT.sdn --log /tmp/PROJECT.log -- \
+  simple test test/path/proof_spec.spl
 ```
+
+`SIMPLE_BETA_CHECKOUT` must be a clean canonical checkout at the pinned tag and
+commit, with its tracked production `bin/simple_native`; the collector invokes
+that exact binary and rejects PATH substitutes, seed/debug binaries, mutated
+checkouts, and output paths inside either checkout.
 
 The `project-proof` workflow exposes the same maintenance operation as a
 manual GitHub Actions run. It resolves repository identity from the catalog,
 uses the exact pinned beta checkout, uploads the receipt and raw test log, and
 fails when the project test or anti-placeholder SSpec review fails.
+The receipt records an explicit follow-up: successful basic-static evidence
+requires manual semantic review, project failures request test repair, and a
+beta preflight failure links the upstream runtime blocker.
 
 The exact beta Linux artifact currently crashes before it can execute SSpec;
 [Simple issue #497](https://github.com/ormastes/simple/issues/497) tracks that

@@ -2,6 +2,7 @@
 set -eu
 root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 workflow="$root/.github/workflows/project-proof.yml"
+readme="$root/README.md"
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 
 guard_line=$(grep -n '^      - name: Verify pristine Simply checkout before collection$' "$workflow" | cut -d: -f1)
@@ -24,6 +25,9 @@ grep -Fq -- '--output "$receipt" --log "$log"' "$collect_block"
 grep -Fq 'if [ -s "$receipt" ]; then' "$collect_block"
 grep -Fq 'cp "$receipt" "data/project_proofs/$PROJECT_ID.sdn"' "$collect_block"
 grep -Fq '${{ runner.temp }}/simply-project-proof/${{ inputs.project_id }}.log' "$workflow"
+grep -Fq -- '--simple-checkout SIMPLE_BETA_CHECKOUT --valid-until "$valid_until"' "$readme"
+grep -Fq -- '--output /tmp/PROJECT.sdn --log /tmp/PROJECT.log' "$readme"
+grep -Fq 'rejects PATH substitutes, seed/debug binaries, mutated' "$readme"
 
 # Behavioral guard: after an early collector failure, the renderer's tracked
 # input is absent, so a stale receipt cannot be selected. A fresh output is
