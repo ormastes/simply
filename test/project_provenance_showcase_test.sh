@@ -1,6 +1,7 @@
 #!/bin/sh
 set -eu
 root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+export PROOF_NOW=2026-09-07T12:00:00Z
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 cp -R "$root/data" "$tmp/data"; mkdir -p "$tmp/data/project_proofs"
 cat > "$tmp/data/project_proofs/simple.sdn" <<'EOF'
@@ -22,6 +23,7 @@ test_output_sha256=0f5c408234c85a2ca5db0ef87b9ddcd7d5907e2cf1cec9fa7d9ca35e2dbaa
 sspec_paths=test/03_system/project_proof/project_provenance_showcase_spec.spl
 sspec_review=basic-static
 checked_at=2026-09-07T00:00:00Z
+valid_until=2026-09-08T00:00:00Z
 follow_up=manual-semantic-review
 EOF
 work=$(mktemp -d); trap 'rm -rf "$tmp" "$work"' EXIT
@@ -54,6 +56,11 @@ cp "$valid" "$proof"; sed -i '/^schema=/d' "$proof"; reject malformed
 cp "$valid" "$proof"; sed -i 's/simple_commit=./simple_commit=f/' "$proof"; reject beta-mismatch
 cp "$valid" "$proof"; printf '%s\n' 'tree=clean' >> "$proof"; reject duplicate-key
 cp "$valid" "$proof"; sed -i 's#test_command=.*#test_command=<script>#' "$proof"; reject unsafe-field
+cp "$valid" "$proof"; sed -i 's/valid_until=.*/valid_until=2026-09-06T00:00:00Z/' "$proof"; reject expired
+cp "$valid" "$proof"; sed -i 's/valid_until=.*/valid_until=2026-09-07T12:00:00Z/' "$proof"; reject boundary
+cp "$valid" "$proof"; sed -i 's/valid_until=.*/valid_until=2026-02-30T00:00:00Z/' "$proof"; reject malformed-expiry
+cp "$valid" "$proof"; sed -i 's/checked_at=.*/checked_at=2026-09-08T00:00:00Z/' "$proof"; reject future-check
+cp "$valid" "$proof.real"; rm "$proof"; ln -s "$proof.real" "$proof"; reject symlink; rm "$proof"; mv "$proof.real" "$proof"
 cp "$valid" "$proof"; printf '%s\n' 'project_tag=v1.0.0' 'project_tag_commit=1111111111111111111111111111111111111111' >> "$proof"; reject tag-mismatch
 cp "$valid" "$proof"; printf '%s\n' 'project_tag=v1.0.1-beta.1' 'project_tag_commit=62eada434c050cb688598bef1ab4f5a25b5cb404' >> "$proof"
 sh "$work/scripts/project_proof.sh" >/dev/null

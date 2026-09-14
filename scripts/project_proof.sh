@@ -13,8 +13,19 @@ field() { sed -n "s/^$2=//p" "$1"; }
 # directly: duplicated keys must invalidate a receipt.
 one() { [ "$(grep -c "^$2=" "$1" || true)" -eq 1 ] && field "$1" "$2"; }
 safe_text() { printf '%s' "$1" | grep -Eq '^[[:alnum:]_./:=,@+ -]+$'; }
+# Parse and round-trip a canonical UTC timestamp. A round-trip is required so
+# date cannot silently normalize malformed calendar values such as 2026-02-30.
+iso_epoch() {
+  value=$1
+  printf '%s' "$value" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' || return 1
+  parsed=$(date -u -d "$value" +%s 2>/dev/null) || return 1
+  [ "$(date -u -d "@$parsed" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" = "$value" ] || return 1
+  printf '%s' "$parsed"
+}
 release_repo=$(one "$release" repository); release_tag=$(one "$release" tag); release_commit=$(one "$release" commit)
 [ "$release_repo" = https://github.com/ormastes/simple ] && [ "$release_tag" = v1.0.1-beta.1 ] && printf '%s' "$release_commit" | grep -Eq '^[0-9a-f]{40}$' || exit 2
+proof_now=${PROOF_NOW:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}
+now_epoch=$(iso_epoch "$proof_now") || { echo "FAIL: invalid PROOF_NOW: $proof_now" >&2; exit 2; }
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 bad=0
 {
@@ -45,10 +56,12 @@ EOF
       if [ "$observation_ok" -eq 1 ]; then checked="$observed_at (observation)"
       else state=failed; bad=1; commit='invalid observation'; checked='—'; follow='repair observation snapshot'; fi
     fi
-    if [ -f "$proof" ] && [ "${observation_ok:-0}" -eq 1 ]; then
+    if [ -L "$proof" ] && [ "${observation_ok:-0}" -eq 1 ]; then
+      state=failed; bad=1; commit='invalid receipt'; follow='receipt must be a regular file'
+    elif [ -f "$proof" ] && [ "${observation_ok:-0}" -eq 1 ]; then
       project=$(one "$proof" project 2>/dev/null || true); prepo=$(one "$proof" repository 2>/dev/null || true); pbranch=$(one "$proof" branch 2>/dev/null || true)
       schema=$(one "$proof" schema 2>/dev/null || true); sha=$(one "$proof" commit 2>/dev/null || true); stag=$(one "$proof" simple_tag 2>/dev/null || true); ssha=$(one "$proof" simple_commit 2>/dev/null || true); sbinary=$(one "$proof" simple_binary_sha256 2>/dev/null || true); sversion=$(one "$proof" simple_version_sha256 2>/dev/null || true)
-      tree=$(one "$proof" tree 2>/dev/null || true); result=$(one "$proof" test_result 2>/dev/null || true); phase=$(one "$proof" failure_phase 2>/dev/null || true); command=$(one "$proof" test_command 2>/dev/null || true); exit_code=$(one "$proof" test_exit 2>/dev/null || true); digest=$(one "$proof" test_output_sha256 2>/dev/null || true); specs=$(one "$proof" sspec_paths 2>/dev/null || true); review=$(one "$proof" sspec_review 2>/dev/null || true); checked=$(one "$proof" checked_at 2>/dev/null || true); follow=$(one "$proof" follow_up 2>/dev/null || true)
+      tree=$(one "$proof" tree 2>/dev/null || true); result=$(one "$proof" test_result 2>/dev/null || true); phase=$(one "$proof" failure_phase 2>/dev/null || true); command=$(one "$proof" test_command 2>/dev/null || true); exit_code=$(one "$proof" test_exit 2>/dev/null || true); digest=$(one "$proof" test_output_sha256 2>/dev/null || true); specs=$(one "$proof" sspec_paths 2>/dev/null || true); review=$(one "$proof" sspec_review 2>/dev/null || true); checked=$(one "$proof" checked_at 2>/dev/null || true); valid_until=$(one "$proof" valid_until 2>/dev/null || true); follow=$(one "$proof" follow_up 2>/dev/null || true)
       tag_count=$(grep -c '^project_tag=' "$proof" || true); tag_commit_count=$(grep -c '^project_tag_commit=' "$proof" || true); tag_ok=0; project_tag=none
       if [ "$tag_count" -eq 0 ] && [ "$tag_commit_count" -eq 0 ]; then tag_ok=1
       elif [ "$tag_count" -eq 1 ] && [ "$tag_commit_count" -eq 1 ]; then
@@ -61,7 +74,9 @@ EOF
       identity_ok=0
       if [ "$schema" = project-proof-v1 ] && [ "$project" = "$id" ] && [ "$prepo" = "$repo" ] && [ "$pbranch" = "$branch" ] && printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$' && [ "$stag" = "$release_tag" ] && [ "$ssha" = "$release_commit" ] && printf '%s' "$sbinary" | grep -Eq '^[0-9a-f]{64}$' && printf '%s' "$sversion" | grep -Eq '^[0-9a-f]{64}$' && [ "$tag_ok" -eq 1 ]; then identity_ok=1; fi
       evidence_ok=0
-      if [ "$identity_ok" -eq 1 ] && [ "$tree" = clean ] && printf '%s' "$digest" | grep -Eq '^[0-9a-f]{64}$' && [ "$specs_ok" -eq 1 ] && [ -n "$specs" ] && [ "$review" = basic-static ] && safe_text "$command" && safe_text "$specs" && printf '%s' "$checked" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' && safe_text "$follow"; then evidence_ok=1; fi
+      freshness_ok=0
+      if checked_epoch=$(iso_epoch "$checked") && valid_until_epoch=$(iso_epoch "$valid_until") && [ "$checked_epoch" -le "$now_epoch" ] && [ "$valid_until_epoch" -gt "$now_epoch" ] && [ "$valid_until_epoch" -gt "$checked_epoch" ]; then freshness_ok=1; fi
+      if [ "$identity_ok" -eq 1 ] && [ "$tree" = clean ] && printf '%s' "$digest" | grep -Eq '^[0-9a-f]{64}$' && [ "$specs_ok" -eq 1 ] && [ -n "$specs" ] && [ "$review" = basic-static ] && safe_text "$command" && safe_text "$specs" && [ "$freshness_ok" -eq 1 ] && safe_text "$follow"; then evidence_ok=1; fi
       if [ "$evidence_ok" -eq 1 ] && [ "$result" = verified ] && [ "$exit_code" = 0 ] && [ "$phase" = none ]; then state=verified
       elif [ "$evidence_ok" -eq 1 ] && [ "$result" = failed ] && { [ "$phase" = simple-version ] || [ "$phase" = project-test ]; } && printf '%s' "$exit_code" | grep -Eq '^[1-9][0-9]*$'; then state=failed
       else state=failed; bad=1; command='—'; checked='—'; follow='repair receipt or test'; fi

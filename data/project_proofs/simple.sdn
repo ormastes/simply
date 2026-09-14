@@ -16,4 +16,5 @@ test_output_sha256=26d422b0a44e4f756144e1c3fde97aaeb3b0e308dc74279a303e17249c0bf
 sspec_paths=test/01_unit/app/ffi_gen/module_gen_spec.spl
 sspec_review=basic-static
 checked_at=2026-09-07T11:59:11Z
+valid_until=2026-09-14T11:59:11Z
 follow_up=https://github.com/ormastes/simple/issues/497

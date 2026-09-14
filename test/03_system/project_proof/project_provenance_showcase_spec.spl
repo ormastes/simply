@@ -5,18 +5,25 @@ describe "Project provenance showcase":
     it "REQ-PPS-001 through REQ-PPS-005 fail closed across every receipt state":
         val (out, err, code) = process_run("sh", ["-c", "if [ -f test/project_provenance_showcase_test.sh ]; then sh test/project_provenance_showcase_test.sh; else sh ../simply/test/project_provenance_showcase_test.sh; fi"])
         expect(code).to_equal(0)
-        expect(out).to_contain("verified, failed, absent, malformed, dirty")
-        expect(out).to_contain("beta-mismatch, and project-tag states")
+        expect(out).to_contain("proof states, immutable observations")
+        expect(out).to_contain("private metadata, and malformed evidence")
         expect(err).to_equal("")
 
     it "REQ-PPS-001 and REQ-PPS-007 bind live maintenance evidence to immutable revisions":
         val (out, err, code) = process_run("sh", ["-c", "if [ -f test/collect_project_proof_test.sh ]; then sh test/collect_project_proof_test.sh; else sh ../simply/test/collect_project_proof_test.sh; fi"])
         expect(code).to_equal(0)
-        expect(out).to_contain("identity, tag, SSpec review, result, digest, and clean tree")
+        expect(out).to_contain("trusted runtime, immutable identity, validity, output safety, and clean tree")
         expect(err).to_equal("")
 
     it "REQ-PPS-006 rejects dirty roots while permitting a staged pre-commit index":
         val (out, err, code) = process_run("sh", ["-c", "if [ -f test/worktree_clean_guard_test.sh ]; then sh test/worktree_clean_guard_test.sh; else sh ../simply/test/worktree_clean_guard_test.sh; fi"])
         expect(code).to_equal(0)
         expect(out).to_contain("staged, unstaged, and untracked changes")
+        expect(err).to_equal("")
+
+    it "REQ-PPS-001 and REQ-PPS-006 isolate each workflow run from stale proof data":
+        val (out, err, code) = process_run("sh", ["-c", "if [ -f test/workflow_project_proof_test.sh ]; then sh test/workflow_project_proof_test.sh; else sh ../simply/test/workflow_project_proof_test.sh; fi"])
+        expect(code).to_equal(0)
+        expect(out).to_contain("isolates proof output")
+        expect(out).to_contain("rejects stale receipts")
         expect(err).to_equal("")

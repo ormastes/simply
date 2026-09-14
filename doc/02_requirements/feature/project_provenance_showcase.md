@@ -17,7 +17,10 @@ to commit `62eada434c050cb688598bef1ab4f5a25b5cb404`.
   timestamp, and explicit follow-up/TODO state.
 - **REQ-PPS-002:** The dedicated generated Projects page shall list every
   in-scope project and show its propagation state as `verified`, `unverified`,
-  or `failed`; absence of a receipt shall be `unverified`, never success.
+  or `failed`; absence of a receipt shall be `unverified`, never success. Every
+  receipt shall include an explicit UTC `valid_until` deadline; acceptance
+  requires `checked_at <= PROOF_NOW < valid_until` (with `PROOF_NOW` defaulting
+  to the current UTC time).
 - **REQ-PPS-003:** Each verified or failed result shall link to its exact project
   commit and Simple tag/commit so a reader can reproduce the evidence.
 - **REQ-PPS-004:** A deterministic simulator fixture shall exercise verified,
@@ -36,4 +39,5 @@ to commit `62eada434c050cb688598bef1ab4f5a25b5cb404`.
 
 An SSpec scenario must prove all receipt states and the clean/dirty root guard;
 the generator must render a stable Projects page from fixtures and reject an
-invalid receipt without publishing a `verified` claim.
+invalid, expired, boundary, malformed, future-dated, or symlink receipt
+without publishing a `verified` claim.

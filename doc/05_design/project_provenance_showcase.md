@@ -10,13 +10,19 @@
 `project_tag_commit`,
 `simple_tag`, `simple_commit`, `tree`, `test_command`, `test_result`,
 `test_exit`, `test_output_sha256`, `sspec_paths`, `sspec_review`, `checked_at`,
-and `follow_up`.
+`valid_until`, and `follow_up`.
 
 `project_tag` and `project_tag_commit` are an optional pair; every other
 identity/result field is mandatory.
 `tree` is `clean` only. `test_result` is `verified`, `failed`, or
 `unverified`. A verified result requires clean tree plus the beta tag/commit
-pair. The renderer checks every condition itself.
+pair and a fresh deadline. The freshness predicate is strict and deterministic:
+`checked_at <= PROOF_NOW < valid_until`, where `PROOF_NOW` is an optional
+canonical UTC timestamp override and otherwise the current UTC time. Invalid
+calendar timestamps, future-dated `checked_at`, expired deadlines, and an exact
+deadline boundary fail closed. The collector/workflow chooses the explicit
+validity window; the renderer never guesses one from receipt age. A receipt
+path must be a regular file and symlinks are rejected.
 
 ## Page
 
@@ -33,9 +39,11 @@ no proof state. Private rows expose neither commit nor tag metadata.
 ## Test approach
 
 The POSIX test exercises materialized simulator fixtures: verified, failed,
-absent, malformed, dirty, unsafe, duplicate, bad beta target, and project-tag
-states. The SSpec invokes that simulator, the live-collector simulator, and the
-root-guard simulator, binding every REQ-PPS requirement to executable behavior.
+absent, malformed, dirty, unsafe, duplicate, expired, exact-boundary,
+future-dated, symlink, bad beta target, and project-tag states. It fixes
+`PROOF_NOW` so the freshness assertions are reproducible. The SSpec invokes
+that simulator, the live-collector simulator, and the root-guard simulator,
+binding every REQ-PPS requirement to executable behavior.
 CI attempts it with the exact pinned beta revision. Until
 `ormastes/simple#497` supplies a runnable production beta artifact, the three
 portable harnesses are executable evidence and beta SSpec execution remains an
